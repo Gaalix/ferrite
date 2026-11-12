@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     ops::Range,
-    sync::{Arc, Mutex, RwLockReadGuard},
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
 
 use futures::StreamExt;
@@ -46,6 +47,10 @@ use crate::{
         AddonCacheStats, AddonHttpEngine, AddonTelemetrySnapshot, CuratedAddonEntry,
         InstallAddonOutcome, MutedAddonEntry,
     },
+    debrid::{
+        DebridAccountStatus, DebridBaseUrls, DebridCacheStatus, LocalDebridResolver,
+        ResolvedDebridStream,
+    },
     env::{DesktopEnv, EnvConfig, SqliteStorage},
     error::CoreRuntimeError,
     model::{DesktopModel, DesktopModelField, ModelMutationQueue},
@@ -54,6 +59,10 @@ use crate::{
         evaluate_next_episode_prewarm, extract_player_series_id, inspect_next_episode_resolution,
         NextEpisodeResolution, NextEpisodeTarget, ResolvedNextEpisode,
     },
+    private_config::{
+        LocalDebridProvider, PrivateIntegrationsConfig, ProwlarrFallbackMode,
+    },
+    prowlarr::{ProwlarrClient, ProwlarrTestResult, RichStreamItem},
     track_prefs::{
         delete_series_track_pref, load_all_series_track_prefs, load_series_track_pref,
         store_series_track_pref, SeriesTrackPreference,
@@ -80,6 +89,10 @@ pub struct CoreController {
     runtime_handle: tokio::runtime::Handle,
     mutation_queue: ModelMutationQueue,
     mutation_gate: Arc<Mutex<()>>,
+    private_config: Arc<RwLock<PrivateIntegrationsConfig>>,
+    private_config_path: PathBuf,
+    debrid_resolver: Arc<LocalDebridResolver>,
+    prowlarr_client: Arc<ProwlarrClient>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -112,6 +125,15 @@ impl CoreController {
         let addon_engine = DesktopEnv::addon_engine()?;
         let http_client = DesktopEnv::http_client()?;
         let runtime_handle = DesktopEnv::runtime_handle()?;
+        let private_config_path = DesktopEnv::private_config_path()?;
+        let loaded_private_config =
+            match PrivateIntegrationsConfig::load_from_path(&private_config_path) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    error!("Failed to load private integrations config: {err}");
+                    PrivateIntegrationsConfig::default()
+                }
+            };
         let buckets = DesktopEnv::bootstrap_buckets().await?;
         let (model, effects) = DesktopModel::from_buckets(buckets);
         let mutation_queue = model.mutation_queue.clone();
@@ -140,6 +162,10 @@ impl CoreController {
             runtime_handle,
             mutation_queue,
             mutation_gate: Arc::new(Mutex::new(())),
+            private_config: Arc::new(RwLock::new(loaded_private_config)),
+            private_config_path,
+            debrid_resolver: Arc::new(LocalDebridResolver::new()),
+            prowlarr_client: Arc::new(ProwlarrClient::new()),
         })
     }
 
@@ -1179,6 +1205,189 @@ impl CoreController {
                 .ok()
                 .map(|(url, _, _)| url)
         })
+    }
+
+    pub fn private_integrations(&self) -> PrivateIntegrationsConfig {
+        self.private_config
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn update_private_integrations(
+        &self,
+        next: PrivateIntegrationsConfig,
+    ) -> Result<(), String> {
+        let normalized = next.normalized();
+        normalized.save_to_path(&self.private_config_path)?;
+        if let Ok(mut guard) = self.private_config.write() {
+            let key_or_provider_changed = guard.active_debrid != normalized.active_debrid
+                || guard.real_debrid_api_key != normalized.real_debrid_api_key
+                || guard.torbox_api_key != normalized.torbox_api_key
+                || guard.alldebrid_api_key != normalized.alldebrid_api_key;
+            *guard = normalized;
+            if key_or_provider_changed {
+                self.debrid_resolver.clear_caches();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_debrid_base_urls(&self, base_urls: DebridBaseUrls) {
+        self.debrid_resolver.set_base_urls(base_urls);
+    }
+
+    pub fn has_local_debrid_configured(&self) -> bool {
+        self.private_integrations().has_local_debrid_configured()
+    }
+
+    pub fn has_any_debrid_configured(&self) -> bool {
+        self.has_local_debrid_configured() || self.has_debrid_addon_configured()
+    }
+
+    pub fn last_debrid_resolve_latency_ms(&self) -> Option<u64> {
+        self.debrid_resolver.last_resolve_latency_ms()
+    }
+
+    pub async fn verify_local_debrid(
+        &self,
+        provider: LocalDebridProvider,
+        override_key: Option<String>,
+    ) -> Result<DebridAccountStatus, String> {
+        let cfg = self.private_integrations();
+        let api_key = override_key
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty())
+            .or_else(|| cfg.key_for_provider(provider).map(|k| k.expose().to_owned()))
+            .unwrap_or_default();
+
+        let resolver = Arc::clone(&self.debrid_resolver);
+        self.runtime_handle
+            .spawn(async move { resolver.verify_account(provider, &api_key).await })
+            .await
+            .map_err(|err| format!("Debrid verification task failed: {err}"))?
+    }
+
+    pub async fn test_prowlarr(
+        &self,
+        override_url: Option<String>,
+        override_key: Option<String>,
+    ) -> Result<ProwlarrTestResult, String> {
+        let cfg = self.private_integrations();
+        let url = override_url
+            .map(|u| u.trim().to_owned())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| cfg.prowlarr_url.clone());
+        let api_key = override_key
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| cfg.prowlarr_api_key.expose().to_owned());
+        let timeout_ms = cfg.prowlarr_timeout_ms;
+
+        let client = Arc::clone(&self.prowlarr_client);
+        self.runtime_handle
+            .spawn(async move { client.test_connection(&url, &api_key, timeout_ms).await })
+            .await
+            .map_err(|err| format!("Prowlarr connection test task failed: {err}"))?
+    }
+
+    pub async fn check_local_debrid_cache(
+        &self,
+        info_hashes: Vec<[u8; 20]>,
+    ) -> HashMap<[u8; 20], DebridCacheStatus> {
+        let cfg = self.private_integrations();
+        if !cfg.has_local_debrid_configured() || info_hashes.is_empty() {
+            return HashMap::new();
+        }
+        let provider = cfg.active_debrid;
+        let api_key = cfg
+            .active_debrid_key()
+            .map(|k| k.expose().to_owned())
+            .unwrap_or_default();
+
+        let resolver = Arc::clone(&self.debrid_resolver);
+        self.runtime_handle
+            .spawn(async move { resolver.check_cache(provider, &api_key, &info_hashes).await })
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn resolve_torrent_via_local_debrid(
+        &self,
+        info_hash: [u8; 20],
+        file_idx: Option<u32>,
+        announce: Vec<String>,
+        season_episode: Option<(u32, u32)>,
+    ) -> Result<ResolvedDebridStream, String> {
+        let cfg = self.private_integrations();
+        if !cfg.has_local_debrid_configured() {
+            return Err("No local Debrid provider is configured".to_owned());
+        }
+        if !cfg.direct_rust_unrestrict {
+            return Err("Direct Rust Debrid unrestricting is disabled in Settings".to_owned());
+        }
+
+        let provider = cfg.active_debrid;
+        let api_key = cfg
+            .active_debrid_key()
+            .map(|k| k.expose().to_owned())
+            .unwrap_or_default();
+
+        let resolver = Arc::clone(&self.debrid_resolver);
+        self.runtime_handle
+            .spawn(async move {
+                resolver
+                    .resolve_torrent(
+                        provider,
+                        &api_key,
+                        info_hash,
+                        file_idx,
+                        &announce,
+                        season_episode,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|err| format!("Debrid resolve task failed: {err}"))?
+    }
+
+    pub async fn fetch_prowlarr_streams(
+        &self,
+        content_type: &str,
+        video_id: &str,
+        title_hint: Option<&str>,
+    ) -> Result<Vec<RichStreamItem>, String> {
+        let cfg = self.private_integrations();
+        if matches!(cfg.prowlarr_mode, ProwlarrFallbackMode::Off) {
+            return Ok(Vec::new());
+        }
+        if cfg.prowlarr_url.trim().is_empty() {
+            return Err("Prowlarr URL is not configured".to_owned());
+        }
+
+        let url = cfg.prowlarr_url.clone();
+        let api_key = cfg.prowlarr_api_key.expose().to_owned();
+        let timeout_ms = cfg.prowlarr_timeout_ms;
+        let content_type = content_type.to_owned();
+        let video_id = video_id.to_owned();
+        let title_hint = title_hint.map(str::to_owned);
+
+        let client = Arc::clone(&self.prowlarr_client);
+        self.runtime_handle
+            .spawn(async move {
+                client
+                    .search(
+                        &url,
+                        &api_key,
+                        timeout_ms,
+                        &content_type,
+                        &video_id,
+                        title_hint.as_deref(),
+                    )
+                    .await
+            })
+            .await
+            .map_err(|err| format!("Prowlarr search task failed: {err}"))?
     }
 }
 

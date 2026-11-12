@@ -6546,23 +6546,30 @@ name = "stremio-core-runtime"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "data-encoding",
  "directories 5.0.1",
  "dirs 5.0.1",
  "futures",
+ "hex",
  "http",
  "once_cell",
+ "percent-encoding",
  "regex",
  "reqwest 0.12.28",
+ "roxmltree 0.21.2",
  "rusqlite",
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "sha1",
  "stremio-core",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
+ "urlencoding",
+ "zeroize",
 ]
 
 [[package]]

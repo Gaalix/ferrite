@@ -1,9 +1,12 @@
 pub mod addon_engine;
 pub mod controller;
+pub mod debrid;
 pub mod env;
 pub mod error;
 pub mod model;
 pub mod prewarm;
+pub mod private_config;
+pub mod prowlarr;
 pub mod stream_parser;
 pub mod track_prefs;
 
@@ -23,6 +26,13 @@ pub use addon_engine::{
 pub use controller::{
     CoreController, DesktopRuntimeAction, DesktopRuntimeEvent, INITIAL_BOARD_SHELVES,
 };
+pub use debrid::{
+    build_canonical_magnet, extract_magnet_trackers, parse_info_hash, select_best_video_file,
+    validate_resolved_stream_url, DebridAccountStatus, DebridBaseUrls, DebridCacheStatus,
+    LocalDebridResolver, ResolvedDebridStream, TorrentFileCandidate, AVAILABILITY_CACHE_TTL,
+    DEFAULT_ALLDEBRID_BASE_URL, DEFAULT_REAL_DEBRID_BASE_URL, DEFAULT_TORBOX_BASE_URL,
+    RESOLVED_URL_CACHE_TTL,
+};
 pub use env::{
     default_storage_path, legacy_storage_path, migrate_legacy_storage_file, DesktopEnv,
     DesktopEnvConfig, EnvConfig, PersistedBuckets, SqliteStorage,
@@ -34,6 +44,13 @@ pub use prewarm::{
     PrewarmTriggerReason, ResolvedNextEpisode, ENDING_PREWARM_WINDOW_SECS,
     MIN_EPISODE_DURATION_FOR_ENDING_PREWARM_SECS,
 };
+pub use private_config::{
+    default_config_path as default_private_config_path, load_from_path as load_private_config,
+    redact_secret, save_to_path as save_private_config, LocalDebridProvider,
+    PrivateIntegrationsConfig, ProwlarrFallbackMode, SecretApiKey, DEFAULT_PROWLARR_TIMEOUT_MS,
+    MAX_PROWLARR_TIMEOUT_MS, MIN_PROWLARR_TIMEOUT_MS,
+};
+pub use prowlarr::{ProwlarrClient, ProwlarrTestResult, RichStreamItem};
 pub use stream_parser::{
     filter_and_rank_streams, format_bytes, is_allowed_addon_stream_url, is_allowed_stream_source,
     is_allowed_stream_url, parse_stream, parse_stream_with_addon, parse_streams, AudioCodec,

@@ -632,12 +632,21 @@ struct EnvState {
     sequential_tx: mpsc::UnboundedSender<BoxedTask>,
     storage: SqliteStorage,
     storage_path: PathBuf,
+    private_config_path: PathBuf,
     streaming_server_url: Option<Url>,
 }
 
 impl EnvState {
     fn build(config: EnvConfig) -> Result<Arc<Self>, CoreRuntimeError> {
         let storage_path = config.effective_storage_path();
+        let private_config_path = match config.storage_path.as_deref() {
+            Some(custom_db) if custom_db != Path::new(":memory:") => custom_db
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.join("private_integrations.json"))
+                .unwrap_or_else(crate::private_config::default_config_path),
+            _ => crate::private_config::default_config_path(),
+        };
         let storage = SqliteStorage::open(&storage_path)?;
         let timeout_override = config.effective_timeout_override();
 
@@ -694,6 +703,7 @@ impl EnvState {
             sequential_tx,
             storage,
             storage_path,
+            private_config_path,
             streaming_server_url: config.streaming_server_url,
         }))
     }
@@ -770,6 +780,11 @@ impl DesktopEnv {
     pub fn storage_path() -> Result<PathBuf, CoreRuntimeError> {
         let env = current_env_arc().map_err(|_| CoreRuntimeError::NotInitialized)?;
         Ok(env.storage_path.clone())
+    }
+
+    pub fn private_config_path() -> Result<PathBuf, CoreRuntimeError> {
+        let env = current_env_arc().map_err(|_| CoreRuntimeError::NotInitialized)?;
+        Ok(env.private_config_path.clone())
     }
 
     pub fn sqlite_storage() -> Result<SqliteStorage, CoreRuntimeError> {
