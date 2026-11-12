@@ -2454,6 +2454,8 @@ dependencies = [
  "tokio",
  "tracing",
  "wayland-sys",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "windows-sys 0.52.0",
 ]
 

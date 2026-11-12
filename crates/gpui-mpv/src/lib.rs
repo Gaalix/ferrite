@@ -1,3 +1,4 @@
+pub mod dcomp;
 pub mod element;
 pub(crate) mod mpv_ffi;
 pub mod player;
@@ -6,6 +7,12 @@ pub mod shaders;
 pub(crate) mod subsurface;
 pub mod thumbnails;
 
+#[cfg(target_os = "windows")]
+pub use dcomp::WindowsDCompUnderlay;
+pub use dcomp::{
+    compute_underlay_placement, DCompBackendMode, DCompDesiredState, DCompHandleSnapshot,
+    DCompStateTracker, DCompSyncDiff, DCompUnderlayRect, UnderlayPlacement,
+};
 pub use element::{mpv_viewport, MpvViewport};
 pub use player::{
     drain_evicted_video_images, shorten_codec_label, validate_stream_url, MediaTrack,

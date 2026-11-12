@@ -7972,11 +7972,19 @@ impl HasDisplayHandle for Window {
     }
 }
 
-/// Raw Win32 window handle for native video rendering integration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Raw Win32 and DirectComposition handles for native video rendering integration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct WindowsVideoHandles {
     /// Raw Win32 `HWND` pointer cast to `isize`.
     pub hwnd: isize,
+    /// Raw `IDCompositionDevice` COM pointer (`as_raw() as usize`), or `0` if unavailable.
+    pub dcomp_device: usize,
+    /// Raw `IDCompositionVisual` COM pointer (`as_raw() as usize`) for the video underlay layer, or `0` if unavailable.
+    pub dcomp_video_visual: usize,
+    /// Raw `ID3D11Device` COM pointer (`as_raw() as usize`), or `0` if unavailable.
+    pub d3d11_device: usize,
+    /// Whether DirectComposition is active for this window.
+    pub direct_composition_active: bool,
 }
 
 impl Window {

@@ -137,6 +137,39 @@ impl Element for MpvViewport {
         self.controller
             .set_viewport_rect(x, y, width, height, scale_factor);
 
+        #[cfg(target_os = "windows")]
+        if self.controller.is_windows_dcomp_active() {
+            if let Some(handles) = window
+                .windows_video_handles()
+                .filter(|h| h.direct_composition_active && h.hwnd != 0)
+            {
+                match self.controller.attach_or_sync_windows_dcomp(handles) {
+                    Ok(()) => {
+                        window.paint_quad(fill(
+                            bounds,
+                            Rgba {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            },
+                        ));
+
+                        for child in &mut self.children {
+                            child.paint(window, cx);
+                        }
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "gpui_mpv::element",
+                            "Windows DirectComposition underlay failed, falling back to software renderer: {err}"
+                        );
+                    }
+                }
+            }
+        }
+
         #[cfg(target_os = "linux")]
         if let Some(handles) = window.wayland_video_handles() {
             if !self.controller.is_subsurface_attached() {
