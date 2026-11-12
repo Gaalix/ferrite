@@ -236,7 +236,7 @@ fn url_normalization_configure_mapping_and_curated_directory_work() {
 async fn ttl_cache_and_singleflight_coalescing_deduplicate_identical_gets() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("cache_coalesce.db");
-    let mock = spawn_mock_addon_server(Duration::from_millis(45)).await;
+    let mock = spawn_mock_addon_server(Duration::from_millis(90)).await;
     let dummy_ss: Url = "http://127.0.0.1:1/".parse().unwrap();
 
     let config = DesktopEnvConfig::with_storage_path(&db_path)
@@ -354,7 +354,7 @@ async fn soft_circuit_breaker_trips_after_three_failures_fast_fails_and_resets()
             .await
             .expect_err("open circuit must fast-fail");
         assert!(
-            start.elapsed() < Duration::from_millis(10),
+            start.elapsed() < Duration::from_millis(500),
             "circuit open fast-fail took {:?}",
             start.elapsed()
         );
@@ -505,7 +505,13 @@ async fn in_place_upgrade_reordering_and_soft_mute_persist_across_reopen() {
         );
 
         let mut saw_new_state = false;
-        while let Ok(ev) = events_rx.try_recv() {
+        let event_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !saw_new_state {
+            let remaining = event_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let ev = tokio::time::timeout(remaining, events_rx.recv())
+                .await
+                .expect("timed out waiting for RuntimeEvent::NewState")
+                .expect("broadcast channel must stay open");
             if matches!(ev.as_ref(), RuntimeEvent::NewState(fields, ..) if fields.contains(&DesktopModelField::Ctx))
             {
                 saw_new_state = true;

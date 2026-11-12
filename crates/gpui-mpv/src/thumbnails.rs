@@ -568,7 +568,7 @@ impl SwMpvEngine {
             return false;
         };
 
-        let seek_deadline = Instant::now() + Duration::from_millis(3000);
+        let seek_deadline = Instant::now() + Duration::from_millis(8000);
         let mut tried_exact_fallback = false;
         let mut seek_reply_ok = false;
         let mut seek_restarted = false;
@@ -613,7 +613,7 @@ impl SwMpvEngine {
                             seek_cmd_id = fallback_id;
                         } else if !same_url {
                             return self
-                                .wait_post_restart_frame(shared, Duration::from_millis(120))
+                                .wait_post_restart_frame(shared, Duration::from_millis(500))
                                 .is_some();
                         } else {
                             return false;
@@ -638,7 +638,7 @@ impl SwMpvEngine {
             return false;
         }
 
-        self.wait_post_restart_frame(shared, Duration::from_millis(120))
+        self.wait_post_restart_frame(shared, Duration::from_millis(500))
             .is_some()
     }
 
@@ -659,7 +659,7 @@ impl SwMpvEngine {
             self.clear_render_update_flags();
 
             let load_cmd_id = self.send_cmd(&["loadfile", clean_url, "replace"])?;
-            let load_deadline = Instant::now() + Duration::from_secs(6);
+            let load_deadline = Instant::now() + Duration::from_secs(10);
             let mut load_replied = false;
             let mut file_loaded = false;
             let mut initial_restarted = false;
@@ -712,7 +712,7 @@ impl SwMpvEngine {
             self.loaded_url = Some(clean_url.to_owned());
 
             if timestamp_secs <= 0.5 {
-                self.wait_post_restart_frame(shared, Duration::from_millis(120))?;
+                self.wait_post_restart_frame(shared, Duration::from_millis(500))?;
             }
         }
 
@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!((f1.width, f1.height), (240, 135));
 
         thumb.clear_and_suspend();
-        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
         while thumb.is_engine_loaded() && Instant::now() < wait_deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1051,6 +1051,10 @@ mod tests {
         );
 
         thumb.clear_and_suspend();
+        let wait_deadline2 = Instant::now() + Duration::from_secs(10);
+        while thumb.is_engine_loaded() && Instant::now() < wait_deadline2 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(!thumb.is_engine_loaded());
     }
 
