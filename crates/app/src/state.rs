@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -32,7 +32,8 @@ use stremio_core_runtime::{
             resource::{MetaItem, MetaItemPreview, Stream, StreamSource},
         },
     },
-    AddonCategory, CoreController, DesktopModel, ParsedStream, Resolution, StreamFilter,
+    AddonCategory, CoreController, DebridCacheStatus, DesktopModel, LocalDebridProvider,
+    ParsedStream, Resolution, RichStreamItem, StreamFilter,
 };
 use stremio_stream_engine::{
     StorageMode, StreamEngine, StreamEngineConfig, StreamEngineError, StreamEngineHandle,
@@ -1006,6 +1007,25 @@ impl PlaybackCandidate {
         }
     }
 
+    pub fn from_rich_stream_item(item: RichStreamItem) -> Self {
+        let addon_name = item
+            .parsed
+            .addon_name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Prowlarr".to_owned());
+        let parsed = item
+            .parsed
+            .with_addon_origin(Some("prowlarr"), Some(&addon_name), None);
+        Self {
+            stream: item.stream,
+            parsed,
+            stream_request: None,
+            addon_key: "prowlarr".to_owned(),
+            addon_name,
+        }
+    }
+
     pub fn summary_badge(&self) -> String {
         let mut parts = Vec::new();
         if !matches!(self.parsed.resolution, Resolution::Unknown) {
@@ -1296,6 +1316,78 @@ pub fn summarize_available_stream_addons(
     list
 }
 
+/// Addon ID, display name, and stream count summary for stream filter pills.
+pub type AddonStreamCounts = Arc<Vec<(String, String, usize)>>;
+/// Ranked stream candidates paired with their per-addon stream counts.
+pub type EnrichedStreamCandidates = (Arc<Vec<PlaybackCandidate>>, AddonStreamCounts);
+
+/// Merges Prowlarr fallback streams (deduplicated by torrent info_hash), applies
+/// local Debrid instant-cache badges (`RD+` / `TB+` / `AD+`), and filters out
+/// uncached P2P torrents when `cached_only_filter` is enabled.
+pub fn merge_and_enrich_stream_candidates(
+    base_candidates: &[PlaybackCandidate],
+    prowlarr_candidates: &[PlaybackCandidate],
+    local_debrid_provider: LocalDebridProvider,
+    debrid_cache: &HashMap<(LocalDebridProvider, [u8; 20]), DebridCacheStatus>,
+    cached_only_filter: bool,
+) -> EnrichedStreamCandidates {
+    let mut merged: Vec<PlaybackCandidate> = base_candidates.to_vec();
+    let mut seen_hashes: HashSet<[u8; 20]> = merged
+        .iter()
+        .filter_map(|c| match c.stream.source {
+            StreamSource::Torrent { info_hash, .. } => Some(info_hash),
+            _ => None,
+        })
+        .collect();
+
+    for cand in prowlarr_candidates {
+        if !cand.parsed.is_allowed() {
+            continue;
+        }
+        if let StreamSource::Torrent { info_hash, .. } = cand.stream.source {
+            if !seen_hashes.insert(info_hash) {
+                continue;
+            }
+        }
+        merged.push(cand.clone());
+    }
+
+    if local_debrid_provider.is_enabled() {
+        let badge = local_debrid_provider.short_badge();
+        for cand in &mut merged {
+            if let StreamSource::Torrent { info_hash, .. } = cand.stream.source {
+                if debrid_cache.get(&(local_debrid_provider, info_hash))
+                    == Some(&DebridCacheStatus::CachedInstant)
+                {
+                    cand.parsed.is_cached = true;
+                    if cand.parsed.debrid_provider.is_none() && !badge.is_empty() {
+                        cand.parsed.debrid_provider = Some(badge.to_owned());
+                    }
+                    if !badge.is_empty()
+                        && !cand
+                            .parsed
+                            .badges
+                            .iter()
+                            .any(|b| b.eq_ignore_ascii_case(badge))
+                    {
+                        cand.parsed.badges.push(badge.to_owned());
+                    }
+                }
+            }
+        }
+
+        if cached_only_filter {
+            merged.retain(|cand| {
+                !matches!(cand.stream.source, StreamSource::Torrent { .. }) || cand.parsed.is_cached
+            });
+        }
+    }
+
+    sort_stream_candidates(&mut merged);
+    let available_addons = Arc::new(summarize_available_stream_addons(&merged));
+    (Arc::new(merged), available_addons)
+}
+
 #[derive(Clone, Debug)]
 pub struct PlaybackSession {
     pub generation: u64,
@@ -1311,6 +1403,8 @@ pub struct PlaybackSession {
     pub start_offset_secs: Option<f64>,
     pub seamless_switch_pending: bool,
     pub applied_series_track_prefs: bool,
+    pub debrid_resolving: bool,
+    pub debrid_error: Option<String>,
     pub resolved_url: Option<String>,
     pub loaded_into_mpv: bool,
     pub started_at: Instant,
@@ -1618,7 +1712,8 @@ pub fn apply_key_to_text_buffer(
     false
 }
 
-pub fn parse_episode_badge_from_video_id(video_id: Option<&str>) -> Option<String> {
+/// Extracts `(season, episode)` from a Stremio-style `id:season:episode` video identifier.
+pub fn parse_season_episode_from_video_id(video_id: Option<&str>) -> Option<(u32, u32)> {
     let raw = video_id?.trim();
     let mut parts = raw.rsplitn(3, ':');
     let ep_str = parts.next()?;
@@ -1626,17 +1721,16 @@ pub fn parse_episode_badge_from_video_id(video_id: Option<&str>) -> Option<Strin
     let _imdb_prefix = parts.next()?;
     let season = season_str.parse::<u32>().ok()?;
     let episode = ep_str.parse::<u32>().ok()?;
+    Some((season, episode))
+}
+
+pub fn parse_episode_badge_from_video_id(video_id: Option<&str>) -> Option<String> {
+    let (season, episode) = parse_season_episode_from_video_id(video_id)?;
     Some(format!("S{season:02}E{episode:02}"))
 }
 
 pub fn format_movietracker_episode_code(video_id: Option<&str>) -> Option<String> {
-    let raw = video_id?.trim();
-    let mut parts = raw.rsplitn(3, ':');
-    let ep_str = parts.next()?;
-    let season_str = parts.next()?;
-    let _imdb_prefix = parts.next()?;
-    let season = season_str.parse::<u32>().ok()?;
-    let episode = ep_str.parse::<u32>().ok()?;
+    let (season, episode) = parse_season_episode_from_video_id(video_id)?;
     Some(format!("S{season} E{episode}"))
 }
 
@@ -2457,5 +2551,155 @@ mod tests {
         assert_eq!(loaded.preferred_subtitle_lang, "eng");
         assert!(loaded.auto_select_subtitles);
         assert_eq!(loaded.default_subtitle_delay_ms, 0);
+    }
+
+    #[test]
+    fn parse_season_episode_from_video_id_parses_standard_and_prefixed_ids() {
+        assert_eq!(parse_season_episode_from_video_id(Some("tt27995113:1:2")), Some((1, 2)));
+        assert_eq!(parse_season_episode_from_video_id(Some("tt27995113:02:14")), Some((2, 14)));
+        assert_eq!(parse_season_episode_from_video_id(Some("kitsu:1234:1:5")), Some((1, 5)));
+        assert_eq!(parse_season_episode_from_video_id(Some("1:5")), None);
+        assert_eq!(parse_season_episode_from_video_id(Some("tt27995113")), None);
+        assert_eq!(parse_season_episode_from_video_id(None), None);
+        assert_eq!(
+            parse_episode_badge_from_video_id(Some("tt27995113:1:2")),
+            Some("S01E02".to_owned())
+        );
+        assert_eq!(
+            format_movietracker_episode_code(Some("tt27995113:1:2")),
+            Some("S1 E2".to_owned())
+        );
+    }
+
+    #[test]
+    fn merge_and_enrich_stream_candidates_dedups_enriches_and_filters() {
+        let hash_cached = [0x11_u8; 20];
+        let hash_uncached = [0x22_u8; 20];
+        let hash_prowlarr_unique = [0x33_u8; 20];
+
+        let base_cached_stream = Stream {
+            source: StreamSource::Torrent {
+                info_hash: hash_cached,
+                file_idx: Some(0),
+                announce: Vec::new(),
+                file_must_include: Vec::new(),
+            },
+            name: Some("Torrentio".to_owned()),
+            description: Some("Movie.2024.2160p.WEB-DL.mkv".to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+        let base_uncached_stream = Stream {
+            source: StreamSource::Torrent {
+                info_hash: hash_uncached,
+                file_idx: None,
+                announce: Vec::new(),
+                file_must_include: Vec::new(),
+            },
+            name: Some("Torrentio".to_owned()),
+            description: Some("Movie.2024.1080p.BluRay.mkv".to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+        let base_url_stream = Stream {
+            source: StreamSource::Url {
+                url: url::Url::parse("https://cdn.example.com/movie.mkv").expect("valid url"),
+            },
+            name: Some("DirectAddon".to_owned()),
+            description: Some("Direct 1080p".to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+
+        let base = vec![
+            PlaybackCandidate::from_stream_and_request(base_cached_stream, None, &[]),
+            PlaybackCandidate::from_stream_and_request(base_uncached_stream, None, &[]),
+            PlaybackCandidate::from_stream_and_request(base_url_stream, None, &[]),
+        ];
+
+        let prowlarr_dup_stream = Stream {
+            source: StreamSource::Torrent {
+                info_hash: hash_cached,
+                file_idx: Some(0),
+                announce: Vec::new(),
+                file_must_include: Vec::new(),
+            },
+            name: Some("Prowlarr · 1337x".to_owned()),
+            description: Some("Movie.2024.2160p.WEB-DL.mkv\n👤 120 · 💾 8.0 GB".to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+        let prowlarr_new_stream = Stream {
+            source: StreamSource::Torrent {
+                info_hash: hash_prowlarr_unique,
+                file_idx: None,
+                announce: vec!["udp://tracker.example:6969".to_owned()],
+                file_must_include: Vec::new(),
+            },
+            name: Some("Prowlarr · TorrentGalaxy".to_owned()),
+            description: Some("Movie.2024.1080p.WEB-DL.mkv\n👤 45 · 💾 4.0 GB".to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+
+        let prowlarr_dup = PlaybackCandidate::from_rich_stream_item(RichStreamItem {
+            parsed: stremio_core_runtime::parse_stream_with_addon(
+                &prowlarr_dup_stream,
+                Some("Prowlarr"),
+            ),
+            stream: prowlarr_dup_stream,
+        });
+        let prowlarr_new = PlaybackCandidate::from_rich_stream_item(RichStreamItem {
+            parsed: stremio_core_runtime::parse_stream_with_addon(
+                &prowlarr_new_stream,
+                Some("Prowlarr"),
+            ),
+            stream: prowlarr_new_stream,
+        });
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            (LocalDebridProvider::RealDebrid, hash_cached),
+            DebridCacheStatus::CachedInstant,
+        );
+        cache.insert(
+            (LocalDebridProvider::RealDebrid, hash_uncached),
+            DebridCacheStatus::UncachedOrUnknown,
+        );
+
+        let (all_merged, _addons) = merge_and_enrich_stream_candidates(
+            &base,
+            &[prowlarr_dup.clone(), prowlarr_new.clone()],
+            LocalDebridProvider::RealDebrid,
+            &cache,
+            false,
+        );
+        // 3 base + 1 unique prowlarr (duplicate hash_cached dropped)
+        assert_eq!(all_merged.len(), 4);
+        let cached_cand = all_merged
+            .iter()
+            .find(|c| matches!(c.stream.source, StreamSource::Torrent { info_hash, .. } if info_hash == hash_cached))
+            .expect("cached torrent present");
+        assert!(cached_cand.parsed.is_cached);
+        assert_eq!(cached_cand.parsed.debrid_provider.as_deref(), Some("RD+"));
+        let summary = crate::theme::summarize_stream_for_humans(&cached_cand.parsed);
+        assert_eq!(summary.availability_text, "[RD+] Cached");
+
+        let (cached_only, _) = merge_and_enrich_stream_candidates(
+            &base,
+            &[prowlarr_dup, prowlarr_new],
+            LocalDebridProvider::RealDebrid,
+            &cache,
+            true,
+        );
+        // Uncached torrents (hash_uncached and hash_prowlarr_unique) filtered out; cached torrent + direct URL remain
+        assert_eq!(cached_only.len(), 2);
+        assert!(cached_only.iter().any(|c| matches!(c.stream.source, StreamSource::Url { .. })));
+        assert!(cached_only.iter().any(|c| c.parsed.is_cached));
     }
 }

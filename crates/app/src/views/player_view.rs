@@ -528,14 +528,20 @@ impl AppShell {
         let poster_img =
             effective_poster_url.and_then(|u| self.poster_cache.resolve_poster_image(u));
 
-        let status_label = if !loaded_into_mpv {
+        let debrid_resolving = session.is_some_and(|s| s.debrid_resolving);
+        let debrid_error = session.and_then(|s| s.debrid_error.clone());
+        let status_label: SharedString = if let Some(err) = debrid_error {
+            err.into()
+        } else if debrid_resolving {
+            "Resolving cached stream via local Debrid...".into()
+        } else if !loaded_into_mpv {
             if is_torrent {
-                "Connecting to torrent swarm..."
+                "Connecting to torrent swarm...".into()
             } else {
-                "Resolving stream source..."
+                "Resolving stream source...".into()
             }
         } else {
-            "Buffering video stream..."
+            "Buffering video stream...".into()
         };
 
         let dl_mbps = dl_bps / (1024.0 * 1024.0);

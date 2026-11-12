@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,20 +21,26 @@ use stremio_core_runtime::{
         },
         types::{
             addon::{ResourcePath, ResourceRequest},
-            resource::Video,
+            resource::{StreamSource, Video},
         },
     },
-    CoreController, DesktopModelField, ResolvedNextEpisode, SeriesTrackPreference, TrackCandidate,
-    INITIAL_BOARD_SHELVES,
+    CoreController, DebridCacheStatus, DesktopModelField, LocalDebridProvider,
+    PrivateIntegrationsConfig, ProwlarrFallbackMode, ResolvedNextEpisode, SecretApiKey,
+    SeriesTrackPreference, TrackCandidate, INITIAL_BOARD_SHELVES,
 };
 use stremio_stream_engine::StreamEngineHandle;
 
 use crate::{
     icons::{svg_icon, IconName},
+    os_integration::{
+        should_inhibit_display_sleep, OsMediaCommand, OsMediaController, OsMediaMetadata,
+        OsPlaybackStatus, SleepInhibitor,
+    },
     poster_cache::PosterCache,
     state::{
         apply_key_to_text_buffer, build_subtitles_resource_path, default_library_selected,
-        detect_addon_url_candidate, is_scrub_thumbnail_stale, pick_default_series_episode_id,
+        detect_addon_url_candidate, is_scrub_thumbnail_stale, merge_and_enrich_stream_candidates,
+        parse_season_episode_from_video_id, pick_default_series_episode_id,
         quantize_scrub_bucket_ms, resolve_ready_meta_item, switch_engine_storage_mode_on_tokio,
         sync_memoized_meta_streams, trim_process_heap, AddonCategoryFilter, AddonSubTab,
         AppPreferences, AppRoute, BootServices, DebridAccessMode, DiscoverDropdown, FocusedInput,
@@ -158,6 +164,17 @@ pub struct AppShell {
     pub prowlarr_timeout_ms: u64,
     pub prowlarr_test_status: Option<String>,
     pub last_debrid_latency_ms: Option<u64>,
+
+    pub sleep_inhibitor: SleepInhibitor,
+    pub os_media: OsMediaController,
+    pub local_debrid_cache_map: HashMap<(LocalDebridProvider, [u8; 20]), DebridCacheStatus>,
+    pub local_debrid_checked_hashes: HashSet<(LocalDebridProvider, [u8; 20])>,
+    pub prowlarr_fallback_key: Option<(String, String, String)>,
+    pub prowlarr_fallback_loading: bool,
+    pub prowlarr_fallback_attempted: bool,
+    pub prowlarr_fallback_streams: Vec<PlaybackCandidate>,
+    pub prowlarr_fallback_error: Option<String>,
+    pub prowlarr_request_seq: u64,
 }
 
 impl Focusable for AppShell {
@@ -214,6 +231,36 @@ impl AppShell {
         } else {
             false
         };
+
+        #[cfg(target_os = "windows")]
+        let windows_hwnd = window
+            .windows_video_handles()
+            .map(|h| h.hwnd)
+            .filter(|&hwnd| hwnd != 0);
+        #[cfg(not(target_os = "windows"))]
+        let windows_hwnd: Option<isize> = None;
+
+        let sleep_inhibitor = SleepInhibitor::new(services.tokio_handle.clone());
+        let (mut os_media, os_media_rx) =
+            OsMediaController::start(services.tokio_handle.clone(), windows_hwnd);
+        os_media.set_enabled(services.preferences.enable_os_media_controls);
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            while let Ok(cmd) = os_media_rx.recv().await {
+                if this
+                    .update(cx, |shell, cx| {
+                        shell.handle_os_media_command(cmd, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let private_cfg = services.core.private_integrations();
+        let last_debrid_latency_ms = services.core.last_debrid_resolve_latency_ms();
 
         let cli_addon_url = services.initial_addon_url;
         let initial_route = if cli_addon_url.is_some() {
@@ -302,23 +349,33 @@ impl AppShell {
             settings_search_query: String::new(),
             settings_open_dropdown: None,
             settings_scroll_handle: ScrollHandle::new(),
-            local_debrid_provider_idx: 0,
-            local_debrid_direct_unrestrict: true,
-            local_debrid_cached_only: false,
+            local_debrid_provider_idx: local_debrid_provider_to_idx(private_cfg.active_debrid),
+            local_debrid_direct_unrestrict: private_cfg.direct_rust_unrestrict,
+            local_debrid_cached_only: private_cfg.debrid_cached_only_filter,
             real_debrid_key_input: String::new(),
             torbox_key_input: String::new(),
             alldebrid_key_input: String::new(),
-            real_debrid_key_configured: false,
-            torbox_key_configured: false,
-            alldebrid_key_configured: false,
+            real_debrid_key_configured: !private_cfg.real_debrid_api_key.is_empty(),
+            torbox_key_configured: !private_cfg.torbox_api_key.is_empty(),
+            alldebrid_key_configured: !private_cfg.alldebrid_api_key.is_empty(),
             debrid_verify_status: None,
-            prowlarr_mode_idx: 1,
-            prowlarr_url_input: String::new(),
+            prowlarr_mode_idx: prowlarr_mode_to_idx(private_cfg.prowlarr_mode),
+            prowlarr_url_input: private_cfg.prowlarr_url,
             prowlarr_key_input: String::new(),
-            prowlarr_key_configured: false,
-            prowlarr_timeout_ms: 4500,
+            prowlarr_key_configured: !private_cfg.prowlarr_api_key.is_empty(),
+            prowlarr_timeout_ms: private_cfg.prowlarr_timeout_ms,
             prowlarr_test_status: None,
-            last_debrid_latency_ms: None,
+            last_debrid_latency_ms,
+            sleep_inhibitor,
+            os_media,
+            local_debrid_cache_map: HashMap::new(),
+            local_debrid_checked_hashes: HashSet::new(),
+            prowlarr_fallback_key: None,
+            prowlarr_fallback_loading: false,
+            prowlarr_fallback_attempted: false,
+            prowlarr_fallback_streams: Vec::new(),
+            prowlarr_fallback_error: None,
+            prowlarr_request_seq: 0,
         };
 
         if cli_addon_url.is_some() {
@@ -334,6 +391,9 @@ impl AppShell {
     ) {
         let _ = mpv.set_hdr_tone_mapping(preferences.tone_mapping.to_mpv());
         let _ = mpv.set_upscale_mode(preferences.upscale_mode.to_mpv());
+        if preferences.default_subtitle_delay_ms != 0 {
+            let _ = mpv.set_subtitle_delay(f64::from(preferences.default_subtitle_delay_ms) / 1000.0);
+        }
         let exp = preferences.experimental_video;
         if exp != Default::default() {
             let _ = mpv.set_shader_preset(exp.shader_preset.to_mpv());
@@ -440,7 +500,7 @@ impl AppShell {
     pub fn has_debrid_access(&self) -> bool {
         self.preferences
             .debrid_access_mode
-            .resolve_access(self.core.has_debrid_addon_configured())
+            .resolve_access(self.core.has_any_debrid_configured())
     }
 
     pub fn is_player_video_frame_ready(&self) -> bool {
@@ -600,6 +660,7 @@ impl AppShell {
 
                 if fields.contains(&DesktopModelField::MetaDetails) {
                     self.ensure_series_default_episode_streams(cx);
+                    self.maybe_trigger_stream_enrichments(cx);
                     self.try_complete_pending_quick_resume(cx);
                 }
 
@@ -650,6 +711,35 @@ impl AppShell {
         }
     }
 
+    fn load_url_into_active_session(&mut self, url_str: String, cx: &mut Context<Self>) {
+        let Some(session) = self.playback_session.as_mut() else {
+            return;
+        };
+        let seamless_switch = session.seamless_switch_pending;
+        let start_offset_secs = session.start_offset_secs;
+        session.resolved_url = Some(url_str.clone());
+        session.loaded_into_mpv = true;
+        session.seamless_switch_pending = false;
+        session.debrid_resolving = false;
+        session.debrid_error = None;
+        session.started_at = Instant::now();
+
+        self.ensure_mpv_initialized(cx);
+        if let Some(mpv) = &self.mpv {
+            if seamless_switch {
+                let resume_at = start_offset_secs.unwrap_or(0.0);
+                let _ = mpv.switch_stream_seamless(&url_str, resume_at);
+            } else {
+                let _ = mpv.load_file(&url_str, start_offset_secs);
+                if (self.playback_speed - 1.0).abs() > 0.01 {
+                    let _ = mpv.set_speed(self.playback_speed);
+                }
+            }
+        }
+        self.sync_os_integrations();
+        cx.notify();
+    }
+
     fn sync_player_from_core_model(&mut self, cx: &mut Context<Self>) {
         if !self.route.is_player() {
             return;
@@ -676,40 +766,30 @@ impl AppShell {
             (stream_url, subs)
         });
 
-        let Some(session) = self.playback_session.as_mut() else {
-            return;
+        let fallback_url_to_load = {
+            let Some(session) = self.playback_session.as_ref() else {
+                return;
+            };
+            if !session.loaded_into_mpv
+                && !session.debrid_resolving
+                && session.debrid_error.is_none()
+            {
+                let direct_fast_url = session.active_candidate().and_then(|c| {
+                    self.core
+                        .resolve_stream_playback_url(&c.stream)
+                        .map(|u| u.to_string())
+                });
+                match session.active_candidate().map(|c| &c.stream.source) {
+                    Some(StreamSource::Url { .. }) => direct_fast_url.or(resolved_stream_url),
+                    _ => resolved_stream_url.or(direct_fast_url),
+                }
+            } else {
+                None
+            }
         };
 
-        if !session.loaded_into_mpv {
-            let fallback_url = resolved_stream_url.or_else(|| {
-                session
-                    .active_candidate()
-                    .and_then(|c| self.core.resolve_stream_playback_url(&c.stream))
-                    .map(|u| u.to_string())
-            });
-
-            if let Some(url_str) = fallback_url {
-                let seamless_switch = session.seamless_switch_pending;
-                let start_offset_secs = session.start_offset_secs;
-                session.resolved_url = Some(url_str.clone());
-                session.loaded_into_mpv = true;
-                session.seamless_switch_pending = false;
-                session.started_at = Instant::now();
-
-                self.ensure_mpv_initialized(cx);
-                if let Some(mpv) = &self.mpv {
-                    if seamless_switch {
-                        let resume_at = start_offset_secs.unwrap_or(0.0);
-                        let _ = mpv.switch_stream_seamless(&url_str, resume_at);
-                    } else {
-                        let _ = mpv.load_file(&url_str, start_offset_secs);
-                        if (self.playback_speed - 1.0).abs() > 0.01 {
-                            let _ = mpv.set_speed(self.playback_speed);
-                        }
-                    }
-                }
-                cx.notify();
-            }
+        if let Some(url_str) = fallback_url_to_load {
+            self.load_url_into_active_session(url_str, cx);
         }
 
         if let Some(session) = self.playback_session.as_mut() {
@@ -811,6 +891,7 @@ impl AppShell {
 
         self.player_snapshot = snap;
         let now_video_ready = self.is_player_video_frame_ready();
+        self.sync_os_integrations();
 
         let state_flipped = prev_paused != self.player_snapshot.paused
             || prev_buffering != self.player_snapshot.buffering
@@ -895,14 +976,35 @@ impl AppShell {
     }
 
     fn apply_saved_series_track_prefs(&mut self, snap: &PlayerSnapshot) {
-        let Some(series_id) = self.active_series_id() else {
-            return;
-        };
-        let Some(pref) = self.core.get_series_track_pref(&series_id) else {
-            return;
-        };
         let Some(mpv) = &self.mpv else {
             return;
+        };
+
+        let series_pref = self
+            .active_series_id()
+            .and_then(|series_id| self.core.get_series_track_pref(&series_id));
+
+        let pref = if let Some(saved) = series_pref {
+            saved
+        } else {
+            let mut global_pref = SeriesTrackPreference::new("global-default");
+            let audio = self.preferences.preferred_audio_lang.trim();
+            if !audio.is_empty() && !audio.eq_ignore_ascii_case("auto") {
+                global_pref.audio_lang = Some(audio.to_owned());
+            }
+            let sub = self.preferences.preferred_subtitle_lang.trim();
+            global_pref.subtitles_enabled = self.preferences.auto_select_subtitles
+                && !sub.eq_ignore_ascii_case("off")
+                && !sub.eq_ignore_ascii_case("none");
+            if global_pref.subtitles_enabled
+                && !sub.is_empty()
+                && !sub.eq_ignore_ascii_case("auto")
+            {
+                global_pref.sub_lang = Some(sub.to_owned());
+            }
+            global_pref.sub_delay_secs =
+                f64::from(self.preferences.default_subtitle_delay_ms) / 1000.0;
+            global_pref
         };
 
         let candidates = Self::build_track_candidates(&snap.tracks);
@@ -1061,6 +1163,7 @@ impl AppShell {
             video_id: resolved_video_id,
         };
         self.ensure_series_default_episode_streams(cx);
+        self.maybe_trigger_stream_enrichments(cx);
         cx.notify();
     }
 
@@ -1098,6 +1201,7 @@ impl AppShell {
             id,
             video_id: Some(video_id),
         };
+        self.maybe_trigger_stream_enrichments(cx);
         cx.notify();
     }
 
@@ -1221,15 +1325,31 @@ impl AppShell {
                     .chain(m.meta_details.streams.iter()),
                 &m.ctx.profile.addons,
             );
-            if candidates.is_empty() {
-                return None;
-            }
             Some((meta, meta_req, vid, candidates, li))
         });
 
-        let Some((meta, meta_req, vid, candidates, li)) = ready else {
+        let Some((meta, meta_req, vid, base_candidates, li)) = ready else {
             return;
         };
+
+        let cfg = self.core.private_integrations();
+        let prowlarr_slice = if self.prowlarr_fallback_key.as_ref()
+            == Some(&(req_type.clone(), req_id.clone(), vid.clone()))
+        {
+            self.prowlarr_fallback_streams.as_slice()
+        } else {
+            &[]
+        };
+        let (candidates, _) = merge_and_enrich_stream_candidates(
+            &base_candidates,
+            prowlarr_slice,
+            cfg.active_debrid,
+            &self.local_debrid_cache_map,
+            cfg.has_local_debrid_configured() && cfg.debrid_cached_only_filter,
+        );
+        if candidates.is_empty() {
+            return;
+        }
 
         self.pending_quick_resume = None;
         let resume_secs = crate::state::resume_offset_for_library_item(li.as_ref(), &vid);
@@ -1324,6 +1444,8 @@ impl AppShell {
             start_offset_secs,
             seamless_switch_pending: false,
             applied_series_track_prefs: false,
+            debrid_resolving: false,
+            debrid_error: None,
             resolved_url: None,
             loaded_into_mpv: false,
             started_at: Instant::now(),
@@ -1361,7 +1483,8 @@ impl AppShell {
         self.schedule_osd_autohide_timer(cx);
         self.schedule_dead_swarm_watchdog(cx);
         self.ensure_player_telemetry_pulse(cx);
-        self.sync_player_from_core_model(cx);
+        self.sync_os_integrations();
+        self.begin_active_candidate_resolution(cx);
         cx.notify();
     }
 
@@ -1393,6 +1516,8 @@ impl AppShell {
         session.active_index = new_index;
         session.start_offset_secs = preserve_pos;
         session.seamless_switch_pending = was_loaded;
+        session.debrid_resolving = false;
+        session.debrid_error = None;
         session.resolved_url = None;
         session.loaded_into_mpv = false;
         session.first_media_ready = false;
@@ -1419,8 +1544,112 @@ impl AppShell {
                 cx,
             );
         }
-        self.sync_player_from_core_model(cx);
+        self.begin_active_candidate_resolution(cx);
         cx.notify();
+    }
+
+    fn begin_active_candidate_resolution(&mut self, cx: &mut Context<Self>) {
+        let cfg = self.core.private_integrations();
+        let torrent_params = self.playback_session.as_ref().and_then(|session| {
+            let cand = session.active_candidate()?;
+            match &cand.stream.source {
+                StreamSource::Torrent {
+                    info_hash,
+                    file_idx,
+                    announce,
+                    ..
+                } if cfg.direct_rust_unrestrict && cfg.has_local_debrid_configured() => Some((
+                    session.generation,
+                    session.active_index,
+                    *info_hash,
+                    file_idx.map(u32::from),
+                    announce.clone(),
+                    parse_season_episode_from_video_id(Some(&session.video_id)),
+                )),
+                _ => None,
+            }
+        });
+
+        let Some((gen_id, cand_idx, info_hash, file_idx, announce, season_episode)) =
+            torrent_params
+        else {
+            self.sync_player_from_core_model(cx);
+            return;
+        };
+
+        if let Some(session) = self.playback_session.as_mut() {
+            session.debrid_resolving = true;
+            session.debrid_error = None;
+        }
+
+        let core = self.core.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = core
+                .resolve_torrent_via_local_debrid(info_hash, file_idx, announce, season_episode)
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                shell.last_debrid_latency_ms = shell.core.last_debrid_resolve_latency_ms();
+                let still_active = shell.route.is_player()
+                    && shell.playback_session.as_ref().is_some_and(|s| {
+                        s.generation == gen_id && s.active_index == cand_idx
+                    });
+                if !still_active {
+                    return;
+                }
+
+                match result {
+                    Ok(resolved) => {
+                        shell.load_url_into_active_session(resolved.url.to_string(), cx);
+                        shell.sync_player_from_core_model(cx);
+                    }
+                    Err(err) => {
+                        let cfg_now = shell.core.private_integrations();
+                        let fallback_p2p = if is_uncached_debrid_error(&err)
+                            && !cfg_now.debrid_cached_only_filter
+                        {
+                            shell.playback_session.as_ref().and_then(|s| {
+                                s.active_candidate().and_then(|c| {
+                                    shell.core.resolve_stream_playback_url(&c.stream)
+                                })
+                            })
+                        } else {
+                            None
+                        };
+
+                        if let Some(session) = shell.playback_session.as_mut() {
+                            session.debrid_resolving = false;
+                        }
+
+                        if let Some(p2p_url) = fallback_p2p {
+                            shell.push_toast(
+                                ToastKind::Info,
+                                "Uncached on Debrid — falling back to P2P swarm",
+                                Some(err),
+                                cx,
+                            );
+                            shell.load_url_into_active_session(p2p_url.to_string(), cx);
+                            shell.sync_player_from_core_model(cx);
+                        } else {
+                            if let Some(session) = shell.playback_session.as_mut() {
+                                session.debrid_error = Some(err.clone());
+                            }
+                            shell.push_toast(
+                                ToastKind::Error,
+                                if cfg_now.debrid_cached_only_filter {
+                                    "Stream uncached (Cached-only filter enabled)"
+                                } else {
+                                    "Local Debrid resolve failed"
+                                },
+                                Some(err),
+                                cx,
+                            );
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     fn trigger_dead_swarm_failover(&mut self, reason: &str, cx: &mut Context<Self>) {
@@ -1552,6 +1781,7 @@ impl AppShell {
         self.replace_hover_thumbnail(None, None);
         self.in_flight_thumb_key = None;
         self.prewarmed_next = None;
+        self.sync_os_integrations();
         trim_process_heap();
     }
 
@@ -1771,6 +2001,7 @@ impl AppShell {
         let dur_ms = (self.player_snapshot.duration.max(0.0) * 1000.0) as u64;
         self.core
             .player_seek((target * 1000.0) as u64, dur_ms, "ferrite");
+        self.os_media.notify_seeked(target);
     }
 
     pub fn seek_player_absolute(&mut self, target_secs: f64, cx: &mut Context<Self>) {
@@ -1782,6 +2013,7 @@ impl AppShell {
         let dur_ms = (self.player_snapshot.duration.max(0.0) * 1000.0) as u64;
         self.core
             .player_seek((clamped * 1000.0) as u64, dur_ms, "ferrite");
+        self.os_media.notify_seeked(clamped);
     }
 
     pub fn step_player_frame(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -2046,38 +2278,55 @@ impl AppShell {
     pub fn set_osd_autohide_secs(&mut self, secs: u8, cx: &mut Context<Self>) {
         self.preferences.osd_autohide_secs = secs.clamp(2, 5);
         let _ = self.preferences.save();
+        if self.route.is_player() {
+            self.schedule_osd_autohide_timer(cx);
+        }
         cx.notify();
     }
 
     pub fn toggle_prevent_display_sleep(&mut self, cx: &mut Context<Self>) {
         self.preferences.prevent_display_sleep = !self.preferences.prevent_display_sleep;
         let _ = self.preferences.save();
-        // TODO(integrator): sync active playback inhibit state with OS screensaver/display-sleep controller.
+        self.sync_os_integrations();
         cx.notify();
     }
 
     pub fn toggle_os_media_controls(&mut self, cx: &mut Context<Self>) {
         self.preferences.enable_os_media_controls = !self.preferences.enable_os_media_controls;
         let _ = self.preferences.save();
-        // TODO(integrator): toggle live MPRIS2 / Windows SMTC integration via OsMedia controller.
+        self.os_media
+            .set_enabled(self.preferences.enable_os_media_controls);
+        self.sync_os_integrations();
         cx.notify();
     }
 
     pub fn set_preferred_audio_lang(&mut self, lang: &str, cx: &mut Context<Self>) {
         self.preferences.preferred_audio_lang = lang.trim().to_ascii_lowercase();
         let _ = self.preferences.save();
+        if self.route.is_player() && !self.player_snapshot.tracks.is_empty() {
+            let snap = self.player_snapshot.clone();
+            self.apply_saved_series_track_prefs(&snap);
+        }
         cx.notify();
     }
 
     pub fn set_preferred_subtitle_lang(&mut self, lang: &str, cx: &mut Context<Self>) {
         self.preferences.preferred_subtitle_lang = lang.trim().to_ascii_lowercase();
         let _ = self.preferences.save();
+        if self.route.is_player() && !self.player_snapshot.tracks.is_empty() {
+            let snap = self.player_snapshot.clone();
+            self.apply_saved_series_track_prefs(&snap);
+        }
         cx.notify();
     }
 
     pub fn toggle_auto_select_subtitles(&mut self, cx: &mut Context<Self>) {
         self.preferences.auto_select_subtitles = !self.preferences.auto_select_subtitles;
         let _ = self.preferences.save();
+        if self.route.is_player() && !self.player_snapshot.tracks.is_empty() {
+            let snap = self.player_snapshot.clone();
+            self.apply_saved_series_track_prefs(&snap);
+        }
         cx.notify();
     }
 
@@ -2085,6 +2334,9 @@ impl AppShell {
         let next = (self.preferences.default_subtitle_delay_ms + delta_ms).clamp(-5000, 5000);
         self.preferences.default_subtitle_delay_ms = next;
         let _ = self.preferences.save();
+        if let Some(mpv) = &self.mpv {
+            let _ = mpv.set_subtitle_delay(f64::from(next) / 1000.0);
+        }
         cx.notify();
     }
 
@@ -2106,36 +2358,77 @@ impl AppShell {
 
     pub fn verify_local_debrid_clicked(&mut self, provider_idx: usize, cx: &mut Context<Self>) {
         self.persist_private_integrations_draft(cx);
-        let (label, has_key) = match provider_idx {
-            1 => (
-                "Real-Debrid",
+        let provider = idx_to_local_debrid_provider(provider_idx);
+        let (label, override_key, has_key) = match provider {
+            LocalDebridProvider::RealDebrid => (
+                provider.label(),
+                (!self.real_debrid_key_input.trim().is_empty())
+                    .then(|| self.real_debrid_key_input.trim().to_owned()),
                 !self.real_debrid_key_input.trim().is_empty() || self.real_debrid_key_configured,
             ),
-            2 => (
-                "TorBox",
+            LocalDebridProvider::TorBox => (
+                provider.label(),
+                (!self.torbox_key_input.trim().is_empty())
+                    .then(|| self.torbox_key_input.trim().to_owned()),
                 !self.torbox_key_input.trim().is_empty() || self.torbox_key_configured,
             ),
-            3 => (
-                "AllDebrid",
+            LocalDebridProvider::AllDebrid => (
+                provider.label(),
+                (!self.alldebrid_key_input.trim().is_empty())
+                    .then(|| self.alldebrid_key_input.trim().to_owned()),
                 !self.alldebrid_key_input.trim().is_empty() || self.alldebrid_key_configured,
             ),
-            _ => ("Local Debrid", false),
+            LocalDebridProvider::None => ("Local Debrid", None, false),
         };
-        if !has_key {
+        if !provider.is_enabled() || !has_key {
             let msg = format!("Enter a {label} API key before verifying.");
             self.debrid_verify_status = Some(msg.clone());
             self.push_toast(ToastKind::Warning, msg, None, cx);
             return;
         }
-        // TODO(integrator): wire CoreController::verify_debrid_account(provider) and update last_debrid_latency_ms.
-        let status = format!("{label} key staged locally (0600); live check ready once backend is wired.");
-        self.debrid_verify_status = Some(status);
-        self.push_toast(
-            ToastKind::Info,
-            format!("{label} key saved locally"),
-            Some("0600 private_integrations.json".to_owned()),
-            cx,
-        );
+
+        self.debrid_verify_status = Some(format!("Verifying {label} account..."));
+        cx.notify();
+
+        let core = self.core.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = core.verify_local_debrid(provider, override_key).await;
+            let _ = this.update(cx, |shell, cx| match res {
+                Ok(status) => {
+                    shell.last_debrid_latency_ms = Some(status.latency_ms);
+                    let tier = if status.premium { "Premium" } else { "Free" };
+                    let exp = status
+                        .expiration
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!(" · exp {s}"))
+                        .unwrap_or_default();
+                    let summary = format!(
+                        "{} ({tier}) · {} · {} ms{exp}",
+                        status.username,
+                        status.provider.label(),
+                        status.latency_ms
+                    );
+                    shell.debrid_verify_status = Some(summary.clone());
+                    shell.push_toast(
+                        ToastKind::Success,
+                        format!("{} verified", status.provider.label()),
+                        Some(summary),
+                        cx,
+                    );
+                }
+                Err(err) => {
+                    shell.debrid_verify_status = Some(format!("Verification failed: {err}"));
+                    shell.push_toast(
+                        ToastKind::Error,
+                        format!("{label} verification failed"),
+                        Some(err),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn clear_local_debrid_key(&mut self, provider_idx: usize, cx: &mut Context<Self>) {
@@ -2171,7 +2464,7 @@ impl AppShell {
 
     pub fn test_prowlarr_clicked(&mut self, cx: &mut Context<Self>) {
         self.persist_private_integrations_draft(cx);
-        let url = self.prowlarr_url_input.trim();
+        let url = self.prowlarr_url_input.trim().to_owned();
         if url.is_empty() {
             let msg = "Enter a local Prowlarr or Torznab URL first.".to_owned();
             self.prowlarr_test_status = Some(msg.clone());
@@ -2184,17 +2477,41 @@ impl AppShell {
             self.push_toast(ToastKind::Warning, msg, None, cx);
             return;
         }
-        // TODO(integrator): wire CoreController::test_prowlarr_connection(url, api_key, timeout_ms).
-        self.prowlarr_test_status = Some(format!(
-            "Endpoint {url} staged ({} ms timeout); live Torznab/REST probe pending backend wiring.",
-            self.prowlarr_timeout_ms
-        ));
-        self.push_toast(
-            ToastKind::Info,
-            "Prowlarr endpoint staged",
-            Some(url.to_owned()),
-            cx,
-        );
+
+        let override_key = (!self.prowlarr_key_input.trim().is_empty())
+            .then(|| self.prowlarr_key_input.trim().to_owned());
+        self.prowlarr_test_status = Some(format!("Testing {url}..."));
+        cx.notify();
+
+        let core = self.core.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = core.test_prowlarr(Some(url.clone()), override_key).await;
+            let _ = this.update(cx, |shell, cx| match res {
+                Ok(test_res) => {
+                    let summary = format!(
+                        "Connected ({}) · {} items · {} ms",
+                        test_res.mode_detected, test_res.item_count, test_res.latency_ms
+                    );
+                    shell.prowlarr_test_status = Some(summary.clone());
+                    shell.push_toast(
+                        ToastKind::Success,
+                        "Prowlarr / Torznab connected",
+                        Some(summary),
+                        cx,
+                    );
+                }
+                Err(err) => {
+                    shell.prowlarr_test_status = Some(format!("Connection failed: {err}"));
+                    shell.push_toast(
+                        ToastKind::Error,
+                        "Prowlarr test failed",
+                        Some(err),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn clear_prowlarr_key(&mut self, cx: &mut Context<Self>) {
@@ -2211,19 +2528,48 @@ impl AppShell {
     }
 
     pub fn persist_private_integrations_draft(&mut self, cx: &mut Context<Self>) {
-        if !self.real_debrid_key_input.trim().is_empty() {
-            self.real_debrid_key_configured = true;
+        let existing = self.core.private_integrations();
+        let next = PrivateIntegrationsConfig {
+            active_debrid: idx_to_local_debrid_provider(self.local_debrid_provider_idx),
+            direct_rust_unrestrict: self.local_debrid_direct_unrestrict,
+            debrid_cached_only_filter: self.local_debrid_cached_only,
+            real_debrid_api_key: merge_secret_key_draft(
+                &self.real_debrid_key_input,
+                &mut self.real_debrid_key_configured,
+                existing.real_debrid_api_key,
+            ),
+            torbox_api_key: merge_secret_key_draft(
+                &self.torbox_key_input,
+                &mut self.torbox_key_configured,
+                existing.torbox_api_key,
+            ),
+            alldebrid_api_key: merge_secret_key_draft(
+                &self.alldebrid_key_input,
+                &mut self.alldebrid_key_configured,
+                existing.alldebrid_api_key,
+            ),
+            prowlarr_mode: idx_to_prowlarr_mode(self.prowlarr_mode_idx),
+            prowlarr_url: self.prowlarr_url_input.trim().to_owned(),
+            prowlarr_api_key: merge_secret_key_draft(
+                &self.prowlarr_key_input,
+                &mut self.prowlarr_key_configured,
+                existing.prowlarr_api_key,
+            ),
+            prowlarr_timeout_ms: self.prowlarr_timeout_ms.clamp(1000, 15000),
+        };
+
+        if let Err(err) = self.core.update_private_integrations(next) {
+            self.push_toast(
+                ToastKind::Error,
+                "Failed to save private integrations",
+                Some(err),
+                cx,
+            );
+        } else {
+            self.memoized_meta_streams = None;
+            self.prowlarr_fallback_key = None;
+            self.prowlarr_fallback_attempted = false;
         }
-        if !self.torbox_key_input.trim().is_empty() {
-            self.torbox_key_configured = true;
-        }
-        if !self.alldebrid_key_input.trim().is_empty() {
-            self.alldebrid_key_configured = true;
-        }
-        if !self.prowlarr_key_input.trim().is_empty() {
-            self.prowlarr_key_configured = true;
-        }
-        // TODO(integrator): persist PrivateIntegrationsConfig to 0600 file via CoreController::update_private_integrations.
         cx.notify();
     }
 
@@ -3943,4 +4289,413 @@ impl Render for AppShell {
             })
             .when_some(resize_handles_el, |el, handles| el.child(handles))
     }
+}
+
+impl AppShell {
+    fn sync_os_integrations(&mut self) {
+        let in_player = self.route.is_player() && self.playback_session.is_some();
+        let video_ready = self.is_player_video_frame_ready();
+        let inhibit = should_inhibit_display_sleep(
+            self.preferences.prevent_display_sleep,
+            in_player,
+            video_ready,
+            self.player_snapshot.paused,
+            self.player_snapshot.eof_reached,
+        );
+        self.sleep_inhibitor.set_inhibited(inhibit, "Playing video");
+
+        let metadata = if !in_player {
+            OsMediaMetadata::default()
+        } else if let Some(session) = &self.playback_session {
+            let status = if self.player_snapshot.paused || self.player_snapshot.eof_reached {
+                OsPlaybackStatus::Paused
+            } else {
+                OsPlaybackStatus::Playing
+            };
+            let (can_go_next, poster_url) = self.core.with_model(|m| {
+                let has_next = m.player.next_video.is_some();
+                let poster = m
+                    .meta_details
+                    .meta_items
+                    .iter()
+                    .find_map(|res| res.content.as_ref().and_then(|c| c.ready()))
+                    .filter(|item| item.preview.id == session.meta_id)
+                    .and_then(|item| item.preview.poster.as_ref().map(|u| u.to_string()))
+                    .or_else(|| {
+                        m.ctx
+                            .library
+                            .items
+                            .get(&session.meta_id)
+                            .and_then(|li| li.poster.as_ref().map(|u| u.to_string()))
+                    });
+                (has_next, poster)
+            });
+            OsMediaMetadata {
+                status,
+                title: session.title.clone(),
+                subtitle: session.episode_label.clone().unwrap_or_default(),
+                poster_url,
+                duration_secs: self.player_snapshot.duration.max(0.0),
+                position_secs: self.player_snapshot.time_pos.max(0.0),
+                can_seek: self.player_snapshot.duration > 0.0,
+                can_go_next,
+                can_go_previous: self.player_snapshot.time_pos > 5.0,
+            }
+        } else {
+            OsMediaMetadata::default()
+        };
+
+        self.os_media.sync_state(metadata);
+    }
+
+    fn handle_os_media_command(&mut self, cmd: OsMediaCommand, cx: &mut Context<Self>) {
+        if !self.route.is_player() {
+            return;
+        }
+        match cmd {
+            OsMediaCommand::Play => {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_paused(false);
+                }
+            }
+            OsMediaCommand::Pause => {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_paused(true);
+                }
+            }
+            OsMediaCommand::PlayPause => {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.toggle_pause();
+                }
+            }
+            OsMediaCommand::Stop => self.exit_player(cx),
+            OsMediaCommand::Next => {
+                let next_vid = self.core.with_model(|m| m.player.next_video.clone());
+                if let Some(vid) = next_vid {
+                    self.advance_to_next_episode(vid, cx);
+                }
+            }
+            OsMediaCommand::Previous => self.seek_player_absolute(0.0, cx),
+            OsMediaCommand::SeekRelativeSecs(delta) => self.seek_player_relative(delta, cx),
+            OsMediaCommand::SetPositionSecs(pos) => self.seek_player_absolute(pos, cx),
+        }
+    }
+
+    pub fn maybe_trigger_stream_enrichments(&mut self, cx: &mut Context<Self>) {
+        let AppRoute::MetaDetails {
+            type_name,
+            id,
+            video_id: route_vid,
+        } = self.route.clone()
+        else {
+            return;
+        };
+
+        let has_debrid = self.has_debrid_access();
+        let memo_slot = &mut self.memoized_meta_streams;
+
+        let snap = self.core.with_model(|model| {
+            let (meta, _) = resolve_ready_meta_item(&model.meta_details.meta_items)?;
+            if meta.preview.id != id {
+                return None;
+            }
+            let selected_stream_vid = model
+                .meta_details
+                .selected
+                .as_ref()
+                .and_then(|s| s.stream_path.as_ref())
+                .map(|p| p.id.clone());
+            let library_item = model
+                .meta_details
+                .library_item
+                .as_ref()
+                .or_else(|| model.ctx.library.items.get(&id));
+            let active_video_id = pick_default_series_episode_id(
+                meta,
+                selected_stream_vid.as_deref().or(route_vid.as_deref()),
+                library_item.and_then(|li| li.state.video_id.as_deref()),
+            )
+            .unwrap_or_else(|| meta.preview.id.clone());
+
+            let (candidates, _, addons_ready, addons_total) = sync_memoized_meta_streams(
+                memo_slot,
+                &type_name,
+                &id,
+                &active_video_id,
+                has_debrid,
+                model
+                    .meta_details
+                    .meta_streams
+                    .iter()
+                    .chain(model.meta_details.streams.iter()),
+                &model.ctx.profile.addons,
+            );
+
+            Some((
+                meta.preview.name.clone(),
+                active_video_id,
+                candidates,
+                addons_ready,
+                addons_total,
+            ))
+        });
+
+        let Some((title_hint, active_video_id, addon_candidates, addons_ready, addons_total)) = snap
+        else {
+            return;
+        };
+
+        let key = (type_name.clone(), id.clone(), active_video_id.clone());
+        let key_changed = self.prowlarr_fallback_key.as_ref() != Some(&key);
+        if key_changed {
+            self.prowlarr_fallback_key = Some(key.clone());
+            self.prowlarr_fallback_loading = false;
+            self.prowlarr_fallback_attempted = false;
+            self.prowlarr_fallback_streams.clear();
+            self.prowlarr_fallback_error = None;
+            self.prowlarr_request_seq = self.prowlarr_request_seq.wrapping_add(1);
+        }
+
+        let cfg = self.core.private_integrations();
+
+        if cfg.has_local_debrid_configured() {
+            let hashes: Vec<[u8; 20]> = addon_candidates
+                .iter()
+                .chain(self.prowlarr_fallback_streams.iter())
+                .filter_map(|c| match c.stream.source {
+                    StreamSource::Torrent { info_hash, .. } => Some(info_hash),
+                    _ => None,
+                })
+                .collect();
+            self.trigger_debrid_cache_check_for_hashes(cfg.active_debrid, hashes, cx);
+        }
+
+        if !self.prowlarr_fallback_attempted
+            && !self.prowlarr_fallback_loading
+            && !cfg.prowlarr_url.trim().is_empty()
+            && cfg.prowlarr_mode != ProwlarrFallbackMode::Off
+        {
+            let all_addons_done = addons_total == 0 || addons_ready >= addons_total;
+            let should_trigger_now = match cfg.prowlarr_mode {
+                ProwlarrFallbackMode::Off => false,
+                ProwlarrFallbackMode::AlwaysMerge => true,
+                ProwlarrFallbackMode::FallbackOnOutage => {
+                    all_addons_done && addon_candidates.is_empty()
+                }
+            };
+
+            if should_trigger_now {
+                self.trigger_prowlarr_fetch(key, title_hint, cx);
+            } else if key_changed
+                && cfg.prowlarr_mode == ProwlarrFallbackMode::FallbackOnOutage
+                && addon_candidates.is_empty()
+            {
+                let watch_seq = self.prowlarr_request_seq;
+                let watch_key = key;
+                let watch_title = title_hint;
+                let wait_ms = cfg.prowlarr_timeout_ms.clamp(2500, 6000);
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(wait_ms))
+                        .await;
+                    let _ = this.update(cx, |shell, cx| {
+                        if shell.prowlarr_request_seq != watch_seq
+                            || shell.prowlarr_fallback_key.as_ref() != Some(&watch_key)
+                            || shell.prowlarr_fallback_attempted
+                            || shell.prowlarr_fallback_loading
+                        {
+                            return;
+                        }
+                        let still_empty = shell.core.with_model(|m| {
+                            m.meta_details
+                                .meta_streams
+                                .iter()
+                                .chain(m.meta_details.streams.iter())
+                                .all(|res| match &res.content {
+                                    Some(Loadable::Ready(list)) => list.is_empty(),
+                                    _ => true,
+                                })
+                        });
+                        if still_empty {
+                            shell.trigger_prowlarr_fetch(watch_key, watch_title, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn trigger_prowlarr_fetch(
+        &mut self,
+        key: (String, String, String),
+        title_hint: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.prowlarr_fallback_loading || self.prowlarr_fallback_attempted {
+            return;
+        }
+        self.prowlarr_fallback_loading = true;
+        self.prowlarr_fallback_attempted = true;
+        let req_seq = self.prowlarr_request_seq;
+        let core = self.core.clone();
+        let (req_type, _req_meta_id, req_vid) = key.clone();
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = core
+                .fetch_prowlarr_streams(&req_type, &req_vid, Some(&title_hint))
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                if shell.prowlarr_request_seq != req_seq
+                    || shell.prowlarr_fallback_key.as_ref() != Some(&key)
+                {
+                    return;
+                }
+                shell.prowlarr_fallback_loading = false;
+                match res {
+                    Ok(items) => {
+                        let cands: Vec<PlaybackCandidate> = items
+                            .into_iter()
+                            .map(PlaybackCandidate::from_rich_stream_item)
+                            .collect();
+                        let count = cands.len();
+                        let hashes: Vec<[u8; 20]> = cands
+                            .iter()
+                            .filter_map(|c| match c.stream.source {
+                                StreamSource::Torrent { info_hash, .. } => Some(info_hash),
+                                _ => None,
+                            })
+                            .collect();
+                        shell.prowlarr_fallback_streams = cands;
+                        shell.prowlarr_fallback_error = None;
+
+                        let cfg = shell.core.private_integrations();
+                        if cfg.has_local_debrid_configured() && !hashes.is_empty() {
+                            shell.trigger_debrid_cache_check_for_hashes(
+                                cfg.active_debrid,
+                                hashes,
+                                cx,
+                            );
+                        }
+                        if count > 0
+                            && matches!(cfg.prowlarr_mode, ProwlarrFallbackMode::FallbackOnOutage)
+                        {
+                            shell.push_toast(
+                                ToastKind::Info,
+                                format!("Prowlarr fallback found {count} streams"),
+                                None,
+                                cx,
+                            );
+                        }
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        shell.prowlarr_fallback_error = Some(err);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn trigger_debrid_cache_check_for_hashes(
+        &mut self,
+        provider: LocalDebridProvider,
+        hashes: Vec<[u8; 20]>,
+        cx: &mut Context<Self>,
+    ) {
+        if !provider.is_enabled() || hashes.is_empty() {
+            return;
+        }
+        let mut unchecked = Vec::new();
+        for hash in hashes {
+            if self.local_debrid_checked_hashes.insert((provider, hash)) {
+                unchecked.push(hash);
+            }
+        }
+        if unchecked.is_empty() {
+            return;
+        }
+
+        let core = self.core.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let map = core.check_local_debrid_cache(unchecked).await;
+            if map.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |shell, cx| {
+                let mut changed = false;
+                for (hash, status) in map {
+                    let prev = shell
+                        .local_debrid_cache_map
+                        .insert((provider, hash), status);
+                    if prev != Some(status) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+fn local_debrid_provider_to_idx(provider: LocalDebridProvider) -> usize {
+    match provider {
+        LocalDebridProvider::None => 0,
+        LocalDebridProvider::RealDebrid => 1,
+        LocalDebridProvider::TorBox => 2,
+        LocalDebridProvider::AllDebrid => 3,
+    }
+}
+
+fn idx_to_local_debrid_provider(idx: usize) -> LocalDebridProvider {
+    match idx {
+        1 => LocalDebridProvider::RealDebrid,
+        2 => LocalDebridProvider::TorBox,
+        3 => LocalDebridProvider::AllDebrid,
+        _ => LocalDebridProvider::None,
+    }
+}
+
+fn prowlarr_mode_to_idx(mode: ProwlarrFallbackMode) -> usize {
+    match mode {
+        ProwlarrFallbackMode::Off => 0,
+        ProwlarrFallbackMode::FallbackOnOutage => 1,
+        ProwlarrFallbackMode::AlwaysMerge => 2,
+    }
+}
+
+fn idx_to_prowlarr_mode(idx: usize) -> ProwlarrFallbackMode {
+    match idx {
+        0 => ProwlarrFallbackMode::Off,
+        2 => ProwlarrFallbackMode::AlwaysMerge,
+        _ => ProwlarrFallbackMode::FallbackOnOutage,
+    }
+}
+
+fn merge_secret_key_draft(
+    input: &str,
+    configured: &mut bool,
+    existing: SecretApiKey,
+) -> SecretApiKey {
+    let trimmed = input.trim();
+    if !trimmed.is_empty() {
+        *configured = true;
+        SecretApiKey::new(trimmed)
+    } else if *configured {
+        existing
+    } else {
+        SecretApiKey::default()
+    }
+}
+
+fn is_uncached_debrid_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("not cached")
+        || lower.contains("not instantly cached")
+        || lower.contains("uncached")
 }

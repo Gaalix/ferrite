@@ -15,9 +15,10 @@ use crate::{
     state::{
         build_subtitles_resource_path, classify_library_item_status, extract_genres,
         extract_imdb_rating, find_cached_preview_in_model, format_movietracker_episode_code,
-        pick_default_series_episode_id, resolve_ready_meta_item, resume_offset_for_library_item,
-        scroll_near_bottom, sync_memoized_meta_streams, CachedTitlePreview, LibraryStatusTab,
-        PlaybackCandidate, StreamResolutionChoice, STREAM_PAGE_SIZE,
+        merge_and_enrich_stream_candidates, pick_default_series_episode_id,
+        resolve_ready_meta_item, resume_offset_for_library_item, scroll_near_bottom,
+        sync_memoized_meta_streams, CachedTitlePreview, LibraryStatusTab, PlaybackCandidate,
+        StreamResolutionChoice, STREAM_PAGE_SIZE,
     },
     theme::{
         editorial_serif, format_timestamp_secs, glass_capsule_shadow, meta_divider, mono_font,
@@ -120,8 +121,8 @@ impl AppShell {
             meta,
             meta_request,
             active_video_id,
-            all_playable_arc,
-            available_addons_arc,
+            addon_playable_arc,
+            _addon_available_arc,
             stream_addons_ready,
             stream_addons_total,
             has_stream_request,
@@ -143,6 +144,26 @@ impl AppShell {
                     .into_any_element();
             }
         };
+
+        self.maybe_trigger_stream_enrichments(cx);
+        let private_cfg = self.core.private_integrations();
+        let prowlarr_slice = if self.prowlarr_fallback_key.as_ref()
+            == Some(&(
+                route_type.to_owned(),
+                meta.preview.id.clone(),
+                active_video_id.clone(),
+            )) {
+            self.prowlarr_fallback_streams.as_slice()
+        } else {
+            &[]
+        };
+        let (all_playable_arc, available_addons_arc) = merge_and_enrich_stream_candidates(
+            &addon_playable_arc,
+            prowlarr_slice,
+            private_cfg.active_debrid,
+            &self.local_debrid_cache_map,
+            private_cfg.has_local_debrid_configured() && private_cfg.debrid_cached_only_filter,
+        );
 
         let mut seasons: Vec<u32> = meta
             .videos
@@ -1697,8 +1718,9 @@ impl AppShell {
                     ),
             )
             .child(if filtered_indices.is_empty() {
-                let is_querying =
-                    addons_ready < addons_total || (!has_stream_request && has_stream_addons);
+                let is_querying = addons_ready < addons_total
+                    || self.prowlarr_fallback_loading
+                    || (!has_stream_request && has_stream_addons);
                 let (empty_heading, empty_sub) = if is_querying {
                     (
                         "Querying stream addons...",

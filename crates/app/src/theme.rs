@@ -266,6 +266,9 @@ pub fn summarize_stream_for_humans(parsed: &ParsedStream) -> CleanStreamSummary 
 
     let availability_text = if parsed.is_cached {
         match parsed.debrid_provider.as_deref() {
+            Some("RD+") => "[RD+] Cached".to_owned(),
+            Some("TB+") => "[TB+] Cached".to_owned(),
+            Some("AD+") => "[AD+] Cached".to_owned(),
             Some(p) if !p.is_empty() => format!("Cached ({p})"),
             _ => "Cached".to_owned(),
         }
