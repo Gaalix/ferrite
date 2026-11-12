@@ -86,6 +86,21 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Ensure Inno Setup 6 is installed
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Candidates = @(
+              (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+              (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+          ) | Where-Object { Test-Path $_ }
+          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and $Candidates.Count -eq 0) {
+              choco install innosetup -y --no-progress
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to install Inno Setup via Chocolatey"
+              }
+          }
+
       - name: Fetch libmpv-2.dll and build Windows packages
         shell: pwsh
         env:

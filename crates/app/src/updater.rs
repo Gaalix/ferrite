@@ -1040,10 +1040,48 @@ mod tests {
     fn bundled_ferrite_ico_has_valid_multi_res_header() {
         let ico_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets/icons/ferrite.ico");
+        let gpui_ico_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/zed-gpui/crates/gpui/resources/windows/ferrite.ico");
         let bytes = fs::read(&ico_path).expect("read ferrite.ico");
+        let gpui_bytes = fs::read(&gpui_ico_path).expect("read gpui ferrite.ico");
+        assert_eq!(bytes, gpui_bytes);
         assert!(bytes.len() > 6 + 4 * 16);
         assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0);
         assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 1);
         assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
+
+        for (idx, expected_dim) in [32u8, 48, 64, 0].into_iter().enumerate() {
+            let off = 6 + idx * 16;
+            assert_eq!(bytes[off], expected_dim);
+            assert_eq!(bytes[off + 1], expected_dim);
+            assert_eq!(u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]), 1);
+            assert_eq!(u16::from_le_bytes([bytes[off + 6], bytes[off + 7]]), 32);
+            let data_len = u32::from_le_bytes([
+                bytes[off + 8],
+                bytes[off + 9],
+                bytes[off + 10],
+                bytes[off + 11],
+            ]) as usize;
+            let data_off = u32::from_le_bytes([
+                bytes[off + 12],
+                bytes[off + 13],
+                bytes[off + 14],
+                bytes[off + 15],
+            ]) as usize;
+            assert!(data_off + data_len <= bytes.len());
+            if expected_dim == 0 {
+                assert_eq!(&bytes[data_off..data_off + 8], b"\x89PNG\r\n\x1a\n");
+            } else {
+                assert_eq!(
+                    u32::from_le_bytes([
+                        bytes[data_off],
+                        bytes[data_off + 1],
+                        bytes[data_off + 2],
+                        bytes[data_off + 3],
+                    ]),
+                    40
+                );
+            }
+        }
     }
 }
