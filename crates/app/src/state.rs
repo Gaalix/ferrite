@@ -821,16 +821,11 @@ impl StreamFilterState {
                 return false;
             }
         }
-        if !self.resolutions.is_empty() {
-            let res_hit = self
+        self.resolutions.is_empty()
+            || self
                 .resolutions
                 .iter()
-                .any(|r| r.to_core_resolution() == cand.parsed.resolution);
-            if !res_hit {
-                return false;
-            }
-        }
-        true
+                .any(|r| r.to_core_resolution() == cand.parsed.resolution)
     }
 }
 

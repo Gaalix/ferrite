@@ -1439,10 +1439,7 @@ impl AddonHttpEngine {
                 return false;
             }
         }
-        if is_localhost_url(url) && !self.config.treat_loopback_as_remote {
-            return false;
-        }
-        true
+        !is_localhost_url(url) || self.config.treat_loopback_as_remote
     }
 
     fn effective_loopback_as_remote(&self, origin: &str) -> bool {
