@@ -399,6 +399,116 @@ impl DebridAccessMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SettingsCategory {
+    #[default]
+    GeneralAndAppearance,
+    PlaybackAndVideo,
+    AudioAndSubtitles,
+    DebridAndStreaming,
+    IntegrationsAndKeys,
+    StorageAndCache,
+    Shortcuts,
+    UpdatesAndAbout,
+}
+
+impl SettingsCategory {
+    pub const ALL: [Self; 8] = [
+        Self::GeneralAndAppearance,
+        Self::PlaybackAndVideo,
+        Self::AudioAndSubtitles,
+        Self::DebridAndStreaming,
+        Self::IntegrationsAndKeys,
+        Self::StorageAndCache,
+        Self::Shortcuts,
+        Self::UpdatesAndAbout,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::GeneralAndAppearance => "General & Appearance",
+            Self::PlaybackAndVideo => "Playback & Video",
+            Self::AudioAndSubtitles => "Audio & Subtitles",
+            Self::DebridAndStreaming => "Debrid & Streaming",
+            Self::IntegrationsAndKeys => "Integrations & Keys",
+            Self::StorageAndCache => "Storage & Cache",
+            Self::Shortcuts => "Shortcuts",
+            Self::UpdatesAndAbout => "Updates & About",
+        }
+    }
+
+    pub const fn subtitle(self) -> &'static str {
+        match self {
+            Self::GeneralAndAppearance => {
+                "Startup update checks, clipboard link detection, and player overlay timing."
+            }
+            Self::PlaybackAndVideo => {
+                "Zero-copy hardware pipeline, HDR tone mapping, GPU shaders, and OS controls."
+            }
+            Self::AudioAndSubtitles => {
+                "Default audio and subtitle languages, auto-selection, and delay offset."
+            }
+            Self::DebridAndStreaming => {
+                "Local Rust Debrid resolver, Prowlarr outage fallback, and BitTorrent resilience."
+            }
+            Self::IntegrationsAndKeys => {
+                "Local-only 0600 credentials for Debrid services, Prowlarr, and Addons Studio."
+            }
+            Self::StorageAndCache => {
+                "Piece cache budget, live engine telemetry, and metadata cleanup."
+            }
+            Self::Shortcuts => "Global navigation and libmpv player keyboard shortcuts.",
+            Self::UpdatesAndAbout => {
+                "Signed SHA-256 releases, version details, and local-first privacy architecture."
+            }
+        }
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::GeneralAndAppearance => "general",
+            Self::PlaybackAndVideo => "playback-video",
+            Self::AudioAndSubtitles => "audio-subtitles",
+            Self::DebridAndStreaming => "debrid-streaming",
+            Self::IntegrationsAndKeys => "integrations-keys",
+            Self::StorageAndCache => "storage-cache",
+            Self::Shortcuts => "shortcuts",
+            Self::UpdatesAndAbout => "updates-about",
+        }
+    }
+
+    pub const fn icon_name(self) -> IconName {
+        match self {
+            Self::GeneralAndAppearance => IconName::Sliders,
+            Self::PlaybackAndVideo => IconName::Film,
+            Self::AudioAndSubtitles => IconName::Subtitles,
+            Self::DebridAndStreaming => IconName::Zap,
+            Self::IntegrationsAndKeys => IconName::ShieldCheck,
+            Self::StorageAndCache => IconName::HardDrive,
+            Self::Shortcuts => IconName::Compass,
+            Self::UpdatesAndAbout => IconName::Info,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsDropdown {
+    ToneMapping,
+    ShaderPreset,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_osd_autohide_secs() -> u8 {
+    3
+}
+
+fn default_lang_eng() -> String {
+    "eng".to_owned()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppPreferences {
@@ -411,6 +521,24 @@ pub struct AppPreferences {
     pub tone_mapping: ToneMappingChoice,
     pub upscale_mode: UpscaleChoice,
     pub experimental_video: ExperimentalVideoPrefs,
+    #[serde(default = "default_true")]
+    pub prevent_display_sleep: bool,
+    #[serde(default = "default_true")]
+    pub enable_os_media_controls: bool,
+    #[serde(default = "default_true")]
+    pub check_updates_on_startup: bool,
+    #[serde(default = "default_true")]
+    pub clipboard_addon_detect: bool,
+    #[serde(default = "default_osd_autohide_secs")]
+    pub osd_autohide_secs: u8,
+    #[serde(default = "default_lang_eng")]
+    pub preferred_audio_lang: String,
+    #[serde(default = "default_lang_eng")]
+    pub preferred_subtitle_lang: String,
+    #[serde(default = "default_true")]
+    pub auto_select_subtitles: bool,
+    #[serde(default)]
+    pub default_subtitle_delay_ms: i32,
 }
 
 impl Default for AppPreferences {
@@ -425,6 +553,15 @@ impl Default for AppPreferences {
             tone_mapping: ToneMappingChoice::Auto,
             upscale_mode: UpscaleChoice::Bilinear,
             experimental_video: ExperimentalVideoPrefs::default(),
+            prevent_display_sleep: true,
+            enable_os_media_controls: true,
+            check_updates_on_startup: true,
+            clipboard_addon_detect: true,
+            osd_autohide_secs: 3,
+            preferred_audio_lang: "eng".to_owned(),
+            preferred_subtitle_lang: "eng".to_owned(),
+            auto_select_subtitles: true,
+            default_subtitle_delay_ms: 0,
         }
     }
 }
@@ -1251,6 +1388,50 @@ pub enum FocusedInput {
     AddonManifestUrl,
     AddonSearch,
     DiscoverCatalogSearch,
+    SettingsSearch,
+    RealDebridApiKey,
+    TorBoxApiKey,
+    AllDebridApiKey,
+    ProwlarrUrl,
+    ProwlarrApiKey,
+}
+
+pub fn settings_row_matches_query(
+    query: &str,
+    label: &str,
+    description: &str,
+    keywords: &[&str],
+) -> bool {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    let label_l = label.to_ascii_lowercase();
+    let desc_l = description.to_ascii_lowercase();
+    q.split_whitespace().all(|token| {
+        label_l.contains(token)
+            || desc_l.contains(token)
+            || keywords
+                .iter()
+                .any(|kw| kw.to_ascii_lowercase().contains(token))
+    })
+}
+
+pub fn mask_api_key_preview(raw: &str, configured: bool) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        if configured {
+            return "•••••••• (saved)".to_owned();
+        }
+        return String::new();
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= 4 {
+        "•".repeat(chars.len())
+    } else {
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("••••••••{tail}")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1710,6 +1891,7 @@ mod tests {
             tone_mapping: ToneMappingChoice::Spline,
             upscale_mode: UpscaleChoice::EwaLanczos,
             experimental_video: ExperimentalVideoPrefs::default(),
+            ..AppPreferences::default()
         };
         prefs.save_to(&pref_path).unwrap();
         let loaded: AppPreferences =
@@ -2181,5 +2363,99 @@ mod tests {
             pick_default_series_episode_id(&meta, Some("tt27995113:0:1"), Some("tt27995113:1:2")),
             Some("tt27995113:0:1".to_owned())
         );
+    }
+
+    #[test]
+    fn settings_categories_all_eight_labels_match_exact_order() {
+        let labels: Vec<&str> = SettingsCategory::ALL.iter().map(|c| c.label()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "General & Appearance",
+                "Playback & Video",
+                "Audio & Subtitles",
+                "Debrid & Streaming",
+                "Integrations & Keys",
+                "Storage & Cache",
+                "Shortcuts",
+                "Updates & About",
+            ]
+        );
+        for cat in SettingsCategory::ALL {
+            assert!(!cat.id().is_empty());
+            assert!(!cat.subtitle().is_empty());
+        }
+    }
+
+    #[test]
+    fn settings_search_helper_matches_labels_descriptions_and_keywords() {
+        assert!(settings_row_matches_query(
+            "",
+            "HDR tone mapping",
+            "Select curve",
+            &["spline"]
+        ));
+        assert!(settings_row_matches_query(
+            "hdr spline",
+            "HDR tone mapping",
+            "Select curve",
+            &["spline", "bt2446a"]
+        ));
+        assert!(settings_row_matches_query(
+            "mpris2",
+            "OS media controls",
+            "Publish metadata to Linux MPRIS2 and Windows SMTC.",
+            &["smtc"]
+        ));
+        assert!(!settings_row_matches_query(
+            "prowlarr",
+            "HDR tone mapping",
+            "Select curve",
+            &["spline"]
+        ));
+
+        assert_eq!(mask_api_key_preview("", false), "");
+        assert_eq!(mask_api_key_preview("", true), "•••••••• (saved)");
+        assert_eq!(mask_api_key_preview("abcd", false), "••••");
+        assert_eq!(mask_api_key_preview("secret_token_9876", false), "••••••••9876");
+    }
+
+    #[test]
+    fn app_preferences_v011_json_deserializes_with_v020_defaults() {
+        let v011_json = r#"{
+            "storage_mode": { "mode": "disk_lru", "budget_gb": 50 },
+            "enable_upnp": false,
+            "dead_swarm_failover": false,
+            "dead_swarm_timeout_secs": 15,
+            "debrid_access_mode": "subscribed",
+            "sidebar_collapsed": true,
+            "tone_mapping": "hable",
+            "upscale_mode": "lanczos"
+        }"#;
+        let loaded: AppPreferences =
+            serde_json::from_str(v011_json).expect("v0.1.1 preferences JSON should deserialize");
+
+        assert_eq!(
+            loaded.storage_mode,
+            StorageModeChoice::DiskLru { budget_gb: 50 }
+        );
+        assert!(!loaded.enable_upnp);
+        assert!(!loaded.dead_swarm_failover);
+        assert_eq!(loaded.dead_swarm_timeout_secs, 15);
+        assert_eq!(loaded.debrid_access_mode, DebridAccessMode::Subscribed);
+        assert!(loaded.sidebar_collapsed);
+        assert_eq!(loaded.tone_mapping, ToneMappingChoice::Hable);
+        assert_eq!(loaded.upscale_mode, UpscaleChoice::Lanczos);
+
+        // v0.2.0 defaults
+        assert!(loaded.prevent_display_sleep);
+        assert!(loaded.enable_os_media_controls);
+        assert!(loaded.check_updates_on_startup);
+        assert!(loaded.clipboard_addon_detect);
+        assert_eq!(loaded.osd_autohide_secs, 3);
+        assert_eq!(loaded.preferred_audio_lang, "eng");
+        assert_eq!(loaded.preferred_subtitle_lang, "eng");
+        assert!(loaded.auto_select_subtitles);
+        assert_eq!(loaded.default_subtitle_delay_ms, 0);
     }
 }

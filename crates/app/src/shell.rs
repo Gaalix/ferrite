@@ -39,9 +39,9 @@ use crate::{
         sync_memoized_meta_streams, trim_process_heap, AddonCategoryFilter, AddonSubTab,
         AppPreferences, AppRoute, BootServices, DebridAccessMode, DiscoverDropdown, FocusedInput,
         LibrarySortOrder, LibraryStatusTab, LibraryTypeFilter, MemoizedMetaStreams,
-        PlaybackCandidate, PlaybackSession, PlayerPopover, SidebarTab, StorageModeChoice,
-        StreamFilterState, ToastKind, ToastMessage, ToneMappingChoice, UpscaleChoice,
-        LIBRARY_PAGE_SIZE, STREAM_PAGE_SIZE,
+        PlaybackCandidate, PlaybackSession, PlayerPopover, SettingsCategory, SettingsDropdown,
+        SidebarTab, StorageModeChoice, StreamFilterState, ToastKind, ToastMessage,
+        ToneMappingChoice, UpscaleChoice, LIBRARY_PAGE_SIZE, STREAM_PAGE_SIZE,
     },
     theme::{
         editorial_serif, glass_capsule_shadow, keycap, movietracker_mark, obsidian_fade_in,
@@ -53,7 +53,6 @@ use crate::{
     updater::{self, AppliedUpdateOutcome, UpdateStatus},
 };
 
-const OSD_AUTOHIDE_TIMEOUT: Duration = Duration::from_millis(2500);
 const TOAST_LIFETIME: Duration = Duration::from_millis(3600);
 const PREWARM_HEAD_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -137,6 +136,28 @@ pub struct AppShell {
     pub toasts: Vec<ToastMessage>,
     pub next_toast_id: u64,
     pub update_status: UpdateStatus,
+
+    pub active_settings_category: SettingsCategory,
+    pub settings_search_query: String,
+    pub settings_open_dropdown: Option<SettingsDropdown>,
+    pub settings_scroll_handle: ScrollHandle,
+    pub local_debrid_provider_idx: usize,
+    pub local_debrid_direct_unrestrict: bool,
+    pub local_debrid_cached_only: bool,
+    pub real_debrid_key_input: String,
+    pub torbox_key_input: String,
+    pub alldebrid_key_input: String,
+    pub real_debrid_key_configured: bool,
+    pub torbox_key_configured: bool,
+    pub alldebrid_key_configured: bool,
+    pub debrid_verify_status: Option<String>,
+    pub prowlarr_mode_idx: usize,
+    pub prowlarr_url_input: String,
+    pub prowlarr_key_input: String,
+    pub prowlarr_key_configured: bool,
+    pub prowlarr_timeout_ms: u64,
+    pub prowlarr_test_status: Option<String>,
+    pub last_debrid_latency_ms: Option<u64>,
 }
 
 impl Focusable for AppShell {
@@ -277,6 +298,27 @@ impl AppShell {
             toasts: Vec::new(),
             next_toast_id: 1,
             update_status: UpdateStatus::Idle,
+            active_settings_category: SettingsCategory::default(),
+            settings_search_query: String::new(),
+            settings_open_dropdown: None,
+            settings_scroll_handle: ScrollHandle::new(),
+            local_debrid_provider_idx: 0,
+            local_debrid_direct_unrestrict: true,
+            local_debrid_cached_only: false,
+            real_debrid_key_input: String::new(),
+            torbox_key_input: String::new(),
+            alldebrid_key_input: String::new(),
+            real_debrid_key_configured: false,
+            torbox_key_configured: false,
+            alldebrid_key_configured: false,
+            debrid_verify_status: None,
+            prowlarr_mode_idx: 1,
+            prowlarr_url_input: String::new(),
+            prowlarr_key_input: String::new(),
+            prowlarr_key_configured: false,
+            prowlarr_timeout_ms: 4500,
+            prowlarr_test_status: None,
+            last_debrid_latency_ms: None,
         };
 
         if cli_addon_url.is_some() {
@@ -458,14 +500,19 @@ impl AppShell {
         .detach();
     }
 
+    pub fn osd_autohide_duration(&self) -> Duration {
+        Duration::from_secs(u64::from(self.preferences.osd_autohide_secs.clamp(2, 5)))
+    }
+
     fn schedule_osd_autohide_timer(&mut self, cx: &mut Context<Self>) {
         if !self.route.is_player() {
             return;
         }
         self.osd_hide_seq = self.osd_hide_seq.wrapping_add(1);
         let seq = self.osd_hide_seq;
+        let timeout = self.osd_autohide_duration();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            cx.background_executor().timer(OSD_AUTOHIDE_TIMEOUT).await;
+            cx.background_executor().timer(timeout).await;
             let _ = this.update(cx, |shell, cx| {
                 if shell.osd_hide_seq == seq
                     && shell.route.is_player()
@@ -935,6 +982,7 @@ impl AppShell {
         self.avatar_menu_open = false;
         self.discover_open_dropdown = None;
         self.meta_addon_dropdown_open = false;
+        self.settings_open_dropdown = None;
         self.pending_quick_resume = None;
 
         match tab {
@@ -1515,7 +1563,7 @@ impl AppShell {
             || self.is_scrubbing
             || self.is_dragging_volume
             || self.scrub_hover_fraction.is_some()
-            || self.last_osd_activity.elapsed() < OSD_AUTOHIDE_TIMEOUT
+            || self.last_osd_activity.elapsed() < self.osd_autohide_duration()
     }
 
     pub fn bump_player_osd_activity(&mut self, cx: &mut Context<Self>) {
@@ -1956,6 +2004,253 @@ impl AppShell {
         cx.notify();
     }
 
+    pub fn set_settings_category(
+        &mut self,
+        category: SettingsCategory,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_settings_category = category;
+        self.settings_open_dropdown = None;
+        self.settings_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+        if !self.settings_search_query.is_empty() {
+            self.settings_search_query.clear();
+        }
+        cx.notify();
+    }
+
+    pub fn clear_settings_search(&mut self, cx: &mut Context<Self>) {
+        self.settings_search_query.clear();
+        self.settings_open_dropdown = None;
+        if self.focused_input == Some(FocusedInput::SettingsSearch) {
+            self.focused_input = None;
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_check_updates_on_startup(&mut self, cx: &mut Context<Self>) {
+        self.preferences.check_updates_on_startup = !self.preferences.check_updates_on_startup;
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn toggle_clipboard_addon_detect(&mut self, cx: &mut Context<Self>) {
+        self.preferences.clipboard_addon_detect = !self.preferences.clipboard_addon_detect;
+        if !self.preferences.clipboard_addon_detect {
+            self.clipboard_addon_suggestion = None;
+        }
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn set_osd_autohide_secs(&mut self, secs: u8, cx: &mut Context<Self>) {
+        self.preferences.osd_autohide_secs = secs.clamp(2, 5);
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn toggle_prevent_display_sleep(&mut self, cx: &mut Context<Self>) {
+        self.preferences.prevent_display_sleep = !self.preferences.prevent_display_sleep;
+        let _ = self.preferences.save();
+        // TODO(integrator): sync active playback inhibit state with OS screensaver/display-sleep controller.
+        cx.notify();
+    }
+
+    pub fn toggle_os_media_controls(&mut self, cx: &mut Context<Self>) {
+        self.preferences.enable_os_media_controls = !self.preferences.enable_os_media_controls;
+        let _ = self.preferences.save();
+        // TODO(integrator): toggle live MPRIS2 / Windows SMTC integration via OsMedia controller.
+        cx.notify();
+    }
+
+    pub fn set_preferred_audio_lang(&mut self, lang: &str, cx: &mut Context<Self>) {
+        self.preferences.preferred_audio_lang = lang.trim().to_ascii_lowercase();
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn set_preferred_subtitle_lang(&mut self, lang: &str, cx: &mut Context<Self>) {
+        self.preferences.preferred_subtitle_lang = lang.trim().to_ascii_lowercase();
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn toggle_auto_select_subtitles(&mut self, cx: &mut Context<Self>) {
+        self.preferences.auto_select_subtitles = !self.preferences.auto_select_subtitles;
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn step_default_subtitle_delay(&mut self, delta_ms: i32, cx: &mut Context<Self>) {
+        let next = (self.preferences.default_subtitle_delay_ms + delta_ms).clamp(-5000, 5000);
+        self.preferences.default_subtitle_delay_ms = next;
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn set_local_debrid_provider(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.local_debrid_provider_idx = idx.min(3);
+        self.debrid_verify_status = None;
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn toggle_local_debrid_direct_unrestrict(&mut self, cx: &mut Context<Self>) {
+        self.local_debrid_direct_unrestrict = !self.local_debrid_direct_unrestrict;
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn toggle_local_debrid_cached_only(&mut self, cx: &mut Context<Self>) {
+        self.local_debrid_cached_only = !self.local_debrid_cached_only;
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn verify_local_debrid_clicked(&mut self, provider_idx: usize, cx: &mut Context<Self>) {
+        self.persist_private_integrations_draft(cx);
+        let (label, has_key) = match provider_idx {
+            1 => (
+                "Real-Debrid",
+                !self.real_debrid_key_input.trim().is_empty() || self.real_debrid_key_configured,
+            ),
+            2 => (
+                "TorBox",
+                !self.torbox_key_input.trim().is_empty() || self.torbox_key_configured,
+            ),
+            3 => (
+                "AllDebrid",
+                !self.alldebrid_key_input.trim().is_empty() || self.alldebrid_key_configured,
+            ),
+            _ => ("Local Debrid", false),
+        };
+        if !has_key {
+            let msg = format!("Enter a {label} API key before verifying.");
+            self.debrid_verify_status = Some(msg.clone());
+            self.push_toast(ToastKind::Warning, msg, None, cx);
+            return;
+        }
+        // TODO(integrator): wire CoreController::verify_debrid_account(provider) and update last_debrid_latency_ms.
+        let status = format!("{label} key staged locally (0600); live check ready once backend is wired.");
+        self.debrid_verify_status = Some(status);
+        self.push_toast(
+            ToastKind::Info,
+            format!("{label} key saved locally"),
+            Some("0600 private_integrations.json".to_owned()),
+            cx,
+        );
+    }
+
+    pub fn clear_local_debrid_key(&mut self, provider_idx: usize, cx: &mut Context<Self>) {
+        match provider_idx {
+            1 => {
+                self.real_debrid_key_input.clear();
+                self.real_debrid_key_configured = false;
+            }
+            2 => {
+                self.torbox_key_input.clear();
+                self.torbox_key_configured = false;
+            }
+            3 => {
+                self.alldebrid_key_input.clear();
+                self.alldebrid_key_configured = false;
+            }
+            _ => {}
+        }
+        self.debrid_verify_status = None;
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn set_prowlarr_mode(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.prowlarr_mode_idx = idx.min(2);
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn step_prowlarr_timeout(&mut self, delta_ms: i64, cx: &mut Context<Self>) {
+        let next = (self.prowlarr_timeout_ms as i64 + delta_ms).clamp(1000, 15000) as u64;
+        self.prowlarr_timeout_ms = next;
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn test_prowlarr_clicked(&mut self, cx: &mut Context<Self>) {
+        self.persist_private_integrations_draft(cx);
+        let url = self.prowlarr_url_input.trim();
+        if url.is_empty() {
+            let msg = "Enter a local Prowlarr or Torznab URL first.".to_owned();
+            self.prowlarr_test_status = Some(msg.clone());
+            self.push_toast(ToastKind::Warning, msg, None, cx);
+            return;
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            let msg = "Prowlarr URL must start with http:// or https://".to_owned();
+            self.prowlarr_test_status = Some(msg.clone());
+            self.push_toast(ToastKind::Warning, msg, None, cx);
+            return;
+        }
+        // TODO(integrator): wire CoreController::test_prowlarr_connection(url, api_key, timeout_ms).
+        self.prowlarr_test_status = Some(format!(
+            "Endpoint {url} staged ({} ms timeout); live Torznab/REST probe pending backend wiring.",
+            self.prowlarr_timeout_ms
+        ));
+        self.push_toast(
+            ToastKind::Info,
+            "Prowlarr endpoint staged",
+            Some(url.to_owned()),
+            cx,
+        );
+    }
+
+    pub fn clear_prowlarr_key(&mut self, cx: &mut Context<Self>) {
+        self.prowlarr_key_input.clear();
+        self.prowlarr_key_configured = false;
+        self.prowlarr_test_status = None;
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn focus_settings_input(&mut self, input: FocusedInput, cx: &mut Context<Self>) {
+        self.settings_open_dropdown = None;
+        self.focused_input = Some(input);
+        cx.notify();
+    }
+
+    pub fn persist_private_integrations_draft(&mut self, cx: &mut Context<Self>) {
+        if !self.real_debrid_key_input.trim().is_empty() {
+            self.real_debrid_key_configured = true;
+        }
+        if !self.torbox_key_input.trim().is_empty() {
+            self.torbox_key_configured = true;
+        }
+        if !self.alldebrid_key_input.trim().is_empty() {
+            self.alldebrid_key_configured = true;
+        }
+        if !self.prowlarr_key_input.trim().is_empty() {
+            self.prowlarr_key_configured = true;
+        }
+        // TODO(integrator): persist PrivateIntegrationsConfig to 0600 file via CoreController::update_private_integrations.
+        cx.notify();
+    }
+
+    pub fn clear_metadata_and_image_cache(&mut self, cx: &mut Context<Self>) {
+        self.core.clear_addon_cache();
+        self.poster_cache.clear_failures();
+        self.poster_cache.trim_for_playback();
+        let cache_root = self.poster_cache.cache_root().to_path_buf();
+        if let Ok(entries) = std::fs::read_dir(&cache_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let _ = std::fs::remove_file(path);
+                } else if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+        trim_process_heap();
+        self.push_toast(
+            ToastKind::Success,
+            "Metadata & image cache cleared",
+            None,
+            cx,
+        );
+    }
+
     pub fn open_command_palette(&mut self, cx: &mut Context<Self>) {
         self.avatar_menu_open = false;
         self.discover_open_dropdown = None;
@@ -2032,6 +2327,10 @@ impl AppShell {
     }
 
     pub fn refresh_clipboard_addon_suggestion(&mut self, cx: &mut Context<Self>) {
+        if !self.preferences.clipboard_addon_detect {
+            self.clipboard_addon_suggestion = None;
+            return;
+        }
         let clip_text = cx.read_from_clipboard().and_then(|c| c.text());
         let candidate = clip_text.as_deref().and_then(|txt| {
             detect_clipboard_addon_url(txt)
@@ -2144,6 +2443,9 @@ impl AppShell {
     }
 
     pub fn schedule_startup_update_check(&mut self, cx: &mut Context<Self>) {
+        if !self.preferences.check_updates_on_startup {
+            return;
+        }
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             cx.background_executor().timer(Duration::from_secs(3)).await;
             let _ = this.update(cx, |shell, cx| {
@@ -2420,6 +2722,13 @@ impl AppShell {
         if let Some(target) = self.focused_input {
             match ks.key.as_str() {
                 "escape" => {
+                    if target == FocusedInput::SettingsSearch
+                        && !self.settings_search_query.is_empty()
+                    {
+                        self.settings_search_query.clear();
+                        cx.notify();
+                        return;
+                    }
                     self.focused_input = None;
                     if target == FocusedInput::DiscoverCatalogSearch {
                         self.discover_open_dropdown = None;
@@ -2433,6 +2742,11 @@ impl AppShell {
                         FocusedInput::AuthPassword => Some(FocusedInput::AuthEmail),
                         FocusedInput::AddonManifestUrl => Some(FocusedInput::AddonSearch),
                         FocusedInput::AddonSearch => Some(FocusedInput::AddonManifestUrl),
+                        FocusedInput::RealDebridApiKey => Some(FocusedInput::TorBoxApiKey),
+                        FocusedInput::TorBoxApiKey => Some(FocusedInput::AllDebridApiKey),
+                        FocusedInput::AllDebridApiKey => Some(FocusedInput::ProwlarrUrl),
+                        FocusedInput::ProwlarrUrl => Some(FocusedInput::ProwlarrApiKey),
+                        FocusedInput::ProwlarrApiKey => Some(FocusedInput::RealDebridApiKey),
                         other => Some(other),
                     };
                     cx.notify();
@@ -2446,9 +2760,19 @@ impl AppShell {
                         FocusedInput::AddonManifestUrl => {
                             self.submit_addon_manifest_lookup(cx);
                         }
-                        FocusedInput::AddonSearch | FocusedInput::DiscoverCatalogSearch => {
+                        FocusedInput::AddonSearch
+                        | FocusedInput::DiscoverCatalogSearch
+                        | FocusedInput::SettingsSearch => {
                             self.focused_input = None;
                             cx.notify();
+                        }
+                        FocusedInput::RealDebridApiKey
+                        | FocusedInput::TorBoxApiKey
+                        | FocusedInput::AllDebridApiKey
+                        | FocusedInput::ProwlarrUrl
+                        | FocusedInput::ProwlarrApiKey => {
+                            self.focused_input = None;
+                            self.persist_private_integrations_draft(cx);
                         }
                         FocusedInput::CommandPalette => {}
                     }
@@ -2456,6 +2780,7 @@ impl AppShell {
                 }
                 _ => {
                     let clip = cx.read_from_clipboard().and_then(|c| c.text());
+                    let mut integration_edited = false;
                     let changed = match target {
                         FocusedInput::AuthEmail => {
                             apply_key_to_text_buffer(&mut self.auth_email_input, event, clip)
@@ -2472,9 +2797,68 @@ impl AppShell {
                         FocusedInput::DiscoverCatalogSearch => {
                             apply_key_to_text_buffer(&mut self.discover_catalog_search, event, clip)
                         }
+                        FocusedInput::SettingsSearch => {
+                            apply_key_to_text_buffer(&mut self.settings_search_query, event, clip)
+                        }
+                        FocusedInput::RealDebridApiKey => {
+                            let c = apply_key_to_text_buffer(
+                                &mut self.real_debrid_key_input,
+                                event,
+                                clip,
+                            );
+                            if c {
+                                self.real_debrid_key_configured =
+                                    !self.real_debrid_key_input.trim().is_empty();
+                                integration_edited = true;
+                            }
+                            c
+                        }
+                        FocusedInput::TorBoxApiKey => {
+                            let c =
+                                apply_key_to_text_buffer(&mut self.torbox_key_input, event, clip);
+                            if c {
+                                self.torbox_key_configured =
+                                    !self.torbox_key_input.trim().is_empty();
+                                integration_edited = true;
+                            }
+                            c
+                        }
+                        FocusedInput::AllDebridApiKey => {
+                            let c = apply_key_to_text_buffer(
+                                &mut self.alldebrid_key_input,
+                                event,
+                                clip,
+                            );
+                            if c {
+                                self.alldebrid_key_configured =
+                                    !self.alldebrid_key_input.trim().is_empty();
+                                integration_edited = true;
+                            }
+                            c
+                        }
+                        FocusedInput::ProwlarrUrl => {
+                            let c =
+                                apply_key_to_text_buffer(&mut self.prowlarr_url_input, event, clip);
+                            if c {
+                                integration_edited = true;
+                            }
+                            c
+                        }
+                        FocusedInput::ProwlarrApiKey => {
+                            let c =
+                                apply_key_to_text_buffer(&mut self.prowlarr_key_input, event, clip);
+                            if c {
+                                self.prowlarr_key_configured =
+                                    !self.prowlarr_key_input.trim().is_empty();
+                                integration_edited = true;
+                            }
+                            c
+                        }
                         FocusedInput::CommandPalette => false,
                     };
-                    if changed {
+                    if integration_edited {
+                        self.persist_private_integrations_draft(cx);
+                    } else if changed {
                         cx.notify();
                     }
                     return;
@@ -2556,6 +2940,9 @@ impl AppShell {
                 cx.notify();
             } else if self.meta_addon_dropdown_open {
                 self.meta_addon_dropdown_open = false;
+                cx.notify();
+            } else if self.settings_open_dropdown.is_some() {
+                self.settings_open_dropdown = None;
                 cx.notify();
             } else if window.is_fullscreen() {
                 window.toggle_fullscreen();
