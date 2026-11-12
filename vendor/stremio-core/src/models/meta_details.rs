@@ -1,0 +1,1043 @@
+use std::{borrow::Cow, marker::PhantomData};
+
+use chrono::{DateTime, Duration, Utc};
+use enclose::enclose;
+use futures::FutureExt;
+use serde::{Deserialize, Serialize};
+
+use stremio_watched_bitfield::WatchedBitField;
+
+use crate::{
+    constants::{
+        LIBRARY_COLLECTION_NAME, META_RESOURCE_NAME, STREAM_RESOURCE_NAME,
+        USER_LIKES_SUPPORTED_ID_PREFIXES, USER_LIKES_SUPPORTED_TYPES, WATCHED_THRESHOLD_COEF,
+    },
+    models::{
+        common::{
+            addon_events_effects, eq_update, item_watched_event_path, resource_update,
+            resources_update, resources_update_with_vector_content, videos_watched_event_paths,
+            Loadable, ResourceAction, ResourceLoadable, ResourcesAction,
+        },
+        ctx::{Ctx, CtxError},
+    },
+    runtime::{
+        msg::{Action, ActionLoad, ActionMetaDetails, Event, Internal, Msg},
+        Effect, EffectFuture, Effects, Env, EnvError, EnvFutureExt, UpdateWithCtx,
+    },
+    types::{
+        addon::{AggrRequest, ResourcePath, ResourceRequest},
+        api::{DatastoreCommand, DatastoreRequest},
+        library::{LibraryBucket, LibraryItem},
+        profile::{AuthKey, Profile},
+        rating::{
+            Rating, RatingGetStatusRequest, RatingGetStatusResponse, RatingInfo, RatingSendRequest,
+            RatingSendResponse,
+        },
+        resource::{MetaItem, Stream},
+        streams::StreamsBucket,
+    },
+};
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Selected {
+    pub meta_path: ResourcePath,
+    pub stream_path: Option<ResourcePath>,
+    #[serde(default)]
+    /// if `stream_path` is `None` then we try to guess the video and make a request
+    /// to the addons to load the streams for that video id
+    pub guess_stream: bool,
+}
+
+#[derive(Default, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MetaDetails {
+    pub selected: Option<Selected>,
+    pub meta_items: Vec<ResourceLoadable<MetaItem>>,
+    pub meta_streams: Vec<ResourceLoadable<Vec<Stream>>>,
+    pub streams: Vec<ResourceLoadable<Vec<Stream>>>,
+    /// A Stream from addon responses, based on your already watched streams on the device
+    /// (i.e. [`StreamsBucket`]), which could be played if binge watching or continuing to watch.
+    ///
+    /// Finds a proper stream for the binge watching group and matching stream source.
+    pub last_used_stream: Option<ResourceLoadable<Option<Stream>>>,
+    pub library_item: Option<LibraryItem>,
+    pub rating_info: Option<Loadable<RatingInfo, EnvError>>,
+    #[serde(skip_serializing)]
+    pub watched: Option<WatchedBitField>,
+    /// A background refresh keeps the displayed channel and its streams available.
+    #[serde(skip)]
+    pub live_schedule_refresh: Option<(ResourceLoadable<MetaItem>, DateTime<Utc>)>,
+}
+
+impl<E: Env + 'static> UpdateWithCtx<E> for MetaDetails {
+    fn update(&mut self, msg: &Msg, ctx: &Ctx) -> Effects {
+        match msg {
+            Msg::Action(Action::Load(ActionLoad::MetaDetails(selected))) => {
+                if self.selected.as_ref().map(|selected| &selected.meta_path)
+                    != Some(&selected.meta_path)
+                {
+                    self.live_schedule_refresh = None;
+                }
+                let selected_effects = eq_update(&mut self.selected, Some(selected.to_owned()));
+                let meta_items_effects =
+                    meta_items_update::<E>(&mut self.meta_items, &self.selected, &ctx.profile);
+                let selected_override_effects =
+                    selected_guess_stream_update(&mut self.selected, &self.meta_items);
+                let meta_streams_effects =
+                    meta_streams_update(&mut self.meta_streams, &self.selected, &self.meta_items);
+                let streams_effects =
+                    streams_update::<E>(&mut self.streams, &self.selected, &ctx.profile);
+                let last_used_stream_effects = last_used_stream_update(
+                    &mut self.last_used_stream,
+                    &self.selected,
+                    &self.meta_items,
+                    &self.meta_streams,
+                    &self.streams,
+                    &ctx.streams,
+                );
+                let library_item_effects = library_item_update::<E>(
+                    &mut self.library_item,
+                    &self.selected,
+                    &self.meta_items,
+                    &ctx.library,
+                );
+                let watched_effects =
+                    watched_update(&mut self.watched, &self.meta_items, &self.library_item);
+                let library_item_sync_effects = library_item_sync(&self.library_item, &ctx.profile);
+
+                let rating_info_effects =
+                    rating_info_update::<E>(&mut self.rating_info, &self.selected, &ctx.profile);
+
+                library_item_sync_effects
+                    .join(selected_effects)
+                    .join(selected_override_effects)
+                    .join(meta_items_effects)
+                    .join(meta_streams_effects)
+                    .join(rating_info_effects)
+                    .join(streams_effects)
+                    .join(last_used_stream_effects)
+                    .join(library_item_effects)
+                    .join(watched_effects)
+            }
+            Msg::Action(Action::Unload) => {
+                self.live_schedule_refresh = None;
+                let selected_effects = eq_update(&mut self.selected, None);
+                let meta_items_effects = eq_update(&mut self.meta_items, vec![]);
+                let meta_streams_effects = eq_update(&mut self.meta_streams, vec![]);
+                let streams_effects = eq_update(&mut self.streams, vec![]);
+                let library_item_effects = eq_update(&mut self.library_item, None);
+                let last_used_stream_effects = eq_update(&mut self.last_used_stream, None);
+                let watched_effects = eq_update(&mut self.watched, None);
+                let rating_info_effects = eq_update(&mut self.rating_info, None);
+
+                selected_effects
+                    .join(meta_items_effects)
+                    .join(meta_streams_effects)
+                    .join(streams_effects)
+                    .join(last_used_stream_effects)
+                    .join(library_item_effects)
+                    .join(watched_effects)
+                    .join(rating_info_effects)
+            }
+            Msg::Action(Action::MetaDetails(ActionMetaDetails::RefreshLive)) => {
+                live_schedule_refresh_update::<E>(self)
+            }
+            Msg::Action(Action::MetaDetails(ActionMetaDetails::MarkAsWatched(is_watched))) => {
+                match &self.library_item {
+                    Some(library_item) => {
+                        let mut library_item = library_item.to_owned();
+                        library_item.mark_as_watched::<E>(*is_watched);
+                        let addon_events = addon_events_effects::<E>(
+                            &ctx.profile.addons,
+                            vec![item_watched_event_path(&library_item, *is_watched)],
+                        );
+                        Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item)))
+                            .unchanged()
+                            .join(addon_events)
+                    }
+                    _ => Effects::none().unchanged(),
+                }
+            }
+            Msg::Action(Action::MetaDetails(ActionMetaDetails::MarkVideoAsWatched(
+                video,
+                is_watched,
+            ))) => match (&self.library_item, &self.watched) {
+                (Some(library_item), Some(watched)) => {
+                    let mut library_item = library_item.to_owned();
+                    library_item.mark_video_as_watched::<E>(watched, video, *is_watched);
+                    if *is_watched
+                        && library_item.state.video_id.as_deref() == Some(video.id.as_str())
+                    {
+                        let next_video_id = self
+                            .meta_items
+                            .iter()
+                            .find_map(|item| item.content.as_ref().and_then(|c| c.ready()))
+                            .and_then(|meta_item| meta_item.next_video(&video.id, &E::now()))
+                            .map(|video| video.id.to_owned());
+                        if let Some(next_video_id) = next_video_id {
+                            library_item.advance_to_video(&next_video_id);
+                        } else {
+                            library_item.state.time_offset = 0;
+                        }
+                    }
+                    let addon_events = addon_events_effects::<E>(
+                        &ctx.profile.addons,
+                        videos_watched_event_paths(&library_item, watched, &[video], *is_watched),
+                    );
+                    Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item)))
+                        .unchanged()
+                        .join(addon_events)
+                }
+                _ => Effects::none().unchanged(),
+            },
+            Msg::Action(Action::MetaDetails(ActionMetaDetails::MarkSeasonAsWatched(
+                season,
+                is_watched,
+            ))) => match (&self.library_item, &self.watched) {
+                (Some(library_item), Some(watched)) => {
+                    // Find the first ready meta item and mark all videos from the requested season.
+                    let meta_item = self
+                        .meta_items
+                        .iter()
+                        .find(|meta_item| matches!(&meta_item.content, Some(Loadable::Ready(_))))
+                        .and_then(|meta_item| meta_item.content.as_ref())
+                        .and_then(|meta_item| meta_item.ready());
+
+                    match meta_item {
+                        Some(meta_item) => {
+                            let videos = meta_item.videos_by_season(*season);
+                            let addon_events = addon_events_effects::<E>(
+                                &ctx.profile.addons,
+                                videos_watched_event_paths(
+                                    library_item,
+                                    watched,
+                                    &videos,
+                                    *is_watched,
+                                ),
+                            );
+                            let mut library_item = library_item.to_owned();
+                            let watched = library_item.mark_videos_as_watched::<E>(
+                                watched,
+                                videos,
+                                *is_watched,
+                            );
+                            if *is_watched {
+                                library_item.reconcile_series_resume_after_watched_change(
+                                    *season,
+                                    &watched,
+                                    meta_item,
+                                    &E::now(),
+                                );
+                            }
+
+                            Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item)))
+                                .unchanged()
+                                .join(addon_events)
+                        }
+                        None => Effects::none().unchanged(),
+                    }
+                }
+                _ => Effects::none().unchanged(),
+            },
+            Msg::Action(Action::MetaDetails(
+                ActionMetaDetails::ExternalPlayerProgressChanged { time },
+            )) => external_player_progress_update::<E>(
+                &self.selected,
+                &self.meta_items,
+                &self.library_item,
+                &self.watched,
+                *time,
+            ),
+            Msg::Action(Action::MetaDetails(ActionMetaDetails::ExternalPlayerStreamOpened(
+                stream,
+            ))) => external_player_stream_opened(
+                stream,
+                &self.meta_items,
+                &self.meta_streams,
+                &self.streams,
+            ),
+            Msg::Action(Action::MetaDetails(ActionMetaDetails::Rate(rating)))
+                if self.rating_info.is_some() =>
+            {
+                match (self.selected.as_ref(), ctx.profile.auth.as_ref()) {
+                    (Some(selected), Some(auth)) => {
+                        let rating_info_effects =
+                            eq_update(&mut self.rating_info, Some(Loadable::Loading));
+
+                        Effects::one(send_rating::<E>(
+                            auth.key.to_owned(),
+                            &selected.meta_path,
+                            rating,
+                        ))
+                        .unchanged()
+                        .join(rating_info_effects)
+                    }
+                    _ => Effects::none().unchanged(),
+                }
+            }
+            Msg::Internal(Internal::ResourceRequestResult(request, result))
+                if request.path.resource == META_RESOURCE_NAME =>
+            {
+                let live_schedule_effects = self
+                    .live_schedule_refresh
+                    .as_mut()
+                    .map(|(refresh, _)| {
+                        let effects = resource_update::<E, MetaItem>(
+                            refresh,
+                            ResourceAction::ResourceRequestResult { request, result },
+                        );
+                        if effects.has_changed
+                            && matches!(refresh.content, Some(Loadable::Ready(_)))
+                        {
+                            self.meta_items
+                                .iter_mut()
+                                .find(|resource| resource.request == *request)
+                                .map(|resource| {
+                                    eq_update(&mut resource.content, refresh.content.clone())
+                                })
+                                .unwrap_or_else(|| Effects::none().unchanged())
+                        } else {
+                            effects.unchanged()
+                        }
+                    })
+                    .unwrap_or_else(|| Effects::none().unchanged());
+                let meta_items_effects = resources_update::<E, _>(
+                    &mut self.meta_items,
+                    ResourcesAction::ResourceRequestResult { request, result },
+                );
+                let selected_override_effects =
+                    selected_guess_stream_update(&mut self.selected, &self.meta_items);
+                let streams_effects = if selected_override_effects.has_changed {
+                    streams_update::<E>(&mut self.streams, &self.selected, &ctx.profile)
+                } else {
+                    Effects::default()
+                };
+                let meta_streams_effects =
+                    meta_streams_update(&mut self.meta_streams, &self.selected, &self.meta_items);
+                let last_used_stream_effects = last_used_stream_update(
+                    &mut self.last_used_stream,
+                    &self.selected,
+                    &self.meta_items,
+                    &self.meta_streams,
+                    &self.streams,
+                    &ctx.streams,
+                );
+                let library_item_effects = library_item_update::<E>(
+                    &mut self.library_item,
+                    &self.selected,
+                    &self.meta_items,
+                    &ctx.library,
+                );
+                let watched_effects =
+                    watched_update(&mut self.watched, &self.meta_items, &self.library_item);
+                selected_override_effects
+                    .join(live_schedule_effects)
+                    .join(meta_items_effects)
+                    .join(meta_streams_effects)
+                    .join(streams_effects)
+                    .join(last_used_stream_effects)
+                    .join(library_item_effects)
+                    .join(watched_effects)
+            }
+            Msg::Internal(Internal::ResourceRequestResult(request, result))
+                if request.path.resource == STREAM_RESOURCE_NAME =>
+            {
+                let streams_effects = resources_update_with_vector_content::<E, _>(
+                    &mut self.streams,
+                    ResourcesAction::ResourceRequestResult { request, result },
+                );
+                let last_used_stream_effects = last_used_stream_update(
+                    &mut self.last_used_stream,
+                    &self.selected,
+                    &self.meta_items,
+                    &self.meta_streams,
+                    &self.streams,
+                    &ctx.streams,
+                );
+                streams_effects.join(last_used_stream_effects)
+            }
+            Msg::Internal(Internal::RatingGetStatusResult(meta_id, result))
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.meta_path.id == *meta_id) =>
+            {
+                let rating_info_loadable = match result {
+                    Ok(rating) => Loadable::Ready(RatingInfo {
+                        meta_id: meta_id.to_owned(),
+                        status: rating.status.to_owned(),
+                    }),
+                    Err(e) => Loadable::Err(e.to_owned()),
+                };
+
+                eq_update(&mut self.rating_info, Some(rating_info_loadable))
+            }
+            Msg::Internal(Internal::RatingSendResult(meta_id, result))
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.meta_path.id == *meta_id) =>
+            {
+                match result {
+                    Ok(response) => {
+                        let status = response
+                            .rating
+                            .as_ref()
+                            .map(|rating| rating.status.to_owned());
+
+                        let rating_info_effets = eq_update(
+                            &mut self.rating_info,
+                            Some(Loadable::Ready(RatingInfo {
+                                meta_id: meta_id.to_owned(),
+                                status: status.to_owned(),
+                            })),
+                        );
+
+                        Effects::one(Effect::Msg(Box::new(Msg::Event(Event::MetaItemRated {
+                            id: meta_id.to_owned(),
+                        }))))
+                        .unchanged()
+                        .join(rating_info_effets)
+                    }
+                    Err(error) => {
+                        let rating_info_effets =
+                            eq_update(&mut self.rating_info, Some(Loadable::Err(error.to_owned())));
+
+                        Effects::msg(Msg::Event(Event::Error {
+                            error: CtxError::Env(EnvError::Other(
+                                "Failed to send rating".to_owned(),
+                            )),
+                            source: Event::MetaItemRated {
+                                id: meta_id.to_owned(),
+                            }
+                            .into(),
+                        }))
+                        .unchanged()
+                        .join(rating_info_effets)
+                    }
+                }
+            }
+            Msg::Internal(Internal::LibraryChanged(_)) => {
+                let library_item_effects = library_item_update::<E>(
+                    &mut self.library_item,
+                    &self.selected,
+                    &self.meta_items,
+                    &ctx.library,
+                );
+                let watched_effects =
+                    watched_update(&mut self.watched, &self.meta_items, &self.library_item);
+                library_item_effects.join(watched_effects)
+            }
+            Msg::Internal(Internal::ProfileChanged) => {
+                let meta_items_effects =
+                    meta_items_update::<E>(&mut self.meta_items, &self.selected, &ctx.profile);
+                let meta_streams_effects =
+                    meta_streams_update(&mut self.meta_streams, &self.selected, &self.meta_items);
+                let streams_effects =
+                    streams_update::<E>(&mut self.streams, &self.selected, &ctx.profile);
+                let last_used_stream_effects = last_used_stream_update(
+                    &mut self.last_used_stream,
+                    &self.selected,
+                    &self.meta_items,
+                    &self.meta_streams,
+                    &self.streams,
+                    &ctx.streams,
+                );
+                let library_item_effects = library_item_update::<E>(
+                    &mut self.library_item,
+                    &self.selected,
+                    &self.meta_items,
+                    &ctx.library,
+                );
+                let watched_effects =
+                    watched_update(&mut self.watched, &self.meta_items, &self.library_item);
+                let rating_info_effects =
+                    rating_info_update::<E>(&mut self.rating_info, &self.selected, &ctx.profile);
+
+                meta_items_effects
+                    .join(meta_streams_effects)
+                    .join(streams_effects)
+                    .join(last_used_stream_effects)
+                    .join(library_item_effects)
+                    .join(watched_effects)
+                    .join(rating_info_effects)
+            }
+            _ => Effects::none().unchanged(),
+        }
+    }
+}
+
+fn external_player_progress_update<E: Env + 'static>(
+    selected: &Option<Selected>,
+    meta_items: &[ResourceLoadable<MetaItem>],
+    library_item: &Option<LibraryItem>,
+    watched: &Option<WatchedBitField>,
+    time: u64,
+) -> Effects {
+    let video_id = match selected
+        .as_ref()
+        .and_then(|selected| selected.stream_path.as_ref())
+        .map(|stream_path| &stream_path.id)
+    {
+        Some(video_id) => video_id,
+        _ => return Effects::none().unchanged(),
+    };
+
+    let mut library_item = match library_item {
+        Some(library_item) => library_item.to_owned(),
+        _ => return Effects::none().unchanged(),
+    };
+
+    library_item.state.last_watched = Some(E::now());
+    let same_video = library_item.state.video_id.as_deref() == Some(video_id);
+    let has_duration = same_video && library_item.state.duration > 0;
+    let already_watched = watched
+        .as_ref()
+        .is_some_and(|watched| watched.get_video(video_id));
+    if !has_duration && already_watched {
+        return Effects::none().unchanged();
+    }
+    let time_watched_delta = if has_duration {
+        time.saturating_sub(library_item.state.time_offset)
+    } else {
+        0
+    };
+
+    if !same_video {
+        library_item.state.video_id = Some(video_id.to_owned());
+        library_item.state.time_watched = 0;
+        library_item.state.flagged_watched = 0;
+    };
+    library_item.state.time_offset = time;
+    library_item.state.time_watched = library_item
+        .state
+        .time_watched
+        .saturating_add(time_watched_delta);
+
+    let mut advanced_to_next_video = false;
+    if has_duration && time as f64 > library_item.state.duration as f64 * WATCHED_THRESHOLD_COEF {
+        let video = meta_items
+            .iter()
+            .find_map(|meta_item| match &meta_item.content {
+                Some(Loadable::Ready(meta_item)) => {
+                    meta_item.videos.iter().find(|video| video.id == *video_id)
+                }
+                _ => None,
+            });
+        if let (Some(watched), Some(video)) = (watched, video) {
+            library_item.mark_video_as_watched::<E>(watched, video, true);
+            let next_video_id = meta_items
+                .iter()
+                .find_map(|meta_item| match &meta_item.content {
+                    Some(Loadable::Ready(meta_item)) => meta_item.next_video(video_id, &E::now()),
+                    _ => None,
+                })
+                .map(|video| video.id.to_owned());
+            if let Some(next_video_id) = next_video_id {
+                library_item.advance_to_video(&next_video_id);
+                advanced_to_next_video = true;
+            } else {
+                library_item.state.time_offset = 0;
+            }
+        }
+    }
+
+    if !advanced_to_next_video {
+        library_item.state.overall_time_watched = library_item
+            .state
+            .overall_time_watched
+            .saturating_add(time_watched_delta);
+    }
+
+    Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item))).unchanged()
+}
+
+fn external_player_stream_opened(
+    stream: &Stream,
+    meta_items: &[ResourceLoadable<MetaItem>],
+    meta_streams: &[ResourceLoadable<Vec<Stream>>],
+    streams: &[ResourceLoadable<Vec<Stream>>],
+) -> Effects {
+    let meta_item = meta_items
+        .iter()
+        .find(|meta_item| matches!(meta_item.content, Some(Loadable::Ready(_))));
+    let stream_request = meta_streams
+        .iter()
+        .chain(streams)
+        .find(|resource| match &resource.content {
+            Some(Loadable::Ready(streams)) => streams.contains(stream),
+            _ => false,
+        })
+        .map(|resource| resource.request.to_owned());
+    match (meta_item, stream_request) {
+        (Some(meta_item), Some(stream_request)) => {
+            Effects::msg(Msg::Internal(Internal::StreamLoaded {
+                stream: stream.to_owned(),
+                stream_request: Some(stream_request),
+                meta_item: meta_item.to_owned(),
+            }))
+            .unchanged()
+        }
+        _ => Effects::none().unchanged(),
+    }
+}
+
+fn library_item_sync(library_item: &Option<LibraryItem>, profile: &Profile) -> Effects {
+    match (library_item, profile.auth_key()) {
+        (Some(library_item), Some(auth_key)) => {
+            Effects::msg(Msg::Internal(Internal::LibrarySyncPlanResult(
+                DatastoreRequest {
+                    auth_key: auth_key.to_owned(),
+                    collection: LIBRARY_COLLECTION_NAME.to_owned(),
+                    command: DatastoreCommand::Meta {},
+                },
+                Ok((vec![library_item.id.to_owned()], vec![])),
+            )))
+            .unchanged()
+        }
+        _ => Effects::none().unchanged(),
+    }
+}
+
+/// If `Selected::guess_stream` is `true` then we will override the selected stream
+/// no matter if it's set (`Some`) or not (`None`).
+///
+/// How we override the stream:
+///
+/// 1. We find the first `MetaItem` that's successfully loaded from the addons.
+/// 2. Selecting the video id for the stream request:
+///    2.1 If there's a `MetaItem.preview.behavior_hints.default_video_id`
+///    we use it for the request
+///    2.2 If there's no `default_video_id` and no `MetaItem.videos` returned by the addon,
+///    we use the `MetaItem.preview.id`
+///
+/// If we haven't found a suitable `video_id`, then we do not override the `Selected::stream_path`.
+fn selected_guess_stream_update(
+    selected: &mut Option<Selected>,
+    meta_items: &[ResourceLoadable<MetaItem>],
+) -> Effects {
+    let meta_path = match &selected {
+        Some(Selected {
+            meta_path,
+            // guess the stream only if `stream_path` is `None`!
+            stream_path: None,
+            guess_stream: true,
+        }) => meta_path,
+        _ => return Effects::default(),
+    };
+
+    // Wait for all requests to finish before retrieving the meta_item
+    let meta_item = if meta_items.iter().all(|meta_item| {
+        matches!(meta_item.content, Some(Loadable::Ready(..)))
+            || matches!(meta_item.content, Some(Loadable::Err(..)))
+    }) {
+        match meta_items
+            .iter()
+            .find_map(|meta_item| match &meta_item.content {
+                Some(Loadable::Ready(meta_item)) => Some(meta_item),
+                _ => None,
+            }) {
+            Some(meta_item) => meta_item,
+            _ => return Effects::default(),
+        }
+    } else {
+        return Effects::default();
+    };
+
+    let video_id = match (
+        meta_item.videos.len(),
+        &meta_item.preview.behavior_hints.default_video_id,
+    ) {
+        (_, Some(default_video_id)) => default_video_id.to_owned(),
+        (0, None) => meta_item.preview.id.to_owned(),
+        (_, None)
+            if meta_item
+                .preview
+                .behavior_hints
+                .is_live(&meta_item.preview.r#type) =>
+        {
+            meta_item.preview.id.to_owned()
+        }
+        _ => return Effects::default(),
+    };
+
+    eq_update(
+        selected,
+        Some(Selected {
+            meta_path: meta_path.to_owned(),
+            stream_path: Some(ResourcePath {
+                resource: STREAM_RESOURCE_NAME.to_owned(),
+                r#type: meta_path.r#type.to_owned(),
+                id: video_id,
+                extra: vec![],
+            }),
+            // we must set the `guess_stream` to `false` after we've overridden it
+            // to make it consistent
+            guess_stream: false,
+        }),
+    )
+}
+
+fn live_schedule_refresh_update<E: Env + 'static>(details: &mut MetaDetails) -> Effects {
+    let Some((resource, meta)) = details.meta_items.iter().find_map(|resource| {
+        resource
+            .content
+            .as_ref()
+            .and_then(Loadable::ready)
+            .map(|meta| (resource, meta))
+    }) else {
+        return Effects::none().unchanged();
+    };
+    if !meta.preview.behavior_hints.is_live(&meta.preview.r#type) {
+        details.live_schedule_refresh = None;
+        return Effects::none().unchanged();
+    }
+    let now = E::now();
+    let (refresh, requested_at) = details
+        .live_schedule_refresh
+        .get_or_insert_with(|| (resource.clone(), now));
+    if refresh.request != resource.request {
+        *refresh = resource.clone();
+        *requested_at = now;
+    }
+    if matches!(refresh.content, Some(Loadable::Loading)) {
+        return Effects::none().unchanged();
+    }
+    let coverage_expired = meta
+        .videos
+        .iter()
+        .filter_map(|video| video.epg_info.as_ref())
+        .filter(|info| info.start_time < info.end_time)
+        .map(|info| info.end_time)
+        .max()
+        .is_some_and(|end| end <= now);
+    let refresh_after = if coverage_expired || matches!(refresh.content, Some(Loadable::Err(_))) {
+        Duration::minutes(1)
+    } else {
+        Duration::minutes(15)
+    };
+    if now - *requested_at < refresh_after {
+        return Effects::none().unchanged();
+    }
+    *requested_at = now;
+    refresh.content = None;
+    let request = refresh.request.clone();
+    resource_update::<E, MetaItem>(
+        refresh,
+        ResourceAction::ResourceRequested { request: &request },
+    )
+    .unchanged()
+}
+
+fn meta_items_update<E: Env + 'static>(
+    meta_items: &mut Vec<ResourceLoadable<MetaItem>>,
+    selected: &Option<Selected>,
+    profile: &Profile,
+) -> Effects {
+    match selected {
+        Some(Selected { meta_path, .. }) => resources_update::<E, _>(
+            meta_items,
+            ResourcesAction::ResourcesRequested {
+                request: &AggrRequest::AllOfResource(meta_path.to_owned()),
+                addons: &profile.addons,
+                // use existing loaded MetaItems instead of making a request every time.
+                force: false,
+            },
+        ),
+        _ => eq_update(meta_items, vec![]),
+    }
+}
+
+fn supported_rating_id(id: &str) -> bool {
+    USER_LIKES_SUPPORTED_ID_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
+fn supported_rating_type(r#type: &str) -> bool {
+    USER_LIKES_SUPPORTED_TYPES.contains(&r#type)
+}
+
+fn rating_info_update<E: Env + 'static>(
+    rating_info: &mut Option<Loadable<RatingInfo, EnvError>>,
+    selected: &Option<Selected>,
+    profile: &Profile,
+) -> Effects {
+    match (selected, profile.auth.as_ref()) {
+        (Some(selected), Some(auth)) => {
+            if supported_rating_id(&selected.meta_path.id)
+                && supported_rating_type(&selected.meta_path.r#type)
+            {
+                let should_update = match rating_info {
+                    Some(Loadable::Ready(info)) => info.meta_id != selected.meta_path.id,
+                    _ => true,
+                };
+
+                if should_update {
+                    let rating_info_effect = eq_update(rating_info, Some(Loadable::Loading));
+                    Effects::one(get_rating::<E>(auth.key.to_owned(), &selected.meta_path))
+                        .unchanged()
+                        .join(rating_info_effect)
+                } else {
+                    Effects::none().unchanged()
+                }
+            } else {
+                eq_update(rating_info, None)
+            }
+        }
+        _ => eq_update(rating_info, None),
+    }
+}
+
+fn get_rating<E: Env + 'static>(auth_key: AuthKey, meta_path: &ResourcePath) -> Effect {
+    let meta_id = meta_path.id.to_owned();
+
+    let request = RatingGetStatusRequest {
+        auth_key,
+        meta_item_id: meta_id.to_owned(),
+        meta_item_type: meta_path.r#type.to_owned(),
+    };
+
+    EffectFuture::Concurrent(
+        E::fetch::<_, RatingGetStatusResponse>(request.into())
+            .map(enclose!((meta_id) move |result| {
+                Msg::Internal(Internal::RatingGetStatusResult(
+                    meta_id, result,
+                ))
+            }))
+            .boxed_env(),
+    )
+    .into()
+}
+
+fn send_rating<E: Env + 'static>(
+    auth_key: AuthKey,
+    meta_path: &ResourcePath,
+    rating: &Option<Rating>,
+) -> Effect {
+    let meta_id = meta_path.id.to_owned();
+
+    let request = RatingSendRequest {
+        auth_key,
+        meta_item_id: meta_id.to_owned(),
+        meta_item_type: meta_path.r#type.to_owned(),
+        rating: rating.to_owned(),
+    };
+
+    EffectFuture::Concurrent(
+        E::fetch::<_, RatingSendResponse>(request.into())
+            .map(enclose!((meta_id) move |result| {
+                Msg::Internal(Internal::RatingSendResult(
+                    meta_id, result,
+                ))
+            }))
+            .boxed_env(),
+    )
+    .into()
+}
+
+fn meta_streams_update(
+    meta_streams: &mut Vec<ResourceLoadable<Vec<Stream>>>,
+    selected: &Option<Selected>,
+    meta_items: &[ResourceLoadable<MetaItem>],
+) -> Effects {
+    match selected {
+        Some(Selected {
+            stream_path: Some(stream_path),
+            ..
+        }) => {
+            let next_meta_streams = meta_items
+                .iter()
+                .find_map(|meta_item| match meta_item {
+                    ResourceLoadable {
+                        request,
+                        content: Some(Loadable::Ready(meta_item)),
+                    } => Some((request, meta_item)),
+                    _ => None,
+                })
+                .and_then(|(request, meta_item)| {
+                    meta_item
+                        .videos
+                        .iter()
+                        .find(|video| video.id == stream_path.id)
+                        .and_then(|video| {
+                            if !video.streams.is_empty() {
+                                Some(Cow::Borrowed(&video.streams))
+                            } else {
+                                Stream::youtube(&video.id)
+                                    .map(|stream| vec![stream])
+                                    .map(Cow::Owned)
+                            }
+                        })
+                        .map(|streams| (request, streams))
+                })
+                .map(|(request, streams)| ResourceLoadable {
+                    request: ResourceRequest {
+                        base: request.base.to_owned(),
+                        path: ResourcePath {
+                            resource: STREAM_RESOURCE_NAME.to_owned(),
+                            r#type: request.path.r#type.to_owned(),
+                            id: stream_path.id.to_owned(),
+                            extra: request.path.extra.to_owned(),
+                        },
+                    },
+                    content: Some(Loadable::Ready(streams.into_owned())),
+                })
+                .into_iter()
+                .collect();
+            eq_update(meta_streams, next_meta_streams)
+        }
+        _ => Effects::none().unchanged(),
+    }
+}
+
+fn streams_update<E: Env + 'static>(
+    streams: &mut Vec<ResourceLoadable<Vec<Stream>>>,
+    selected: &Option<Selected>,
+    profile: &Profile,
+) -> Effects {
+    match selected {
+        Some(Selected {
+            stream_path: Some(stream_path),
+            ..
+        }) => resources_update_with_vector_content::<E, _>(
+            streams,
+            ResourcesAction::ResourcesRequested {
+                request: &AggrRequest::AllOfResource(stream_path.to_owned()),
+                addons: &profile.addons,
+                // use existing loaded MetaItems instead of making a request every time.
+                force: false,
+            },
+        ),
+        _ => eq_update(streams, vec![]),
+    }
+}
+
+/// Find a stream from addon responses, which should be played if binge watching or continuing to watch.
+/// We've already loaded the next Video id and we need to find a proper stream for the binge watching.
+///
+/// First find the latest `StreamItem` stored based on last **30** videos from current video
+/// (ie. we're in E4, so we're going to check E4, E3, E2, E1 in this order until we hit a stored `StreamItem`).
+/// Then with the stream item we try to find a stream from addon responses (including the streams inside the meta itself `meta_streams`) -
+/// we find the responses from the addon based on `StreamItem.stream_transport_url`,
+/// then first we try to find the stream based on equality (as otherwise stored stream might be expired/no longer valid),
+/// if not found we try to find a stream based on it's `StreamBehaviorHints.bingeGroup`.
+/// One note, why we cannot return `StreamItem.stream` directly if it's for the same episode,
+/// is that user might have played a stream from an addon which he no longer has due to some constrains (ie p2p addon),
+/// that's why we have to try to find it first and verify that's it's still available.
+fn last_used_stream_update(
+    last_used_stream: &mut Option<ResourceLoadable<Option<Stream>>>,
+    selected: &Option<Selected>,
+    meta_items: &[ResourceLoadable<MetaItem>],
+    meta_streams: &[ResourceLoadable<Vec<Stream>>],
+    streams: &[ResourceLoadable<Vec<Stream>>],
+    stream_bucket: &StreamsBucket,
+) -> Effects {
+    let all_streams = [meta_streams, streams].concat();
+    let next_last_used_stream = match selected {
+        Some(Selected {
+            stream_path: Some(stream_path),
+            ..
+        }) => meta_items
+            .iter()
+            .filter(|_| !all_streams.is_empty())
+            .find_map(|meta_item_res| match &meta_item_res.content {
+                Some(Loadable::Ready(meta_item)) => stream_bucket
+                    .last_stream_item(&stream_path.id, meta_item)
+                    .and_then(|stream_item| {
+                        all_streams
+                            .iter()
+                            .find(|resource| {
+                                resource.request.base == stream_item.stream_transport_url
+                            })
+                            .and_then(|resource| match &resource.content {
+                                Some(Loadable::Ready(streams)) => Some(ResourceLoadable {
+                                    request: resource.request.clone(),
+                                    content: Some(Loadable::Ready(
+                                        streams
+                                            .iter()
+                                            .find(|stream| {
+                                                stream.is_source_match(&stream_item.stream)
+                                            })
+                                            .or_else(|| {
+                                                streams.iter().find(|stream| {
+                                                    stream.is_binge_match(&stream_item.stream)
+                                                })
+                                            })
+                                            .cloned(),
+                                    )),
+                                }),
+                                Some(Loadable::Loading) => Some(ResourceLoadable {
+                                    request: resource.request.clone(),
+                                    content: Some(Loadable::Loading),
+                                }),
+                                Some(Loadable::Err(error)) => Some(ResourceLoadable {
+                                    request: resource.request.clone(),
+                                    content: Some(Loadable::Err(error.clone())),
+                                }),
+                                _ => None,
+                            })
+                    })
+                    .or_else(|| {
+                        Some(ResourceLoadable {
+                            request: meta_item_res.request.clone(),
+                            content: Some(Loadable::Ready(None)),
+                        })
+                    }),
+                _ => None,
+            }),
+        _ => None,
+    };
+    eq_update(last_used_stream, next_last_used_stream)
+}
+
+fn library_item_update<E: Env + 'static>(
+    library_item: &mut Option<LibraryItem>,
+    selected: &Option<Selected>,
+    meta_items: &[ResourceLoadable<MetaItem>],
+    library: &LibraryBucket,
+) -> Effects {
+    let meta_item = meta_items
+        .iter()
+        .find_map(|meta_item| match &meta_item.content {
+            Some(Loadable::Ready(meta_item)) => Some(meta_item),
+            _ => None,
+        });
+    let next_library_item = match selected {
+        Some(selected) => library
+            .items
+            .get(&selected.meta_path.id)
+            .map(|library_item| {
+                meta_item.map_or_else(
+                    || library_item.to_owned(),
+                    |meta_item| LibraryItem::from((&meta_item.preview, library_item)),
+                )
+            })
+            .or_else(|| {
+                meta_item.map(|meta_item| LibraryItem::from((&meta_item.preview, PhantomData::<E>)))
+            }),
+        _ => None,
+    };
+    eq_update(library_item, next_library_item)
+}
+
+fn watched_update(
+    watched: &mut Option<WatchedBitField>,
+    meta_items: &[ResourceLoadable<MetaItem>],
+    library_item: &Option<LibraryItem>,
+) -> Effects {
+    let next_watched = meta_items
+        .iter()
+        .find_map(|meta_item| match &meta_item.content {
+            Some(Loadable::Ready(meta_item)) => Some(meta_item),
+            _ => None,
+        })
+        .and_then(|meta_item| {
+            library_item
+                .as_ref()
+                .map(|library_item| (meta_item, library_item))
+        })
+        .map(|(meta_item, library_item)| library_item.state.watched_bitfield(&meta_item.videos));
+    eq_update(watched, next_watched)
+}

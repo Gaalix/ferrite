@@ -1,0 +1,43 @@
+[package]
+name = "ferrite"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Gaalix/ferrite"
+description = "High-framerate GPU-accelerated desktop cinema client built on GPUI, librqbit, and libmpv"
+
+[lib]
+name = "ferrite"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrite"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+flate2 = "1"
+futures = "0.3"
+gpui = { path = "../../vendor/zed-gpui/crates/gpui" }
+gpui-mpv = { path = "../gpui-mpv" }
+gpui_platform = { path = "../../vendor/zed-gpui/crates/gpui_platform", features = ["font-kit"] }
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+smallvec = "1"
+stremio-core-runtime = { path = "../core-runtime" }
+stremio-stream-engine = { path = "../stream-engine" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = { version = "2.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

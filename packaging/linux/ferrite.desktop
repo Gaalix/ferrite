@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Ferrite
+GenericName=Media Player
+Comment=High-framerate desktop cinema player
+Exec=ferrite %u
+TryExec=ferrite
+Icon=ferrite
+Terminal=false
+Categories=AudioVideo;Video;Player;
+MimeType=x-scheme-handler/stremio;
+StartupWMClass=ferrite
+StartupNotify=true

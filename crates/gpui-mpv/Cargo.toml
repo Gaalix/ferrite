@@ -1,0 +1,28 @@
+[package]
+name = "gpui-mpv"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Gaalix/ferrite"
+description = "Cross-platform libmpv video viewport and thumbnailer for GPUI"
+
+[dependencies]
+async-channel = "2"
+gpui = { path = "../../vendor/zed-gpui/crates/gpui" }
+image = { version = "0.25", default-features = false }
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+wayland-sys = { version = "0.31", features = ["client", "egl", "dlopen"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52.0", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[dev-dependencies]
+gpui_platform = { path = "../../vendor/zed-gpui/crates/gpui_platform" }
+
+[build-dependencies]
+pkg-config = "0.3"

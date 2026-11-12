@@ -1,0 +1,14 @@
+/target/
+/dist/
+*.deb
+*.tar.gz
+*.zip
+*.exe
+*.dll
+*.res
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+.env
+.env.*

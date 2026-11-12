@@ -1,0 +1,618 @@
+use crate::{
+    constants::{CINEMETA_URL, META_RESOURCE_NAME, OFFICIAL_ADDONS, STREAM_RESOURCE_NAME},
+    models::{
+        ctx::Ctx,
+        meta_details::{MetaDetails, Selected},
+    },
+    runtime::{
+        msg::{Action, ActionLoad, ActionMetaDetails},
+        EnvFutureExt, Runtime, RuntimeAction, TryEnvFuture,
+    },
+    types::{
+        addon::{ResourcePath, ResourceResponse},
+        library::{LibraryBucket, LibraryItem, LibraryItemState},
+        profile::Profile,
+        resource::{MetaItem, MetaItemPreview, SeriesInfo, Video},
+    },
+    unit_tests::{default_fetch_handler, Request, TestEnv, FETCH_HANDLER},
+};
+use chrono::{DateTime, Duration, Utc};
+use futures::future;
+use std::any::Any;
+use stremio_derive::Model;
+
+#[derive(Model, Default, Clone, Debug)]
+#[model(TestEnv)]
+struct TestModel {
+    ctx: Ctx,
+    meta_details: MetaDetails,
+}
+
+const PREVIOUS_TIME_WATCHED: u64 = 40 * 60 * 1000;
+const PREVIOUS_OVERALL_TIME_WATCHED: u64 = 5 * 60 * 1000;
+
+fn create_video(season: u32, episode: u32) -> Video {
+    Video {
+        id: format!("tt123456:{season}:{episode}"),
+        title: format!("S{season}E{episode}"),
+        series_info: Some(SeriesInfo { season, episode }),
+        ..Default::default()
+    }
+}
+
+fn fetch_handler(request: Request) -> TryEnvFuture<Box<dyn Any + Send>> {
+    match request {
+        Request { url, .. } if url == "https://v3-cinemeta.strem.io/meta/series/tt123456.json" => {
+            future::ok(Box::new(ResourceResponse::Meta {
+                meta: MetaItem {
+                    preview: MetaItemPreview {
+                        id: "tt123456".to_owned(),
+                        r#type: "series".to_owned(),
+                        ..Default::default()
+                    },
+                    videos: vec![create_video(1, 1), create_video(1, 2)],
+                },
+            }) as Box<dyn Any + Send>)
+            .boxed_env()
+        }
+        _ => default_fetch_handler(request),
+    }
+}
+
+fn fetch_handler_next_season(request: Request) -> TryEnvFuture<Box<dyn Any + Send>> {
+    match request {
+        Request { url, .. } if url == "https://v3-cinemeta.strem.io/meta/series/tt123456.json" => {
+            future::ok(Box::new(ResourceResponse::Meta {
+                meta: MetaItem {
+                    preview: MetaItemPreview {
+                        id: "tt123456".to_owned(),
+                        r#type: "series".to_owned(),
+                        ..Default::default()
+                    },
+                    videos: vec![create_video(1, 1), create_video(1, 2), create_video(2, 1)],
+                },
+            }) as Box<dyn Any + Send>)
+            .boxed_env()
+        }
+        _ => default_fetch_handler(request),
+    }
+}
+
+fn fetch_handler_unreleased_next(request: Request) -> TryEnvFuture<Box<dyn Any + Send>> {
+    match request {
+        Request { url, .. } if url == "https://v3-cinemeta.strem.io/meta/series/tt123456.json" => {
+            let mut next_video = create_video(1, 2);
+            next_video.released = Some(Utc::now() + Duration::days(1));
+            future::ok(Box::new(ResourceResponse::Meta {
+                meta: MetaItem {
+                    preview: MetaItemPreview {
+                        id: "tt123456".to_owned(),
+                        r#type: "series".to_owned(),
+                        ..Default::default()
+                    },
+                    videos: vec![create_video(1, 1), next_video],
+                },
+            }) as Box<dyn Any + Send>)
+            .boxed_env()
+        }
+        _ => default_fetch_handler(request),
+    }
+}
+
+fn create_library_item(video_id: &str) -> LibraryItem {
+    LibraryItem {
+        id: "tt123456".to_owned(),
+        name: "Test Series".to_owned(),
+        r#type: "series".to_owned(),
+        poster: None,
+        poster_shape: Default::default(),
+        removed: false,
+        temp: false,
+        ctime: None,
+        mtime: DateTime::<Utc>::default(),
+        state: LibraryItemState {
+            video_id: Some(video_id.to_owned()),
+            time_offset: PREVIOUS_TIME_WATCHED,
+            time_watched: PREVIOUS_TIME_WATCHED,
+            overall_time_watched: PREVIOUS_OVERALL_TIME_WATCHED,
+            flagged_watched: 1,
+            duration: 60 * 60 * 1000,
+            ..Default::default()
+        },
+        behavior_hints: Default::default(),
+    }
+}
+
+fn run_with_library_item<R>(
+    library_item: LibraryItem,
+    run: impl FnOnce(Runtime<TestEnv, TestModel>) -> R,
+) -> R {
+    let (runtime, _rx) = Runtime::<TestEnv, _>::new(
+        TestModel {
+            ctx: Ctx {
+                profile: Profile {
+                    addons: OFFICIAL_ADDONS
+                        .iter()
+                        .filter(|addon| addon.transport_url == *CINEMETA_URL)
+                        .cloned()
+                        .collect(),
+                    ..Default::default()
+                },
+                library: LibraryBucket {
+                    uid: None,
+                    items: vec![("tt123456".to_owned(), library_item)]
+                        .into_iter()
+                        .collect(),
+                },
+                ..Default::default()
+            },
+            meta_details: Default::default(),
+        },
+        vec![],
+        1000,
+    );
+    run(runtime)
+}
+
+fn load_selected_video(runtime: &Runtime<TestEnv, TestModel>, video_id: &str) {
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Load(ActionLoad::MetaDetails(Selected {
+                meta_path: ResourcePath {
+                    resource: META_RESOURCE_NAME.to_owned(),
+                    r#type: "series".to_owned(),
+                    id: "tt123456".to_owned(),
+                    extra: vec![],
+                },
+                stream_path: Some(ResourcePath {
+                    resource: STREAM_RESOURCE_NAME.to_owned(),
+                    r#type: "series".to_owned(),
+                    id: video_id.to_owned(),
+                    extra: vec![],
+                }),
+                guess_stream: false,
+            })),
+        });
+    });
+}
+
+#[test]
+fn mark_video_as_watched_advances_video_id() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler);
+
+    let library_item = create_library_item("tt123456:1:1");
+    let (runtime, _rx) = Runtime::<TestEnv, _>::new(
+        TestModel {
+            ctx: Ctx {
+                profile: Profile {
+                    addons: OFFICIAL_ADDONS
+                        .iter()
+                        .filter(|addon| addon.transport_url == *CINEMETA_URL)
+                        .cloned()
+                        .collect(),
+                    ..Default::default()
+                },
+                library: LibraryBucket {
+                    uid: None,
+                    items: vec![("tt123456".to_owned(), library_item)]
+                        .into_iter()
+                        .collect(),
+                },
+                ..Default::default()
+            },
+            meta_details: Default::default(),
+        },
+        vec![],
+        1000,
+    );
+
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Load(ActionLoad::MetaDetails(Selected {
+                meta_path: ResourcePath {
+                    resource: META_RESOURCE_NAME.to_owned(),
+                    r#type: "series".to_owned(),
+                    id: "tt123456".to_owned(),
+                    extra: vec![],
+                },
+                stream_path: None,
+                guess_stream: false,
+            })),
+        });
+    });
+
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::MetaDetails(ActionMetaDetails::MarkVideoAsWatched(
+                create_video(1, 1),
+                true,
+            )),
+        });
+    });
+
+    let model = runtime.model().unwrap();
+    let library_item = model.ctx.library.items.get("tt123456").unwrap();
+    assert_eq!(
+        library_item.state.video_id,
+        Some("tt123456:1:2".to_owned()),
+        "video_id should advance to the next episode after marking current as watched",
+    );
+    assert_eq!(
+        library_item.state.time_offset, 1,
+        "time_offset should be reset when advancing to the next episode",
+    );
+    assert_eq!(
+        library_item.state.time_watched, 0,
+        "time_watched should not carry over to the next episode",
+    );
+    assert_eq!(
+        library_item.state.flagged_watched, 0,
+        "flagged_watched should be reset for the next episode",
+    );
+    assert_eq!(
+        library_item.state.overall_time_watched,
+        PREVIOUS_OVERALL_TIME_WATCHED + PREVIOUS_TIME_WATCHED,
+        "previous episode time_watched should be folded into overall_time_watched",
+    );
+}
+
+#[test]
+fn mark_video_as_watched_does_not_advance_to_unreleased_video() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler_unreleased_next);
+
+    run_with_library_item(create_library_item("tt123456:1:1"), |runtime| {
+        load_selected_video(&runtime, "tt123456:1:1");
+
+        TestEnv::run(|| {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::MetaDetails(ActionMetaDetails::MarkVideoAsWatched(
+                    create_video(1, 1),
+                    true,
+                )),
+            });
+        });
+
+        let model = runtime.model().unwrap();
+        let library_item = model.ctx.library.items.get("tt123456").unwrap();
+        assert_eq!(
+            library_item.state.video_id,
+            Some("tt123456:1:1".to_owned()),
+            "video_id should remain on the current episode when the next one is unreleased",
+        );
+        assert_eq!(
+            library_item.state.time_offset, 0,
+            "unreleased episodes should not keep the item in Continue Watching",
+        );
+    });
+}
+
+#[test]
+fn mark_last_video_as_watched_clears_continue_watching_progress() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler);
+
+    let library_item = create_library_item("tt123456:1:2");
+    let (runtime, _rx) = Runtime::<TestEnv, _>::new(
+        TestModel {
+            ctx: Ctx {
+                profile: Profile {
+                    addons: OFFICIAL_ADDONS
+                        .iter()
+                        .filter(|addon| addon.transport_url == *CINEMETA_URL)
+                        .cloned()
+                        .collect(),
+                    ..Default::default()
+                },
+                library: LibraryBucket {
+                    uid: None,
+                    items: vec![("tt123456".to_owned(), library_item)]
+                        .into_iter()
+                        .collect(),
+                },
+                ..Default::default()
+            },
+            meta_details: Default::default(),
+        },
+        vec![],
+        1000,
+    );
+
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::Load(ActionLoad::MetaDetails(Selected {
+                meta_path: ResourcePath {
+                    resource: META_RESOURCE_NAME.to_owned(),
+                    r#type: "series".to_owned(),
+                    id: "tt123456".to_owned(),
+                    extra: vec![],
+                },
+                stream_path: None,
+                guess_stream: false,
+            })),
+        });
+    });
+
+    TestEnv::run(|| {
+        runtime.dispatch(RuntimeAction {
+            field: None,
+            action: Action::MetaDetails(ActionMetaDetails::MarkVideoAsWatched(
+                create_video(1, 2),
+                true,
+            )),
+        });
+    });
+
+    let model = runtime.model().unwrap();
+    let library_item = model.ctx.library.items.get("tt123456").unwrap();
+    assert_eq!(
+        library_item.state.video_id,
+        Some("tt123456:1:2".to_owned()),
+        "video_id should remain on the last episode when there is no next video",
+    );
+    assert_eq!(
+        library_item.state.time_offset, 0,
+        "time_offset should be cleared when there is no next episode",
+    );
+}
+
+#[test]
+fn mark_season_as_watched_clears_continue_watching_when_all_released_episodes_are_watched() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler);
+
+    run_with_library_item(create_library_item("tt123456:1:1"), |runtime| {
+        load_selected_video(&runtime, "tt123456:1:1");
+
+        TestEnv::run(|| {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::MetaDetails(ActionMetaDetails::MarkSeasonAsWatched(1, true)),
+            });
+        });
+
+        let model = runtime.model().unwrap();
+        let library_item = model.ctx.library.items.get("tt123456").unwrap();
+        assert_eq!(
+            library_item.state.time_offset, 0,
+            "marking the final released season watched should clear stale resume progress",
+        );
+        assert_eq!(
+            library_item.state.video_id,
+            Some("tt123456:1:1".to_owned()),
+            "clearing stale progress should not invent a different completed episode pointer",
+        );
+    });
+}
+
+#[test]
+fn mark_season_as_watched_advances_to_next_released_unwatched_season() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler_next_season);
+
+    run_with_library_item(create_library_item("tt123456:1:1"), |runtime| {
+        load_selected_video(&runtime, "tt123456:1:1");
+
+        TestEnv::run(|| {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::MetaDetails(ActionMetaDetails::MarkSeasonAsWatched(1, true)),
+            });
+        });
+
+        let model = runtime.model().unwrap();
+        let library_item = model.ctx.library.items.get("tt123456").unwrap();
+        assert_eq!(
+            library_item.state.video_id,
+            Some("tt123456:2:1".to_owned()),
+            "resume pointer should advance to the next released unwatched episode",
+        );
+        assert_eq!(
+            library_item.state.time_offset, 1,
+            "the next released unwatched episode should remain available in Continue Watching",
+        );
+        assert_eq!(library_item.state.time_watched, 0);
+        assert_eq!(library_item.state.flagged_watched, 0);
+        assert_eq!(
+            library_item.state.overall_time_watched,
+            PREVIOUS_OVERALL_TIME_WATCHED + PREVIOUS_TIME_WATCHED,
+        );
+    });
+}
+
+#[test]
+fn mark_other_season_as_watched_preserves_resume_progress() {
+    for (video_id, season) in [("tt123456:2:1", 1), ("tt123456:1:1", 2)] {
+        let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+        *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler_next_season);
+
+        let mut library_item = create_library_item(video_id);
+        let videos = vec![create_video(1, 1), create_video(1, 2), create_video(2, 1)];
+        let mut watched = library_item.state.watched_bitfield(&videos);
+        watched.set_video(video_id, true);
+        library_item.state.watched = Some(watched.into());
+
+        run_with_library_item(library_item, |runtime| {
+            load_selected_video(&runtime, video_id);
+            TestEnv::run(|| {
+                runtime.dispatch(RuntimeAction {
+                    field: None,
+                    action: Action::MetaDetails(ActionMetaDetails::MarkSeasonAsWatched(
+                        season, true,
+                    )),
+                });
+            });
+
+            let model = runtime.model().unwrap();
+            let library_item = model.ctx.library.items.get("tt123456").unwrap();
+            assert_eq!(library_item.state.video_id.as_deref(), Some(video_id));
+            assert_eq!(library_item.state.time_offset, PREVIOUS_TIME_WATCHED);
+            assert_eq!(library_item.state.time_watched, PREVIOUS_TIME_WATCHED);
+            let watched = library_item.state.watched_bitfield(&videos);
+            assert!(videos
+                .iter()
+                .filter(|video| video.series_info.as_ref().unwrap().season == season)
+                .all(|video| watched.get_video(&video.id)));
+        });
+    }
+}
+
+#[test]
+fn mark_season_as_unwatched_preserves_existing_resume_progress() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler);
+
+    run_with_library_item(create_library_item("tt123456:1:1"), |runtime| {
+        load_selected_video(&runtime, "tt123456:1:1");
+
+        TestEnv::run(|| {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::MetaDetails(ActionMetaDetails::MarkSeasonAsWatched(1, false)),
+            });
+        });
+
+        let model = runtime.model().unwrap();
+        let library_item = model.ctx.library.items.get("tt123456").unwrap();
+        assert_eq!(
+            library_item.state.video_id,
+            Some("tt123456:1:1".to_owned()),
+            "marking a season unwatched must not move the resume pointer",
+        );
+        assert_eq!(
+            library_item.state.time_offset, PREVIOUS_TIME_WATCHED,
+            "marking a season unwatched must preserve existing resume progress",
+        );
+    });
+}
+
+#[test]
+fn external_player_progress_updates_position_without_known_duration() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler);
+
+    let mut library_item = create_library_item("tt123456:1:1");
+    library_item.state.time_offset = 10 * 60 * 1000;
+    library_item.state.time_watched = 7 * 60 * 1000;
+    library_item.state.overall_time_watched = 3 * 60 * 1000;
+    library_item.state.flagged_watched = 1;
+    library_item.state.duration = 0;
+
+    run_with_library_item(library_item, |runtime| {
+        load_selected_video(&runtime, "tt123456:1:2");
+
+        TestEnv::run(|| {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::MetaDetails(ActionMetaDetails::ExternalPlayerProgressChanged {
+                    time: 45 * 60 * 1000,
+                }),
+            });
+        });
+
+        let model = runtime.model().unwrap();
+        let library_item = model.ctx.library.items.get("tt123456").unwrap();
+        assert_eq!(
+            library_item.state.video_id,
+            Some("tt123456:1:2".to_owned()),
+            "video_id should use the callback episode",
+        );
+        assert_eq!(
+            library_item.state.time_offset,
+            45 * 60 * 1000,
+            "time_offset should use the callback position",
+        );
+        assert_eq!(library_item.state.time_watched, 0);
+        assert_eq!(library_item.state.flagged_watched, 0);
+        assert_eq!(library_item.state.overall_time_watched, 3 * 60 * 1000);
+        assert_eq!(library_item.state.times_watched, 0);
+    });
+}
+
+#[test]
+fn external_player_progress_without_duration_keeps_already_watched_video_state() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler);
+
+    let mut library_item = create_library_item("tt123456:1:1");
+    library_item.state.duration = 0;
+
+    run_with_library_item(library_item, |runtime| {
+        load_selected_video(&runtime, "tt123456:1:1");
+
+        TestEnv::run(|| {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::MetaDetails(ActionMetaDetails::MarkVideoAsWatched(
+                    create_video(1, 1),
+                    true,
+                )),
+            });
+        });
+
+        TestEnv::run(|| {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::MetaDetails(ActionMetaDetails::ExternalPlayerProgressChanged {
+                    time: 45 * 60 * 1000,
+                }),
+            });
+        });
+
+        let model = runtime.model().unwrap();
+        let library_item = model.ctx.library.items.get("tt123456").unwrap();
+        assert_eq!(
+            library_item.state.video_id,
+            Some("tt123456:1:2".to_owned()),
+            "callback must not move continue watching back to an already watched episode",
+        );
+        assert_eq!(library_item.state.time_offset, 1);
+    });
+}
+
+#[test]
+fn external_player_progress_with_duration_marks_watched_and_advances_video_id() {
+    let _env_mutex = TestEnv::reset().expect("Should have exclusive lock to TestEnv");
+    *FETCH_HANDLER.write().unwrap() = Box::new(fetch_handler);
+
+    let mut library_item = create_library_item("tt123456:1:1");
+    library_item.state.time_offset = 10 * 60 * 1000;
+    library_item.state.time_watched = 0;
+    library_item.state.overall_time_watched = 0;
+    library_item.state.flagged_watched = 0;
+
+    run_with_library_item(library_item, |runtime| {
+        load_selected_video(&runtime, "tt123456:1:1");
+
+        TestEnv::run(|| {
+            runtime.dispatch(RuntimeAction {
+                field: None,
+                action: Action::MetaDetails(ActionMetaDetails::ExternalPlayerProgressChanged {
+                    time: 45 * 60 * 1000,
+                }),
+            });
+        });
+
+        let model = runtime.model().unwrap();
+        let library_item = model.ctx.library.items.get("tt123456").unwrap();
+        assert_eq!(
+            library_item.state.video_id,
+            Some("tt123456:1:2".to_owned()),
+            "video_id should advance to the next episode after callback progress crosses the watched threshold",
+        );
+        assert_eq!(
+            library_item.state.time_offset, 1,
+            "time_offset should move to progress 1 on the next episode",
+        );
+        assert_eq!(library_item.state.time_watched, 0);
+        assert_eq!(library_item.state.flagged_watched, 0);
+        assert_eq!(library_item.state.overall_time_watched, 35 * 60 * 1000);
+        assert_eq!(library_item.state.times_watched, 0);
+    });
+}
