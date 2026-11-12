@@ -317,7 +317,7 @@ mod platform {
             match cmd {
                 WindowsSleepCmd::Set(true) => {
                     unsafe {
-                        SetThreadExecutionState(
+                        let _ = SetThreadExecutionState(
                             ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
                         );
                     }
@@ -326,7 +326,7 @@ mod platform {
                 WindowsSleepCmd::Set(false) => {
                     if active {
                         unsafe {
-                            SetThreadExecutionState(ES_CONTINUOUS);
+                            let _ = SetThreadExecutionState(ES_CONTINUOUS);
                         }
                         active = false;
                     }
@@ -338,7 +338,7 @@ mod platform {
         }
         if active {
             unsafe {
-                SetThreadExecutionState(ES_CONTINUOUS);
+                let _ = SetThreadExecutionState(ES_CONTINUOUS);
             }
         }
     }

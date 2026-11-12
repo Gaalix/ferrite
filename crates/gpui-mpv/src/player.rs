@@ -90,11 +90,11 @@ fn is_direct_composition_disabled_value(val: Option<&str>) -> bool {
 
 #[cfg(target_os = "windows")]
 fn is_direct_composition_disabled() -> bool {
-    std::env::var("GPUI_DISABLE_DIRECT_COMPOSITION")
-        .ok()
-        .as_deref()
-        .map(|v| is_direct_composition_disabled_value(Some(v)))
-        .unwrap_or(false)
+    is_direct_composition_disabled_value(
+        std::env::var("GPUI_DISABLE_DIRECT_COMPOSITION")
+            .ok()
+            .as_deref(),
+    )
 }
 
 #[allow(dead_code)]

@@ -730,11 +730,12 @@ use linux_mpris::MediaBackend;
 
 #[cfg(target_os = "windows")]
 mod windows_smtc {
-    use std::ffi::c_void;
     use std::sync::{atomic::AtomicI64, mpsc, Arc};
     use std::thread::JoinHandle;
 
+    use windows::core::HSTRING;
     use windows::Foundation::{TimeSpan, TypedEventHandler, Uri};
+    use windows::Media::Playback::MediaPlayer;
     use windows::Media::{
         MediaPlaybackStatus, MediaPlaybackType, PlaybackPositionChangeRequestedEventArgs,
         SystemMediaTransportControls, SystemMediaTransportControlsButton,
@@ -742,10 +743,6 @@ mod windows_smtc {
         SystemMediaTransportControlsTimelineProperties,
     };
     use windows::Storage::Streams::RandomAccessStreamReference;
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::WinRT::Media::ISystemMediaTransportControlsInterop;
-    use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
-    use windows_core::{factory, Ref, HSTRING};
 
     use super::{OsMediaCommand, OsMediaMetadata, OsPlaybackStatus};
 
@@ -778,21 +775,14 @@ mod windows_smtc {
     impl MediaBackend {
         pub(super) fn start(
             _tokio_handle: tokio::runtime::Handle,
-            windows_hwnd: Option<isize>,
+            _windows_hwnd: Option<isize>,
             cmd_tx: async_channel::Sender<OsMediaCommand>,
             _position_us: Arc<AtomicI64>,
         ) -> Self {
-            let Some(hwnd_raw) = windows_hwnd.filter(|&h| h != 0) else {
-                return Self {
-                    tx: None,
-                    worker: None,
-                };
-            };
-
             let (tx, rx) = mpsc::channel();
             let worker = std::thread::Builder::new()
                 .name("ferrite-smtc".to_owned())
-                .spawn(move || run_smtc_worker(hwnd_raw, rx, cmd_tx))
+                .spawn(move || run_smtc_worker(rx, cmd_tx))
                 .ok();
 
             Self {
@@ -830,26 +820,23 @@ mod windows_smtc {
     }
 
     fn run_smtc_worker(
-        hwnd_raw: isize,
         rx: mpsc::Receiver<WindowsMediaMsg>,
         cmd_tx: async_channel::Sender<OsMediaCommand>,
     ) {
-        let ro_initialized = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok();
-
-        let smtc = (|| -> windows_core::Result<SystemMediaTransportControls> {
-            let interop: ISystemMediaTransportControlsInterop =
-                factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>()?;
-            unsafe { interop.GetForWindow(HWND(hwnd_raw as *mut c_void)) }
+        let init = (|| -> windows::core::Result<(MediaPlayer, SystemMediaTransportControls)> {
+            let player = MediaPlayer::new()?;
+            if let Ok(cmd_manager) = player.CommandManager() {
+                let _ = cmd_manager.SetIsEnabled(false);
+            }
+            let smtc = player.SystemMediaTransportControls()?;
+            Ok((player, smtc))
         })();
 
-        let Ok(smtc) = smtc else {
+        let Ok((player, smtc)) = init else {
             tracing::debug!(
                 target: "ferrite::os_integration",
-                "Failed to acquire Windows SystemMediaTransportControls for HWND"
+                "Failed to initialize Windows SystemMediaTransportControls via MediaPlayer"
             );
-            if ro_initialized {
-                unsafe { RoUninitialize() };
-            }
             return;
         };
 
@@ -858,34 +845,32 @@ mod windows_smtc {
             .ButtonPressed(&TypedEventHandler::<
                 SystemMediaTransportControls,
                 SystemMediaTransportControlsButtonPressedEventArgs,
-            >::new(
-                move |_sender, args: Ref<'_, SystemMediaTransportControlsButtonPressedEventArgs>| {
-                    if let Some(args) = args.as_ref() {
-                        if let Ok(button) = args.Button() {
-                            let cmd = match button {
-                                SystemMediaTransportControlsButton::Play => Some(OsMediaCommand::Play),
-                                SystemMediaTransportControlsButton::Pause => Some(OsMediaCommand::Pause),
-                                SystemMediaTransportControlsButton::Stop => Some(OsMediaCommand::Stop),
-                                SystemMediaTransportControlsButton::Next => Some(OsMediaCommand::Next),
-                                SystemMediaTransportControlsButton::Previous => {
-                                    Some(OsMediaCommand::Previous)
-                                }
-                                SystemMediaTransportControlsButton::FastForward => {
-                                    Some(OsMediaCommand::SeekRelativeSecs(10.0))
-                                }
-                                SystemMediaTransportControlsButton::Rewind => {
-                                    Some(OsMediaCommand::SeekRelativeSecs(-10.0))
-                                }
-                                _ => None,
-                            };
-                            if let Some(cmd) = cmd {
-                                let _ = btn_tx.try_send(cmd);
+            >::new(move |_sender, args| {
+                if let Some(args) = args.as_ref() {
+                    if let Ok(button) = args.Button() {
+                        let cmd = match button {
+                            SystemMediaTransportControlsButton::Play => Some(OsMediaCommand::Play),
+                            SystemMediaTransportControlsButton::Pause => Some(OsMediaCommand::Pause),
+                            SystemMediaTransportControlsButton::Stop => Some(OsMediaCommand::Stop),
+                            SystemMediaTransportControlsButton::Next => Some(OsMediaCommand::Next),
+                            SystemMediaTransportControlsButton::Previous => {
+                                Some(OsMediaCommand::Previous)
                             }
+                            SystemMediaTransportControlsButton::FastForward => {
+                                Some(OsMediaCommand::SeekRelativeSecs(10.0))
+                            }
+                            SystemMediaTransportControlsButton::Rewind => {
+                                Some(OsMediaCommand::SeekRelativeSecs(-10.0))
+                            }
+                            _ => None,
+                        };
+                        if let Some(cmd) = cmd {
+                            let _ = btn_tx.try_send(cmd);
                         }
                     }
-                    Ok(())
-                },
-            ))
+                }
+                Ok(())
+            }))
             .ok();
 
         let seek_tx = cmd_tx;
@@ -893,17 +878,15 @@ mod windows_smtc {
             .PlaybackPositionChangeRequested(&TypedEventHandler::<
                 SystemMediaTransportControls,
                 PlaybackPositionChangeRequestedEventArgs,
-            >::new(
-                move |_sender, args: Ref<'_, PlaybackPositionChangeRequestedEventArgs>| {
-                    if let Some(args) = args.as_ref() {
-                        if let Ok(pos) = args.RequestedPlaybackPosition() {
-                            let secs = (pos.Duration.max(0) as f64) / TICKS_PER_SEC;
-                            let _ = seek_tx.try_send(OsMediaCommand::SetPositionSecs(secs));
-                        }
+            >::new(move |_sender, args| {
+                if let Some(args) = args.as_ref() {
+                    if let Ok(pos) = args.RequestedPlaybackPosition() {
+                        let secs = (pos.Duration.max(0) as f64) / TICKS_PER_SEC;
+                        let _ = seek_tx.try_send(OsMediaCommand::SetPositionSecs(secs));
                     }
-                    Ok(())
-                },
-            ))
+                }
+                Ok(())
+            }))
             .ok();
 
         let mut last_duration_secs = 0.0_f64;
@@ -971,10 +954,7 @@ mod windows_smtc {
         }
         let _ = smtc.SetIsEnabled(false);
         drop(smtc);
-
-        if ro_initialized {
-            unsafe { RoUninitialize() };
-        }
+        drop(player);
     }
 
     fn update_smtc_timeline(
