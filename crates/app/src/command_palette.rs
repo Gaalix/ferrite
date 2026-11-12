@@ -406,7 +406,7 @@ impl AppShell {
             } => {
                 let poster_tex = poster_url
                     .as_deref()
-                    .and_then(|u| self.poster_cache.resolve_poster_image(u));
+                    .and_then(|u| self.poster_cache.resolve_thumbnail_image(u));
                 let clean_type = sentence_case_label(type_name);
                 let year_clean = release_info
                     .as_ref()

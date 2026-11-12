@@ -3459,6 +3459,8 @@ impl Render for AppShell {
             }
         }
 
+        self.poster_cache.begin_render_frame();
+
         let mut evicted_images = self.poster_cache.drain_evicted_images();
         evicted_images.extend(gpui_mpv::drain_evicted_video_images());
         if !evicted_images.is_empty() {
