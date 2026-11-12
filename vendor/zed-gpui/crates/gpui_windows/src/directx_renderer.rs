@@ -118,6 +118,8 @@ impl Drop for Annotation<'_> {
 struct DirectComposition {
     comp_device: IDCompositionDevice,
     comp_target: IDCompositionTarget,
+    root_visual: IDCompositionVisual,
+    video_visual: IDCompositionVisual,
     comp_visual: IDCompositionVisual,
 }
 
@@ -199,6 +201,30 @@ impl DirectXRenderer {
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
+    }
+
+    pub(crate) fn video_underlay_handles(&self, hwnd: HWND) -> gpui::WindowsVideoHandles {
+        let d3d11_device = self
+            .devices
+            .as_ref()
+            .map_or(0, |devices| devices.device.as_raw() as usize);
+        if let Some(composition) = &self.direct_composition {
+            gpui::WindowsVideoHandles {
+                hwnd: hwnd.0 as isize,
+                dcomp_device: composition.comp_device.as_raw() as usize,
+                dcomp_video_visual: composition.video_visual.as_raw() as usize,
+                d3d11_device,
+                direct_composition_active: true,
+            }
+        } else {
+            gpui::WindowsVideoHandles {
+                hwnd: hwnd.0 as isize,
+                dcomp_device: 0,
+                dcomp_video_visual: 0,
+                d3d11_device,
+                direct_composition_active: false,
+            }
+        }
     }
 
     fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
@@ -1014,12 +1040,22 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
+        // topmost=true ensures GPUI's premultiplied-alpha UI visual composites above
+        // both video_visual and any child video HWND.
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        let root_visual = unsafe { comp_device.CreateVisual() }?;
+        let video_visual = unsafe { comp_device.CreateVisual() }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
+        unsafe {
+            root_visual.AddVisual(&video_visual, false, None)?;
+            root_visual.AddVisual(&comp_visual, true, &video_visual)?;
+        }
 
         Ok(Self {
             comp_device,
             comp_target,
+            root_visual,
+            video_visual,
             comp_visual,
         })
     }
@@ -1027,7 +1063,7 @@ impl DirectComposition {
     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
         unsafe {
             self.comp_visual.SetContent(swap_chain)?;
-            self.comp_target.SetRoot(&self.comp_visual)?;
+            self.comp_target.SetRoot(&self.root_visual)?;
             self.comp_device.Commit()?;
         }
         Ok(())

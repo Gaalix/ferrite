@@ -1061,9 +1061,12 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn windows_video_handles(&self) -> Option<gpui::WindowsVideoHandles> {
-        Some(gpui::WindowsVideoHandles {
-            hwnd: self.0.hwnd.0 as isize,
-        })
+        Some(
+            self.state
+                .renderer
+                .borrow()
+                .video_underlay_handles(self.0.hwnd),
+        )
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
