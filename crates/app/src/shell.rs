@@ -2716,6 +2716,13 @@ impl AppShell {
         if !force_rematch && !self.preferences.auto_match_native_subtitles {
             return;
         }
+        if force_rematch {
+            let mut cfg = self.core.private_integrations();
+            if !cfg.native_subtitles_enabled {
+                cfg.native_subtitles_enabled = true;
+                let _ = self.core.update_private_integrations(cfg);
+            }
+        }
         let Some(session) = self.playback_session.as_ref() else {
             return;
         };
@@ -3304,7 +3311,7 @@ impl AppShell {
                 existing.prowlarr_api_key,
             ),
             prowlarr_timeout_ms: self.prowlarr_timeout_ms.clamp(1000, 15000),
-            native_subtitles_enabled: self.preferences.auto_match_native_subtitles,
+            native_subtitles_enabled: true,
             opensubtitles_api_key: merge_secret_key_draft(
                 &self.opensubtitles_key_input,
                 &mut self.opensubtitles_key_configured,
