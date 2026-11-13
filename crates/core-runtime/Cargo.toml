@@ -28,6 +28,10 @@ zeroize = { version = "1.9", features = ["derive"] }
 data-encoding = "2.11"
 hex = "0.4"
 urlencoding = "2.1"
+flate2 = "1"
+sha2 = "0.10"
+chardetng = "1.0"
+encoding_rs = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

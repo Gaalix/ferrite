@@ -8,6 +8,7 @@ pub mod prewarm;
 pub mod private_config;
 pub mod prowlarr;
 pub mod stream_parser;
+pub mod subtitles;
 pub mod track_prefs;
 
 pub use addon_engine::{
@@ -40,9 +41,10 @@ pub use env::{
 pub use error::CoreRuntimeError;
 pub use model::{clone_model_field, DesktopModel, DesktopModelField};
 pub use prewarm::{
-    convert_stream_to_playback_url, evaluate_next_episode_prewarm, NextEpisodeTarget,
-    PrewarmTriggerReason, ResolvedNextEpisode, ENDING_PREWARM_WINDOW_SECS,
-    MIN_EPISODE_DURATION_FOR_ENDING_PREWARM_SECS,
+    convert_stream_to_playback_url, evaluate_next_episode_prewarm, rank_continuation_candidates,
+    ActiveEpisodeMatchSpec, NextEpisodeTarget, PrewarmTriggerReason, ResolvedNextEpisode,
+    ENDING_PREWARM_WINDOW_SECS, MAX_RANKED_NEXT_EPISODE_CANDIDATES,
+    MIN_EPISODE_DURATION_FOR_ENDING_PREWARM_SECS, OUTRO_PREWARM_LEAD_SECS,
 };
 pub use private_config::{
     default_config_path as default_private_config_path, load_from_path as load_private_config,
@@ -52,9 +54,21 @@ pub use private_config::{
 };
 pub use prowlarr::{ProwlarrClient, ProwlarrTestResult, RichStreamItem};
 pub use stream_parser::{
-    filter_and_rank_streams, format_bytes, is_allowed_addon_stream_url, is_allowed_stream_source,
-    is_allowed_stream_url, parse_stream, parse_stream_with_addon, parse_streams, AudioCodec,
+    estimate_bitrate_mbps, filter_and_rank_streams, format_bitrate_mbps, format_bytes,
+    is_allowed_addon_stream_url, is_allowed_stream_source, is_allowed_stream_url,
+    parse_runtime_minutes, parse_stream, parse_stream_with_addon, parse_streams, AudioCodec,
     HdrFormat, ParsedStream, Resolution, StreamFilter, StreamQuality, VideoCodec,
+};
+pub use subtitles::{
+    decode_subtitle_payload, extract_best_subtitle_from_zip, normalize_bytes_to_utf8,
+    normalize_subtitle_lang_code, normalize_subtitle_lang_iso639_1,
+    normalize_subtitle_lang_iso639_2, subtitle_lang_matches, FetchedNativeSubtitle, FpsHint,
+    NativeSubtitleClient, NativeSubtitleEndpoints, NativeSubtitleQuery, ReleaseEdition,
+    StreamingServiceTag, SubtitleAlignmentResult, SubtitleMatchRanker, SubtitleMatchTier,
+    SubtitleSourceCut, SubtitleSyncAligner, VideoReleaseFingerprint,
+    DEFAULT_OPENSUBTITLES_API_BASE, DEFAULT_OPENSUBTITLES_V3_BASE, DEFAULT_SUBDL_API_BASE,
+    DEFAULT_SUBDL_DL_BASE, MAX_SUBTITLE_ARCHIVE_BYTES, MAX_UNCOMPRESSED_SUBTITLE_BYTES,
+    NATIVE_SUBTITLE_HTTP_TIMEOUT_MS, NATIVE_SUBTITLE_POOL_IDLE_SECS,
 };
 pub use track_prefs::{
     extract_track_keywords, parse_lang_tag, select_preferred_tracks, MatchedTracks,

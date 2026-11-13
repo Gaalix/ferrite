@@ -6549,10 +6549,13 @@ dependencies = [
 name = "stremio-core-runtime"
 version = "0.1.0"
 dependencies = [
+ "chardetng",
  "chrono",
  "data-encoding",
  "directories 5.0.1",
  "dirs 5.0.1",
+ "encoding_rs",
+ "flate2",
  "futures",
  "hex",
  "http",
@@ -6564,6 +6567,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "sha2",
  "stremio-core",
  "tempfile",
  "thiserror 2.0.21",

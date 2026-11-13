@@ -159,6 +159,12 @@ pub struct PrivateIntegrationsConfig {
     pub prowlarr_api_key: SecretApiKey,
     #[serde(default = "default_prowlarr_timeout_ms")]
     pub prowlarr_timeout_ms: u64,
+    #[serde(default = "default_true")]
+    pub native_subtitles_enabled: bool,
+    #[serde(default)]
+    pub opensubtitles_api_key: SecretApiKey,
+    #[serde(default)]
+    pub subdl_api_key: SecretApiKey,
 }
 
 impl Default for PrivateIntegrationsConfig {
@@ -174,6 +180,9 @@ impl Default for PrivateIntegrationsConfig {
             prowlarr_url: String::new(),
             prowlarr_api_key: SecretApiKey::default(),
             prowlarr_timeout_ms: DEFAULT_PROWLARR_TIMEOUT_MS,
+            native_subtitles_enabled: true,
+            opensubtitles_api_key: SecretApiKey::default(),
+            subdl_api_key: SecretApiKey::default(),
         }
     }
 }
@@ -188,6 +197,8 @@ impl PrivateIntegrationsConfig {
         self.torbox_api_key = SecretApiKey::new(self.torbox_api_key.expose());
         self.alldebrid_api_key = SecretApiKey::new(self.alldebrid_api_key.expose());
         self.prowlarr_api_key = SecretApiKey::new(self.prowlarr_api_key.expose());
+        self.opensubtitles_api_key = SecretApiKey::new(self.opensubtitles_api_key.expose());
+        self.subdl_api_key = SecretApiKey::new(self.subdl_api_key.expose());
         self
     }
 
@@ -222,6 +233,8 @@ impl PrivateIntegrationsConfig {
             self.torbox_api_key.expose(),
             self.alldebrid_api_key.expose(),
             self.prowlarr_api_key.expose(),
+            self.opensubtitles_api_key.expose(),
+            self.subdl_api_key.expose(),
         ]
         .into_iter()
         .filter(|s| !s.is_empty())
@@ -446,6 +459,9 @@ mod tests {
             prowlarr_url: "http://127.0.0.1:9696/".to_owned(),
             prowlarr_api_key: SecretApiKey::new("prowl_secret_5678"),
             prowlarr_timeout_ms: 99_999,
+            native_subtitles_enabled: true,
+            opensubtitles_api_key: SecretApiKey::new("os_secret_key_42"),
+            subdl_api_key: SecretApiKey::new("subdl_secret_key_99"),
         };
 
         cfg.save_to_path(&nested).unwrap();
@@ -476,5 +492,43 @@ mod tests {
         let redacted = redact_secret(msg, &["my+secret/key"]);
         assert!(!redacted.contains("my+secret/key"));
         assert!(!redacted.contains("my%2Bsecret%2Fkey"));
+    }
+
+    #[test]
+    fn loads_v020_json_backwards_compatibly_and_redacts_subtitle_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v020_private_integrations.json");
+        let v020_json = r#"{
+  "active_debrid": "TorBox",
+  "direct_rust_unrestrict": true,
+  "debrid_cached_only_filter": false,
+  "real_debrid_api_key": "",
+  "torbox_api_key": "tb_legacy_key",
+  "alldebrid_api_key": "",
+  "prowlarr_mode": "FallbackOnOutage",
+  "prowlarr_url": "http://127.0.0.1:9696",
+  "prowlarr_api_key": "pw_legacy_key",
+  "prowlarr_timeout_ms": 4500
+}"#;
+        std::fs::write(&path, v020_json).unwrap();
+
+        let loaded = PrivateIntegrationsConfig::load_from_path(&path).unwrap();
+        assert_eq!(loaded.active_debrid, LocalDebridProvider::TorBox);
+        assert_eq!(loaded.torbox_api_key.expose(), "tb_legacy_key");
+        assert!(loaded.native_subtitles_enabled);
+        assert!(loaded.opensubtitles_api_key.is_empty());
+        assert!(loaded.subdl_api_key.is_empty());
+
+        let with_sub_keys = PrivateIntegrationsConfig {
+            opensubtitles_api_key: SecretApiKey::new("os_ultra_secret_777"),
+            subdl_api_key: SecretApiKey::new("subdl_ultra_secret_888"),
+            ..loaded
+        };
+        let dbg = format!("{with_sub_keys:?}");
+        assert!(!dbg.contains("os_ultra_secret_777"));
+        assert!(!dbg.contains("subdl_ultra_secret_888"));
+        assert!(!dbg.contains("tb_legacy_key"));
+        assert!(with_sub_keys.all_secrets().contains(&"os_ultra_secret_777"));
+        assert!(with_sub_keys.all_secrets().contains(&"subdl_ultra_secret_888"));
     }
 }

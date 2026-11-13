@@ -285,9 +285,12 @@ async fn end_to_end_next_episode_prewarm_and_url_resolution_in_controller() {
         assert!(controller
             .should_trigger_next_episode_prewarm(300.0, 1420.0)
             .is_none());
+        assert!(controller
+            .should_trigger_next_episode_prewarm(1350.0, 1420.0)
+            .is_none());
         let prewarm = controller
-            .should_trigger_next_episode_prewarm(1345.0, 1420.0)
-            .expect("should trigger in final 90s");
+            .should_trigger_next_episode_prewarm(1365.0, 1420.0)
+            .expect("should trigger in final 60s");
         assert_eq!(prewarm.series_id.as_deref(), Some("tt0999888"));
         assert_eq!(prewarm.video_id, "tt0999888:1:2");
         assert_eq!(prewarm.trigger_reason, PrewarmTriggerReason::EndingWindow);
