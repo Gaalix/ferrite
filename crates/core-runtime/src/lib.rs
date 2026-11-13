@@ -35,8 +35,9 @@ pub use debrid::{
     RESOLVED_URL_CACHE_TTL,
 };
 pub use env::{
-    default_storage_path, legacy_storage_path, migrate_legacy_storage_file, DesktopEnv,
-    DesktopEnvConfig, EnvConfig, PersistedBuckets, SqliteStorage,
+    default_storage_path, is_loopback_streaming_url, legacy_storage_path,
+    migrate_legacy_storage_file, DesktopEnv, DesktopEnvConfig, EnvConfig, PersistedBuckets,
+    SqliteStorage,
 };
 pub use error::CoreRuntimeError;
 pub use model::{clone_model_field, DesktopModel, DesktopModelField};
@@ -56,23 +57,27 @@ pub use prowlarr::{ProwlarrClient, ProwlarrTestResult, RichStreamItem};
 pub use stream_parser::{
     estimate_bitrate_mbps, filter_and_rank_streams, format_bitrate_mbps, format_bytes,
     is_allowed_addon_stream_url, is_allowed_stream_source, is_allowed_stream_url,
-    parse_runtime_minutes, parse_stream, parse_stream_with_addon, parse_streams, AudioCodec,
-    HdrFormat, ParsedStream, Resolution, StreamFilter, StreamQuality, VideoCodec,
+    is_native_playable_stream, parse_runtime_minutes, parse_stream, parse_stream_with_addon,
+    parse_streams, AudioCodec, HdrFormat, ParsedStream, Resolution, StreamFilter, StreamQuality,
+    VideoCodec,
 };
 pub use subtitles::{
-    decode_subtitle_payload, extract_best_subtitle_from_zip, normalize_bytes_to_utf8,
-    normalize_subtitle_lang_code, normalize_subtitle_lang_iso639_1,
-    normalize_subtitle_lang_iso639_2, subtitle_lang_matches, FetchedNativeSubtitle, FpsHint,
-    NativeSubtitleClient, NativeSubtitleEndpoints, NativeSubtitleQuery, ReleaseEdition,
+    decode_subtitle_payload, extract_best_subtitle_from_zip, human_language_name,
+    normalize_bytes_to_utf8, normalize_subtitle_lang_code, normalize_subtitle_lang_iso639_1,
+    normalize_subtitle_lang_iso639_2, prune_subtitle_cache_dir, short_language_badge,
+    subtitle_lang_matches, AudioSpeechFingerprint, AudioSpeechWindow, FetchedNativeSubtitle,
+    FpsHint, NativeSubtitleClient, NativeSubtitleEndpoints, NativeSubtitleQuery, ReleaseEdition,
     StreamingServiceTag, SubtitleAlignmentResult, SubtitleMatchRanker, SubtitleMatchTier,
-    SubtitleSourceCut, SubtitleSyncAligner, VideoReleaseFingerprint,
-    DEFAULT_OPENSUBTITLES_API_BASE, DEFAULT_OPENSUBTITLES_V3_BASE, DEFAULT_SUBDL_API_BASE,
-    DEFAULT_SUBDL_DL_BASE, MAX_SUBTITLE_ARCHIVE_BYTES, MAX_UNCOMPRESSED_SUBTITLE_BYTES,
+    SubtitleSourceCut, SubtitleSyncAligner, VideoReleaseFingerprint, AUDIO_ENV_FRAME_MS,
+    AUDIO_SAMPLE_RATE_HZ, DEFAULT_OPENSUBTITLES_API_BASE, DEFAULT_OPENSUBTITLES_V3_BASE,
+    DEFAULT_SUBDL_API_BASE, DEFAULT_SUBDL_DL_BASE, MAX_SUBTITLE_ARCHIVE_BYTES,
+    MAX_SUBTITLE_CACHE_BYTES, MAX_SUBTITLE_CACHE_FILES, MAX_UNCOMPRESSED_SUBTITLE_BYTES,
     NATIVE_SUBTITLE_HTTP_TIMEOUT_MS, NATIVE_SUBTITLE_POOL_IDLE_SECS,
 };
 pub use track_prefs::{
-    extract_track_keywords, parse_lang_tag, select_preferred_tracks, MatchedTracks,
-    SeriesTrackPreference, TrackCandidate, TrackKind, SERIES_TRACK_PREFS_STORAGE_KEY,
+    extract_track_keywords, has_full_embedded_subtitle_for_lang, parse_lang_tag,
+    select_preferred_tracks, MatchedTracks, SeriesTrackPreference, TrackCandidate, TrackKind,
+    SERIES_TRACK_PREFS_STORAGE_KEY,
 };
 
 pub use stremio_core;

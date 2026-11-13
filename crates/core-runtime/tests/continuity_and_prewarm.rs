@@ -131,7 +131,7 @@ async fn series_track_preferences_persist_across_restarts_and_plain_os_threads()
             sub_delay_secs: 0.25,
         };
 
-        let ui_controller = controller.clone();
+        let ui_controller = controller;
         let pref_clone = pref.clone();
         let read_back = std::thread::spawn(move || {
             ui_controller.save_series_track_pref(pref_clone);

@@ -34,11 +34,13 @@ fn main() -> anyhow::Result<()> {
     let streaming_url = engine.base_url();
 
     let env_config = EnvConfig::default()
-        .with_streaming_server_url(streaming_url)
+        .with_streaming_server_url(streaming_url.clone())
         .with_runtime_handle(rt_handle.clone());
     let core = runtime.block_on(CoreController::boot(env_config))?;
 
-    core.reload_streaming_server();
+    if !core.sync_loopback_streaming_server_url(streaming_url) {
+        core.reload_streaming_server();
+    }
     core.load_board();
     core.load_library(default_library_selected());
     core.load_installed_addons(None);

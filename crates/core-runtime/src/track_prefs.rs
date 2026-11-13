@@ -162,6 +162,27 @@ pub struct MatchedTracks {
     pub sub_id: Option<Option<i64>>,
 }
 
+pub fn has_full_embedded_subtitle_for_lang(
+    tracks: &[TrackCandidate],
+    preferred_lang: &str,
+) -> bool {
+    let Some((target_primary, target_region)) = parse_lang_tag(preferred_lang) else {
+        return false;
+    };
+    tracks.iter().any(|track| {
+        if track.kind != TrackKind::Sub || track.external {
+            return false;
+        }
+        if match_track_language(&target_primary, target_region.as_deref(), track).is_none() {
+            return false;
+        }
+        matches!(
+            classify_subtitle_role(track.title.as_deref(), track.forced),
+            SubtitleRole::FullExplicit | SubtitleRole::Standard | SubtitleRole::Sdh
+        )
+    })
+}
+
 pub fn select_preferred_tracks(
     pref: &SeriesTrackPreference,
     tracks: &[TrackCandidate],
@@ -940,5 +961,22 @@ mod tests {
         let matched = select_preferred_tracks(&pref, &tracks);
         assert_eq!(matched.audio_id, Some(1));
         assert_eq!(matched.sub_id, Some(Some(2)));
+    }
+
+    #[test]
+    fn recognizes_only_full_embedded_subtitles_in_preferred_language() {
+        let forced_only = vec![
+            TrackCandidate::sub(1, Some("eng"), Some("Forced")).with_forced(true),
+            TrackCandidate::sub(2, Some("eng"), Some("Commentary")),
+            TrackCandidate::sub(3, Some("eng"), Some("External SRT")).with_external(true),
+        ];
+        assert!(!has_full_embedded_subtitle_for_lang(&forced_only, "eng"));
+
+        let with_full = vec![
+            TrackCandidate::sub(1, Some("eng"), Some("Forced")).with_forced(true),
+            TrackCandidate::sub(2, Some("eng"), Some("English")),
+        ];
+        assert!(has_full_embedded_subtitle_for_lang(&with_full, "eng"));
+        assert!(!has_full_embedded_subtitle_for_lang(&with_full, "spa"));
     }
 }

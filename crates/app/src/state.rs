@@ -15,7 +15,8 @@ use gpui_mpv::{
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use stremio_core_runtime::{
-    parse_stream_with_addon, resolve_addon_for_request_base,
+    is_loopback_streaming_url, is_native_playable_stream, parse_stream_with_addon,
+    resolve_addon_for_request_base,
     stremio_core::{
         constants::{META_RESOURCE_NAME, STREAM_RESOURCE_NAME, SUBTITLES_RESOURCE_NAME},
         models::{
@@ -27,14 +28,13 @@ use stremio_core_runtime::{
             player::Selected as PlayerSelected,
         },
         types::{
-            addon::{Descriptor, ResourcePath, ResourceRequest},
+            addon::{Descriptor, ExtraValue, ResourcePath, ResourceRequest},
             library::LibraryItem,
             resource::{MetaItem, MetaItemPreview, Stream, StreamSource},
         },
     },
     AddonCategory, CoreController, DebridCacheStatus, DesktopModel, FetchedNativeSubtitle,
-    LocalDebridProvider, ParsedStream, Resolution, RichStreamItem, StreamFilter,
-    SubtitleMatchTier,
+    LocalDebridProvider, ParsedStream, Resolution, RichStreamItem, StreamFilter, SubtitleMatchTier,
 };
 use stremio_stream_engine::{
     StorageMode, StreamEngine, StreamEngineConfig, StreamEngineError, StreamEngineHandle,
@@ -736,10 +736,10 @@ pub fn build_engine_config_from_prefs(prefs: &AppPreferences) -> StreamEngineCon
         cache_size: Some(prefs.storage_mode.budget_bytes() as f64),
         ..StreamEngineConfig::default()
     };
-    let timeout_dur = Duration::from_secs(prefs.dead_swarm_timeout_secs.max(4));
     if prefs.dead_swarm_failover {
-        cfg.metadata_timeout = timeout_dur;
-        cfg.first_byte_timeout = timeout_dur;
+        let failover_secs = prefs.dead_swarm_timeout_secs.max(12);
+        cfg.metadata_timeout = Duration::from_secs(prefs.dead_swarm_timeout_secs.max(15));
+        cfg.first_byte_timeout = Duration::from_secs(failover_secs);
     }
     cfg
 }
@@ -1310,7 +1310,11 @@ pub fn sync_memoized_meta_streams<'a>(
                         installed_addons,
                     )
                 })
-                .filter(|c| has_debrid_access || !c.parsed.is_debrid_stream())
+                .filter(|c| {
+                    c.parsed.is_allowed()
+                        && is_native_playable_stream(&c.stream)
+                        && (has_debrid_access || !c.parsed.is_debrid_stream())
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1391,7 +1395,11 @@ pub fn merge_and_enrich_stream_candidates(
     debrid_cache: &HashMap<(LocalDebridProvider, [u8; 20]), DebridCacheStatus>,
     cached_only_filter: bool,
 ) -> EnrichedStreamCandidates {
-    let mut merged: Vec<PlaybackCandidate> = base_candidates.to_vec();
+    let mut merged: Vec<PlaybackCandidate> = base_candidates
+        .iter()
+        .filter(|c| c.parsed.is_allowed() && is_native_playable_stream(&c.stream))
+        .cloned()
+        .collect();
     let mut seen_hashes: HashSet<[u8; 20]> = merged
         .iter()
         .filter_map(|c| match c.stream.source {
@@ -1401,7 +1409,7 @@ pub fn merge_and_enrich_stream_candidates(
         .collect();
 
     for cand in prowlarr_candidates {
-        if !cand.parsed.is_allowed() {
+        if !cand.parsed.is_allowed() || !is_native_playable_stream(&cand.stream) {
             continue;
         }
         if let StreamSource::Torrent { info_hash, .. } = cand.stream.source {
@@ -1448,6 +1456,50 @@ pub fn merge_and_enrich_stream_candidates(
     (Arc::new(merged), available_addons)
 }
 
+pub const MAX_AUTO_FAILOVER_ATTEMPTS: usize = 3;
+
+/// Rewrites stale loopback `StreamEngine` playback URLs (e.g. from persisted settings pointing
+/// at `:11470` when a fallback ephemeral port is active) to use `engine_base`'s host and port.
+pub fn rewrite_loopback_engine_url(raw_url: &str, engine_base: &Url) -> String {
+    let Ok(mut parsed) = Url::parse(raw_url.trim()) else {
+        return raw_url.to_owned();
+    };
+    if !is_loopback_streaming_url(&parsed) {
+        return raw_url.to_owned();
+    }
+    let first_seg = parsed
+        .path_segments()
+        .and_then(|mut segs| segs.next())
+        .unwrap_or("");
+    let is_engine_path = (first_seg.len() == 40
+        && first_seg.bytes().all(|b| b.is_ascii_hexdigit()))
+        || first_seg.eq_ignore_ascii_case("proxy");
+    if !is_engine_path {
+        return raw_url.to_owned();
+    }
+    let _ = parsed.set_scheme(engine_base.scheme());
+    if let Some(host) = engine_base.host_str() {
+        let _ = parsed.set_host(Some(host));
+    }
+    let _ = parsed.set_port(engine_base.port());
+    parsed.to_string()
+}
+
+/// Returns `true` when `raw_url` points to an in-process loopback P2P torrent route
+/// (`http://127.0.0.1:<port>/<40-hex-infohash>/<file_idx>`).
+pub fn is_loopback_p2p_torrent_url(raw_url: &str) -> bool {
+    let Ok(parsed) = Url::parse(raw_url.trim()) else {
+        return false;
+    };
+    if !is_loopback_streaming_url(&parsed) {
+        return false;
+    }
+    let Some(first_seg) = parsed.path_segments().and_then(|mut segs| segs.next()) else {
+        return false;
+    };
+    first_seg.len() == 40 && first_seg.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[derive(Clone, Debug)]
 pub struct PlaybackSession {
     pub generation: u64,
@@ -1469,6 +1521,8 @@ pub struct PlaybackSession {
     pub loaded_into_mpv: bool,
     pub started_at: Instant,
     pub first_media_ready: bool,
+    pub auto_failover_attempts: usize,
+    pub failover_exhausted_notified: bool,
     pub attached_external_subs: HashSet<String>,
     pub last_reported_time_ms: u64,
     pub last_reported_paused: Option<bool>,
@@ -1482,11 +1536,24 @@ impl PlaybackSession {
 
     pub fn build_player_selected(&self) -> Option<PlayerSelected> {
         let cand = self.active_candidate()?;
+        let subtitles_path = self.subtitles_path.as_ref().map(|path| {
+            if path.extra.is_empty() {
+                build_subtitles_resource_path_with_hints(
+                    &path.r#type,
+                    &path.id,
+                    cand.stream.behavior_hints.video_hash.as_deref(),
+                    cand.stream.behavior_hints.video_size,
+                    cand.stream.behavior_hints.filename.as_deref(),
+                )
+            } else {
+                path.clone()
+            }
+        });
         Some(PlayerSelected {
             stream: cand.stream.clone(),
             stream_request: cand.stream_request.clone(),
             meta_request: self.meta_request.clone(),
-            subtitles_path: self.subtitles_path.clone(),
+            subtitles_path,
         })
     }
 }
@@ -1495,7 +1562,13 @@ impl PlaybackSession {
 pub enum NativeSubtitleMatchStatus {
     #[default]
     Idle,
+    EmbeddedReady,
     Searching,
+    AudioSyncing,
+    AudioSynced {
+        offset_ms: i64,
+        fps_adjusted: bool,
+    },
     Matched {
         tier: SubtitleMatchTier,
         elapsed_ms: u64,
@@ -1512,8 +1585,13 @@ pub struct NativeSubtitleMatchState {
     pub status: NativeSubtitleMatchStatus,
     pub fetched_subs: Vec<FetchedNativeSubtitle>,
     pub active_local_sub_path: Option<PathBuf>,
+    pub local_source_sub_path: Option<PathBuf>,
     pub reference_sub_path: Option<PathBuf>,
     pub last_alignment_badge: Option<String>,
+    pub audio_sync_in_flight: bool,
+    pub deferred_p2p_sync_attempted: bool,
+    pub file_loaded_ready: bool,
+    pub synced_track_title: Option<String>,
 }
 
 impl NativeSubtitleMatchState {
@@ -1527,7 +1605,21 @@ impl NativeSubtitleMatchState {
         }
         match &self.status {
             NativeSubtitleMatchStatus::Idle => None,
-            NativeSubtitleMatchStatus::Searching => Some("Matching...".to_owned()),
+            NativeSubtitleMatchStatus::EmbeddedReady => Some("Embedded Subtitles".to_owned()),
+            NativeSubtitleMatchStatus::Searching => Some("Matching…".to_owned()),
+            NativeSubtitleMatchStatus::AudioSyncing => Some("Syncing to audio…".to_owned()),
+            NativeSubtitleMatchStatus::AudioSynced {
+                offset_ms,
+                fps_adjusted,
+            } => {
+                let sign = if *offset_ms >= 0 { "+" } else { "" };
+                let secs = *offset_ms as f64 / 1000.0;
+                if *fps_adjusted {
+                    Some(format!("Audio Synced ({sign}{secs:.1}s · FPS)"))
+                } else {
+                    Some(format!("Audio Synced ({sign}{secs:.1}s)"))
+                }
+            }
             NativeSubtitleMatchStatus::Matched { tier, elapsed_ms } => {
                 Some(format!("{} · {}ms", tier.display_label(), elapsed_ms))
             }
@@ -1543,8 +1635,8 @@ impl NativeSubtitleMatchState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerPopover {
     Volume,
-    AudioTracks,
-    Subtitles,
+    AudioAndSubtitles,
+    SubtitleAppearance,
     VideoShaders,
     PlaybackSpeed,
     SwitchStream,
@@ -1871,6 +1963,40 @@ pub fn build_subtitles_resource_path(type_name: &str, video_id: &str) -> Resourc
         r#type: type_name.to_owned(),
         id: video_id.to_owned(),
         extra: vec![],
+    }
+}
+
+pub fn build_subtitles_resource_path_with_hints(
+    type_name: &str,
+    video_id: &str,
+    video_hash: Option<&str>,
+    video_size: Option<u64>,
+    filename: Option<&str>,
+) -> ResourcePath {
+    let mut extra = Vec::new();
+    if let Some(h) = video_hash.map(str::trim).filter(|s| !s.is_empty()) {
+        extra.push(ExtraValue {
+            name: "videoHash".to_owned(),
+            value: h.to_owned(),
+        });
+    }
+    if let Some(sz) = video_size.filter(|&v| v > 0) {
+        extra.push(ExtraValue {
+            name: "videoSize".to_owned(),
+            value: sz.to_string(),
+        });
+    }
+    if let Some(f) = filename.map(str::trim).filter(|s| !s.is_empty()) {
+        extra.push(ExtraValue {
+            name: "filename".to_owned(),
+            value: f.to_owned(),
+        });
+    }
+    ResourcePath {
+        resource: SUBTITLES_RESOURCE_NAME.to_owned(),
+        r#type: type_name.to_owned(),
+        id: video_id.to_owned(),
+        extra,
     }
 }
 
@@ -2387,11 +2513,13 @@ mod tests {
         ui_filter.toggle_resolution(StreamResolutionChoice::Uhd4k);
         ui_filter.toggle_resolution(StreamResolutionChoice::Fhd1080p);
         ui_filter.hdr_only = true;
-        let matched_hdr: Vec<_> = ranked_debrid
-            .iter()
-            .filter(|c| ui_filter.matches_candidate(c, true))
-            .collect();
-        assert_eq!(matched_hdr.len(), 2);
+        assert_eq!(
+            ranked_debrid
+                .iter()
+                .filter(|c| ui_filter.matches_candidate(c, true))
+                .count(),
+            2
+        );
 
         let ranked_no_debrid = build_ranked_stream_candidates(&raw, &addons, false);
         assert_eq!(ranked_no_debrid.len(), 2);
@@ -2516,10 +2644,8 @@ mod tests {
         assert_eq!(avail_3.len(), 2);
         assert_eq!(memo.as_ref().unwrap().total_streams_parsed, 1_000);
 
-        let page_1_indices: Vec<usize> = (0..ranked_3.len()).take(STREAM_PAGE_SIZE).collect();
-        assert_eq!(page_1_indices.len(), 30);
-        let page_2_indices: Vec<usize> = (0..ranked_3.len()).take(STREAM_PAGE_SIZE * 2).collect();
-        assert_eq!(page_2_indices.len(), 60);
+        assert_eq!((0..ranked_3.len()).take(STREAM_PAGE_SIZE).count(), 30);
+        assert_eq!((0..ranked_3.len()).take(STREAM_PAGE_SIZE * 2).count(), 60);
     }
 
     #[test]
@@ -2854,5 +2980,67 @@ mod tests {
         assert_eq!(cached_only.len(), 2);
         assert!(cached_only.iter().any(|c| matches!(c.stream.source, StreamSource::Url { .. })));
         assert!(cached_only.iter().any(|c| c.parsed.is_cached));
+    }
+
+    #[test]
+    fn rewrite_loopback_and_p2p_url_helpers_and_external_stream_filter() {
+        let live_base: Url = "http://127.0.0.1:49152/".parse().unwrap();
+        let stale_p2p = "http://127.0.0.1:11470/0123456789abcdef0123456789abcdef01234567/0?tr=udp://t.example:80";
+        let rewritten = rewrite_loopback_engine_url(stale_p2p, &live_base);
+        assert_eq!(
+            rewritten,
+            "http://127.0.0.1:49152/0123456789abcdef0123456789abcdef01234567/0?tr=udp://t.example:80"
+        );
+        assert!(is_loopback_p2p_torrent_url(&rewritten));
+        assert!(!is_loopback_p2p_torrent_url(
+            "https://cdn.debrid.example/download/movie.mkv"
+        ));
+
+        let debrid_url = "https://cdn.debrid.example/0123456789abcdef0123456789abcdef01234567/movie.mkv";
+        assert_eq!(rewrite_loopback_engine_url(debrid_url, &live_base), debrid_url);
+
+        let addon_url = Url::parse("https://addon.example/manifest.json").unwrap();
+        let addons: Vec<Descriptor> = vec![serde_json::from_value(serde_json::json!({
+            "transportUrl": addon_url.as_str(),
+            "manifest": {
+                "id": "org.test.addon",
+                "version": "1.0.0",
+                "name": "Test",
+                "description": "Test addon",
+                "types": ["movie"],
+                "resources": ["stream"],
+                "catalogs": []
+            }
+        }))
+        .unwrap()];
+        let req = build_default_stream_request(&addon_url, "movie", "tt0133093");
+        let streams: Vec<Stream> = vec![
+            serde_json::from_value(serde_json::json!({
+                "externalUrl": "https://peario.xyz/room/123",
+                "name": "Peario"
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "url": "https://cdn.example.com/movie.mkv",
+                "name": "Direct"
+            }))
+            .unwrap(),
+        ];
+        let slots = [ResourceLoadable {
+            request: req,
+            content: Some(Loadable::Ready(streams)),
+        }];
+        let mut memo = None;
+        let (ranked, _, _, _) = sync_memoized_meta_streams(
+            &mut memo,
+            "movie",
+            "tt0133093",
+            "tt0133093",
+            false,
+            slots.iter(),
+            &addons,
+        );
+        assert_eq!(ranked.len(), 1);
+        assert!(matches!(ranked[0].stream.source, StreamSource::Url { .. }));
     }
 }

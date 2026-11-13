@@ -17,8 +17,9 @@ use url::Url;
 use crate::{
     model::DesktopModel,
     stream_parser::{
-        filter_and_rank_streams, is_allowed_stream_source, is_allowed_stream_url, parse_stream,
-        AudioCodec, HdrFormat, Resolution, StreamFilter, StreamQuality, VideoCodec,
+        filter_and_rank_streams, is_allowed_stream_source, is_allowed_stream_url,
+        is_native_playable_stream, parse_stream, AudioCodec, HdrFormat, Resolution, StreamFilter,
+        StreamQuality, VideoCodec,
     },
 };
 
@@ -138,6 +139,11 @@ pub fn convert_stream_to_playback_url(
             "Stream rejected: disallowed or untrusted URL scheme".into(),
         ));
     }
+    if !is_native_playable_stream(stream) {
+        return Err(EnvError::Other(
+            "Stream rejected: source is external or unsupported by native player".into(),
+        ));
+    }
     let converted = stream.convert(streaming_server_url)?;
     let urls = StreamUrls::new(converted.clone(), streaming_server_url);
     let playback_url = urls.streaming_url.clone().ok_or_else(|| {
@@ -171,14 +177,12 @@ pub fn evaluate_next_episode_prewarm(
 
     let series_id = extract_player_series_id(&model.player);
     let server_url = effective_streaming_server_url(model);
-    let stream_ready = find_ready_next_stream(model, &next_video)
-        .map(|matched| {
-            matched
-                .ranked_candidates
-                .iter()
-                .any(|(stream, _)| convert_stream_to_playback_url(stream, server_url).is_ok())
-        })
-        .unwrap_or(false);
+    let stream_ready = find_ready_next_stream(model, &next_video).is_some_and(|matched| {
+        matched
+            .ranked_candidates
+            .iter()
+            .any(|(stream, _)| convert_stream_to_playback_url(stream, server_url).is_ok())
+    });
 
     Some(NextEpisodeTarget {
         series_id,
@@ -436,15 +440,6 @@ pub(crate) fn inspect_next_episode_resolution(model: &DesktopModel) -> NextEpiso
         .is_some_and(|path| path.id == next_video.id);
 
     if meta_details_targeting_next {
-        let any_loading = model.meta_details.streams.is_empty()
-            || model
-                .meta_details
-                .streams
-                .iter()
-                .any(|res| matches!(res.content, None | Some(Loadable::Loading)));
-        if any_loading {
-            return NextEpisodeResolution::Unavailable;
-        }
         return NextEpisodeResolution::Unavailable;
     }
 
@@ -452,7 +447,7 @@ pub(crate) fn inspect_next_episode_resolution(model: &DesktopModel) -> NextEpiso
         return NextEpisodeResolution::NeedsStreamFetch {
             type_name,
             meta_id,
-            video_id: next_video.id.clone(),
+            video_id: next_video.id,
         };
     }
 
@@ -1156,7 +1151,7 @@ mod tests {
         };
 
         let req_a = ResourceRequest {
-            base: addon_a.clone(),
+            base: addon_a,
             path: ResourcePath {
                 resource: STREAM_RESOURCE_NAME.to_owned(),
                 r#type: "series".to_owned(),

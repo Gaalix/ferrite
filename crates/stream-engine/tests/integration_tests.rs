@@ -1717,3 +1717,145 @@ async fn security_hardening_cors_origin_traversal_schemes_permissions_and_redact
 
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn magnet_stream_endpoint_waits_for_metadata_or_times_out_never_returning_uninitialized_500() {
+    // Part 1: Real magnet ut_metadata exchange over 127.0.0.1 while handle is Initializing.
+    // Without wait_until_initialized() in ensure_torrent_resolved, GET /{ih_hex}/0 immediately
+    // hit handle.with_metadata(...) and failed with 500 "Torrent is not initialized".
+    let seed_dir = TempDir::new().unwrap();
+    let movie_folder = seed_dir.path().join("Magnet.Movie");
+    tokio::fs::create_dir_all(&movie_folder).await.unwrap();
+    let movie_bytes = deterministic_payload(777, 256 * 1024);
+    tokio::fs::write(movie_folder.join("Hoodwinked.1080p.mp4"), &movie_bytes)
+        .await
+        .unwrap();
+
+    let seeder_session = Session::new_with_opts(
+        seed_dir.path().to_path_buf(),
+        SessionOptions {
+            dht: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            listen: Some(ListenerOptions {
+                mode: ListenerMode::TcpOnly,
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                enable_upnp_port_forwarding: false,
+                ipv4_only: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let seeder_addr = seeder_session
+        .listen_addr()
+        .expect("seeder should bind TCP listener");
+    let (_created_meta, seed_handle) = seeder_session
+        .create_and_serve_torrent(
+            &movie_folder,
+            CreateTorrentOptions {
+                name: Some("Magnet.Movie"),
+                piece_length: Some(32 * 1024),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let ih_hex = hex::encode(seed_handle.info_hash().0);
+
+    let tmp = TempDir::new().unwrap();
+    let engine = start_test_engine(&tmp, Duration::from_secs(10)).await;
+    let base = engine.base_url();
+    let client = reqwest::Client::new();
+
+    let out_dir = tmp.path().join(&ih_hex);
+    tokio::fs::create_dir_all(&out_dir).await.unwrap();
+    let magnet_uri = format!("magnet:?xt=urn:btih:{ih_hex}");
+    let _magnet_resp = engine
+        .session()
+        .add_torrent(
+            librqbit::AddTorrent::from_url(magnet_uri),
+            Some(librqbit::AddTorrentOptions {
+                overwrite: true,
+                output_folder: Some(out_dir.to_string_lossy().into_owned()),
+                initial_peers: Some(vec![seeder_addr]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Immediately request GET /{ih_hex}/0 before ut_metadata finishes: must wait for metadata
+    // initialization and stream 200 OK with exact bytes, NEVER 500 "Torrent is not initialized".
+    let seeded_resp = client
+        .get(base.join(&format!("{ih_hex}/0")).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seeded_resp.status(), StatusCode::OK);
+    let downloaded = seeded_resp.bytes().await.unwrap();
+    assert_eq!(&downloaded[..], &movie_bytes[..]);
+
+    // Part 2: Unresolvable magnets (both warm via POST /{info_hash}/create and cold via direct GET)
+    // must return 504 Gateway Timeout or 502 Bad Gateway, NEVER 500 "Torrent is not initialized".
+    let dead_tmp = TempDir::new().unwrap();
+    let dead_engine = start_test_engine(&dead_tmp, Duration::from_millis(400)).await;
+    let dead_base = dead_engine.base_url();
+
+    let info_hash: InfoHash = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
+    let create_req: http::Request<CreateMagnetBody> = CreateMagnetRequest {
+        server_url: dead_base.clone(),
+        info_hash,
+        announce: vec![],
+    }
+    .into();
+    let (parts, body) = create_req.into_parts();
+    let create_resp = client
+        .post(parts.uri.to_string())
+        .json(&serde_json::to_value(body).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::OK);
+
+    let stream_resp = client
+        .get(dead_base.join(&format!("{info_hash}/0")).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        stream_resp.status() == StatusCode::GATEWAY_TIMEOUT
+            || stream_resp.status() == StatusCode::BAD_GATEWAY,
+        "expected 504 or 502 on unresolvable warm magnet, got {}",
+        stream_resp.status()
+    );
+    let body_text = stream_resp.text().await.unwrap();
+    assert!(
+        !body_text.contains("Torrent is not initialized"),
+        "unexpected uninitialized 500 error: {body_text}"
+    );
+
+    let cold_hash = "fedcba9876543210fedcba9876543210fedcba98";
+    let cold_resp = client
+        .get(dead_base.join(&format!("{cold_hash}/0")).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        cold_resp.status() == StatusCode::GATEWAY_TIMEOUT
+            || cold_resp.status() == StatusCode::BAD_GATEWAY,
+        "expected 504 or 502 on unresolvable cold magnet, got {}",
+        cold_resp.status()
+    );
+    let cold_body = cold_resp.text().await.unwrap();
+    assert!(
+        !cold_body.contains("Torrent is not initialized"),
+        "unexpected uninitialized 500 error on cold magnet: {cold_body}"
+    );
+
+    dead_engine.shutdown().await;
+    engine.shutdown().await;
+    seeder_session.cancellation_token().cancel();
+}

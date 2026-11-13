@@ -79,14 +79,14 @@ impl AppShell {
                     .flex()
                     .flex_col()
                     .gap(px(24.0))
-                    .child(self.render_addons_header(total_active, &cache_stats, cx))
+                    .child(Self::render_addons_header(total_active, &cache_stats, cx))
                     .when_some(self.clipboard_addon_suggestion.clone(), |el, clip_url| {
                         let is_update = is_clipboard_url_in_place_update(
                             &clip_url,
                             &active_addons,
                             &muted_addons,
                         );
-                        el.child(self.render_clipboard_addon_bar(clip_url, is_update, cx))
+                        el.child(self.render_clipboard_addon_bar(&clip_url, is_update, cx))
                     })
                     .child(self.render_universal_manifest_bar(cx))
                     .child(self.render_addons_toolbar(
@@ -117,7 +117,6 @@ impl AppShell {
     }
 
     fn render_addons_header(
-        &self,
         active_count: usize,
         cache_stats: &stremio_core_runtime::AddonCacheStats,
         cx: &mut Context<Self>,
@@ -201,13 +200,13 @@ impl AppShell {
 
     fn render_clipboard_addon_bar(
         &self,
-        clip_url: String,
+        clip_url: &str,
         is_update: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_installing = self.installing_addon_urls.contains(&clip_url);
-        let install_url = clip_url.clone();
-        let dismiss_url = clip_url.clone();
+        let is_installing = self.installing_addon_urls.contains(clip_url);
+        let install_url = clip_url.to_owned();
+        let dismiss_url = clip_url.to_owned();
         let action_label = if is_installing {
             "Installing..."
         } else if is_update {
@@ -256,7 +255,7 @@ impl AppShell {
                             .font(mono_font())
                             .text_xs()
                             .text_color(rgb(TEXT_SECONDARY))
-                            .child(redact_long_manifest_url(&clip_url)),
+                            .child(redact_long_manifest_url(clip_url)),
                     ),
             )
             .child(
@@ -283,7 +282,7 @@ impl AppShell {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     this.install_or_replace_addon_from_raw(
-                                        install_url.clone(),
+                                        &install_url,
                                         false,
                                         cx,
                                     );
@@ -823,7 +822,7 @@ impl AppShell {
         let url_for_copy = url_str.clone();
         let url_for_switch = transport_url.clone();
         let addon_for_remove = addon.clone();
-        let url_for_muted_remove = transport_url.clone();
+        let url_for_muted_remove = transport_url;
         let addon_name_for_switch = addon.manifest.name.clone();
 
         div()
@@ -965,7 +964,7 @@ impl AppShell {
                                 )
                             })
                             .when_some(telemetry, |el, snap| {
-                                el.children(self.render_telemetry_readout(
+                                el.children(Self::render_telemetry_readout(
                                     dom_idx,
                                     snap,
                                     &url_str,
@@ -1146,7 +1145,6 @@ impl AppShell {
     }
 
     fn render_telemetry_readout(
-        &self,
         dom_idx: usize,
         snap: &AddonTelemetrySnapshot,
         url_str: &str,
@@ -1612,7 +1610,7 @@ impl AppShell {
                                         }
                                     } else {
                                         this.install_or_replace_addon_from_raw(
-                                            raw_install_url.clone(),
+                                            &raw_install_url,
                                             false,
                                             cx,
                                         );

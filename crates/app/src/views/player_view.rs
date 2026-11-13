@@ -6,6 +6,7 @@ use gpui::{
     Pixels, Point, ScrollEvent, SharedString, Window, WindowControlArea,
 };
 use gpui_mpv::{mpv_viewport, MediaTrack, TrackType};
+use stremio_core_runtime::{human_language_name, short_language_badge};
 
 use crate::{
     icons::{svg_icon, IconName},
@@ -73,6 +74,170 @@ fn compact_status_pill(
         .child(label.into())
 }
 
+fn extract_audio_channels(tr: &MediaTrack) -> Option<&'static str> {
+    for src in [tr.codec.as_deref(), tr.title.as_deref()].into_iter().flatten() {
+        let lower = src.to_ascii_lowercase();
+        if lower.contains("7.1") || lower.contains("8ch") {
+            return Some("7.1");
+        }
+        if lower.contains("5.1") || lower.contains("6ch") {
+            return Some("5.1");
+        }
+        if lower.contains("2.0") || lower.contains("stereo") || lower.contains("2ch") {
+            return Some("2.0");
+        }
+    }
+    None
+}
+
+fn normalize_audio_codec(codec: &str) -> String {
+    let lower = codec.trim().to_ascii_lowercase();
+    if lower.contains("eac3") || lower.contains("e-ac-3") || lower.contains("dd+") {
+        "DD+".to_owned()
+    } else if lower.contains("ac3") || lower.contains("ac-3") {
+        "DD".to_owned()
+    } else if lower.contains("truehd") {
+        "TrueHD".to_owned()
+    } else if lower.contains("dts") {
+        "DTS".to_owned()
+    } else if lower.contains("aac") {
+        "AAC".to_owned()
+    } else if lower.contains("opus") {
+        "Opus".to_owned()
+    } else if lower.contains("flac") {
+        "FLAC".to_owned()
+    } else {
+        codec.trim().to_ascii_uppercase()
+    }
+}
+
+fn format_audio_pill_summary(tr: &MediaTrack) -> String {
+    let lang = tr
+        .lang
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("und"))
+        .map(human_language_name)
+        .or_else(|| {
+            tr.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("Track {}", tr.id));
+    if let Some(ch) = extract_audio_channels(tr) {
+        format!("{lang} {ch}")
+    } else {
+        lang
+    }
+}
+
+fn format_audio_track_display(tr: &MediaTrack) -> (String, String) {
+    let lang_opt = tr
+        .lang
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("und"));
+    let primary = lang_opt
+        .map(human_language_name)
+        .or_else(|| {
+            tr.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("Track {}", tr.id));
+
+    let mut meta = Vec::with_capacity(2);
+    if let Some(codec) = tr.codec.as_deref().filter(|c| !c.trim().is_empty()) {
+        let mut label = normalize_audio_codec(codec);
+        if let Some(ch) = extract_audio_channels(tr) {
+            label.push(' ');
+            label.push_str(ch);
+        }
+        meta.push(label);
+    } else if let Some(ch) = extract_audio_channels(tr) {
+        meta.push(ch.to_owned());
+    }
+
+    if let Some(raw_title) = tr.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let lower = raw_title.to_ascii_lowercase();
+        let is_redundant = lower == primary.to_ascii_lowercase()
+            || lang_opt.is_some_and(|l| lower == l.to_ascii_lowercase());
+        if !is_redundant {
+            if lower.contains("commentary") {
+                meta.push("Commentary".to_owned());
+            } else if lower.contains("atmos") {
+                meta.push("Atmos".to_owned());
+            } else if lower.contains("original") {
+                meta.push("Original".to_owned());
+            } else if meta.is_empty() {
+                meta.push(raw_title.to_owned());
+            }
+        }
+    }
+
+    (primary, meta.join(" · "))
+}
+
+fn format_subtitle_track_display(tr: &MediaTrack) -> (String, String) {
+    if let Some(title) = tr.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some((left, right)) = title.split_once(" — ") {
+            return (left.trim().to_owned(), right.trim().to_owned());
+        }
+    }
+
+    let is_sdh = tr
+        .title
+        .as_deref()
+        .is_some_and(|t| t.to_ascii_uppercase().contains("SDH"));
+    let mut primary = tr
+        .lang
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("und"))
+        .map(human_language_name)
+        .or_else(|| {
+            tr.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("Subtitle {}", tr.id));
+    if is_sdh && !primary.to_ascii_uppercase().contains("SDH") {
+        primary.push_str(" SDH");
+    }
+
+    let mut meta = vec![if tr.external {
+        "External".to_owned()
+    } else {
+        "Embedded".to_owned()
+    }];
+    if tr.forced && !tr.external {
+        meta.push("Forced".to_owned());
+    }
+    if let Some(codec) = tr.codec.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        let lower = codec.to_ascii_lowercase();
+        let clean_codec = if lower.contains("subrip") || lower == "srt" {
+            "SRT".to_owned()
+        } else if lower.contains("ass") || lower.contains("ssa") {
+            "ASS".to_owned()
+        } else if lower.contains("pgs") {
+            "PGS".to_owned()
+        } else if lower.contains("vtt") {
+            "VTT".to_owned()
+        } else {
+            codec.to_ascii_uppercase()
+        };
+        meta.push(clean_codec);
+    }
+
+    (primary, meta.join(" · "))
+}
+
 const SUBTITLE_SWATCHES: &[(&str, &str)] = &[
     ("#F5F1E8", "Warm Cream · HDR Safe"),
     ("#E5E7EB", "Soft Silver"),
@@ -89,7 +254,7 @@ impl AppShell {
     ) -> impl IntoElement {
         let is_fullscreen = window.is_fullscreen();
         let hud_visible = self.is_player_osd_visible();
-        let player_csd_controls = self.render_csd_window_controls(window, "player", true);
+        let player_csd_controls = AppShell::render_csd_window_controls(window, "player", true);
         let overlay =
             self.render_player_osd_overlay(is_fullscreen, hud_visible, player_csd_controls, cx);
 
@@ -137,7 +302,7 @@ impl AppShell {
             .map(|s| s.title.clone())
             .unwrap_or_else(|| "Now playing".to_owned());
         let ep_label = session.and_then(|s| s.episode_label.clone());
-        let meta_id_opt = session.map(|s| s.meta_id.clone());
+        let meta_id_opt = session.map(|s| s.meta_id.as_str());
 
         let (intro_window, next_video, model_poster_url, model_bg_url) = self.core.with_model(|m| {
             let intro = m
@@ -150,7 +315,7 @@ impl AppShell {
             let mut poster: Option<String> = None;
             let mut background: Option<String> = None;
             if !video_ready {
-                if let Some(mid) = meta_id_opt.as_deref() {
+                if let Some(mid) = meta_id_opt {
                     if let Some(meta_item) = m
                         .meta_details
                         .meta_items
@@ -274,7 +439,7 @@ impl AppShell {
                 el.child(self.render_player_loading_backdrop(
                     &title,
                     ep_label.as_deref(),
-                    meta_id_opt.as_deref(),
+                    meta_id_opt,
                     model_poster_url.as_deref(),
                     model_bg_url.as_deref(),
                     cx,
@@ -568,7 +733,7 @@ impl AppShell {
                             .flex()
                             .items_center()
                             .gap(px(8.0))
-                            .child(self.osd_icon_btn(
+                            .child(Self::osd_icon_btn(
                                 "player-btn-stats",
                                 IconName::Info,
                                 Some("Stats"),
@@ -577,7 +742,7 @@ impl AppShell {
                                     this.toggle_player_stats_for_nerds(cx);
                                 }),
                             ))
-                            .child(self.osd_icon_btn(
+                            .child(Self::osd_icon_btn(
                                 "player-btn-top-fullscreen",
                                 if is_fullscreen {
                                     IconName::Minimize
@@ -604,7 +769,7 @@ impl AppShell {
                     is_fullscreen,
                     video_ready,
                     intro_bounds_secs,
-                    scrub_bounds,
+                    &scrub_bounds,
                     vol_slider_bounds,
                     cx,
                 )
@@ -991,7 +1156,7 @@ impl AppShell {
         is_fullscreen: bool,
         video_ready: bool,
         intro_bounds_secs: Option<(f64, f64)>,
-        scrub_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        scrub_bounds: &Rc<Cell<Option<Bounds<Pixels>>>>,
         vol_slider_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1028,7 +1193,6 @@ impl AppShell {
         let hover_metrics = self.scrub_hover_metrics;
         let hover_thumb = self.hover_thumbnail_image.clone();
 
-        let sub_delay_ms = (snap.sub_delay * 1000.0).round() as i64;
         let candidate_count = self
             .playback_session
             .as_ref()
@@ -1041,9 +1205,9 @@ impl AppShell {
             .to_owned()
             + "x";
 
-        let scrub_bounds_prepaint = Rc::clone(&scrub_bounds);
-        let scrub_bounds_move = Rc::clone(&scrub_bounds);
-        let scrub_bounds_click = Rc::clone(&scrub_bounds);
+        let scrub_bounds_prepaint = Rc::clone(scrub_bounds);
+        let scrub_bounds_move = Rc::clone(scrub_bounds);
+        let scrub_bounds_click = Rc::clone(scrub_bounds);
 
         div()
             .w_full()
@@ -1337,7 +1501,7 @@ impl AppShell {
                                                     rgb(TEXT_PRIMARY),
                                                 )),
                                         )
-                                        .child(self.osd_icon_btn(
+                                        .child(Self::osd_icon_btn(
                                             "osd-seek-b10",
                                             IconName::RotateCcw,
                                             Some("10s"),
@@ -1346,7 +1510,7 @@ impl AppShell {
                                                 this.seek_player_relative(-10.0, cx);
                                             }),
                                         ))
-                                        .child(self.osd_icon_btn(
+                                        .child(Self::osd_icon_btn(
                                             "osd-seek-f10",
                                             IconName::RotateCw,
                                             Some("10s"),
@@ -1432,10 +1596,7 @@ impl AppShell {
                                         .flex()
                                         .items_center()
                                         .gap(px(6.0))
-                                        .when(sub_delay_ms != 0, |el| {
-                                            el.child(neutral_chip(format!("Sub {sub_delay_ms:+}ms")))
-                                        })
-                                        .child(self.osd_text_btn(
+                                        .child(Self::osd_text_btn(
                                             "osd-pop-speed",
                                             speed_label,
                                             self.player_popover
@@ -1447,32 +1608,92 @@ impl AppShell {
                                                 );
                                             }),
                                         ))
-                                        .child(self.osd_icon_btn(
-                                            "osd-pop-audio",
-                                            IconName::Music,
-                                            Some("Audio"),
-                                            self.player_popover
-                                                == Some(PlayerPopover::AudioTracks),
-                                            cx.listener(|this, _, _, cx| {
-                                                this.toggle_player_popover(
-                                                    PlayerPopover::AudioTracks,
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                        .child(self.osd_icon_btn(
-                                            "osd-pop-subs",
-                                            IconName::Subtitles,
-                                            Some("Subtitles"),
-                                            self.player_popover == Some(PlayerPopover::Subtitles),
-                                            cx.listener(|this, _, _, cx| {
-                                                this.toggle_player_popover(
-                                                    PlayerPopover::Subtitles,
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                        .child(self.osd_icon_btn(
+                                        .child({
+                                            let active_sub = snap
+                                                .tracks
+                                                .iter()
+                                                .find(|t| t.track_type == TrackType::Sub && t.selected);
+                                            let sub_badge = active_sub
+                                                .map(|t| {
+                                                    t.lang
+                                                        .as_deref()
+                                                        .filter(|l| {
+                                                            !l.trim().is_empty()
+                                                                && !l.eq_ignore_ascii_case("und")
+                                                        })
+                                                        .map(short_language_badge)
+                                                        .unwrap_or_else(|| "CC".to_owned())
+                                                })
+                                                .unwrap_or_else(|| "Off".to_owned());
+                                            let active_audio = snap
+                                                .tracks
+                                                .iter()
+                                                .find(|t| t.track_type == TrackType::Audio && t.selected);
+                                            let audio_short = active_audio
+                                                .map(format_audio_pill_summary)
+                                                .unwrap_or_else(|| "Audio".to_owned());
+                                            let active = matches!(
+                                                self.player_popover,
+                                                Some(
+                                                    PlayerPopover::AudioAndSubtitles
+                                                        | PlayerPopover::SubtitleAppearance
+                                                )
+                                            );
+                                            div()
+                                                .id("osd-pop-audio-subs")
+                                                .cursor_pointer()
+                                                .h(px(34.0))
+                                                .px(px(12.0))
+                                                .rounded(px(9.0))
+                                                .bg(if active {
+                                                    rgba(0xE07A5F29)
+                                                } else {
+                                                    rgba(0xFFFFFF0F)
+                                                })
+                                                .border_1()
+                                                .border_color(if active {
+                                                    rgba(0xE07A5F66)
+                                                } else {
+                                                    rgba(BORDER_SUBTLE)
+                                                })
+                                                .hover(|s| {
+                                                    s.bg(if active {
+                                                        rgba(0xE07A5F36)
+                                                    } else {
+                                                        rgba(0xFFFFFF18)
+                                                    })
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(8.0))
+                                                .text_size(px(12.5))
+                                                .font(ui_sans(FontWeight::MEDIUM))
+                                                .text_color(if active {
+                                                    rgb(ACCENT)
+                                                } else {
+                                                    rgb(TEXT_PRIMARY)
+                                                })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.toggle_player_popover(
+                                                            PlayerPopover::AudioAndSubtitles,
+                                                            cx,
+                                                        );
+                                                    }),
+                                                )
+                                                .child(svg_icon(
+                                                    IconName::Subtitles,
+                                                    15.0,
+                                                    if active {
+                                                        rgb(ACCENT)
+                                                    } else {
+                                                        rgb(TEXT_SECONDARY)
+                                                    },
+                                                ))
+                                                .child(format!("{sub_badge} · {audio_short}"))
+                                        })
+                                        .child(Self::osd_icon_btn(
                                             "osd-pop-shaders",
                                             IconName::Sliders,
                                             Some("Quality"),
@@ -1486,7 +1707,7 @@ impl AppShell {
                                             }),
                                         ))
                                         .when(candidate_count > 1, |el| {
-                                            el.child(self.osd_icon_btn(
+                                            el.child(Self::osd_icon_btn(
                                                 "osd-pop-switch-stream",
                                                 IconName::Layers,
                                                 Some(format!("Source ({candidate_count})")),
@@ -1500,7 +1721,7 @@ impl AppShell {
                                                 }),
                                             ))
                                         })
-                                        .child(self.osd_icon_btn(
+                                        .child(Self::osd_icon_btn(
                                             "osd-fullscreen",
                                             if is_fullscreen {
                                                 IconName::Minimize
@@ -1523,7 +1744,6 @@ impl AppShell {
     }
 
     fn osd_icon_btn(
-        &self,
         id: &'static str,
         icon: IconName,
         label: Option<impl Into<SharedString>>,
@@ -1564,7 +1784,6 @@ impl AppShell {
     }
 
     fn osd_text_btn(
-        &self,
         id: &'static str,
         label: impl Into<SharedString>,
         active: bool,
@@ -1613,10 +1832,12 @@ impl AppShell {
                 .render_volume_popover(vol_slider_bounds, cx)
                 .into_any_element(),
             PlayerPopover::SwitchStream => self.render_switch_stream_drawer(cx).into_any_element(),
-            PlayerPopover::AudioTracks => self
-                .render_track_popover(TrackType::Audio, "Audio track", "A", cx)
+            PlayerPopover::AudioAndSubtitles => {
+                self.render_audio_and_subtitles_popover(cx).into_any_element()
+            }
+            PlayerPopover::SubtitleAppearance => self
+                .render_subtitle_appearance_popover(cx)
                 .into_any_element(),
-            PlayerPopover::Subtitles => self.render_subtitle_studio_popover(cx).into_any_element(),
             PlayerPopover::VideoShaders => self.render_video_shader_popover(cx).into_any_element(),
             PlayerPopover::PlaybackSpeed => self.render_speed_popover(cx).into_any_element(),
         }
@@ -1818,22 +2039,653 @@ impl AppShell {
             )
     }
 
-    fn render_subtitle_studio_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_audio_and_subtitles_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let prefs = &self.preferences;
-        let tracks: Vec<MediaTrack> = self
+        let audio_tracks: Vec<MediaTrack> = self
+            .player_snapshot
+            .tracks
+            .iter()
+            .filter(|t| t.track_type == TrackType::Audio)
+            .cloned()
+            .collect();
+        let sub_tracks: Vec<MediaTrack> = self
             .player_snapshot
             .tracks
             .iter()
             .filter(|t| t.track_type == TrackType::Sub)
             .cloned()
             .collect();
-        let any_sub_selected = tracks.iter().any(|t| t.selected);
-        let delay_ms = (self.player_snapshot.sub_delay * 1000.0).round() as i64;
-        let match_badge = self.native_sub_match.status_badge();
-        let searching = matches!(
-            self.native_sub_match.status,
-            NativeSubtitleMatchStatus::Searching
-        );
+        let any_sub_selected = sub_tracks.iter().any(|t| t.selected);
+
+        let delay_secs = self.player_snapshot.sub_delay;
+        let delay_label = if delay_secs.abs() < 0.05 {
+            "0.0s".to_owned()
+        } else {
+            format!("{delay_secs:+.1}s")
+        };
+
+        let size_s_selected = prefs.subtitle_font_size <= 41;
+        let size_m_selected = prefs.subtitle_font_size > 41 && prefs.subtitle_font_size < 52;
+        let size_l_selected = prefs.subtitle_font_size >= 52;
+
+        #[derive(Clone, Copy)]
+        enum SyncPillKind {
+            Busy,
+            Synced,
+            FetchOnline,
+            AutoSync,
+        }
+
+        let sync_pill = match &self.native_sub_match.status {
+            NativeSubtitleMatchStatus::Searching => Some(("Matching…", SyncPillKind::Busy)),
+            NativeSubtitleMatchStatus::AudioSyncing => Some(("Syncing…", SyncPillKind::Busy)),
+            NativeSubtitleMatchStatus::AudioSynced { .. } => {
+                Some(("Synced", SyncPillKind::Synced))
+            }
+            NativeSubtitleMatchStatus::EmbeddedReady | NativeSubtitleMatchStatus::NoMatches => {
+                Some(("Fetch online", SyncPillKind::FetchOnline))
+            }
+            NativeSubtitleMatchStatus::Matched { .. }
+            | NativeSubtitleMatchStatus::LocalFile { .. } => {
+                Some(("Auto-Sync", SyncPillKind::AutoSync))
+            }
+            NativeSubtitleMatchStatus::Idle | NativeSubtitleMatchStatus::Failed(_) => None,
+        };
+
+        div()
+            .w_full()
+            .max_w(px(940.0))
+            .flex()
+            .justify_end()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .id("player-audio-subs-popover")
+                    .w(px(580.0))
+                    .rounded(px(16.0))
+                    .bg(rgb(0x161618))
+                    .border_1()
+                    .border_color(rgba(BORDER_SUBTLE))
+                    .shadow(glass_capsule_shadow())
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    // Two-column body: AUDIO [A] | SUBTITLES [V]
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            // Left Column: AUDIO
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .p(px(16.0))
+                                    .border_r_1()
+                                    .border_color(rgba(BORDER_SOFT))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(10.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .font(ui_sans(FontWeight::SEMIBOLD))
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .child("AUDIO"),
+                                            )
+                                            .child(keycap("A")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("player-audio-track-list")
+                                            .max_h(px(280.0))
+                                            .overflow_y_scroll()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .when(audio_tracks.is_empty(), |col| {
+                                                col.child(
+                                                    div()
+                                                        .px(px(12.0))
+                                                        .py(px(10.0))
+                                                        .text_xs()
+                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .child("No audio tracks detected"),
+                                                )
+                                            })
+                                            .children(audio_tracks.into_iter().enumerate().map(
+                                                |(idx, tr)| {
+                                                    let tid = tr.id;
+                                                    let (primary, secondary) =
+                                                        format_audio_track_display(&tr);
+                                                    div()
+                                                        .id(("player-audio-track-item", idx))
+                                                        .flex_shrink_0()
+                                                        .cursor_pointer()
+                                                        .px(px(12.0))
+                                                        .py(px(9.0))
+                                                        .rounded(px(10.0))
+                                                        .bg(if tr.selected {
+                                                            rgba(0xFFFFFF0F)
+                                                        } else {
+                                                            rgba(0x00000000)
+                                                        })
+                                                        .hover(|s| s.bg(rgba(0xFFFFFF0A)))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .gap(px(8.0))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.user_select_audio_track(
+                                                                    tid, cx,
+                                                                );
+                                                            }),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .min_w(px(0.0))
+                                                                .flex()
+                                                                .flex_col()
+                                                                .gap(px(2.0))
+                                                                .child(
+                                                                    div()
+                                                                        .font(ui_sans(
+                                                                            FontWeight::MEDIUM,
+                                                                        ))
+                                                                        .text_size(px(13.0))
+                                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                                        .truncate()
+                                                                        .child(primary),
+                                                                )
+                                                                .when(
+                                                                    !secondary.is_empty(),
+                                                                    |card| {
+                                                                        card.child(
+                                                                            div()
+                                                                                .font(mono_font())
+                                                                                .text_size(px(11.0))
+                                                                                .text_color(rgb(
+                                                                                    TEXT_MUTED,
+                                                                                ))
+                                                                                .truncate()
+                                                                                .child(secondary),
+                                                                        )
+                                                                    },
+                                                                ),
+                                                        )
+                                                        .when(tr.selected, |row| {
+                                                            row.child(svg_icon(
+                                                                IconName::Check,
+                                                                14.0,
+                                                                rgb(ACCENT),
+                                                            ))
+                                                        })
+                                                },
+                                            )),
+                                    ),
+                            )
+                            // Right Column: SUBTITLES
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .p(px(16.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(10.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(8.0))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(
+                                                        div()
+                                                            .font(ui_sans(FontWeight::SEMIBOLD))
+                                                            .text_size(px(11.0))
+                                                            .text_color(rgb(TEXT_MUTED))
+                                                            .child("SUBTITLES"),
+                                                    )
+                                                    .when_some(sync_pill, |row, (label, kind)| {
+                                                        row.child(
+                                                            div()
+                                                                .id("sub-sync-pill-trigger")
+                                                                .cursor_pointer()
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |this, _, _, cx| match kind {
+                                                                            SyncPillKind::Busy => {}
+                                                                            SyncPillKind::FetchOnline => {
+                                                                                this.trigger_native_subtitle_auto_match(true, cx);
+                                                                            }
+                                                                            SyncPillKind::Synced
+                                                                            | SyncPillKind::AutoSync => {
+                                                                                this.auto_sync_active_subtitle(cx);
+                                                                            }
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .child(match kind {
+                                                                    SyncPillKind::Busy => {
+                                                                        compact_status_pill(
+                                                                            label,
+                                                                            ACCENT_AMBER,
+                                                                            0xfbbf244d,
+                                                                            0xfbbf241c,
+                                                                        )
+                                                                    }
+                                                                    SyncPillKind::Synced => {
+                                                                        compact_status_pill(
+                                                                            label,
+                                                                            STATUS_WATCHED,
+                                                                            0x4ade804d,
+                                                                            0x4ade801c,
+                                                                        )
+                                                                    }
+                                                                    SyncPillKind::FetchOnline => {
+                                                                        compact_status_pill(
+                                                                            label,
+                                                                            TEXT_SECONDARY,
+                                                                            0xffffff22,
+                                                                            0xffffff0a,
+                                                                        )
+                                                                    }
+                                                                    SyncPillKind::AutoSync => {
+                                                                        compact_status_pill(
+                                                                            label,
+                                                                            ACCENT_HOVER,
+                                                                            0xc8553d4d,
+                                                                            0xc8553d1c,
+                                                                        )
+                                                                    }
+                                                                }),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(keycap("V")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("player-sub-track-list")
+                                            .max_h(px(280.0))
+                                            .overflow_y_scroll()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child({
+                                                let off_selected = !any_sub_selected;
+                                                div()
+                                                    .id("player-sub-track-off")
+                                                    .flex_shrink_0()
+                                                    .cursor_pointer()
+                                                    .px(px(12.0))
+                                                    .py(px(9.0))
+                                                    .rounded(px(10.0))
+                                                    .bg(if off_selected {
+                                                        rgba(0xFFFFFF0F)
+                                                    } else {
+                                                        rgba(0x00000000)
+                                                    })
+                                                    .hover(|s| s.bg(rgba(0xFFFFFF0A)))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .font(ui_sans(FontWeight::MEDIUM))
+                                                    .text_size(px(13.0))
+                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.user_select_subtitle_track(
+                                                                None, cx,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child("Off")
+                                                    .when(off_selected, |row| {
+                                                        row.child(svg_icon(
+                                                            IconName::Check,
+                                                            14.0,
+                                                            rgb(ACCENT),
+                                                        ))
+                                                    })
+                                            })
+                                            .children(sub_tracks.into_iter().enumerate().map(
+                                                |(idx, tr)| {
+                                                    let tid = tr.id;
+                                                    let (primary, secondary) =
+                                                        format_subtitle_track_display(&tr);
+                                                    div()
+                                                        .id(("player-sub-track-item", idx))
+                                                        .flex_shrink_0()
+                                                        .cursor_pointer()
+                                                        .px(px(12.0))
+                                                        .py(px(9.0))
+                                                        .rounded(px(10.0))
+                                                        .bg(if tr.selected {
+                                                            rgba(0xFFFFFF0F)
+                                                        } else {
+                                                            rgba(0x00000000)
+                                                        })
+                                                        .hover(|s| s.bg(rgba(0xFFFFFF0A)))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .gap(px(8.0))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.user_select_subtitle_track(
+                                                                    Some(tid),
+                                                                    cx,
+                                                                );
+                                                            }),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .min_w(px(0.0))
+                                                                .flex()
+                                                                .flex_col()
+                                                                .gap(px(2.0))
+                                                                .child(
+                                                                    div()
+                                                                        .font(ui_sans(
+                                                                            FontWeight::MEDIUM,
+                                                                        ))
+                                                                        .text_size(px(13.0))
+                                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                                        .truncate()
+                                                                        .child(primary),
+                                                                )
+                                                                .when(
+                                                                    !secondary.is_empty(),
+                                                                    |card| {
+                                                                        card.child(
+                                                                            div()
+                                                                                .font(mono_font())
+                                                                                .text_size(px(11.0))
+                                                                                .text_color(rgb(
+                                                                                    TEXT_MUTED,
+                                                                                ))
+                                                                                .truncate()
+                                                                                .child(secondary),
+                                                                        )
+                                                                    },
+                                                                ),
+                                                        )
+                                                        .when(tr.selected, |row| {
+                                                            row.child(svg_icon(
+                                                                IconName::Check,
+                                                                14.0,
+                                                                rgb(ACCENT),
+                                                            ))
+                                                        })
+                                                },
+                                            )),
+                                    ),
+                            ),
+                    )
+                    // Compact Footer: Delay [- -0.4s +] | Size [S|M|L] | Style | Load file
+                    .child(
+                        div()
+                            .px(px(16.0))
+                            .py(px(11.0))
+                            .border_t_1()
+                            .border_color(rgba(BORDER_SOFT))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    // Delay Stepper Pill
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(7.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .child("Delay"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h(px(28.0))
+                                                    .px(px(4.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(rgba(0xFFFFFF08))
+                                                    .border_1()
+                                                    .border_color(rgba(BORDER_SUBTLE))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(2.0))
+                                                    .child(
+                                                        div()
+                                                            .id("sub-footer-delay-minus")
+                                                            .cursor_pointer()
+                                                            .px(px(7.0))
+                                                            .py(px(3.0))
+                                                            .rounded(px(5.0))
+                                                            .hover(|s| s.bg(rgba(0xFFFFFF12)))
+                                                            .text_xs()
+                                                            .text_color(rgb(TEXT_SECONDARY))
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(|this, _, _, cx| {
+                                                                    this.adjust_subtitle_delay(
+                                                                        -0.1, cx,
+                                                                    );
+                                                                }),
+                                                            )
+                                                            .child("−"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("sub-footer-delay-reset")
+                                                            .cursor_pointer()
+                                                            .px(px(6.0))
+                                                            .py(px(3.0))
+                                                            .rounded(px(5.0))
+                                                            .hover(|s| s.bg(rgba(0xFFFFFF12)))
+                                                            .font(mono_font())
+                                                            .font_features(tabular_nums())
+                                                            .text_size(px(11.5))
+                                                            .text_color(rgb(TEXT_PRIMARY))
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(|this, _, _, cx| {
+                                                                    let cur = this
+                                                                        .player_snapshot
+                                                                        .sub_delay;
+                                                                    this.adjust_subtitle_delay(
+                                                                        -cur, cx,
+                                                                    );
+                                                                }),
+                                                            )
+                                                            .child(delay_label),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("sub-footer-delay-plus")
+                                                            .cursor_pointer()
+                                                            .px(px(7.0))
+                                                            .py(px(3.0))
+                                                            .rounded(px(5.0))
+                                                            .hover(|s| s.bg(rgba(0xFFFFFF12)))
+                                                            .text_xs()
+                                                            .text_color(rgb(TEXT_SECONDARY))
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(|this, _, _, cx| {
+                                                                    this.adjust_subtitle_delay(
+                                                                        0.1, cx,
+                                                                    );
+                                                                }),
+                                                            )
+                                                            .child("+"),
+                                                    ),
+                                            ),
+                                    )
+                                    // Size [S | M | L]
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(7.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .child("Size"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h(px(28.0))
+                                                    .p(px(2.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(rgba(0xFFFFFF08))
+                                                    .border_1()
+                                                    .border_color(rgba(BORDER_SUBTLE))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(2.0))
+                                                    .children(
+                                                        [
+                                                            ("S", 38u32, size_s_selected),
+                                                            ("M", 46u32, size_m_selected),
+                                                            ("L", 56u32, size_l_selected),
+                                                        ]
+                                                        .into_iter()
+                                                        .map(|(label, size_px, active)| {
+                                                            div()
+                                                                .id(("sub-footer-size", size_px as usize))
+                                                                .cursor_pointer()
+                                                                .px(px(8.0))
+                                                                .h(px(22.0))
+                                                                .rounded(px(6.0))
+                                                                .bg(if active {
+                                                                    rgba(0xFFFFFF1A)
+                                                                } else {
+                                                                    rgba(0x00000000)
+                                                                })
+                                                                .hover(|s| s.bg(rgba(0xFFFFFF12)))
+                                                                .flex()
+                                                                .items_center()
+                                                                .text_size(px(11.5))
+                                                                .font(ui_sans(FontWeight::MEDIUM))
+                                                                .text_color(if active {
+                                                                    rgb(TEXT_PRIMARY)
+                                                                } else {
+                                                                    rgb(TEXT_MUTED)
+                                                                })
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(move |this, _, _, cx| {
+                                                                        this.set_subtitle_font_size(
+                                                                            size_px, cx,
+                                                                        );
+                                                                    }),
+                                                                )
+                                                                .child(label)
+                                                        }),
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    // Pop-off Appearance Style Window Trigger
+                                    .child(
+                                        div()
+                                            .id("sub-footer-style-btn")
+                                            .cursor_pointer()
+                                            .h(px(28.0))
+                                            .px(px(9.0))
+                                            .rounded(px(8.0))
+                                            .bg(rgba(0xFFFFFF08))
+                                            .border_1()
+                                            .border_color(rgba(BORDER_SUBTLE))
+                                            .hover(|s| s.bg(rgba(0xFFFFFF14)))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .text_size(px(11.5))
+                                            .font(ui_sans(FontWeight::MEDIUM))
+                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.player_popover = Some(
+                                                        PlayerPopover::SubtitleAppearance,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(svg_icon(
+                                                IconName::Sliders,
+                                                12.5,
+                                                rgb(TEXT_SECONDARY),
+                                            ))
+                                            .child("Style"),
+                                    )
+                                    // Native OS Load File Trigger
+                                    .child(
+                                        div()
+                                            .id("sub-footer-load-file-btn")
+                                            .cursor_pointer()
+                                            .h(px(28.0))
+                                            .px(px(9.0))
+                                            .rounded(px(8.0))
+                                            .hover(|s| s.bg(rgba(0xFFFFFF10)))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .text_size(px(12.0))
+                                            .font(ui_sans(FontWeight::MEDIUM))
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.prompt_and_load_local_subtitle(cx);
+                                                }),
+                                            )
+                                            .child(svg_icon(
+                                                IconName::FolderOpen,
+                                                14.0,
+                                                rgb(TEXT_PRIMARY),
+                                            ))
+                                            .child("Load file"),
+                                    ),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_subtitle_appearance_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let prefs = &self.preferences;
         let preview_color = parse_hex_rgb(&prefs.subtitle_color_hex);
         let preview_font_px = ((prefs.subtitle_font_size as f32) * 0.29).clamp(11.0, 21.0);
         let preview_bottom_pad =
@@ -1855,22 +2707,21 @@ impl AppShell {
             })
             .child(
                 div()
-                    .id("player-subtitle-studio-popover")
-                    .w(px(400.0))
-                    .max_h(px(560.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .rounded(px(12.0))
-                    .bg(rgba(BG_POPOVER_GLASS))
+                    .id("player-subtitle-appearance-popover")
+                    .w(px(430.0))
+                    .p(px(16.0))
+                    .rounded(px(16.0))
+                    .bg(rgb(0x161618))
                     .border_1()
                     .border_color(rgba(BORDER_SUBTLE))
                     .shadow(glass_capsule_shadow())
                     .flex()
                     .flex_col()
-                    .gap(px(10.0))
+                    .gap(px(12.0))
+                    // Header: <- Back | Subtitle Appearance | Reset | X
                     .child(
                         div()
-                            .pb(px(8.0))
+                            .pb(px(10.0))
                             .border_b_1()
                             .border_color(rgba(BORDER_SOFT))
                             .flex()
@@ -1882,93 +2733,69 @@ impl AppShell {
                                     .flex()
                                     .items_center()
                                     .gap(px(8.0))
-                                    .min_w(px(0.0))
+                                    .child(Self::render_studio_chip(
+                                        "sub-appearance-back",
+                                        "← Back",
+                                        false,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.player_popover =
+                                                Some(PlayerPopover::AudioAndSubtitles);
+                                            cx.notify();
+                                        }),
+                                    ))
                                     .child(
                                         div()
                                             .font(ui_sans(FontWeight::SEMIBOLD))
                                             .text_size(px(13.5))
                                             .text_color(rgb(TEXT_PRIMARY))
-                                            .child("Subtitle Studio"),
-                                    )
-                                    .child(keycap("S"))
-                                    .when_some(match_badge, |row, badge| {
-                                        row.child(if searching {
-                                            compact_status_pill(
-                                                badge,
-                                                ACCENT_AMBER,
-                                                0xfbbf244d,
-                                                0xfbbf241c,
-                                            )
-                                        } else {
-                                            compact_status_pill(
-                                                badge,
-                                                STATUS_WATCHED,
-                                                0x4ade804d,
-                                                0x4ade801c,
-                                            )
-                                        })
-                                    }),
+                                            .child("Subtitle Appearance"),
+                                    ),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(5.0))
-                                    .flex_shrink_0()
+                                    .gap(px(6.0))
+                                    .child(Self::render_studio_chip(
+                                        "sub-appearance-reset",
+                                        "Reset",
+                                        false,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.reset_subtitle_style_prefs(cx);
+                                        }),
+                                    ))
                                     .child(
                                         div()
-                                            .id("studio-rematch-btn")
+                                            .id("sub-appearance-close")
                                             .cursor_pointer()
-                                            .px(px(8.0))
-                                            .py(px(4.0))
-                                            .rounded(px(5.0))
-                                            .bg(rgb(BG_ELEVATED))
-                                            .border_1()
-                                            .border_color(rgba(BORDER_SUBTLE))
-                                            .hover(|s| s.bg(rgb(BG_SURFACE_3)))
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .p(px(5.0))
+                                            .rounded(px(6.0))
+                                            .hover(|s| s.bg(rgba(0xFFFFFF12)))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.trigger_native_subtitle_auto_match(true, cx);
+                                                    this.toggle_player_popover(
+                                                        PlayerPopover::SubtitleAppearance,
+                                                        cx,
+                                                    );
                                                 }),
                                             )
-                                            .child(if searching { "Matching..." } else { "Re-Match" }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("studio-autosync-btn")
-                                            .cursor_pointer()
-                                            .px(px(8.0))
-                                            .py(px(4.0))
-                                            .rounded(px(5.0))
-                                            .bg(rgba(ACCENT_SOFT))
-                                            .border_1()
-                                            .border_color(rgba(BORDER_ACCENT))
-                                            .hover(|s| s.bg(rgb(ACCENT)))
-                                            .text_size(px(11.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(TEXT_PRIMARY))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.auto_sync_active_subtitle(cx);
-                                                }),
-                                            )
-                                            .child("Auto-Sync"),
+                                            .child(svg_icon(
+                                                IconName::X,
+                                                13.0,
+                                                rgb(TEXT_SECONDARY),
+                                            )),
                                     ),
                             ),
                     )
                     // Live Cinema Preview Strip
                     .child(
                         div()
-                            .h(px(64.0))
+                            .h(px(68.0))
                             .w_full()
                             .px(px(12.0))
                             .pb(px(preview_bottom_pad))
-                            .rounded(px(8.0))
+                            .rounded(px(10.0))
                             .bg(rgb(0x09090C))
                             .border_1()
                             .border_color(rgba(BORDER_SOFT))
@@ -2002,12 +2829,12 @@ impl AppShell {
                                     .child("The signal arrived forty-five seconds early."),
                             ),
                     )
-                    // HDR-Safe Color Swatches
+                    // HDR-Safe Color Swatches & Backdrop Style
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(5.0))
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .flex()
@@ -2062,7 +2889,7 @@ impl AppShell {
                                             .flex()
                                             .items_center()
                                             .gap(px(4.0))
-                                            .child(self.render_studio_chip(
+                                            .child(Self::render_studio_chip(
                                                 "studio-bg-shadow",
                                                 "Drop Shadow",
                                                 !prefs.subtitle_background_pill,
@@ -2070,7 +2897,7 @@ impl AppShell {
                                                     this.set_subtitle_background_pill(false, cx);
                                                 }),
                                             ))
-                                            .child(self.render_studio_chip(
+                                            .child(Self::render_studio_chip(
                                                 "studio-bg-pill",
                                                 "Translucent Pill",
                                                 prefs.subtitle_background_pill,
@@ -2081,7 +2908,7 @@ impl AppShell {
                                     ),
                             ),
                     )
-                    // Font Size Stepper & Presets
+                    // Fine Font Size Stepper & Presets
                     .child(
                         div()
                             .flex()
@@ -2099,7 +2926,7 @@ impl AppShell {
                                             .text_color(rgb(TEXT_MUTED))
                                             .child("Size"),
                                     )
-                                    .child(self.render_studio_chip(
+                                    .child(Self::render_studio_chip(
                                         "studio-size-minus",
                                         "-",
                                         false,
@@ -2115,7 +2942,7 @@ impl AppShell {
                                             .text_color(rgb(TEXT_PRIMARY))
                                             .child(format!("{}px", prefs.subtitle_font_size)),
                                     )
-                                    .child(self.render_studio_chip(
+                                    .child(Self::render_studio_chip(
                                         "studio-size-plus",
                                         "+",
                                         false,
@@ -2127,7 +2954,7 @@ impl AppShell {
                             .child(
                                 div().flex().items_center().gap(px(4.0)).children(
                                     [38u32, 46, 56, 66].into_iter().map(|sz| {
-                                        self.render_studio_chip(
+                                        Self::render_studio_chip(
                                             ("studio-size-preset", sz as usize),
                                             format!("{sz}"),
                                             prefs.subtitle_font_size == sz,
@@ -2157,7 +2984,7 @@ impl AppShell {
                                             .text_color(rgb(TEXT_MUTED))
                                             .child("Position"),
                                     )
-                                    .child(self.render_studio_chip(
+                                    .child(Self::render_studio_chip(
                                         "studio-pos-up",
                                         "-2%",
                                         false,
@@ -2173,7 +3000,7 @@ impl AppShell {
                                             .text_color(rgb(TEXT_PRIMARY))
                                             .child(format!("{}%", prefs.subtitle_vertical_pos)),
                                     )
-                                    .child(self.render_studio_chip(
+                                    .child(Self::render_studio_chip(
                                         "studio-pos-down",
                                         "+2%",
                                         false,
@@ -2187,7 +3014,7 @@ impl AppShell {
                                     [(100u32, "Lower"), (96, "Cinema"), (88, "Raised"), (80, "High")]
                                         .into_iter()
                                         .map(|(pos, label)| {
-                                            self.render_studio_chip(
+                                            Self::render_studio_chip(
                                                 ("studio-pos-preset", pos as usize),
                                                 label,
                                                 prefs.subtitle_vertical_pos == pos,
@@ -2199,208 +3026,38 @@ impl AppShell {
                                 ),
                             ),
                     )
-                    // Precision Sync Bar
+                    // ASS Style Override Toggle
                     .child(
                         div()
-                            .pt(px(4.0))
+                            .pt(px(6.0))
                             .border_t_1()
                             .border_color(rgba(BORDER_SOFT))
                             .flex()
                             .items_center()
                             .justify_between()
-                            .gap(px(6.0))
                             .child(
                                 div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child("Sync"),
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child("Override ASS scaling"),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.0))
-                                    .child(self.render_studio_chip(
-                                        "studio-sync-m500",
-                                        "-500ms",
-                                        false,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.adjust_subtitle_delay(-0.5, cx);
-                                        }),
-                                    ))
-                                    .child(self.render_studio_chip(
-                                        "studio-sync-m50",
-                                        "-50ms",
-                                        false,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.adjust_subtitle_delay(-0.05, cx);
-                                        }),
-                                    ))
-                                    .child(self.render_studio_chip(
-                                        "studio-sync-zero",
-                                        format!("{delay_ms:+}ms"),
-                                        delay_ms == 0,
-                                        cx.listener(|this, _, _, cx| {
-                                            let cur = this.player_snapshot.sub_delay;
-                                            this.adjust_subtitle_delay(-cur, cx);
-                                        }),
-                                    ))
-                                    .child(self.render_studio_chip(
-                                        "studio-sync-p50",
-                                        "+50ms",
-                                        false,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.adjust_subtitle_delay(0.05, cx);
-                                        }),
-                                    ))
-                                    .child(self.render_studio_chip(
-                                        "studio-sync-p500",
-                                        "+500ms",
-                                        false,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.adjust_subtitle_delay(0.5, cx);
-                                        }),
-                                    )),
-                            ),
-                    )
-                    // Scrollable Track Selector
-                    .child(
-                        div()
-                            .id("studio-sub-track-list")
-                            .max_h(px(150.0))
-                            .overflow_y_scroll()
-                            .pt(px(6.0))
-                            .border_t_1()
-                            .border_color(rgba(BORDER_SOFT))
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .child({
-                                let off_selected = !any_sub_selected;
-                                div()
-                                    .id("player-sub-track-off")
-                                    .flex_shrink_0()
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(7.0))
-                                    .rounded(px(6.0))
-                                    .bg(if off_selected {
-                                        rgba(ACCENT_SOFT)
-                                    } else {
-                                        rgba(0x00000000)
-                                    })
-                                    .hover(|s| s.bg(rgb(BG_ELEVATED)))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .text_xs()
-                                    .text_color(if off_selected {
-                                        rgb(ACCENT)
-                                    } else {
-                                        rgb(TEXT_PRIMARY)
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.user_select_subtitle_track(None, cx);
-                                        }),
-                                    )
-                                    .child("Subtitles off")
-                                    .when(off_selected, |row| {
-                                        row.child(svg_icon(IconName::Check, 13.0, rgb(ACCENT)))
-                                    })
-                            })
-                            .children(tracks.into_iter().enumerate().map(|(idx, tr)| {
-                                let tid = tr.id;
-                                let primary_name = tr
-                                    .title
-                                    .clone()
-                                    .or_else(|| tr.lang.as_ref().map(|l| l.to_ascii_uppercase()))
-                                    .unwrap_or_else(|| format!("Track #{tid}"));
-
-                                let mut secondary_tags: Vec<String> = Vec::with_capacity(3);
-                                if let Some(lang) = &tr.lang {
-                                    if tr.title.is_some() {
-                                        secondary_tags.push(lang.to_ascii_uppercase());
-                                    }
-                                }
-                                if let Some(codec) = &tr.codec {
-                                    secondary_tags.push(codec.to_ascii_uppercase());
-                                }
-                                if tr.external {
-                                    secondary_tags.push("External".to_owned());
-                                }
-
-                                div()
-                                    .id(("studio-sub-track-item", idx))
-                                    .flex_shrink_0()
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(7.0))
-                                    .rounded(px(6.0))
-                                    .bg(if tr.selected {
-                                        rgba(ACCENT_SOFT)
-                                    } else {
-                                        rgba(0x00000000)
-                                    })
-                                    .hover(|s| s.bg(rgb(BG_ELEVATED)))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.user_select_subtitle_track(Some(tid), cx);
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .min_w(px(0.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(if tr.selected {
-                                                        rgb(ACCENT)
-                                                    } else {
-                                                        rgb(TEXT_PRIMARY)
-                                                    })
-                                                    .truncate()
-                                                    .child(primary_name),
-                                            )
-                                            .when(!secondary_tags.is_empty(), |meta_row| {
-                                                meta_row.child(
-                                                    div()
-                                                        .font(mono_font())
-                                                        .text_size(px(10.5))
-                                                        .text_color(rgb(TEXT_MUTED))
-                                                        .child(secondary_tags.join(" / ")),
-                                                )
-                                            }),
-                                    )
-                                    .when(tr.selected, |row| {
-                                        row.child(svg_icon(IconName::Check, 13.0, rgb(ACCENT)))
-                                    })
-                            })),
-                    )
-                    // Drop hint
-                    .child(
-                        div()
-                            .pt(px(4.0))
-                            .text_size(px(11.0))
-                            .text_color(rgb(TEXT_MUTED))
-                            .text_center()
-                            .child("Drop any .srt or .ass file onto the player"),
+                            .child(Self::render_studio_chip(
+                                "sub-appearance-ass-override",
+                                if prefs.subtitle_ass_scale_override {
+                                    "On"
+                                } else {
+                                    "Off"
+                                },
+                                prefs.subtitle_ass_scale_override,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_subtitle_ass_scale_override(cx);
+                                }),
+                            )),
                     ),
             )
     }
 
     fn render_studio_chip(
-        &self,
         id: impl Into<gpui::ElementId>,
         label: impl Into<SharedString>,
         selected: bool,
@@ -2438,246 +3095,7 @@ impl AppShell {
             .child(label.into())
     }
 
-    fn render_track_popover(
-        &self,
-        kind: TrackType,
-        heading: &'static str,
-        shortcut_key: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let tracks: Vec<MediaTrack> = self
-            .player_snapshot
-            .tracks
-            .iter()
-            .filter(|t| t.track_type == kind)
-            .cloned()
-            .collect();
-        let any_sub_selected = tracks.iter().any(|t| t.selected);
 
-        div()
-            .w_full()
-            .max_w(px(940.0))
-            .flex()
-            .justify_end()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .id("player-track-popover-scroll")
-                    .w(px(380.0))
-                    .max_h(px(340.0))
-                    .overflow_y_scroll()
-                    .p(px(14.0))
-                    .rounded(px(10.0))
-                    .bg(rgba(BG_POPOVER_GLASS))
-                    .border_1()
-                    .border_color(rgba(BORDER_SUBTLE))
-                    .shadow(glass_capsule_shadow())
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .pb(px(6.0))
-                                    .border_b_1()
-                                    .border_color(rgba(BORDER_SOFT))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .child(
-                                                div()
-                                                    .font(ui_sans(FontWeight::MEDIUM))
-                                                    .text_size(px(13.0))
-                                                    .text_color(rgb(TEXT_PRIMARY))
-                                                    .child(heading),
-                                            )
-                                            .child(keycap(shortcut_key)),
-                                    )
-                                    .when(kind == TrackType::Sub, |el| {
-                                        el.child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(6.0))
-                                                .child(
-                                                    div()
-                                                        .id("sub-delay-minus")
-                                                        .cursor_pointer()
-                                                        .px(px(8.0))
-                                                        .py(px(3.0))
-                                                        .rounded(px(4.0))
-                                                        .bg(rgb(BG_ELEVATED))
-                                                        .border_1()
-                                                        .border_color(rgba(BORDER_SUBTLE))
-                                                        .hover(|s| s.bg(rgb(BG_SURFACE_3)))
-                                                        .font(mono_font())
-                                                        .text_xs()
-                                                        .text_color(rgb(TEXT_PRIMARY))
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _, _, cx| {
-                                                                this.adjust_subtitle_delay(-0.1, cx);
-                                                            }),
-                                                        )
-                                                        .child("-100ms"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("sub-delay-plus")
-                                                        .cursor_pointer()
-                                                        .px(px(8.0))
-                                                        .py(px(3.0))
-                                                        .rounded(px(4.0))
-                                                        .bg(rgb(BG_ELEVATED))
-                                                        .border_1()
-                                                        .border_color(rgba(BORDER_SUBTLE))
-                                                        .hover(|s| s.bg(rgb(BG_SURFACE_3)))
-                                                        .font(mono_font())
-                                                        .text_xs()
-                                                        .text_color(rgb(TEXT_PRIMARY))
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _, _, cx| {
-                                                                this.adjust_subtitle_delay(0.1, cx);
-                                                            }),
-                                                        )
-                                                        .child("+100ms"),
-                                                ),
-                                        )
-                                    }),
-                            )
-                            .when(kind == TrackType::Sub, |el| {
-                                let off_selected = !any_sub_selected;
-                                el.child(
-                                    div()
-                                        .id("track-sub-off")
-                                        .flex_shrink_0()
-                                        .cursor_pointer()
-                                        .px(px(10.0))
-                                        .py(px(8.0))
-                                        .rounded(px(6.0))
-                                        .bg(if off_selected {
-                                            rgba(ACCENT_SOFT)
-                                        } else {
-                                            rgba(0x00000000)
-                                        })
-                                        .hover(|s| s.bg(rgb(BG_ELEVATED)))
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .text_xs()
-                                        .text_color(if off_selected {
-                                            rgb(ACCENT)
-                                        } else {
-                                            rgb(TEXT_PRIMARY)
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.user_select_subtitle_track(None, cx);
-                                            }),
-                                        )
-                                        .child("Subtitles off")
-                                        .when(off_selected, |row| {
-                                            row.child(svg_icon(IconName::Check, 13.0, rgb(ACCENT)))
-                                        }),
-                                )
-                            })
-                            .children(tracks.into_iter().enumerate().map(|(idx, tr)| {
-                                let tid = tr.id;
-                                let primary_name = tr
-                                    .title
-                                    .clone()
-                                    .or_else(|| tr.lang.as_ref().map(|l| l.to_ascii_uppercase()))
-                                    .unwrap_or_else(|| format!("Track #{tid}"));
-
-                                let mut secondary_tags: Vec<String> = Vec::with_capacity(3);
-                                if let Some(lang) = &tr.lang {
-                                    if tr.title.is_some() {
-                                        secondary_tags.push(lang.to_ascii_uppercase());
-                                    }
-                                }
-                                if let Some(codec) = &tr.codec {
-                                    secondary_tags.push(codec.to_ascii_uppercase());
-                                }
-                                if tr.external {
-                                    secondary_tags.push("Addon".to_owned());
-                                }
-
-                                div()
-                                    .id(("player-track-item", idx))
-                                    .flex_shrink_0()
-                                    .cursor_pointer()
-                                    .px(px(10.0))
-                                    .py(px(8.0))
-                                    .rounded(px(6.0))
-                                    .bg(if tr.selected {
-                                        rgba(ACCENT_SOFT)
-                                    } else {
-                                        rgba(0x00000000)
-                                    })
-                                    .hover(|s| s.bg(rgb(BG_ELEVATED)))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| match kind {
-                                            TrackType::Audio => {
-                                                this.user_select_audio_track(tid, cx)
-                                            }
-                                            TrackType::Sub => {
-                                                this.user_select_subtitle_track(Some(tid), cx)
-                                            }
-                                            TrackType::Video => {}
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .min_w(px(0.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(if tr.selected {
-                                                        rgb(ACCENT)
-                                                    } else {
-                                                        rgb(TEXT_PRIMARY)
-                                                    })
-                                                    .truncate()
-                                                    .child(primary_name),
-                                            )
-                                            .when(!secondary_tags.is_empty(), |meta_row| {
-                                                meta_row.child(
-                                                    div()
-                                                        .font(mono_font())
-                                                        .text_size(px(11.0))
-                                                        .text_color(rgb(TEXT_MUTED))
-                                                        .child(secondary_tags.join(" / ")),
-                                                )
-                                            }),
-                                    )
-                                    .when(tr.selected, |row| {
-                                        row.child(svg_icon(IconName::Check, 13.0, rgb(ACCENT)))
-                                    })
-                            })),
-                    ),
-            )
-    }
 
     fn render_video_shader_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let prefs = &self.preferences;

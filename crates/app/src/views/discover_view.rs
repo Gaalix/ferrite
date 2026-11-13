@@ -88,10 +88,6 @@ impl AppShell {
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case("genre"))
             .cloned();
-        let secondary_extras: Vec<_> = extras
-            .into_iter()
-            .filter(|e| !e.name.eq_ignore_ascii_case("genre") && !e.options.is_empty())
-            .collect();
 
         let active_type_label = types
             .iter()
@@ -744,7 +740,15 @@ impl AppShell {
                                             )
                                         },
                                     )
-                                    .children(secondary_extras.into_iter().enumerate().map(
+                                    .children(
+                                        extras
+                                            .into_iter()
+                                            .filter(|e| {
+                                                !e.name.eq_ignore_ascii_case("genre")
+                                                    && !e.options.is_empty()
+                                            })
+                                            .enumerate()
+                                            .map(
                                         |(e_idx, extra)| {
                                             let extra_name = extra.name.clone();
                                             let dd_variant =
@@ -762,7 +766,7 @@ impl AppShell {
                                                 .find(|o| o.selected)
                                                 .is_some_and(|o| o.value.is_some());
                                             let field_title = sentence_case_label(&extra_name);
-                                            let dd_for_click = dd_variant.clone();
+                                            let dd_for_click = dd_variant;
 
                                             div()
                                                 .relative()

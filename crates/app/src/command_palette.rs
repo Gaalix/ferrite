@@ -298,7 +298,7 @@ impl AppShell {
                                                 }),
                                             )
                                             .child(self.render_palette_row_left(&entry))
-                                            .child(self.render_palette_row_right(&entry))
+                                            .child(Self::render_palette_row_right(&entry))
                                     })),
                             ),
                     )
@@ -465,7 +465,7 @@ impl AppShell {
         }
     }
 
-    fn render_palette_row_right(&self, entry: &PaletteEntry) -> impl IntoElement {
+    fn render_palette_row_right(entry: &PaletteEntry) -> impl IntoElement {
         match entry {
             PaletteEntry::QuickNav { tab, .. } => div()
                 .flex_shrink_0()

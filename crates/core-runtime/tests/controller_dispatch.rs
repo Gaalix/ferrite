@@ -552,3 +552,40 @@ async fn load_board_fetches_only_initial_shelves_until_load_board_range_advances
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn boot_updates_stale_loopback_streaming_server_url_while_preserving_remote_url() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("loopback_sync.db");
+
+    // Boot 1: writes initial loopback URL (port 11470) into sqlite profile storage.
+    let url_1: Url = "http://127.0.0.1:11470/".parse().unwrap();
+    let cfg_1 = EnvConfig::with_storage_path(&db_path).with_streaming_server_url(url_1.clone());
+    DesktopEnv::run_isolated(cfg_1, async {
+        let controller = CoreController::from_initialized_env().await.unwrap();
+        let active = controller.with_model(|m| m.ctx.profile.settings.streaming_server_url.clone());
+        assert_eq!(active, url_1);
+    })
+    .await
+    .unwrap();
+
+    // Boot 2: existing profile in sqlite had port 11470; engine now runs on ephemeral port 45678.
+    let url_2: Url = "http://127.0.0.1:45678/".parse().unwrap();
+    let cfg_2 = EnvConfig::with_storage_path(&db_path).with_streaming_server_url(url_2.clone());
+    DesktopEnv::run_isolated(cfg_2, async {
+        let controller = CoreController::from_initialized_env().await.unwrap();
+        let active = controller.with_model(|m| m.ctx.profile.settings.streaming_server_url.clone());
+        assert_eq!(active, url_2);
+
+        // Switching profile settings to a non-loopback remote streaming server must be preserved.
+        let mut settings = controller.with_model(|m| m.ctx.profile.settings.clone());
+        let remote_url: Url = "https://remote-stream.example.com/".parse().unwrap();
+        settings.streaming_server_url = remote_url.clone();
+        controller.update_profile_settings(settings);
+        controller.sync_loopback_streaming_server_url("http://127.0.0.1:59999/".parse().unwrap());
+        let after = controller.with_model(|m| m.ctx.profile.settings.streaming_server_url.clone());
+        assert_eq!(after, remote_url);
+    })
+    .await
+    .unwrap();
+}

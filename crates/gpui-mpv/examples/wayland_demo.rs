@@ -287,14 +287,13 @@ fn main() {
 
     gpui_platform::application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), cx);
-        let url_for_win = media_url.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
-            move |_window, cx| cx.new(|cx| DemoPlayerView::new(url_for_win, cx)),
+            move |_window, cx| cx.new(|cx| DemoPlayerView::new(media_url, cx)),
         )
         .expect("failed to open transparent Wayland GPUI window");
         cx.activate(true);

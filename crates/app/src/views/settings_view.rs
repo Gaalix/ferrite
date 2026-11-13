@@ -971,13 +971,13 @@ impl AppShell {
 
         match cat {
             SettingsCategory::IntegrationsAndKeys => {
-                body_children.push(self.render_integrations_security_banner().into_any_element());
+                body_children.push(Self::render_integrations_security_banner().into_any_element());
             }
             SettingsCategory::StorageAndCache => {
                 body_children.push(self.render_storage_telemetry_strip().into_any_element());
             }
             SettingsCategory::UpdatesAndAbout => {
-                body_children.push(self.render_about_version_strip().into_any_element());
+                body_children.push(Self::render_about_version_strip().into_any_element());
             }
             _ => {}
         }
@@ -1013,7 +1013,7 @@ impl AppShell {
             .into_any_element()
     }
 
-    fn render_integrations_security_banner(&self) -> impl IntoElement {
+    fn render_integrations_security_banner() -> impl IntoElement {
         div()
             .my(px(4.0))
             .px(px(14.0))
@@ -1101,7 +1101,7 @@ impl AppShell {
             ))
     }
 
-    fn render_about_version_strip(&self) -> impl IntoElement {
+    fn render_about_version_strip() -> impl IntoElement {
         div()
             .my(px(4.0))
             .px(px(16.0))

@@ -135,22 +135,23 @@ impl BoundedTextureLru {
             .get(&key)
             .map(|r| r.last_used_epoch.max(current_epoch))
             .unwrap_or(current_epoch);
+        let image_ptr = Arc::as_ptr(&image);
 
         if let Some(prev_rec) = self.map.insert(
             key,
             TextureRecord {
-                slot: TextureSlot::Ready(Arc::clone(&image)),
+                slot: TextureSlot::Ready(image),
                 last_used_epoch: merged_epoch,
             },
         ) {
             if let TextureSlot::Ready(prev) = prev_rec.slot {
-                if !Arc::ptr_eq(&prev, &image) {
+                if !std::ptr::eq(Arc::as_ptr(&prev), image_ptr) {
                     evicted.push(prev);
                 }
             }
         }
 
-        evicted.extend(self.evict_stale_excess(current_epoch, Some(&image)));
+        evicted.extend(self.evict_stale_excess(current_epoch, Some(image_ptr)));
         evicted
     }
 
@@ -161,7 +162,7 @@ impl BoundedTextureLru {
     fn evict_stale_excess(
         &mut self,
         current_epoch: u64,
-        protect_ptr: Option<&Arc<RenderImage>>,
+        protect_ptr: Option<*const RenderImage>,
     ) -> Vec<Arc<RenderImage>> {
         let mut evicted = Vec::new();
         let mut idx = 0;
@@ -178,7 +179,7 @@ impl BoundedTextureLru {
             if let Some(stale_key) = self.order.remove(idx) {
                 if let Some(old_rec) = self.map.remove(&stale_key) {
                     if let TextureSlot::Ready(old_img) = old_rec.slot {
-                        if protect_ptr.is_none_or(|p| !Arc::ptr_eq(&old_img, p)) {
+                        if protect_ptr.is_none_or(|p| !std::ptr::eq(Arc::as_ptr(&old_img), p)) {
                             evicted.push(old_img);
                         }
                     }

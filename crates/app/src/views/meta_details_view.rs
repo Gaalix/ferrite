@@ -383,7 +383,7 @@ impl AppShell {
                                             .flex()
                                             .flex_col()
                                             .gap(px(24.0))
-                                            .child(self.render_back_button(cx))
+                                            .child(Self::render_back_button(cx))
                                             .child(
                                                 div()
                                                     .flex()
@@ -794,7 +794,7 @@ impl AppShell {
                         .flex()
                         .flex_col()
                         .gap(px(20.0))
-                        .child(self.render_back_button(cx))
+                        .child(Self::render_back_button(cx))
                         .child(
                             div()
                                 .p(px(32.0))
@@ -882,7 +882,7 @@ impl AppShell {
                                             .flex()
                                             .flex_col()
                                             .gap(px(24.0))
-                                            .child(self.render_back_button(cx))
+                                            .child(Self::render_back_button(cx))
                                             .child(
                                                 div()
                                                     .flex()
@@ -1035,7 +1035,7 @@ impl AppShell {
             .into_any_element()
     }
 
-    fn render_back_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_back_button(cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().child(
             div()
                 .id("btn-details-back")

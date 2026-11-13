@@ -265,6 +265,30 @@ pub fn is_allowed_stream_source(stream: &Stream) -> bool {
     }
 }
 
+/// Returns `true` only for stream sources that the in-app `libmpv` player can
+/// play directly (torrents routed through `StreamEngine`, or direct HTTP/HTTPS media URLs),
+/// rejecting browser-only embeds (`External`, `PlayerFrame`, `YouTube`), `magnet:`, and archives/NZBs.
+pub fn is_native_playable_stream(stream: &Stream) -> bool {
+    if !is_allowed_stream_source(stream) {
+        return false;
+    }
+    match &stream.source {
+        StreamSource::Torrent { .. } => true,
+        StreamSource::Url { url } => {
+            matches!(url.scheme(), "http" | "https")
+        }
+        StreamSource::YouTube { .. }
+        | StreamSource::PlayerFrame { .. }
+        | StreamSource::External { .. }
+        | StreamSource::Rar { .. }
+        | StreamSource::Zip { .. }
+        | StreamSource::Zip7 { .. }
+        | StreamSource::Tgz { .. }
+        | StreamSource::Tar { .. }
+        | StreamSource::Nzb { .. } => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedStream {
     pub resolution: Resolution,
@@ -1581,24 +1605,23 @@ mod tests {
             .with_resolution(Resolution::Uhd4k)
             .with_resolution(Resolution::Fhd1080p)
             .only_hdr();
-        let m2: Vec<_> = all
-            .iter()
-            .copied()
-            .filter(|s| s.matches(&f_4k_or_1080_hdr))
-            .collect();
         assert_eq!(
-            m2.len(),
+            all.iter()
+                .copied()
+                .filter(|s| s.matches(&f_4k_or_1080_hdr))
+                .count(),
             3,
             "should match Torrentio 4K HDR, Comet 4K HDR, and WebStreamr 1080p HDR, excluding 1080p SDR"
         );
 
         let f_multi_addon = f_4k_or_1080_hdr.with_addon_sources(["comet", "WebStreamr"]);
-        let m3: Vec<_> = all
-            .iter()
-            .copied()
-            .filter(|s| s.matches(&f_multi_addon))
-            .collect();
-        assert_eq!(m3.len(), 2);
+        assert_eq!(
+            all.iter()
+                .copied()
+                .filter(|s| s.matches(&f_multi_addon))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1692,5 +1715,57 @@ mod tests {
         assert_eq!(estimate_bitrate_mbps(Some(1_000_000), Some(0)), None);
         assert_eq!(format_bitrate_mbps(0.0), "");
         assert_eq!(format_bitrate_mbps(f64::NAN), "");
+    }
+
+    #[test]
+    fn is_native_playable_stream_filters_external_and_archive_sources() {
+        let http_stream = make_stream_with_url(
+            "https://cdn.example.com/video.mkv",
+            Some("Direct"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(is_native_playable_stream(&http_stream));
+
+        let torrent_stream = Stream {
+            source: StreamSource::Torrent {
+                info_hash: [0x11; 20],
+                file_idx: Some(0),
+                announce: vec![],
+                file_must_include: vec![],
+            },
+            name: Some("Torrentio".to_owned()),
+            description: None,
+            thumbnail: None,
+            subtitles: vec![],
+            behavior_hints: Default::default(),
+        };
+        assert!(is_native_playable_stream(&torrent_stream));
+
+        let external_peario: Stream = serde_json::from_value(serde_json::json!({
+            "externalUrl": "https://peario.xyz/view?id=123",
+            "name": "Peario"
+        }))
+        .unwrap();
+        assert!(!is_native_playable_stream(&external_peario));
+
+        let yt_stream: Stream = serde_json::from_value(serde_json::json!({
+            "ytId": "dQw4w9WgXcQ",
+            "name": "YouTube Trailer"
+        }))
+        .unwrap();
+        assert!(!is_native_playable_stream(&yt_stream));
+
+        let magnet_stream = make_stream_with_url(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Test",
+            Some("Magnet"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!is_native_playable_stream(&magnet_stream));
     }
 }

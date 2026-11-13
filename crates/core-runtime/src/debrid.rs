@@ -1335,12 +1335,12 @@ pub fn select_best_video_file(
     };
 
     if let Some((season, episode)) = season_episode {
-        let ep_matches: Vec<&TorrentFileCandidate> = pool
+        if let Some(best_ep) = pool
             .iter()
             .copied()
             .filter(|f| matches_season_episode(&f.path, season, episode))
-            .collect();
-        if let Some(best_ep) = ep_matches.into_iter().max_by_key(|f| f.size_bytes) {
+            .max_by_key(|f| f.size_bytes)
+        {
             return Some(best_ep);
         }
     }

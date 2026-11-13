@@ -636,12 +636,12 @@ async fn stream_torrent_file(
         .map_err(|e| ApiHttpError::internal(format!("Failed building stream response: {e}")))
 }
 
-fn map_opensubhash_err(err: OpensubHashError) -> ApiHttpError {
+fn map_opensubhash_err(err: &OpensubHashError) -> ApiHttpError {
     match err {
         OpensubHashError::FileTooSmall(_) | OpensubHashError::InvalidTarget(_) => {
             ApiHttpError::bad_request(err.to_string())
         }
-        OpensubHashError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+        OpensubHashError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
             ApiHttpError::not_found("File not found")
         }
         OpensubHashError::Io(_) => ApiHttpError::internal("Failed reading local stream file"),
@@ -727,7 +727,7 @@ async fn get_opensubhash(
             .map_err(|_| ApiHttpError::bad_request("Invalid HTTP URL parameter"))?;
         compute_opensubhash_http(&state.http_client, &parsed)
             .await
-            .map_err(map_opensubhash_err)?
+            .map_err(|e| map_opensubhash_err(&e))?
     } else if trimmed.starts_with("file://") {
         let parsed = Url::parse(trimmed)
             .map_err(|_| ApiHttpError::bad_request("Invalid file URL parameter"))?;
@@ -737,7 +737,7 @@ async fn get_opensubhash(
         let confined = resolve_confined_local_opensubhash_path(&state, &local_path).await?;
         compute_opensubhash_path(&confined)
             .await
-            .map_err(map_opensubhash_err)?
+            .map_err(|e| map_opensubhash_err(&e))?
     } else {
         if let Some((scheme, _)) = trimmed.split_once("://") {
             if !scheme.is_empty()
@@ -753,7 +753,7 @@ async fn get_opensubhash(
         let confined = resolve_confined_local_opensubhash_path(&state, FsPath::new(trimmed)).await?;
         compute_opensubhash_path(&confined)
             .await
-            .map_err(map_opensubhash_err)?
+            .map_err(|e| map_opensubhash_err(&e))?
     };
 
     Ok(Json(OpensubHashResponse { result }))

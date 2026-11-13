@@ -1108,7 +1108,7 @@ mod tests {
 
         // Smooth 60Hz frame advance updates position atomic without re-syncing backend.
         meta.position_secs = 120.05;
-        controller.sync_state(meta.clone());
+        controller.sync_state(meta);
         assert_eq!(
             controller.latest_position_us.load(Ordering::Relaxed),
             120_050_000

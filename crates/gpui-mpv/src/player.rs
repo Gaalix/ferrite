@@ -1,12 +1,15 @@
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr;
 use std::ffi::CString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(target_os = "windows")]
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
@@ -16,10 +19,11 @@ use crate::dcomp::DCompBackendMode;
 #[cfg(target_os = "windows")]
 use crate::dcomp::{parse_swapchain_ptr_str, WindowsDCompUnderlay};
 #[cfg(target_os = "windows")]
-use crate::mpv_ffi::{mpv_free, mpv_get_property, MPV_EVENT_VIDEO_RECONFIG};
+use crate::mpv_ffi::{mpv_free, MPV_EVENT_VIDEO_RECONFIG};
 use crate::mpv_ffi::{
     self, error_to_string, mpv_command_async, mpv_create, mpv_error_string, mpv_event_end_file,
-    mpv_event_log_message, mpv_event_property, mpv_handle, mpv_initialize, mpv_node,
+    mpv_event_log_message, mpv_event_property, mpv_free_node_contents, mpv_get_property,
+    mpv_handle, mpv_initialize, mpv_node,
     mpv_observe_property, mpv_render_context, mpv_render_context_create, mpv_render_context_free,
     mpv_render_context_render, mpv_render_context_report_swap,
     mpv_render_context_set_update_callback, mpv_render_context_update, mpv_render_param,
@@ -374,6 +378,8 @@ pub struct MediaTrack {
     pub codec: Option<String>,
     pub selected: bool,
     pub external: bool,
+    pub forced: bool,
+    pub default: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -720,6 +726,14 @@ pub(crate) unsafe fn parse_track_list_node(node: &mpv_node) -> Vec<MediaTrack> {
             .map_get("external")
             .and_then(|n| n.as_bool())
             .unwrap_or(false);
+        let forced = entry
+            .map_get("forced")
+            .and_then(|n| n.as_bool())
+            .unwrap_or(false);
+        let default = entry
+            .map_get("default")
+            .and_then(|n| n.as_bool())
+            .unwrap_or(false);
 
         tracks.push(MediaTrack {
             id,
@@ -729,6 +743,8 @@ pub(crate) unsafe fn parse_track_list_node(node: &mpv_node) -> Vec<MediaTrack> {
             codec,
             selected,
             external,
+            forced,
+            default,
         });
     }
     tracks
@@ -878,11 +894,13 @@ struct PendingSub {
     source: PendingSubSource,
     title: Option<String>,
     lang: Option<String>,
+    select: bool,
 }
 
 #[derive(Default)]
 struct PendingMediaQueue {
     render_ready: bool,
+    file_loaded: bool,
     load: Option<PendingLoad>,
     subs: Vec<PendingSub>,
 }
@@ -1062,7 +1080,7 @@ struct MpvControllerInner {
     observer: Arc<ObserverShared>,
     event_rx_template: async_channel::Receiver<PlayerEvent>,
     viewport_cache: Arc<Mutex<ViewportState>>,
-    pending_media: Mutex<PendingMediaQueue>,
+    pending_media: Arc<Mutex<PendingMediaQueue>>,
     persisted: Mutex<PersistedSettings>,
     failed_target: Mutex<Option<RenderTargetKey>>,
     render_worker: Mutex<Option<ActiveRenderWorker>>,
@@ -1082,6 +1100,7 @@ impl MpvControllerInner {
 
         if let Ok(mut q) = self.pending_media.lock() {
             q.render_ready = false;
+            q.file_loaded = false;
             q.load = None;
             q.subs.clear();
             q.subs.shrink_to_fit();
@@ -1320,24 +1339,38 @@ impl MpvController {
             #[cfg(target_os = "windows")]
             let viewport_cache_clone = Arc::clone(&viewport_cache);
 
-            let event_join = thread::Builder::new()
-                .name("ferrite-mpv-events".into())
-                .spawn(move || {
-                    #[cfg(target_os = "windows")]
-                    run_event_loop(mpv_ptr, observer_clone, dcomp_clone, viewport_cache_clone);
-                    #[cfg(not(target_os = "windows"))]
-                    run_event_loop(mpv_ptr, observer_clone);
-                })
-                .map_err(|e| {
-                    mpv_terminate_destroy(mpv);
-                    MpvError::Init(format!("failed to spawn mpv event thread: {e}"))
-                })?;
-
             let uses_libmpv_vo = active_vo == "libmpv";
             #[cfg(target_os = "windows")]
             let defer_media_until_attach = uses_libmpv_vo || win_sel.defer_media_until_attach;
             #[cfg(not(target_os = "windows"))]
             let defer_media_until_attach = uses_libmpv_vo;
+
+            let pending_media = Arc::new(Mutex::new(PendingMediaQueue {
+                render_ready: !defer_media_until_attach,
+                file_loaded: false,
+                load: None,
+                subs: Vec::new(),
+            }));
+            let pending_media_clone = Arc::clone(&pending_media);
+
+            let event_join = thread::Builder::new()
+                .name("ferrite-mpv-events".into())
+                .spawn(move || {
+                    #[cfg(target_os = "windows")]
+                    run_event_loop(
+                        mpv_ptr,
+                        observer_clone,
+                        pending_media_clone,
+                        dcomp_clone,
+                        viewport_cache_clone,
+                    );
+                    #[cfg(not(target_os = "windows"))]
+                    run_event_loop(mpv_ptr, observer_clone, pending_media_clone);
+                })
+                .map_err(|e| {
+                    mpv_terminate_destroy(mpv);
+                    MpvError::Init(format!("failed to spawn mpv event thread: {e}"))
+                })?;
 
             ACTIVE_MPV_INSTANCES.fetch_add(1, Ordering::AcqRel);
             let inner = Arc::new(MpvControllerInner {
@@ -1349,11 +1382,7 @@ impl MpvController {
                 observer,
                 event_rx_template,
                 viewport_cache,
-                pending_media: Mutex::new(PendingMediaQueue {
-                    render_ready: !defer_media_until_attach,
-                    load: None,
-                    subs: Vec::new(),
-                }),
+                pending_media,
                 persisted: Mutex::new(PersistedSettings::default()),
                 failed_target: Mutex::new(None),
                 render_worker: Mutex::new(None),
@@ -1881,13 +1910,14 @@ impl MpvController {
                 .pending_media
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            q.file_loaded = false;
+            q.subs.clear();
             if !q.render_ready {
                 q.load = Some(PendingLoad {
                     url: clean_url.to_owned(),
                     start_time_secs: start_secs,
                     sub_delay_secs,
                 });
-                q.subs.clear();
                 return Ok(());
             }
         }
@@ -1931,7 +1961,16 @@ impl MpvController {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             q.render_ready = true;
-            (q.load.take(), core::mem::take(&mut q.subs))
+            let load = q.load.take();
+            if load.is_some() {
+                q.file_loaded = false;
+                // Keep queued subtitles until MPV_EVENT_FILE_LOADED fires for `load`.
+                (load, Vec::new())
+            } else if q.file_loaded {
+                (None, core::mem::take(&mut q.subs))
+            } else {
+                (None, Vec::new())
+            }
         };
 
         if let Some(load) = pending_load {
@@ -1948,6 +1987,7 @@ impl MpvController {
                         &url,
                         sub.title.as_deref(),
                         sub.lang.as_deref(),
+                        sub.select,
                     )?;
                 }
                 PendingSubSource::LocalFile(path) => {
@@ -1955,6 +1995,7 @@ impl MpvController {
                         &path,
                         sub.title.as_deref(),
                         sub.lang.as_deref(),
+                        sub.select,
                     )?;
                 }
             }
@@ -1964,6 +2005,7 @@ impl MpvController {
 
     pub fn stop(&self) -> Result<(), MpvError> {
         if let Ok(mut q) = self.inner.pending_media.lock() {
+            q.file_loaded = false;
             q.load = None;
             q.subs.clear();
         }
@@ -2038,16 +2080,17 @@ impl MpvController {
                 .pending_media
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !q.render_ready {
+            if !q.render_ready || !q.file_loaded || q.load.is_some() {
                 q.subs.push(PendingSub {
                     source: PendingSubSource::RemoteUrl(clean_url.to_owned()),
                     title: title.map(str::to_owned),
                     lang: lang.map(str::to_owned),
+                    select: false,
                 });
                 return Ok(());
             }
         }
-        self.dispatch_add_subtitle_now(clean_url, title, lang)
+        self.dispatch_add_subtitle_now(clean_url, title, lang, false)
     }
 
     /// Safely validates and loads a local `.srt`/`.ass`/`.ssa`/`.vtt`/`.sub` subtitle file via `sub-add <path> auto`.
@@ -2057,6 +2100,17 @@ impl MpvController {
         title: Option<&str>,
         lang: Option<&str>,
     ) -> Result<(), MpvError> {
+        self.add_local_subtitle_file_selected(path, title, lang, false)
+    }
+
+    /// Safely validates and loads a local subtitle file with explicit `select` vs `auto` mode.
+    pub fn add_local_subtitle_file_selected(
+        &self,
+        path: &Path,
+        title: Option<&str>,
+        lang: Option<&str>,
+        select: bool,
+    ) -> Result<(), MpvError> {
         let canonical = validate_local_subtitle_path(path)?;
         {
             let mut q = self
@@ -2064,16 +2118,26 @@ impl MpvController {
                 .pending_media
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !q.render_ready {
+            if !q.render_ready || !q.file_loaded || q.load.is_some() {
                 q.subs.push(PendingSub {
                     source: PendingSubSource::LocalFile(canonical),
                     title: title.map(str::to_owned),
                     lang: lang.map(str::to_owned),
+                    select,
                 });
                 return Ok(());
             }
         }
-        self.dispatch_add_local_subtitle_now(&canonical, title, lang)
+        self.dispatch_add_local_subtitle_now(&canonical, title, lang, select)
+    }
+
+    /// Removes an existing external/native subtitle track by its mpv track ID.
+    pub fn remove_subtitle_track(&self, track_id: i64) -> Result<(), MpvError> {
+        if track_id <= 0 {
+            return Ok(());
+        }
+        let id_str = track_id.to_string();
+        self.command_async(&["sub-remove", &id_str])
     }
 
     fn dispatch_add_subtitle_now(
@@ -2081,16 +2145,18 @@ impl MpvController {
         url: &str,
         title: Option<&str>,
         lang: Option<&str>,
+        select: bool,
     ) -> Result<(), MpvError> {
         let clean_url = validate_stream_url(url)?;
+        let mode = if select { "select" } else { "auto" };
         let t = title.unwrap_or("");
         let l = lang.unwrap_or("");
         if !l.is_empty() {
-            self.command_async(&["sub-add", clean_url, "select", t, l])
+            self.command_async(&["sub-add", clean_url, mode, t, l])
         } else if !t.is_empty() {
-            self.command_async(&["sub-add", clean_url, "select", t])
+            self.command_async(&["sub-add", clean_url, mode, t])
         } else {
-            self.command_async(&["sub-add", clean_url, "select"])
+            self.command_async(&["sub-add", clean_url, mode])
         }
     }
 
@@ -2099,19 +2165,21 @@ impl MpvController {
         path: &Path,
         title: Option<&str>,
         lang: Option<&str>,
+        select: bool,
     ) -> Result<(), MpvError> {
         let canonical = validate_local_subtitle_path(path)?;
         let path_str = canonical.to_str().ok_or_else(|| {
             MpvError::Command("rejected non-UTF-8 canonical local subtitle path".into())
         })?;
+        let mode = if select { "select" } else { "auto" };
         let t = title.unwrap_or("");
         let l = lang.unwrap_or("");
         if !l.is_empty() {
-            self.command_async(&["sub-add", path_str, "auto", t, l])
+            self.command_async(&["sub-add", path_str, mode, t, l])
         } else if !t.is_empty() {
-            self.command_async(&["sub-add", path_str, "auto", t])
+            self.command_async(&["sub-add", path_str, mode, t])
         } else {
-            self.command_async(&["sub-add", path_str, "auto"])
+            self.command_async(&["sub-add", path_str, mode])
         }
     }
 
@@ -2685,6 +2753,25 @@ unsafe fn observe_all_properties(mpv: *mut mpv_handle) -> Result<(), MpvError> {
     Ok(())
 }
 
+unsafe fn read_track_list_now(mpv: *mut mpv_handle) -> Vec<MediaTrack> {
+    if mpv.is_null() {
+        return Vec::new();
+    }
+    let mut node: mpv_node = core::mem::zeroed();
+    let rc = mpv_get_property(
+        mpv,
+        c"track-list".as_ptr(),
+        MPV_FORMAT_NODE,
+        &mut node as *mut mpv_node as *mut c_void,
+    );
+    if rc < 0 {
+        return Vec::new();
+    }
+    let tracks = parse_track_list_node(&node);
+    mpv_free_node_contents(&mut node);
+    tracks
+}
+
 #[cfg(target_os = "windows")]
 unsafe fn read_display_swapchain_ptr(mpv: *mut mpv_handle) -> usize {
     let mut out_ptr: *mut c_char = ptr::null_mut();
@@ -2704,9 +2791,62 @@ unsafe fn read_display_swapchain_ptr(mpv: *mut mpv_handle) -> usize {
     }
 }
 
+unsafe fn send_command_async_raw(mpv: *mut mpv_handle, args: &[&str]) -> Result<(), MpvError> {
+    if mpv.is_null() {
+        return Ok(());
+    }
+    let mut c_strings = Vec::with_capacity(args.len());
+    for &arg in args {
+        c_strings.push(
+            CString::new(arg)
+                .map_err(|_| MpvError::Command("command argument contains interior NUL".into()))?,
+        );
+    }
+    let mut ptrs: Vec<*const c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
+    ptrs.push(ptr::null());
+    let rc = mpv_command_async(mpv, 0, ptrs.as_ptr());
+    if rc < 0 {
+        let cmd_name = args.first().copied().unwrap_or("unknown");
+        Err(MpvError::Command(format!(
+            "mpv_command_async({cmd_name}) failed: {}",
+            error_to_string(rc)
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn send_pending_sub_on_handle(mpv: *mut mpv_handle, sub: &PendingSub) {
+    let mode = if sub.select { "select" } else { "auto" };
+    let t = sub.title.as_deref().unwrap_or("");
+    let l = sub.lang.as_deref().unwrap_or("");
+    let target_res: Result<String, MpvError> = match &sub.source {
+        PendingSubSource::RemoteUrl(url) => validate_stream_url(url).map(str::to_owned),
+        PendingSubSource::LocalFile(path) => validate_local_subtitle_path(path).and_then(|p| {
+            p.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| MpvError::Command("non-UTF-8 local subtitle path".into()))
+        }),
+    };
+    let Ok(target) = target_res else {
+        return;
+    };
+    let res = if !l.is_empty() {
+        send_command_async_raw(mpv, &["sub-add", &target, mode, t, l])
+    } else if !t.is_empty() {
+        send_command_async_raw(mpv, &["sub-add", &target, mode, t])
+    } else {
+        send_command_async_raw(mpv, &["sub-add", &target, mode])
+    };
+    if let Err(err) = res {
+        tracing::warn!(target: "gpui_mpv::libmpv", "deferred sub-add failed: {err}");
+    }
+}
+
 fn run_event_loop(
     mpv: RawMpvPtr,
     observer: Arc<ObserverShared>,
+    pending_media: Arc<Mutex<PendingMediaQueue>>,
     #[cfg(target_os = "windows")] dcomp: Arc<WindowsDCompCoordinator>,
     #[cfg(target_os = "windows")] viewport_cache: Arc<Mutex<ViewportState>>,
 ) {
@@ -2759,6 +2899,9 @@ fn run_event_loop(
                 }
             }
             MPV_EVENT_START_FILE => {
+                if let Ok(mut q) = pending_media.lock() {
+                    q.file_loaded = false;
+                }
                 let mut snap = observer
                     .snapshot
                     .write()
@@ -2767,6 +2910,7 @@ fn run_event_loop(
                 snap.buffering = true;
                 snap.cache_speed_bytes = 0;
                 snap.video_format.clear();
+                snap.tracks.clear();
                 let cloned = snap.clone();
                 drop(snap);
                 let _ = observer.watch_tx.send(cloned.clone());
@@ -2775,14 +2919,41 @@ fn run_event_loop(
                     .try_send(PlayerEvent::SnapshotChanged(cloned));
             }
             MPV_EVENT_FILE_LOADED | MPV_EVENT_PLAYBACK_RESTART => {
+                let is_file_loaded = ev.event_id == MPV_EVENT_FILE_LOADED;
+                let loaded_tracks = if is_file_loaded {
+                    let queued_subs = {
+                        let mut q = pending_media.lock().unwrap_or_else(|e| e.into_inner());
+                        if q.load.is_none() {
+                            q.file_loaded = true;
+                            core::mem::take(&mut q.subs)
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    for sub in queued_subs {
+                        unsafe {
+                            send_pending_sub_on_handle(mpv.0, &sub);
+                        }
+                    }
+                    Some(unsafe { read_track_list_now(mpv.0) })
+                } else {
+                    None
+                };
                 {
                     let mut snap = observer
                         .snapshot
                         .write()
                         .unwrap_or_else(|e| e.into_inner());
                     let new_buf = paused_for_cache || seeking;
-                    if snap.buffering != new_buf {
-                        snap.buffering = new_buf;
+                    let mut changed = snap.buffering != new_buf;
+                    snap.buffering = new_buf;
+                    if let Some(tracks) = loaded_tracks {
+                        if snap.tracks != tracks {
+                            snap.tracks = tracks;
+                            changed = true;
+                        }
+                    }
+                    if changed {
                         let cloned = snap.clone();
                         drop(snap);
                         let _ = observer.watch_tx.send(cloned.clone());
@@ -2791,7 +2962,7 @@ fn run_event_loop(
                             .try_send(PlayerEvent::SnapshotChanged(cloned));
                     }
                 }
-                if ev.event_id == MPV_EVENT_FILE_LOADED {
+                if is_file_loaded {
                     let _ = observer.event_tx.try_send(PlayerEvent::FileLoaded);
                 }
             }
@@ -2806,6 +2977,9 @@ fn run_event_loop(
                 }
             }
             MPV_EVENT_END_FILE => {
+                if let Ok(mut q) = pending_media.lock() {
+                    q.file_loaded = false;
+                }
                 if !ev.data.is_null() {
                     let end = unsafe { *(ev.data as *const mpv_event_end_file) };
                     let eof = end.reason == MPV_END_FILE_REASON_EOF;
@@ -3465,6 +3639,259 @@ fn run_software_render_loop(
     }
 }
 
+const MAX_AUDIO_PROBE_PCM_BYTES: usize = 8_000 * 2 * 100;
+
+static AUDIO_PROBE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct TempPcmGuard(PathBuf);
+
+impl Drop for TempPcmGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn decode_pcm_s16le_bytes(bytes: &[u8]) -> Vec<i16> {
+    let aligned = bytes.len() & !1;
+    let mut out = Vec::with_capacity(aligned / 2);
+    let (chunks, _) = bytes[..aligned].as_chunks::<2>();
+    for chunk in chunks {
+        out.push(i16::from_le_bytes(*chunk));
+    }
+    out
+}
+
+fn extract_audio_pcm_via_ffmpeg(
+    clean_url: &str,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Result<Vec<i16>, MpvError> {
+    const FFMPEG_PROBE_WALL_TIMEOUT: Duration = Duration::from_secs(6);
+    let start_arg = format!("{start_secs:.2}");
+    let dur_arg = format!("{duration_secs:.2}");
+    let mut child = Command::new("ffmpeg")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .args([
+            "-nostdin",
+            "-nostats",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            "1",
+            "-rw_timeout",
+            "5000000",
+            "-accurate_seek",
+            "-ss",
+            &start_arg,
+            "-i",
+            clean_url,
+            "-t",
+            &dur_arg,
+            "-vn",
+            "-sn",
+            "-dn",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ])
+        .spawn()
+        .map_err(|err| MpvError::Command(format!("ffmpeg probe spawn failed: {err}")))?;
+
+    let stdout = child.stdout.take();
+    let deadline = Instant::now() + FFMPEG_PROBE_WALL_TIMEOUT;
+    let mut timed_out = false;
+    let mut exit_status = None;
+    let raw_bytes = thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(stdout) = stdout {
+                let _ = stdout
+                    .take(MAX_AUDIO_PROBE_PCM_BYTES as u64)
+                    .read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exit_status = Some(status);
+                    break;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        timed_out = true;
+                        let _ = child.kill();
+                        exit_status = child.wait().ok();
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(15));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    exit_status = child.wait().ok();
+                    break;
+                }
+            }
+        }
+
+        reader.join().unwrap_or_default()
+    });
+
+    if timed_out {
+        return Err(MpvError::Command(
+            "ffmpeg audio probe timed out after 6s".into(),
+        ));
+    }
+    let samples = decode_pcm_s16le_bytes(&raw_bytes);
+    if samples.len() < 8_000 {
+        return Err(MpvError::Command(format!(
+            "ffmpeg audio probe returned insufficient PCM samples ({}, exit={exit_status:?})",
+            samples.len()
+        )));
+    }
+    Ok(samples)
+}
+
+fn extract_audio_pcm_via_libmpv(
+    clean_url: &str,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Result<Vec<i16>, MpvError> {
+    let seq = AUDIO_PROBE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = std::env::temp_dir().join(format!(
+        "ferrite_audio_probe_{}_{seq}.pcm",
+        std::process::id()
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .and_then(|_| {
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            });
+    }
+    let _guard = TempPcmGuard(tmp_path.clone());
+    let tmp_path_str = tmp_path
+        .to_str()
+        .ok_or_else(|| MpvError::Init("non-UTF-8 temp PCM path".into()))?;
+
+    unsafe {
+        mpv_ffi::ensure_mpv_loaded().map_err(MpvError::Init)?;
+        mpv_ffi::set_c_numeric_locale();
+        let mpv = mpv_create();
+        if mpv.is_null() {
+            return Err(MpvError::Init("mpv_create failed for audio probe".into()));
+        }
+
+        let start_opt = format!("{start_secs:.2}");
+        let len_opt = format!("{duration_secs:.2}");
+        let opts: &[(&str, &str)] = &[
+            ("vid", "no"),
+            ("sid", "no"),
+            ("ytdl", "no"),
+            ("terminal", "no"),
+            ("untimed", "yes"),
+            ("audio-channels", "mono"),
+            ("audio-samplerate", "8000"),
+            ("audio-format", "s16"),
+            ("ao", "pcm"),
+            ("ao-pcm-waveheader", "no"),
+            ("ao-pcm-file", tmp_path_str),
+            ("start", &start_opt),
+            ("length", &len_opt),
+        ];
+        for &(k, v) in opts {
+            if let Err(err) = set_option_str(mpv, k, v) {
+                mpv_terminate_destroy(mpv);
+                return Err(err);
+            }
+        }
+        if mpv_initialize(mpv) < 0 {
+            mpv_terminate_destroy(mpv);
+            return Err(MpvError::Init("mpv_initialize failed for audio probe".into()));
+        }
+        if let Err(err) = send_command_async_raw(mpv, &["loadfile", clean_url, "replace"]) {
+            mpv_terminate_destroy(mpv);
+            return Err(err);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            let ev_ptr = mpv_wait_event(mpv, 0.2);
+            if ev_ptr.is_null() {
+                continue;
+            }
+            let ev = *ev_ptr;
+            if ev.event_id == MPV_EVENT_END_FILE || ev.event_id == MPV_EVENT_SHUTDOWN {
+                break;
+            }
+        }
+        mpv_terminate_destroy(mpv);
+    }
+
+    let mut file = std::fs::File::open(&tmp_path)
+        .map_err(|err| MpvError::Command(format!("failed to read libmpv PCM output: {err}")))?;
+    let mut raw_bytes = Vec::new();
+    let _ = (&mut file)
+        .take(MAX_AUDIO_PROBE_PCM_BYTES as u64)
+        .read_to_end(&mut raw_bytes);
+    let samples = decode_pcm_s16le_bytes(&raw_bytes);
+    if samples.len() < 8_000 {
+        return Err(MpvError::Command(format!(
+            "libmpv audio probe returned insufficient PCM samples ({})",
+            samples.len()
+        )));
+    }
+    Ok(samples)
+}
+
+/// Extracts bounded mono `8 kHz` `s16le` PCM audio directly from a validated HTTP/HTTPS media stream.
+pub fn extract_audio_pcm_s16le_8khz(
+    stream_url: &str,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Result<Vec<i16>, MpvError> {
+    let clean_url = validate_stream_url(stream_url)?;
+    if clean_url.starts_with('-') {
+        return Err(MpvError::Command(
+            "rejected stream URL starting with '-'".into(),
+        ));
+    }
+    let clean_start = if start_secs.is_finite() {
+        start_secs.max(0.0)
+    } else {
+        0.0
+    };
+    let clean_duration = if duration_secs.is_finite() {
+        duration_secs.clamp(5.0, 95.0)
+    } else {
+        60.0
+    };
+
+    match extract_audio_pcm_via_ffmpeg(clean_url, clean_start, clean_duration) {
+        Ok(samples) => Ok(samples),
+        Err(ffmpeg_err) => {
+            extract_audio_pcm_via_libmpv(clean_url, clean_start, clean_duration).map_err(|mpv_err| {
+                MpvError::Command(format!("{ffmpeg_err}; fallback failed: {mpv_err}"))
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3812,6 +4239,8 @@ mod tests {
                     codec: Some("truehd".into()),
                     selected: true,
                     external: false,
+                    forced: false,
+                    default: false,
                 }]
             );
         }
@@ -4297,5 +4726,158 @@ mod tests {
         ctrl.shutdown_blocking();
 
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn extract_audio_pcm_rejects_disallowed_urls_before_spawning() {
+        assert!(extract_audio_pcm_s16le_8khz("file:///etc/passwd", 10.0, 30.0).is_err());
+        assert!(extract_audio_pcm_s16le_8khz("lavfi://aevalsrc=0", 10.0, 30.0).is_err());
+        assert!(extract_audio_pcm_s16le_8khz("-i", 10.0, 30.0).is_err());
+        assert!(extract_audio_pcm_s16le_8khz("/tmp/video.mkv", 10.0, 30.0).is_err());
+    }
+
+    #[test]
+    fn pending_media_queue_holds_subtitles_until_file_loaded() {
+        let ctrl = MpvController::new().expect("MpvController::new()");
+        ctrl.add_subtitle("https://subs.example.com/en.srt", Some("English"), Some("en"))
+            .expect("queued before render attach");
+        assert!(ctrl.add_subtitle("file:///bad.srt", None, None).is_err());
+        {
+            let q = ctrl.inner.pending_media.lock().unwrap();
+            assert!(!q.file_loaded);
+            assert_eq!(q.subs.len(), 1);
+            assert!(!q.subs[0].select);
+        }
+
+        ctrl.set_viewport_rect(0, 0, 320, 180, 1.0);
+        ctrl.attach_software_renderer()
+            .expect("attach software renderer");
+
+        // Still queued because MPV_EVENT_FILE_LOADED has not fired yet for any media file.
+        ctrl.add_subtitle("https://subs.example.com/es.srt", Some("Spanish"), Some("es"))
+            .expect("queued while file_loaded is false");
+        {
+            let q = ctrl.inner.pending_media.lock().unwrap();
+            assert!(q.render_ready);
+            assert!(!q.file_loaded);
+            assert_eq!(q.subs.len(), 2);
+        }
+        ctrl.shutdown_blocking();
+    }
+
+    #[test]
+    fn local_http_stream_loads_and_attaches_queued_local_subtitle_without_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Build a valid 1-second 8kHz mono PCM WAV payload in memory.
+        let sample_count = 8000u32;
+        let data_bytes = sample_count * 2;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        wav.resize(44 + data_bytes as usize, 0);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback HTTP server");
+        let port = listener.local_addr().unwrap().port();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop_flag);
+        let wav_arc = Arc::new(wav);
+        let server_thread = std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            while !stop_srv.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                        let mut req_buf = [0u8; 1024];
+                        let _ = stream.read(&mut req_buf);
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            wav_arc.len()
+                        );
+                        let _ = stream.write_all(hdr.as_bytes());
+                        let _ = stream.write_all(&wav_arc);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let sub_dir = std::env::temp_dir().join(format!(
+            "gpui_mpv_http_sub_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let srt_path = sub_dir.join("sync_test.srt");
+        std::fs::write(&srt_path, "1\n00:00:00,100 --> 00:00:00,900\nSynced line\n").unwrap();
+
+        let ctrl = MpvController::with_extra_options(&[("vo", "null"), ("ao", "null")])
+            .expect("headless mpv controller");
+        let rx = ctrl.subscribe_events();
+        ctrl.add_local_subtitle_file_selected(&srt_path, Some("English · Synced"), Some("eng"), true)
+            .expect("queue local subtitle before load_file");
+        let _ = ctrl.load_file(format!("http://127.0.0.1:{port}/clip.wav"), None);
+        // Re-enqueue right after load_file (same sequence as AppShell::load_url_into_active_session).
+        ctrl.add_local_subtitle_file_selected(&srt_path, Some("English · Synced"), Some("eng"), true)
+            .expect("queue local subtitle before FileLoaded");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_file_loaded = false;
+        let mut saw_sub_track = false;
+        while std::time::Instant::now() < deadline && !(saw_file_loaded && saw_sub_track) {
+            if let Ok(ev) = rx.try_recv() {
+                match ev {
+                    PlayerEvent::FileLoaded => saw_file_loaded = true,
+                    PlayerEvent::EndFile {
+                        error: Some(err_msg),
+                        ..
+                    } => panic!("unexpected mpv EndFile error: {err_msg}"),
+                    PlayerEvent::SnapshotChanged(snap)
+                        if snap
+                            .tracks
+                            .iter()
+                            .any(|t| {
+                                t.track_type == TrackType::Sub
+                                    && t.title.as_deref() == Some("English · Synced")
+                            }) =>
+                    {
+                        saw_sub_track = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !saw_sub_track
+                && ctrl
+                    .snapshot()
+                    .tracks
+                    .iter()
+                    .any(|t| t.track_type == TrackType::Sub && t.title.as_deref() == Some("English · Synced"))
+            {
+                saw_sub_track = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        assert!(saw_file_loaded, "expected PlayerEvent::FileLoaded");
+        assert!(saw_sub_track, "expected queued subtitle track to attach after FileLoaded");
+
+        ctrl.shutdown_blocking();
+        stop_flag.store(true, Ordering::Relaxed);
+        let _ = server_thread.join();
+        let _ = std::fs::remove_dir_all(&sub_dir);
     }
 }

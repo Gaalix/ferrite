@@ -157,7 +157,7 @@ impl AppShell {
                     .flex_col()
                     .gap(px(44.0))
                     .when(!has_any_content, |el| {
-                        el.child(self.render_empty_board_banner(cx))
+                        el.child(Self::render_empty_board_banner(cx))
                     })
                     .when(!cw_items.is_empty(), |el| {
                         el.child(self.render_continue_watching_section(&cw_items, cx))
@@ -591,7 +591,7 @@ impl AppShell {
             })
     }
 
-    fn render_empty_board_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_empty_board_banner(cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .p(px(36.0))
             .rounded(px(10.0))

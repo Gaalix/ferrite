@@ -58,6 +58,14 @@ tokio::task_local! {
 
 pub type DesktopEnvConfig = EnvConfig;
 
+pub fn is_loopback_streaming_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+        )
+}
+
 #[derive(Clone, Debug)]
 pub struct EnvConfig {
     pub storage_path: Option<PathBuf>,
@@ -865,9 +873,15 @@ impl DesktopEnv {
 
         let profile_was_empty = stored_profile.is_none();
         let mut profile = stored_profile.unwrap_or_default();
-        if profile_was_empty {
-            if let Some(override_url) = &env.streaming_server_url {
+        if let Some(override_url) = &env.streaming_server_url {
+            if (profile_was_empty
+                || is_loopback_streaming_url(&profile.settings.streaming_server_url))
+                && profile.settings.streaming_server_url != *override_url
+            {
                 profile.settings.streaming_server_url = override_url.clone();
+                if !profile_was_empty {
+                    let _ = Self::set_storage(PROFILE_STORAGE_KEY, Some(&profile)).await;
+                }
             }
         }
 

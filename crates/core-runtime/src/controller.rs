@@ -1159,6 +1159,20 @@ impl CoreController {
         self.dispatch_action(Action::Ctx(ActionCtx::UpdateSettings(settings)));
     }
 
+    /// Returns `true` when the loopback URL changed and triggered a server reload.
+    pub fn sync_loopback_streaming_server_url(&self, live_url: Url) -> bool {
+        let mut settings = self.with_model(|m| m.ctx.profile.settings.clone());
+        if crate::env::is_loopback_streaming_url(&settings.streaming_server_url)
+            && settings.streaming_server_url != live_url
+        {
+            settings.streaming_server_url = live_url;
+            self.update_profile_settings(settings);
+            self.reload_streaming_server();
+            return true;
+        }
+        false
+    }
+
     pub fn reload_streaming_server(&self) {
         self.dispatch(
             Action::StreamingServer(ActionStreamingServer::Reload),
@@ -1465,20 +1479,7 @@ impl CoreController {
             .map(|e| e.to_ascii_lowercase())
             .filter(|e| matches!(e.as_str(), "srt" | "ass" | "ssa" | "vtt"))
             .unwrap_or_else(|| "srt".to_owned());
-        let stem_raw = target_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("subtitle");
-        let sanitized_stem: String = stem_raw
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .take(40)
-            .collect();
-        let stem = if sanitized_stem.is_empty() {
-            "subtitle"
-        } else {
-            &sanitized_stem
-        };
+        let stem = aligned_output_stem(target_path);
         let out_path = self
             .native_subtitles
             .cache_dir()
@@ -1490,8 +1491,95 @@ impl CoreController {
             alignment.offset_ms,
             alignment.drift_ratio,
         )?;
+        let _ = crate::prune_subtitle_cache_dir(self.native_subtitles.cache_dir());
 
         Ok((out_path, alignment))
+    }
+
+    /// Evaluates candidate subtitle files against extracted speech windows, selects the best-matching
+    /// release/cut, rewrites timestamps when shifted (`|offset| >= 50ms` or PAL/NTSC drift), and
+    /// returns `(winning_index, final_path, alignment)`.
+    pub fn align_best_subtitle_to_audio(
+        &self,
+        candidate_paths: &[PathBuf],
+        fingerprint: &crate::subtitles::AudioSpeechFingerprint,
+    ) -> Result<(usize, PathBuf, SubtitleAlignmentResult), String> {
+        if candidate_paths.is_empty() {
+            return Err("No candidate subtitle paths provided for audio sync".to_owned());
+        }
+        if fingerprint.is_empty() {
+            return Err("Extracted audio fingerprint contained no speech windows".to_owned());
+        }
+
+        let mut best: Option<(usize, f64, SubtitleAlignmentResult)> = None;
+        for (idx, path) in candidate_paths.iter().enumerate() {
+            let Ok(cues) = SubtitleSyncAligner::parse_spoken_dialogue_file(path) else {
+                continue;
+            };
+            if cues.len() < 4 {
+                continue;
+            }
+            let align = SubtitleSyncAligner::align_cues_to_audio(&cues, fingerprint);
+            let rank_score = align.confidence - (idx as f64 * 0.004);
+            let replace = best
+                .as_ref()
+                .is_none_or(|(_, best_score, _)| rank_score > *best_score);
+            if replace {
+                best = Some((idx, rank_score, align));
+            }
+        }
+
+        let (best_idx, _, alignment) = best
+            .ok_or_else(|| "None of the candidate subtitles had enough dialogue cues to sync".to_owned())?;
+        let winner_path = &candidate_paths[best_idx];
+
+        let needs_rewrite =
+            alignment.offset_ms.abs() >= 50 || (alignment.drift_ratio - 1.0).abs() > 1e-4;
+        if !needs_rewrite {
+            return Ok((best_idx, winner_path.clone(), alignment));
+        }
+
+        let ext = winner_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .filter(|e| matches!(e.as_str(), "srt" | "ass" | "ssa" | "vtt"))
+            .unwrap_or_else(|| "srt".to_owned());
+        let stem = aligned_output_stem(winner_path);
+        let out_path = self
+            .native_subtitles
+            .cache_dir()
+            .join(format!("{stem}.audio_aligned.{ext}"));
+
+        SubtitleSyncAligner::write_aligned_subtitle_file(
+            winner_path,
+            &out_path,
+            alignment.offset_ms,
+            alignment.drift_ratio,
+        )?;
+        let _ = crate::prune_subtitle_cache_dir(self.native_subtitles.cache_dir());
+
+        Ok((best_idx, out_path, alignment))
+    }
+}
+
+fn aligned_output_stem(path: &Path) -> String {
+    let stem_raw = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("subtitle");
+    let stripped = stem_raw
+        .trim_end_matches(".audio_aligned")
+        .trim_end_matches(".aligned");
+    let sanitized: String = stripped
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(40)
+        .collect();
+    if sanitized.is_empty() {
+        "subtitle".to_owned()
+    } else {
+        sanitized
     }
 }
 

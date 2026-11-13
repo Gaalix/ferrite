@@ -137,7 +137,7 @@ impl AppShell {
                             )),
                     )
                     .child(if let Some((email, user_id)) = auth_user {
-                        self.render_authenticated_panel(email, user_id, cx)
+                        Self::render_authenticated_panel(email, user_id, cx)
                             .into_any_element()
                     } else {
                         self.render_unauthenticated_panels(link_code_state, link_data_state, cx)
@@ -147,7 +147,6 @@ impl AppShell {
     }
 
     fn render_authenticated_panel(
-        &self,
         email: String,
         user_id: String,
         cx: &mut Context<Self>,

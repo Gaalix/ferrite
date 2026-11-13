@@ -563,21 +563,44 @@ impl EngineInner {
         }
     }
 
+    async fn wait_handle_initialized(
+        &self,
+        info_hash: [u8; 20],
+        handle: Arc<ManagedTorrent>,
+    ) -> Result<Arc<ManagedTorrent>, routes::ApiHttpError> {
+        let timeout_dur = self.config.metadata_timeout;
+        tokio::time::timeout(timeout_dur, handle.wait_until_initialized())
+            .await
+            .map_err(|_| {
+                routes::ApiHttpError::timeout(format!(
+                    "Timed out after {:?} waiting for torrent metadata ({})",
+                    timeout_dur,
+                    hex::encode(info_hash)
+                ))
+            })?
+            .map_err(|e| map_torrent_init_err(&info_hash, e))?;
+        Ok(handle)
+    }
+
     pub async fn ensure_torrent_resolved(
         &self,
         info_hash: [u8; 20],
         extra_trackers: Vec<String>,
     ) -> Result<Arc<ManagedTorrent>, routes::ApiHttpError> {
+        let entry = self.get_or_insert_magnet_entry(info_hash, extra_trackers);
         if let Some(existing) = self.get_managed_torrent(&info_hash) {
-            return Ok(existing);
+            return self.wait_handle_initialized(info_hash, existing).await;
         }
 
-        let entry = self.get_or_insert_magnet_entry(info_hash, extra_trackers);
         let timeout_dur = self.config.metadata_timeout;
 
         let resolve_fut = async {
             let _guard = entry.resolve_lock.lock().await;
             if let Some(existing) = self.get_managed_torrent(&info_hash) {
+                existing
+                    .wait_until_initialized()
+                    .await
+                    .map_err(|e| map_torrent_init_err(&info_hash, e))?;
                 return Ok(existing);
             }
 
@@ -666,6 +689,11 @@ impl EngineInner {
                 routes::ApiHttpError::internal("librqbit returned ListOnly handle unexpectedly")
             })?;
 
+            handle
+                .wait_until_initialized()
+                .await
+                .map_err(|e| map_torrent_init_err(&info_hash, e))?;
+
             let stats = handle.stats();
             self.cache_tracker.record_or_touch(
                 info_hash,
@@ -706,13 +734,13 @@ impl EngineInner {
         if let Some(existing) = self.get_managed_torrent(&expected_hash) {
             let merged_trackers = self.merge_with_curated_trackers(trackers);
             let _ = self.get_or_insert_magnet_entry(expected_hash, merged_trackers);
-            let loc = self.cache_tracker.location_of(&expected_hash).unwrap_or(
+            let loc = self.cache_tracker.location_of(&expected_hash).unwrap_or_else(|| {
                 if self.cache_tracker.mode().is_ram_only() {
                     TorrentStorageLocation::Ram
                 } else {
                     TorrentStorageLocation::Disk
-                },
-            );
+                }
+            });
             let folder = self
                 .cache_tracker
                 .output_folder_of(&expected_hash)
@@ -1739,6 +1767,13 @@ impl StreamEngine {
             server_task: Arc::new(Mutex::new(Some(server_task))),
         })
     }
+}
+
+fn map_torrent_init_err(info_hash: &[u8; 20], e: impl std::fmt::Display) -> routes::ApiHttpError {
+    routes::ApiHttpError::bad_gateway(format!(
+        "Failed initializing torrent {}: {e:#}",
+        hex::encode(info_hash)
+    ))
 }
 
 #[derive(Clone)]

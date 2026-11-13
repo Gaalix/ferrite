@@ -1,10 +1,10 @@
 use std::{
-    cmp::Ordering,
+    collections::{HashMap, HashSet},
     fmt,
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicU64, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -31,18 +31,25 @@ pub const NATIVE_SUBTITLE_HTTP_TIMEOUT_MS: u64 = 2_800;
 pub const NATIVE_SUBTITLE_POOL_IDLE_SECS: u64 = 90;
 pub const MAX_SUBTITLE_ARCHIVE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_UNCOMPRESSED_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SUBTITLE_CACHE_FILES: usize = 48;
+pub const MAX_SUBTITLE_CACHE_BYTES: u64 = 6 * 1024 * 1024;
 
 const ALIGN_MAX_OFFSET_MS: i64 = 45_000;
 const ALIGN_BIN_MS: i64 = 50;
 const ALIGN_BIN_COUNT: usize = ((ALIGN_MAX_OFFSET_MS * 2) / ALIGN_BIN_MS) as usize + 3;
 const ALIGN_ONSET_TOLERANCE_MS: i64 = 250;
 const ALIGN_FINE_WINDOW_MS: i64 = 150;
-const ALIGN_DRIFT_CANDIDATES: [f64; 4] = [
+const ALIGN_DRIFT_CANDIDATES: [f64; 5] = [
     1.0,
+    24.0 / 23.976,
+    23.976 / 24.0,
     25.0 / 23.976,
     23.976 / 25.0,
-    24.0 / 23.976,
 ];
+pub const AUDIO_SAMPLE_RATE_HZ: usize = 8_000;
+pub const AUDIO_ENV_FRAME_MS: i64 = 20;
+const AUDIO_ENV_SAMPLES_PER_FRAME: usize = 160; // 20ms at 8 kHz
+const AUDIO_ALIGN_MAX_OFFSET_MS: i64 = 35_000;
 
 static TEMP_SUB_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -140,6 +147,75 @@ pub fn subtitle_lang_matches(a: &str, b: &str) -> bool {
     let na = normalize_subtitle_lang_code(a);
     let nb = normalize_subtitle_lang_code(b);
     !na.is_empty() && na == nb
+}
+
+/// Converts a raw ISO-639-1/2/regional subtitle tag (`"eng"`, `"pob"`, `"slv"`, `"pt-BR"`) into a clean human name.
+pub fn human_language_name(code: &str) -> String {
+    let cleaned = code.trim().to_ascii_lowercase().replace('_', "-");
+    if cleaned.is_empty() || cleaned == "und" || cleaned == "unknown" {
+        return "Unknown".to_owned();
+    }
+    match cleaned.as_str() {
+        "pob" | "pt-br" | "ptbr" | "pb" => return "Portuguese (BR)".to_owned(),
+        "pt-pt" => return "Portuguese (PT)".to_owned(),
+        "zh-tw" | "cht" | "zht" => return "Chinese (Trad.)".to_owned(),
+        "zh-cn" | "chs" | "zhs" => return "Chinese (Simp.)".to_owned(),
+        "es-la" | "es-419" | "spl" => return "Spanish (LatAm)".to_owned(),
+        _ => {}
+    }
+    match normalize_subtitle_lang_iso639_1(&cleaned) {
+        Some("en") => "English".to_owned(),
+        Some("sl") => "Slovenian".to_owned(),
+        Some("es") => "Spanish".to_owned(),
+        Some("fr") => "French".to_owned(),
+        Some("de") => "German".to_owned(),
+        Some("it") => "Italian".to_owned(),
+        Some("pt") => "Portuguese".to_owned(),
+        Some("ja") => "Japanese".to_owned(),
+        Some("ko") => "Korean".to_owned(),
+        Some("zh") => "Chinese".to_owned(),
+        Some("ru") => "Russian".to_owned(),
+        Some("nl") => "Dutch".to_owned(),
+        Some("pl") => "Polish".to_owned(),
+        Some("tr") => "Turkish".to_owned(),
+        Some("ar") => "Arabic".to_owned(),
+        Some("he") => "Hebrew".to_owned(),
+        Some("hi") => "Hindi".to_owned(),
+        Some("sv") => "Swedish".to_owned(),
+        Some("no") => "Norwegian".to_owned(),
+        Some("da") => "Danish".to_owned(),
+        Some("fi") => "Finnish".to_owned(),
+        Some("cs") => "Czech".to_owned(),
+        Some("hu") => "Hungarian".to_owned(),
+        Some("ro") => "Romanian".to_owned(),
+        Some("el") => "Greek".to_owned(),
+        Some("uk") => "Ukrainian".to_owned(),
+        Some("bg") => "Bulgarian".to_owned(),
+        Some("hr") => "Croatian".to_owned(),
+        Some("sr") => "Serbian".to_owned(),
+        Some("th") => "Thai".to_owned(),
+        Some("vi") => "Vietnamese".to_owned(),
+        Some("id") => "Indonesian".to_owned(),
+        Some("ms") => "Malay".to_owned(),
+        _ => code.trim().to_ascii_uppercase(),
+    }
+}
+
+/// Formats a compact badge like `"EN"`, `"PT-BR"`, or `"SL"` for bottom player pills.
+pub fn short_language_badge(code: &str) -> String {
+    let cleaned = code.trim().to_ascii_lowercase().replace('_', "-");
+    if matches!(cleaned.as_str(), "pob" | "pt-br" | "ptbr" | "pb") {
+        return "PT-BR".to_owned();
+    }
+    if let Some(iso1) = normalize_subtitle_lang_iso639_1(&cleaned) {
+        return iso1.to_ascii_uppercase();
+    }
+    let upper = code.trim().to_ascii_uppercase();
+    if upper.is_empty() {
+        "SUB".to_owned()
+    } else {
+        upper.chars().take(5).collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -695,11 +771,20 @@ impl NativeSubtitleClient {
                 .then_with(|| a.release_name.cmp(&b.release_name))
         });
 
-        let attempt_limit = max_downloads.saturating_mul(2).max(max_downloads);
-        let to_fetch: Vec<RankedSubtitleCandidate> =
-            candidates.into_iter().take(attempt_limit).collect();
+        let mut seen_downloads = HashSet::new();
+        candidates.retain(|cand| {
+            let key = match &cand.download {
+                ProviderDownloadSpec::DirectUrl(u) => u.clone(),
+                ProviderDownloadSpec::OpenSubtitlesFileId { file_id, .. } => {
+                    format!("os:{file_id}")
+                }
+            };
+            seen_downloads.insert(key)
+        });
 
-        let fetch_futs = to_fetch.into_iter().map(|cand| {
+        let attempt_limit = max_downloads.saturating_mul(2).max(max_downloads);
+
+        let fetch_futs = candidates.into_iter().take(attempt_limit).map(|cand| {
             let endpoints_clone = endpoints.clone();
             async move { self.download_and_cache(cand, &endpoints_clone, query).await }
         });
@@ -752,20 +837,29 @@ impl NativeSubtitleClient {
         };
 
         let mut extra_parts = Vec::new();
-        if let Some(hash) = query
+        let has_hash = query
             .opensubhash
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+            .filter(|s| !s.is_empty());
+        if let Some(hash) = has_hash {
             extra_parts.push(format!("videoHash={}", urlencoding::encode(hash)));
         }
         if let Some(size) = query.video_byte_size.filter(|&b| b > 0) {
             extra_parts.push(format!("videoSize={size}"));
         }
+        if let Some(fname) = query
+            .video_filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            extra_parts.push(format!("filename={}", urlencoding::encode(fname)));
+        }
 
-        let url = if extra_parts.is_empty() {
-            format!("{base}/subtitles/{media_type}/{stremio_id}.json")
+        let plain_url = format!("{base}/subtitles/{media_type}/{stremio_id}.json");
+        let primary_url = if extra_parts.is_empty() {
+            plain_url.clone()
         } else {
             format!(
                 "{base}/subtitles/{media_type}/{stremio_id}/{}.json",
@@ -773,30 +867,64 @@ impl NativeSubtitleClient {
             )
         };
 
-        let resp = match self.client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                debug!("OpenSubtitles v3 returned status {}", r.status());
-                return Vec::new();
-            }
-            Err(err) => {
-                debug!("OpenSubtitles v3 lookup failed: {err}");
-                return Vec::new();
+        let fetch_subtitles_json = |target_url: String| async move {
+            let resp = match self.client.get(&target_url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    debug!("OpenSubtitles v3 returned status {}", r.status());
+                    return None;
+                }
+                Err(err) => {
+                    debug!("OpenSubtitles v3 lookup failed: {err}");
+                    return None;
+                }
+            };
+            match resp.json::<Value>().await {
+                Ok(v) => v.get("subtitles").and_then(Value::as_array).cloned(),
+                Err(err) => {
+                    debug!("OpenSubtitles v3 invalid JSON: {err}");
+                    None
+                }
             }
         };
 
-        let json: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(err) => {
-                debug!("OpenSubtitles v3 invalid JSON: {err}");
-                return Vec::new();
-            }
+        let (primary_items_opt, plain_items_opt) = if has_hash.is_some() && primary_url != plain_url
+        {
+            tokio::join!(
+                fetch_subtitles_json(primary_url),
+                fetch_subtitles_json(plain_url)
+            )
+        } else {
+            (fetch_subtitles_json(primary_url).await, None)
         };
 
-        let Some(items) = json.get("subtitles").and_then(Value::as_array) else {
+        let Some(items) = primary_items_opt else {
             return Vec::new();
         };
 
+        // OpenSubtitles v3 Stremio addon returns plain items without explicit `hashMatch` boolean:
+        // compare hash-queried items against plain IMDb items per language to detect hash-matched/promoted IDs.
+        let mut plain_ranks_by_lang: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        let plain_available = plain_items_opt
+            .as_ref()
+            .is_some_and(|list| !list.is_empty());
+        if let Some(plain_items) = plain_items_opt.as_ref() {
+            for pitem in plain_items {
+                let lang = normalize_subtitle_lang_code(
+                    pitem.get("lang").and_then(Value::as_str).unwrap_or("und"),
+                );
+                let per_lang = plain_ranks_by_lang.entry(lang).or_default();
+                let next_rank = per_lang.len();
+                if let Some(id) = pitem.get("id").and_then(Value::as_str).map(str::trim) {
+                    per_lang.entry(format!("id:{id}")).or_insert(next_rank);
+                }
+                if let Some(u) = pitem.get("url").and_then(Value::as_str).map(str::trim) {
+                    per_lang.entry(format!("url:{u}")).or_insert(next_rank);
+                }
+            }
+        }
+
+        let mut hash_rank_by_lang: HashMap<String, usize> = HashMap::new();
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let Some(sub_url) = item.get("url").and_then(Value::as_str).map(str::trim) else {
@@ -810,6 +938,12 @@ impl NativeSubtitleClient {
                 .and_then(Value::as_str)
                 .unwrap_or("und");
             let lang = normalize_subtitle_lang_code(lang_raw);
+            let cur_hash_rank = {
+                let entry = hash_rank_by_lang.entry(lang.clone()).or_insert(0);
+                let r = *entry;
+                *entry += 1;
+                r
+            };
             if !query.preferred_langs.is_empty()
                 && !query
                     .preferred_langs
@@ -835,16 +969,42 @@ impl NativeSubtitleClient {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&release_name)
                 .to_owned();
-            let hash_match = item
+
+            let item_id = item.get("id").and_then(Value::as_str).map(str::trim);
+            let plain_diff_match = if has_hash.is_some() && plain_available {
+                let per_lang_plain = plain_ranks_by_lang.get(&lang);
+                match per_lang_plain {
+                    None => true,
+                    Some(map) => {
+                        let rank_in_plain = item_id
+                            .and_then(|id| map.get(&format!("id:{id}")).copied())
+                            .or_else(|| map.get(&format!("url:{sub_url}")).copied());
+                        match rank_in_plain {
+                            None => true,
+                            Some(plain_rank) => cur_hash_rank == 0 && plain_rank >= 2,
+                        }
+                    }
+                }
+            } else {
+                false
+            };
+
+            let explicit_hash_tag = item
                 .get("hashMatch")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+                || item
+                    .get("m")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.eq_ignore_ascii_case("h"))
                 || (query.opensubhash.is_some()
                     && item
                         .get("MovieHash")
                         .and_then(Value::as_str)
                         .zip(query.opensubhash.as_deref())
                         .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)));
+
+            let hash_match = explicit_hash_tag || plain_diff_match;
 
             let cand_fp = VideoReleaseFingerprint::parse(&release_name);
             let (tier, score) = SubtitleMatchRanker::score_candidate(
@@ -886,9 +1046,8 @@ impl NativeSubtitleClient {
         }
         let secrets = [key];
 
-        let mut url = match Url::parse(&format!("{base}/subtitles")) {
-            Ok(u) => u,
-            Err(_) => return Vec::new(),
+        let Ok(mut url) = Url::parse(&format!("{base}/subtitles")) else {
+            return Vec::new();
         };
 
         let imdb_numeric = query.imdb_id.trim().trim_start_matches("tt");
@@ -1043,9 +1202,8 @@ impl NativeSubtitleClient {
         }
         let secrets = [key];
 
-        let mut url = match Url::parse(&format!("{base}/subtitles")) {
-            Ok(u) => u,
-            Err(_) => return Vec::new(),
+        let Ok(mut url) = Url::parse(&format!("{base}/subtitles")) else {
+            return Vec::new();
         };
 
         let subdl_type = match query.media_type.trim().to_ascii_lowercase().as_str() {
@@ -1600,9 +1758,16 @@ fn decode_with_chardetng(bytes: &[u8]) -> String {
     cow.into_owned()
 }
 
+fn head_ascii_lowercase(content: &str, max_bytes: usize) -> String {
+    let mut end = content.len().min(max_bytes);
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    content[..end].to_ascii_lowercase()
+}
+
 fn detect_subtitle_extension(content: &str) -> &'static str {
-    let head: String = content.chars().take(1024).collect();
-    let lower = head.to_ascii_lowercase();
+    let lower = head_ascii_lowercase(content, 1024);
     if lower.contains("[v4+ styles]") || (lower.contains("[script info]") && lower.contains("dialogue:"))
     {
         "ass"
@@ -1644,7 +1809,7 @@ fn write_private_file(path: &Path, content: &str) -> Result<(), String> {
         ensure_private_subtitle_dir(parent)?;
     }
 
-    let seq = TEMP_SUB_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+    let seq = TEMP_SUB_SEQ.fetch_add(1, Ordering::Relaxed);
     let fname = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1691,6 +1856,67 @@ fn write_private_file(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn prune_subtitle_cache_dir(cache_dir: &Path) -> usize {
+    prune_subtitle_cache_dir_with_limits(
+        cache_dir,
+        MAX_SUBTITLE_CACHE_FILES,
+        MAX_SUBTITLE_CACHE_BYTES,
+        None,
+    )
+}
+
+fn prune_subtitle_cache_dir_with_limits(
+    cache_dir: &Path,
+    max_files: usize,
+    max_bytes: u64,
+    keep_path: Option<&Path>,
+) -> usize {
+    let Ok(read_dir) = std::fs::read_dir(cache_dir) else {
+        return 0;
+    };
+
+    let mut entries = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let len = meta.len();
+        total_bytes = total_bytes.saturating_add(len);
+        let modified = meta
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        entries.push((modified, len, path));
+    }
+
+    let mut total_files = entries.len();
+    if total_files <= max_files && total_bytes <= max_bytes {
+        return 0;
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+
+    let mut removed = 0usize;
+    for (_, len, path) in entries {
+        if total_files <= max_files && total_bytes <= max_bytes {
+            break;
+        }
+        if keep_path.is_some_and(|keep| keep == path.as_path()) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total_files = total_files.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(len);
+            removed += 1;
+        }
+    }
+    removed
+}
+
 fn write_cached_subtitle(cache_dir: &Path, utf8_content: &str, ext: &str) -> Result<PathBuf, String> {
     ensure_private_subtitle_dir(cache_dir)?;
     let mut hasher = Sha256::new();
@@ -1699,6 +1925,12 @@ fn write_cached_subtitle(cache_dir: &Path, utf8_content: &str, ext: &str) -> Res
     let prefix = &digest_hex[..24];
     let out_path = cache_dir.join(format!("{prefix}.{ext}"));
     write_private_file(&out_path, utf8_content)?;
+    let _ = prune_subtitle_cache_dir_with_limits(
+        cache_dir,
+        MAX_SUBTITLE_CACHE_FILES,
+        MAX_SUBTITLE_CACHE_BYTES,
+        Some(&out_path),
+    );
     Ok(out_path)
 }
 
@@ -1710,6 +1942,124 @@ pub struct SubtitleAlignmentResult {
     pub confidence: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioSpeechWindow {
+    pub start_ms: i64,
+    pub frame_ms: i64,
+    pub vad: Vec<f32>,
+    pub onset: Vec<f32>,
+}
+
+impl AudioSpeechWindow {
+    /// Extracts a noise- and music-resistant `[0.0..1.0]` speech activity + onset envelope from `8 kHz` mono PCM.
+    pub fn from_pcm_8khz(start_secs: f64, pcm: &[i16]) -> Self {
+        let start_ms = if start_secs.is_finite() {
+            (start_secs.max(0.0) * 1000.0).round() as i64
+        } else {
+            0
+        };
+        let frame_count = pcm.len() / AUDIO_ENV_SAMPLES_PER_FRAME;
+        if frame_count == 0 {
+            return Self {
+                start_ms,
+                frame_ms: AUDIO_ENV_FRAME_MS,
+                vad: Vec::new(),
+                onset: Vec::new(),
+            };
+        }
+
+        // Pre-emphasis + cascaded 300 Hz HP + 3200 Hz LP to isolate vocal formants from sustained bass/music.
+        let mut prev_raw = 0.0_f32;
+        let mut hp1_in = 0.0_f32;
+        let mut hp1_out = 0.0_f32;
+        let mut hp2_in = 0.0_f32;
+        let mut hp2_out = 0.0_f32;
+        let mut lp_out = 0.0_f32;
+
+        let mut log_energies = Vec::with_capacity(frame_count);
+        let (chunks, _) = pcm.as_chunks::<AUDIO_ENV_SAMPLES_PER_FRAME>();
+        for chunk in chunks {
+            let mut sq_sum = 0.0_f64;
+            for &sample in chunk {
+                let x = f32::from(sample) / 32768.0;
+                let pre = x - 0.95 * prev_raw;
+                prev_raw = x;
+
+                hp1_out = 0.79 * (hp1_out + pre - hp1_in);
+                hp1_in = pre;
+
+                hp2_out = 0.79 * (hp2_out + hp1_out - hp2_in);
+                hp2_in = hp1_out;
+
+                lp_out = 0.65 * hp2_out + 0.35 * lp_out;
+                sq_sum += f64::from(lp_out) * f64::from(lp_out);
+            }
+            let rms = (sq_sum / AUDIO_ENV_SAMPLES_PER_FRAME as f64).sqrt();
+            log_energies.push((rms + 1e-6).ln() as f32);
+        }
+
+        // Subtract local 1.6s (80-frame) 25th-percentile floor so steady score/music beds fade to zero.
+        let mut speech_mod = vec![0.0_f32; frame_count];
+        let mut win_buf = Vec::with_capacity(81);
+        for k in 0..frame_count {
+            let lo = k.saturating_sub(40);
+            let hi = (k + 41).min(frame_count);
+            win_buf.clear();
+            win_buf.extend_from_slice(&log_energies[lo..hi]);
+            let pct_idx = win_buf.len() / 4;
+            let (_, floor_val, _) =
+                win_buf.select_nth_unstable_by(pct_idx, |a, b| a.total_cmp(b));
+            speech_mod[k] = (log_energies[k] - *floor_val).max(0.0);
+        }
+
+        // Reuse log_energies as scratch buffer to find the 96th-percentile peak without extra allocation.
+        log_energies.clear();
+        log_energies.extend_from_slice(&speech_mod);
+        let norm_idx = ((log_energies.len() * 96) / 100).min(log_energies.len().saturating_sub(1));
+        let (_, peak_ref, _) =
+            log_energies.select_nth_unstable_by(norm_idx, |a, b| a.total_cmp(b));
+        let scale = peak_ref.max(0.25);
+
+        for val in &mut speech_mod {
+            // Suppress low residual floor below 12% of peak modulation.
+            *val = (((*val / scale) - 0.12).max(0.0) / 0.88).min(1.0);
+        }
+        let vad = speech_mod;
+
+        let mut onset = vec![0.0_f32; frame_count];
+        for k in 1..frame_count {
+            let prev_min = if k >= 2 {
+                vad[k - 1].min(vad[k - 2])
+            } else {
+                vad[k - 1]
+            };
+            onset[k] = (vad[k] - prev_min).max(0.0);
+        }
+
+        Self {
+            start_ms,
+            frame_ms: AUDIO_ENV_FRAME_MS,
+            vad,
+            onset,
+        }
+    }
+
+    pub fn end_ms(&self) -> i64 {
+        self.start_ms + (self.vad.len() as i64 * self.frame_ms)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioSpeechFingerprint {
+    pub windows: Vec<AudioSpeechWindow>,
+}
+
+impl AudioSpeechFingerprint {
+    pub fn is_empty(&self) -> bool {
+        self.windows.iter().all(|w| w.vad.is_empty())
+    }
+}
+
 pub struct SubtitleSyncAligner;
 
 impl SubtitleSyncAligner {
@@ -1717,7 +2067,7 @@ impl SubtitleSyncAligner {
     /// stripping formatting tags and ignoring common uploader watermark cues.
     pub fn parse_subtitle_cues(content: &str) -> Vec<(i64, i64)> {
         let trimmed = content.strip_prefix('\u{feff}').unwrap_or(content);
-        let lower_head: String = trimmed.chars().take(1024).collect::<String>().to_ascii_lowercase();
+        let lower_head = head_ascii_lowercase(trimmed, 1024);
         if lower_head.contains("[events]") || lower_head.contains("dialogue:") {
             parse_ass_cues(trimmed)
         } else {
@@ -1733,6 +2083,487 @@ impl SubtitleSyncAligner {
         })?;
         let text = normalize_bytes_to_utf8(&bytes)?;
         Ok(Self::parse_subtitle_cues(&text))
+    }
+
+    /// Parses spoken dialogue cues, filtering out pure lyrics (`♪`/`♫`) and bracketed SFX tags.
+    pub fn parse_spoken_dialogue_cues(content: &str) -> Vec<(i64, i64)> {
+        let trimmed = content.strip_prefix('\u{feff}').unwrap_or(content);
+        let lower_head = head_ascii_lowercase(trimmed, 1024);
+        if lower_head.contains("[events]") || lower_head.contains("dialogue:") {
+            parse_ass_cues_filtered(trimmed, true)
+        } else {
+            parse_srt_or_vtt_cues_filtered(trimmed, true)
+        }
+    }
+
+    /// Reads a subtitle file and returns spoken dialogue cues suited for audio-to-subtitle alignment.
+    pub fn parse_spoken_dialogue_file(path: &Path) -> Result<Vec<(i64, i64)>, String> {
+        let bytes = std::fs::read(path).map_err(|err| match err.kind() {
+            ErrorKind::NotFound => format!("Subtitle file not found: {}", path.display()),
+            _ => format!("Failed to read subtitle file {}: {err}", path.display()),
+        })?;
+        let text = normalize_bytes_to_utf8(&bytes)?;
+        let spoken = Self::parse_spoken_dialogue_cues(&text);
+        if spoken.len() >= 8 {
+            Ok(spoken)
+        } else {
+            Ok(Self::parse_subtitle_cues(&text))
+        }
+    }
+
+    /// Selects 1 or 2 high-density `(start_secs, duration_secs)` windows for fast audio extraction.
+    pub fn select_dialogue_probe_windows(
+        cues: &[(i64, i64)],
+        playhead_secs: f64,
+        duration_secs: f64,
+    ) -> Vec<(f64, f64)> {
+        let mut valid: Vec<(i64, i64)> = cues
+            .iter()
+            .copied()
+            .filter(|&(s, e)| s >= 0 && e > s + 150)
+            .collect();
+        valid.sort_unstable_by_key(|&(s, _)| s);
+        if valid.is_empty() {
+            let start = if playhead_secs.is_finite() && playhead_secs > 45.0 {
+                (playhead_secs - 25.0).max(0.0)
+            } else {
+                90.0
+            };
+            return vec![(start, 60.0)];
+        }
+
+        let max_cue_secs = valid
+            .iter()
+            .map(|&(_, e)| e as f64 / 1000.0)
+            .fold(0.0_f64, f64::max);
+        let media_end_secs = if duration_secs.is_finite() && duration_secs > 120.0 {
+            duration_secs
+        } else {
+            max_cue_secs + 60.0
+        };
+
+        let pick_best_center = |min_secs: f64, max_secs: f64, anchor_secs: Option<f64>| -> f64 {
+            let lo_ms = (min_secs * 1000.0) as i64;
+            let hi_ms = (max_secs * 1000.0) as i64;
+            let mut best_center = (min_secs + max_secs) * 0.5;
+            let mut best_score = f64::NEG_INFINITY;
+
+            for &(cs, _) in &valid {
+                if cs < lo_ms || cs > hi_ms {
+                    continue;
+                }
+                let mut cluster_score = 0.0_f64;
+                let mut prev_end: Option<i64> = None;
+                for &(s, e) in &valid {
+                    if s >= cs - 25_000 && s <= cs + 25_000 && (e - s) <= 8_500 {
+                        cluster_score += 1.0;
+                        if prev_end.is_none_or(|pe| s - pe >= 320) {
+                            cluster_score += 0.35;
+                        }
+                        prev_end = Some(e);
+                    }
+                }
+                let center_s = cs as f64 / 1000.0;
+                let dist_penalty = anchor_secs
+                    .map(|a| ((center_s - a).abs() / 600.0).min(3.0))
+                    .unwrap_or(0.0);
+                let score = cluster_score - dist_penalty;
+                if score > best_score {
+                    best_score = score;
+                    best_center = center_s;
+                }
+            }
+            best_center
+        };
+
+        let (min_e, max_e, anchor) = if playhead_secs.is_finite() && playhead_secs > 50.0 {
+            (
+                (playhead_secs - 180.0).max(30.0),
+                (playhead_secs + 240.0).min((media_end_secs - 70.0).max(40.0)),
+                Some(playhead_secs),
+            )
+        } else if media_end_secs >= 720.0 {
+            let mut min_early = (media_end_secs * 0.12).clamp(180.0, 420.0);
+            let max_early = (media_end_secs * 0.42)
+                .max(min_early + 120.0)
+                .min(media_end_secs - 75.0);
+            let min_early_ms = (min_early * 1000.0) as i64;
+            let max_early_ms = (max_early * 1000.0) as i64;
+            let early_cue_count = valid
+                .iter()
+                .filter(|&&(s, _)| s >= min_early_ms && s <= max_early_ms)
+                .count();
+            if early_cue_count < 5 {
+                min_early = 45.0;
+            }
+            let anchor_early = Some(min_early + (max_early - min_early) * 0.35);
+            (min_early, max_early, anchor_early)
+        } else {
+            (25.0, (media_end_secs - 65.0).max(40.0), None)
+        };
+
+        let c1 = if max_e > min_e + 20.0 {
+            pick_best_center(min_e, max_e, anchor)
+        } else {
+            (media_end_secs * 0.35).max(30.0)
+        };
+        let w1_start = (c1 - 30.0).clamp(10.0, (media_end_secs - 70.0).max(10.0));
+        let mut windows = vec![(w1_start, 60.0)];
+
+        if media_end_secs >= 720.0 {
+            if w1_start < media_end_secs * 0.50 {
+                let min_2 = (w1_start + 390.0)
+                    .max(media_end_secs * 0.58)
+                    .min(media_end_secs - 130.0);
+                let max_2 = (media_end_secs * 0.86)
+                    .max(min_2 + 50.0)
+                    .min(media_end_secs - 70.0);
+                if max_2 > min_2 + 20.0 {
+                    let c2 = pick_best_center(min_2, max_2, None);
+                    let w2_start = (c2 - 30.0).clamp(min_2, (media_end_secs - 65.0).max(min_2));
+                    windows.push((w2_start, 60.0));
+                }
+            } else {
+                let min_2 = (media_end_secs * 0.12).clamp(120.0, 300.0);
+                let max_2 = (w1_start - 390.0).max(min_2 + 50.0);
+                if max_2 > min_2 + 20.0 && max_2 < w1_start - 180.0 {
+                    let c2 = pick_best_center(min_2, max_2, None);
+                    let w2_start = (c2 - 30.0).clamp(10.0, max_2);
+                    windows.push((w2_start, 60.0));
+                }
+            }
+        }
+        windows
+    }
+
+    /// Correlates subtitle speech intervals and onsets against extracted `AudioSpeechFingerprint` windows.
+    pub fn align_cues_to_audio(
+        cues: &[(i64, i64)],
+        fingerprint: &AudioSpeechFingerprint,
+    ) -> SubtitleAlignmentResult {
+        if cues.is_empty() || fingerprint.is_empty() {
+            return SubtitleAlignmentResult {
+                offset_ms: 0,
+                drift_ratio: 1.0,
+                matched_onsets: 0,
+                confidence: 0.0,
+            };
+        }
+
+        let filtered: Vec<(i64, i64)> = {
+            let mut v: Vec<(i64, i64)> = cues
+                .iter()
+                .copied()
+                .filter(|&(s, e)| e > s + 150 && (e - s) <= 12_000)
+                .collect();
+            if v.len() < 4 {
+                v = cues.iter().copied().filter(|&(s, e)| e > s).collect();
+            }
+            v.sort_unstable_by_key(|&(s, _)| s);
+            v
+        };
+        if filtered.is_empty() {
+            return SubtitleAlignmentResult {
+                offset_ms: 0,
+                drift_ratio: 1.0,
+                matched_onsets: 0,
+                confidence: 0.0,
+            };
+        }
+
+        #[derive(Clone, Copy)]
+        struct CueMeta {
+            start_ms: i64,
+            box_dur_ms: i64,
+            is_utterance_start: bool,
+        }
+
+        let cue_metas: Vec<CueMeta> = filtered
+            .iter()
+            .enumerate()
+            .map(|(i, &(cs, ce))| {
+                let is_utterance_start = i == 0 || (cs - filtered[i - 1].1) >= 320;
+                let gap_after = if i + 1 < filtered.len() {
+                    filtered[i + 1].0 - ce
+                } else {
+                    1_000
+                };
+                let raw_dur = ce - cs;
+                let box_dur_ms = if gap_after >= 250 && raw_dur > 900 {
+                    let tail_trim = ((raw_dur - 900) * 35 / 100).min(480);
+                    (raw_dur - tail_trim).max(400)
+                } else {
+                    raw_dur
+                };
+                CueMeta {
+                    start_ms: cs,
+                    box_dur_ms,
+                    is_utterance_start,
+                }
+            })
+            .collect();
+
+        struct PrecomputedWin<'a> {
+            win: &'a AudioSpeechWindow,
+            prefix_vad: Vec<f64>,
+            sum_vad: f64,
+            var_vad: f64,
+        }
+
+        let precomputed: Vec<PrecomputedWin<'_>> = fingerprint
+            .windows
+            .iter()
+            .filter(|w| w.vad.len() >= 25)
+            .map(|w| {
+                let n = w.vad.len() as f64;
+                let mut prefix_vad = Vec::with_capacity(w.vad.len() + 1);
+                prefix_vad.push(0.0);
+                let mut sum_v = 0.0_f64;
+                let mut sum_v2 = 0.0_f64;
+                for &val in &w.vad {
+                    let fv = f64::from(val);
+                    sum_v += fv;
+                    sum_v2 += fv * fv;
+                    prefix_vad.push(sum_v);
+                }
+                let var_vad = (sum_v2 - (sum_v * sum_v) / n).max(1e-9);
+                PrecomputedWin {
+                    win: w,
+                    prefix_vad,
+                    sum_vad: sum_v,
+                    var_vad,
+                }
+            })
+            .collect();
+
+        if precomputed.is_empty() {
+            return SubtitleAlignmentResult {
+                offset_ms: 0,
+                drift_ratio: 1.0,
+                matched_onsets: 0,
+                confidence: 0.0,
+            };
+        }
+
+        let eval_candidate = |drift: f64, offset_ms: i64| -> (f64, usize) {
+            let mut total_score = 0.0_f64;
+            let mut total_weight = 0.0_f64;
+            let mut matched_onsets = 0usize;
+
+            for pw in &precomputed {
+                let w = pw.win;
+                let n = w.vad.len();
+                let nf = n as f64;
+                let w_start = w.start_ms;
+                let w_end = w.end_ms();
+
+                // Collect & merge shifted cue frame intervals [a, b) intersecting this window.
+                let mut intervals: Vec<(usize, usize)> = Vec::new();
+                let mut attack_sum = 0.0_f64;
+                let mut attack_weight = 0.0_f64;
+                let mut cues_in_win = 0usize;
+
+                for cue in &cue_metas {
+                    let ts = (cue.start_ms as f64 * drift).round() as i64 + offset_ms;
+                    if ts > w_end {
+                        break;
+                    }
+                    let te = ts + (cue.box_dur_ms as f64 * drift).round() as i64;
+                    if te <= w_start {
+                        continue;
+                    }
+                    let rel_s = ((ts - w_start).max(0) / w.frame_ms) as usize;
+                    let rel_e = (((te - w_start + w.frame_ms - 1) / w.frame_ms) as usize).min(n);
+                    if rel_e <= rel_s {
+                        continue;
+                    }
+
+                    if ts >= w_start && ts < w_end {
+                        cues_in_win += 1;
+                        let center = (((ts - w_start) / w.frame_ms) as usize).min(n - 1);
+                        let k_lo = center.saturating_sub(4);
+                        let k_hi = (center + 4).min(n - 1);
+                        let mut weighted_onset = 0.0_f64;
+                        let mut raw_peak_onset = 0.0_f32;
+                        for (k, &on_val) in w.onset.iter().enumerate().take(k_hi + 1).skip(k_lo) {
+                            let dist = center.abs_diff(k);
+                            let kernel = 1.0 - (dist as f64) * 0.18;
+                            weighted_onset = weighted_onset.max(f64::from(on_val) * kernel);
+                            if dist <= 3 {
+                                raw_peak_onset = raw_peak_onset.max(on_val);
+                            }
+                        }
+
+                        if cue.is_utterance_start && center >= 6 && center + 8 <= n {
+                            let pre_lo = center.saturating_sub(10);
+                            let pre_hi = center.saturating_sub(1);
+                            let pre_mean = (pw.prefix_vad[pre_hi] - pw.prefix_vad[pre_lo])
+                                / (pre_hi - pre_lo).max(1) as f64;
+                            let post_hi = (center + 10).min(n);
+                            let post_mean = (pw.prefix_vad[post_hi] - pw.prefix_vad[center])
+                                / (post_hi - center).max(1) as f64;
+                            let step = (post_mean - 0.70 * pre_mean).max(0.0);
+                            attack_sum += 0.55 * weighted_onset + 0.45 * step;
+                            attack_weight += 1.0;
+                        } else {
+                            attack_sum += 0.4 * (0.35 * weighted_onset);
+                            attack_weight += 0.4;
+                        }
+
+                        if f64::from(raw_peak_onset) >= 0.12 || f64::from(w.vad[center]) >= 0.22 {
+                            matched_onsets += 1;
+                        }
+                    }
+
+                    if let Some(last) = intervals.last_mut() {
+                        if rel_s <= last.1 {
+                            last.1 = last.1.max(rel_e);
+                            continue;
+                        }
+                    }
+                    intervals.push((rel_s, rel_e));
+                }
+
+                if cues_in_win < 2 || intervals.is_empty() {
+                    continue;
+                }
+
+                let mut dot = 0.0_f64;
+                let mut ones = 0usize;
+                for (a, b) in intervals {
+                    dot += pw.prefix_vad[b] - pw.prefix_vad[a];
+                    ones += b - a;
+                }
+                if ones == 0 || ones >= n {
+                    continue;
+                }
+                let ones_f = ones as f64;
+                let cov = dot - ones_f * (pw.sum_vad / nf);
+                let var_m = ones_f - (ones_f * ones_f) / nf;
+                if var_m <= 1e-9 {
+                    continue;
+                }
+                let zncc = cov / (var_m * pw.var_vad).sqrt();
+                let attack_mean = if attack_weight > 0.0 {
+                    attack_sum / attack_weight
+                } else {
+                    0.0
+                };
+                let win_score = 0.58 * zncc + 0.62 * attack_mean;
+                let weight = cues_in_win as f64;
+                total_score += win_score * weight;
+                total_weight += weight;
+            }
+
+            if total_weight <= 0.0 {
+                return (-10.0, 0);
+            }
+            let drift_prior = if (drift - 1.0).abs() < 1e-6 {
+                0.012
+            } else {
+                0.0
+            };
+            let shift_prior = -0.00025 * (offset_ms.abs() as f64 / 1000.0);
+            (
+                (total_score / total_weight) + drift_prior + shift_prior,
+                matched_onsets,
+            )
+        };
+
+        // Disable drift stretching if all audio windows fall inside a short range where 25/23.976 drift
+        // would merely look identical to a constant shift.
+        let min_win_ms = precomputed
+            .iter()
+            .map(|p| p.win.start_ms)
+            .min()
+            .unwrap_or(0);
+        let max_win_ms = precomputed
+            .iter()
+            .map(|p| p.win.end_ms())
+            .max()
+            .unwrap_or(0);
+        let drifts_to_test: &[f64] = if max_win_ms - min_win_ms >= 360_000 {
+            &ALIGN_DRIFT_CANDIDATES
+        } else {
+            &ALIGN_DRIFT_CANDIDATES[..1]
+        };
+
+        let mut best_drift = 1.0_f64;
+        let mut best_offset_ms = 0_i64;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_matches = 0usize;
+
+        for &drift in drifts_to_test {
+            let mut top_coarse: Vec<(f64, i64)> = Vec::new();
+            let mut off = -AUDIO_ALIGN_MAX_OFFSET_MS;
+            while off <= AUDIO_ALIGN_MAX_OFFSET_MS {
+                let (score, _) = eval_candidate(drift, off);
+                if let Some(existing) = top_coarse
+                    .iter_mut()
+                    .find(|&&mut (_, prev_off)| (prev_off - off).abs() < 320)
+                {
+                    if score > existing.0 {
+                        *existing = (score, off);
+                        top_coarse.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    }
+                } else if top_coarse.len() < 8 {
+                    top_coarse.push((score, off));
+                    top_coarse.sort_by(|a, b| b.0.total_cmp(&a.0));
+                } else if score > top_coarse[7].0 {
+                    top_coarse[7] = (score, off);
+                    top_coarse.sort_by(|a, b| b.0.total_cmp(&a.0));
+                }
+                off += 40;
+            }
+
+            let mut local_best_score = f64::NEG_INFINITY;
+            let mut local_best_off = 0_i64;
+            let mut local_best_matches = 0usize;
+            for &(_, coarse_off) in &top_coarse {
+                let mut fine_off = (coarse_off - 160).max(-AUDIO_ALIGN_MAX_OFFSET_MS);
+                let fine_max = (coarse_off + 160).min(AUDIO_ALIGN_MAX_OFFSET_MS);
+                while fine_off <= fine_max {
+                    let (score, matches) = eval_candidate(drift, fine_off);
+                    if score > local_best_score {
+                        local_best_score = score;
+                        local_best_off = fine_off;
+                        local_best_matches = matches;
+                    }
+                    fine_off += AUDIO_ENV_FRAME_MS;
+                }
+            }
+
+            // 3-point parabolic refinement around local_best_off on the 20ms grid.
+            let (s_left, _) = eval_candidate(drift, local_best_off - AUDIO_ENV_FRAME_MS);
+            let (s_right, _) = eval_candidate(drift, local_best_off + AUDIO_ENV_FRAME_MS);
+            let denom = 2.0 * (s_left - 2.0 * local_best_score + s_right);
+            if denom.abs() > 1e-6 && denom < 0.0 {
+                let frac = ((s_left - s_right) / denom).clamp(-0.5, 0.5);
+                let sub_off =
+                    local_best_off + (frac * AUDIO_ENV_FRAME_MS as f64).round() as i64;
+                let (sub_score, sub_matches) = eval_candidate(drift, sub_off);
+                if sub_score >= local_best_score {
+                    local_best_score = sub_score;
+                    local_best_off = sub_off;
+                    local_best_matches = sub_matches;
+                }
+            }
+
+            if local_best_score > best_score {
+                best_score = local_best_score;
+                best_drift = drift;
+                best_offset_ms = local_best_off;
+                best_matches = local_best_matches;
+            }
+        }
+
+        let confidence = (best_score / 0.65).clamp(0.0, 1.0);
+        SubtitleAlignmentResult {
+            offset_ms: best_offset_ms,
+            drift_ratio: best_drift,
+            matched_onsets: best_matches,
+            confidence,
+        }
     }
 
     /// Solves optimal constant offset and PAL/NTSC drift ratio aligning `target_cues` to `reference_cues`.
@@ -1915,15 +2746,34 @@ fn transform_ms(ms: i64, offset_ms: i64, drift_ratio: f64) -> i64 {
 }
 
 fn clean_cue_text(raw: &str) -> String {
-    let no_ass = RE_ASS_OVERRIDE.replace_all(raw, " ");
-    let no_html = RE_HTML_TAG.replace_all(&no_ass, " ");
-    no_html
-        .replace("\\N", " ")
-        .replace("\\n", " ")
-        .replace("\\h", " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let no_ass = if raw.contains('{') {
+        RE_ASS_OVERRIDE.replace_all(raw, " ")
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
+    let no_html = if no_ass.contains('<') {
+        RE_HTML_TAG.replace_all(&no_ass, " ")
+    } else {
+        no_ass
+    };
+    let normalized = if no_html.contains('\\') {
+        std::borrow::Cow::Owned(
+            no_html
+                .replace("\\N", " ")
+                .replace("\\n", " ")
+                .replace("\\h", " "),
+        )
+    } else {
+        no_html
+    };
+    let mut out = String::with_capacity(normalized.len());
+    for word in normalized.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 fn is_watermark_cue(cleaned_text: &str) -> bool {
@@ -2022,7 +2872,23 @@ fn format_ass_timestamp(ms: i64) -> String {
     format!("{hours}:{mins:02}:{secs:02}.{cs:02}")
 }
 
+fn is_non_speech_cue(cleaned_text: &str) -> bool {
+    let trimmed = cleaned_text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.contains('♪') || trimmed.contains('♫') {
+        return true;
+    }
+    (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        || (trimmed.starts_with('(') && trimmed.ends_with(')'))
+}
+
 fn parse_srt_or_vtt_cues(content: &str) -> Vec<(i64, i64)> {
+    parse_srt_or_vtt_cues_filtered(content, false)
+}
+
+fn parse_srt_or_vtt_cues_filtered(content: &str, spoken_only: bool) -> Vec<(i64, i64)> {
     let mut cues = Vec::new();
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     for block in normalized.split("\n\n") {
@@ -2045,7 +2911,7 @@ fn parse_srt_or_vtt_cues(content: &str) -> Vec<(i64, i64)> {
         }
         let body = lines[ts_idx + 1..].join(" ");
         let cleaned = clean_cue_text(&body);
-        if is_watermark_cue(&cleaned) {
+        if is_watermark_cue(&cleaned) || (spoken_only && is_non_speech_cue(&cleaned)) {
             continue;
         }
         cues.push((start_ms, end_ms));
@@ -2054,6 +2920,10 @@ fn parse_srt_or_vtt_cues(content: &str) -> Vec<(i64, i64)> {
 }
 
 fn parse_ass_cues(content: &str) -> Vec<(i64, i64)> {
+    parse_ass_cues_filtered(content, false)
+}
+
+fn parse_ass_cues_filtered(content: &str, spoken_only: bool) -> Vec<(i64, i64)> {
     let mut cues = Vec::new();
     let mut start_col = 1usize;
     let mut end_col = 2usize;
@@ -2089,7 +2959,7 @@ fn parse_ass_cues(content: &str) -> Vec<(i64, i64)> {
                 continue;
             }
             let cleaned = clean_cue_text(fields[text_col]);
-            if is_watermark_cue(&cleaned) {
+            if is_watermark_cue(&cleaned) || (spoken_only && is_non_speech_cue(&cleaned)) {
                 continue;
             }
             cues.push((start_ms, end_ms));
@@ -2180,11 +3050,6 @@ fn rewrite_ass_timestamps(content: &str, offset_ms: i64, drift_ratio: f64) -> St
         out_lines.push(line.to_owned());
     }
     out_lines.join("\n")
-}
-
-#[allow(dead_code)]
-fn _compare_f64(a: f64, b: f64) -> Ordering {
-    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
 #[cfg(test)]
@@ -2657,5 +3522,308 @@ mod tests {
                 assert_eq!(file_mode, 0o600);
             }
         }
+    }
+
+    fn synth_speech_with_music_pcm(
+        window_start_secs: f64,
+        window_dur_secs: f64,
+        speech_intervals_ms: &[(i64, i64)],
+    ) -> Vec<i16> {
+        let total_samples = (window_dur_secs * AUDIO_SAMPLE_RATE_HZ as f64).round() as usize;
+        let win_start_ms = (window_start_secs * 1000.0).round() as i64;
+        let mut out = Vec::with_capacity(total_samples);
+        for i in 0..total_samples {
+            let t_sec = i as f64 / AUDIO_SAMPLE_RATE_HZ as f64;
+            let abs_ms = win_start_ms + ((i as i64 * 1000) / AUDIO_SAMPLE_RATE_HZ as i64);
+            let speaking = speech_intervals_ms
+                .iter()
+                .any(|&(s, e)| abs_ms >= s && abs_ms <= e);
+            // Continuous 180 Hz + 440 Hz background score bed across whole window
+            let music = 0.22 * (2.0 * std::f64::consts::PI * 180.0 * t_sec).sin()
+                + 0.14 * (2.0 * std::f64::consts::PI * 440.0 * t_sec).sin();
+            let speech = if speaking {
+                // Syllabic 5 Hz AM modulated vocal formants (700 Hz + 1450 Hz)
+                let env = 0.55 + 0.45 * (2.0 * std::f64::consts::PI * 5.0 * t_sec).sin();
+                env * (0.55 * (2.0 * std::f64::consts::PI * 700.0 * t_sec).sin()
+                    + 0.35 * (2.0 * std::f64::consts::PI * 1450.0 * t_sec).sin())
+            } else {
+                0.0
+            };
+            let s = ((music + speech) * 14_000.0).clamp(-32767.0, 32767.0) as i16;
+            out.push(s);
+        }
+        out
+    }
+
+    #[test]
+    fn human_language_names_and_badges_format_cleanly() {
+        assert_eq!(human_language_name("eng"), "English");
+        assert_eq!(human_language_name("en"), "English");
+        assert_eq!(human_language_name("pob"), "Portuguese (BR)");
+        assert_eq!(human_language_name("slv"), "Slovenian");
+        assert_eq!(human_language_name("jpn"), "Japanese");
+        assert_eq!(short_language_badge("eng"), "EN");
+        assert_eq!(short_language_badge("pob"), "PT-BR");
+        assert_eq!(short_language_badge("sl"), "SL");
+    }
+
+    #[test]
+    fn audio_aligner_recovers_exact_offset_through_background_music_and_rejects_decoy() {
+        // True dialogue cadence in [10s..70s]
+        let true_speech: Vec<(i64, i64)> = vec![
+            (114_000, 116_200),
+            (118_500, 121_000),
+            (124_000, 125_800),
+            (129_200, 132_500),
+            (136_000, 138_900),
+            (143_000, 145_400),
+            (150_500, 153_200),
+            (157_000, 159_800),
+            (164_000, 166_500),
+        ];
+        let pcm = synth_speech_with_music_pcm(100.0, 80.0, &true_speech);
+        let fp = AudioSpeechFingerprint {
+            windows: vec![AudioSpeechWindow::from_pcm_8khz(100.0, &pcm)],
+        };
+
+        // Shifted subtitle cues (+4,260ms too late -> true shift needed is -4,260ms)
+        let shifted_cues: Vec<(i64, i64)> =
+            true_speech.iter().map(|&(s, e)| (s + 4_260, e + 4_260)).collect();
+        // Wrong cut decoy cues with completely different spacing
+        let decoy_cues: Vec<(i64, i64)> = (0..9)
+            .map(|k| (112_000 + k * 7_300, 113_100 + k * 7_300))
+            .collect();
+
+        let good_res = SubtitleSyncAligner::align_cues_to_audio(&shifted_cues, &fp);
+        let decoy_res = SubtitleSyncAligner::align_cues_to_audio(&decoy_cues, &fp);
+
+        assert!(
+            (good_res.offset_ms - (-4_260)).abs() <= 45,
+            "expected offset near -4260ms, got {:?}",
+            good_res
+        );
+        assert!(
+            good_res.confidence > decoy_res.confidence + 0.15,
+            "good={:?} vs decoy={:?}",
+            good_res,
+            decoy_res
+        );
+    }
+
+    #[test]
+    fn audio_aligner_recovers_pal_drift_and_offset_across_two_windows() {
+        let pal_ratio = 25.0_f64 / 23.976_f64;
+        let offset_true = 1_600_i64;
+        let mut raw_cues = Vec::new();
+        // Early cluster (~130s..180s) & Late cluster (~1450s..1500s)
+        for idx in 0..8 {
+            let s1 = 132_000 + idx * 5_600;
+            raw_cues.push((s1, s1 + 2_100));
+        }
+        for idx in 0..8 {
+            let s2 = 1_452_000 + idx * 5_800;
+            raw_cues.push((s2, s2 + 2_200));
+        }
+
+        // Video audio is spoken at transformed timestamps `raw * pal_ratio + offset_true`
+        let audio_speech: Vec<(i64, i64)> = raw_cues
+            .iter()
+            .map(|&(s, e)| {
+                (
+                    (s as f64 * pal_ratio).round() as i64 + offset_true,
+                    (e as f64 * pal_ratio).round() as i64 + offset_true,
+                )
+            })
+            .collect();
+
+        let pcm1 = synth_speech_with_music_pcm(120.0, 75.0, &audio_speech);
+        let pcm2 = synth_speech_with_music_pcm(1_495.0, 75.0, &audio_speech);
+        let fp = AudioSpeechFingerprint {
+            windows: vec![
+                AudioSpeechWindow::from_pcm_8khz(120.0, &pcm1),
+                AudioSpeechWindow::from_pcm_8khz(1_495.0, &pcm2),
+            ],
+        };
+
+        let aligned = SubtitleSyncAligner::align_cues_to_audio(&raw_cues, &fp);
+        assert!(
+            (aligned.drift_ratio - pal_ratio).abs() < 0.005,
+            "expected PAL drift {pal_ratio:.5}, got {:?}",
+            aligned
+        );
+        assert!(
+            (aligned.offset_ms - offset_true).abs() <= 60,
+            "expected offset ~{offset_true}ms, got {:?}",
+            aligned
+        );
+    }
+
+    #[tokio::test]
+    async fn opensubtitles_v3_hash_vs_plain_diff_detects_exact_hash_match() {
+        let dir = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let base_clone = base_url.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, ctype, body) = if path.contains("videoHash=") {
+                        // Hash response prepends "hash-only-1" which wasn't in plain IMDb list
+                        let json = serde_json::json!({
+                            "subtitles": [
+                                {"id": "hash-only-1", "url": format!("{base_clone}/h.srt"), "lang": "eng"},
+                                {"id": "plain-1", "url": format!("{base_clone}/p1.srt"), "lang": "eng"}
+                            ]
+                        });
+                        ("200 OK", "application/json", json.to_string())
+                    } else if path == "/osv3/subtitles/movie/tt0443536.json" {
+                        let json = serde_json::json!({
+                            "subtitles": [
+                                {"id": "plain-1", "url": format!("{base_clone}/p1.srt"), "lang": "eng"},
+                                {"id": "plain-2", "url": format!("{base_clone}/p2.srt"), "lang": "eng"},
+                                {"id": "plain-3", "url": format!("{base_clone}/p3.srt"), "lang": "eng"}
+                            ]
+                        });
+                        ("200 OK", "application/json", json.to_string())
+                    } else {
+                        (
+                            "200 OK",
+                            "text/plain",
+                            "1\n00:00:05,000 --> 00:00:07,000\nHello\n".to_owned(),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let endpoints = NativeSubtitleEndpoints {
+            opensubtitles_v3_base: format!("http://{addr}/osv3"),
+            ..Default::default()
+        };
+        let client = NativeSubtitleClient::with_endpoints(dir.path(), endpoints.clone());
+        let query = NativeSubtitleQuery {
+            imdb_id: "tt0443536".to_owned(),
+            media_type: "movie".to_owned(),
+            opensubhash: Some("deadbeef12345678".to_owned()),
+            video_byte_size: Some(1_500_000_000),
+            preferred_langs: vec!["eng".to_owned()],
+            ..Default::default()
+        };
+        let cands = client
+            .query_opensubtitles_v3(&endpoints.opensubtitles_v3_base, &query, None)
+            .await;
+        server.abort();
+
+        assert_eq!(cands.len(), 2);
+        assert_eq!(cands[0].match_tier, SubtitleMatchTier::ExactHash);
+        assert_eq!(cands[1].match_tier, SubtitleMatchTier::Fallback);
+    }
+
+    #[test]
+    fn prunes_subtitle_cache_dir_by_file_count_and_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for idx in 0..8usize {
+            let path = dir.path().join(format!("sub-{idx:02}.srt"));
+            std::fs::write(&path, format!("cue-{idx:02}-payload-0123456789")).expect("write");
+        }
+
+        let removed = prune_subtitle_cache_dir_with_limits(dir.path(), 3, 128, None);
+        assert_eq!(removed, 5);
+
+        let remaining_count = std::fs::read_dir(dir.path()).expect("read_dir").count();
+        assert_eq!(remaining_count, 3);
+    }
+
+    #[test]
+    fn audio_aligner_stays_accurate_with_reading_speed_tail_padding_and_24fps_pulldown_drift() {
+        let pulldown_ratio = 23.976_f64 / 24.0_f64;
+        let offset_true = 2_340_i64;
+        let mut raw_cues = Vec::new();
+        let mut spoken_speech = Vec::new();
+        // Two separated clusters (~180s and ~1520s) where .srt cues hold +650ms after speech stops
+        for idx in 0..8 {
+            let s1 = 182_000 + idx * 5_500;
+            raw_cues.push((s1, s1 + 1_950));
+            spoken_speech.push((
+                (s1 as f64 * pulldown_ratio).round() as i64 + offset_true,
+                ((s1 + 1_300) as f64 * pulldown_ratio).round() as i64 + offset_true,
+            ));
+        }
+        for idx in 0..8 {
+            let s2 = 1_522_000 + idx * 5_600;
+            raw_cues.push((s2, s2 + 1_950));
+            spoken_speech.push((
+                (s2 as f64 * pulldown_ratio).round() as i64 + offset_true,
+                ((s2 + 1_300) as f64 * pulldown_ratio).round() as i64 + offset_true,
+            ));
+        }
+
+        let pcm1 = synth_speech_with_music_pcm(175.0, 65.0, &spoken_speech);
+        let pcm2 = synth_speech_with_music_pcm(1_515.0, 65.0, &spoken_speech);
+        let fp = AudioSpeechFingerprint {
+            windows: vec![
+                AudioSpeechWindow::from_pcm_8khz(175.0, &pcm1),
+                AudioSpeechWindow::from_pcm_8khz(1_515.0, &pcm2),
+            ],
+        };
+
+        let aligned = SubtitleSyncAligner::align_cues_to_audio(&raw_cues, &fp);
+        assert!(
+            (aligned.drift_ratio - pulldown_ratio).abs() < 0.0005,
+            "expected 23.976/24.0 drift {pulldown_ratio:.5}, got {:?}",
+            aligned
+        );
+        assert!(
+            (aligned.offset_ms - offset_true).abs() <= 50,
+            "expected offset within 50ms of {offset_true}ms, got {:?}",
+            aligned
+        );
+    }
+
+    #[test]
+    fn dialogue_probe_windows_skip_intro_recap_and_provide_two_separated_windows() {
+        let mut cues = Vec::new();
+        // Opening recap / credits noise in [15s..120s]
+        for s in (15_000..120_000).step_by(6_000) {
+            cues.push((s, s + 2_200));
+        }
+        // Main episode/movie dialogue across [180s..2500s]
+        for s in (180_000..2_500_000).step_by(5_000) {
+            cues.push((s, s + 2_000));
+        }
+
+        let windows = SubtitleSyncAligner::select_dialogue_probe_windows(&cues, 0.0, 0.0);
+        assert_eq!(windows.len(), 2, "expected 2 windows, got {windows:?}");
+        assert!(
+            windows[0].0 >= 150.0,
+            "expected first window to skip intro/recap (>=150s), got {:?}",
+            windows
+        );
+        assert!(
+            (windows[1].0 + windows[1].1) - windows[0].0 >= 390.0,
+            "expected >=390s separation across windows, got {:?}",
+            windows
+        );
     }
 }
