@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,11 +25,13 @@ use stremio_core_runtime::{
             resource::{StreamSource, Video},
         },
     },
-    CoreController, DebridCacheStatus, DesktopModelField, LocalDebridProvider,
-    PrivateIntegrationsConfig, ProwlarrFallbackMode, ResolvedNextEpisode, SecretApiKey,
-    SeriesTrackPreference, TrackCandidate, INITIAL_BOARD_SHELVES,
+    CoreController, DebridCacheStatus, DesktopModelField, FetchedNativeSubtitle,
+    LocalDebridProvider, NativeSubtitleQuery, PrivateIntegrationsConfig, ProwlarrFallbackMode,
+    ResolvedNextEpisode, SecretApiKey, SeriesTrackPreference, SubtitleAlignmentResult,
+    SubtitleMatchTier, TrackCandidate, INITIAL_BOARD_SHELVES,
 };
-use stremio_stream_engine::StreamEngineHandle;
+use stremio_stream_engine::{opensubhash::compute_opensubhash_http, StreamEngineHandle};
+use url::Url;
 
 use crate::{
     icons::{svg_icon, IconName},
@@ -45,9 +48,10 @@ use crate::{
         sync_memoized_meta_streams, trim_process_heap, AddonCategoryFilter, AddonSubTab,
         AppPreferences, AppRoute, BootServices, DebridAccessMode, DiscoverDropdown, FocusedInput,
         LibrarySortOrder, LibraryStatusTab, LibraryTypeFilter, MemoizedMetaStreams,
-        PlaybackCandidate, PlaybackSession, PlayerPopover, SettingsCategory, SettingsDropdown,
-        SidebarTab, StorageModeChoice, StreamFilterState, ToastKind, ToastMessage,
-        ToneMappingChoice, UpscaleChoice, LIBRARY_PAGE_SIZE, STREAM_PAGE_SIZE,
+        NativeSubtitleMatchState, NativeSubtitleMatchStatus, PlaybackCandidate, PlaybackSession,
+        PlayerPopover, SettingsCategory, SettingsDropdown, SidebarTab, StorageModeChoice,
+        StreamFilterState, ToastKind, ToastMessage, ToneMappingChoice, UpscaleChoice,
+        LIBRARY_PAGE_SIZE, STREAM_PAGE_SIZE,
     },
     theme::{
         editorial_serif, glass_capsule_shadow, keycap, movietracker_mark, obsidian_fade_in,
@@ -141,6 +145,11 @@ pub struct AppShell {
     pub in_flight_thumb_key: Option<(String, i64)>,
     pub next_episode_prewarmed: bool,
     pub prewarmed_next: Option<ResolvedNextEpisode>,
+    pub prewarm_fetch_requested_vid: Option<String>,
+    pub prewarmed_next_direct_url: Option<(String, String)>,
+    pub native_sub_match: NativeSubtitleMatchState,
+    pub pending_auto_select_sub_title: Option<String>,
+    pub user_picked_subtitle: bool,
     pub pending_quick_resume: Option<(String, String, Option<String>)>,
 
     pub toasts: Vec<ToastMessage>,
@@ -167,6 +176,10 @@ pub struct AppShell {
     pub prowlarr_key_configured: bool,
     pub prowlarr_timeout_ms: u64,
     pub prowlarr_test_status: Option<String>,
+    pub opensubtitles_key_input: String,
+    pub subdl_key_input: String,
+    pub opensubtitles_key_configured: bool,
+    pub subdl_key_configured: bool,
     pub last_debrid_latency_ms: Option<u64>,
 
     pub sleep_inhibitor: SleepInhibitor,
@@ -349,6 +362,11 @@ impl AppShell {
             in_flight_thumb_key: None,
             next_episode_prewarmed: false,
             prewarmed_next: None,
+            prewarm_fetch_requested_vid: None,
+            prewarmed_next_direct_url: None,
+            native_sub_match: NativeSubtitleMatchState::default(),
+            pending_auto_select_sub_title: None,
+            user_picked_subtitle: false,
             pending_quick_resume: None,
             toasts: Vec::new(),
             next_toast_id: 1,
@@ -373,6 +391,10 @@ impl AppShell {
             prowlarr_key_configured: !private_cfg.prowlarr_api_key.is_empty(),
             prowlarr_timeout_ms: private_cfg.prowlarr_timeout_ms,
             prowlarr_test_status: None,
+            opensubtitles_key_input: String::new(),
+            subdl_key_input: String::new(),
+            opensubtitles_key_configured: !private_cfg.opensubtitles_api_key.is_empty(),
+            subdl_key_configured: !private_cfg.subdl_api_key.is_empty(),
             last_debrid_latency_ms,
             sleep_inhibitor,
             os_media,
@@ -399,6 +421,7 @@ impl AppShell {
     ) {
         let _ = mpv.set_hdr_tone_mapping(preferences.tone_mapping.to_mpv());
         let _ = mpv.set_upscale_mode(preferences.upscale_mode.to_mpv());
+        let _ = mpv.set_subtitle_style(preferences.to_mpv_subtitle_style());
         if preferences.default_subtitle_delay_ms != 0 {
             let _ = mpv.set_subtitle_delay(f64::from(preferences.default_subtitle_delay_ms) / 1000.0);
         }
@@ -744,6 +767,12 @@ impl AppShell {
                 }
             }
         }
+        if !seamless_switch
+            && self.preferences.auto_match_native_subtitles
+            && matches!(self.native_sub_match.status, NativeSubtitleMatchStatus::Idle)
+        {
+            self.trigger_native_subtitle_auto_match(false, cx);
+        }
         self.sync_os_integrations();
         cx.notify();
     }
@@ -860,16 +889,49 @@ impl AppShell {
             self.apply_saved_series_track_prefs(&snap);
         }
 
+        if let Some(pending_title) = self.pending_auto_select_sub_title.as_deref() {
+            if let Some(track) = snap
+                .tracks
+                .iter()
+                .find(|t| t.track_type == TrackType::Sub && t.title.as_deref() == Some(pending_title))
+            {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.select_subtitle_track(Some(track.id));
+                }
+                self.pending_auto_select_sub_title = None;
+            }
+        }
+
         let mut prewarm_changed = false;
-        if self.route.is_player()
-            && !self.next_episode_prewarmed
-            && self
+        if self.route.is_player() && !self.next_episode_prewarmed {
+            if let Some(target) = self
                 .core
                 .should_trigger_next_episode_prewarm(snap.time_pos, snap.duration)
-                .is_some()
-        {
-            prewarm_changed = self.maybe_prewarm_next_episode();
+            {
+                let meta_streams_ready_for_target = self.core.with_model(|m| {
+                    m.meta_details.meta_items.iter().any(|r| {
+                        matches!(r.content, Some(Loadable::Ready(_)))
+                    }) && m.meta_details.streams.iter().any(|r| {
+                        r.request.path.id == target.video_id
+                            && matches!(r.content, Some(Loadable::Ready(_)))
+                    })
+                });
+                if self.prewarm_fetch_requested_vid.as_deref() != Some(target.video_id.as_str())
+                    || meta_streams_ready_for_target
+                {
+                    self.prewarm_fetch_requested_vid = Some(target.video_id.clone());
+                    prewarm_changed = self.maybe_prewarm_next_episode(cx);
+                }
+            }
         }
+
+        let should_auto_play_next = self.route.is_player()
+            && !prev_eof
+            && snap.eof_reached
+            && snap.duration > 30.0
+            && snap.time_pos >= snap.duration * 0.90
+            && self.preferences.auto_play_next_episode
+            && self.prewarmed_next.is_some();
 
         let (intro_visible, next_ep_visible) = if self.route.is_player() {
             self.core.with_model(|m| {
@@ -900,6 +962,13 @@ impl AppShell {
         self.player_snapshot = snap;
         let now_video_ready = self.is_player_video_frame_ready();
         self.sync_os_integrations();
+
+        if should_auto_play_next {
+            if let Some(next_vid) = self.prewarmed_next.as_ref().map(|r| r.next_video.clone()) {
+                self.advance_to_next_episode(next_vid, cx);
+                return;
+            }
+        }
 
         let state_flipped = prev_paused != self.player_snapshot.paused
             || prev_buffering != self.player_snapshot.buffering
@@ -1426,6 +1495,38 @@ impl AppShell {
         start_offset_secs: Option<f64>,
         cx: &mut Context<Self>,
     ) {
+        self.start_playback_session_inner(
+            type_name,
+            meta_id,
+            video_id,
+            title,
+            episode_label,
+            meta_request,
+            subtitles_path,
+            candidates,
+            active_index,
+            start_offset_secs,
+            None,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_playback_session_inner(
+        &mut self,
+        type_name: String,
+        meta_id: String,
+        video_id: String,
+        title: String,
+        episode_label: Option<String>,
+        meta_request: Option<ResourceRequest>,
+        subtitles_path: Option<ResourcePath>,
+        candidates: Arc<Vec<PlaybackCandidate>>,
+        active_index: usize,
+        start_offset_secs: Option<f64>,
+        prewarmed_direct_url: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if candidates.is_empty() {
             return;
         }
@@ -1478,6 +1579,11 @@ impl AppShell {
         self.expanded_stream_rows.clear();
         self.next_episode_prewarmed = false;
         self.prewarmed_next = None;
+        self.prewarm_fetch_requested_vid = None;
+        self.prewarmed_next_direct_url = None;
+        self.native_sub_match.reset();
+        self.pending_auto_select_sub_title = None;
+        self.user_picked_subtitle = false;
         self.is_scrubbing = false;
         self.is_dragging_volume = false;
         self.scrub_hover_fraction = None;
@@ -1492,7 +1598,12 @@ impl AppShell {
         self.schedule_dead_swarm_watchdog(cx);
         self.ensure_player_telemetry_pulse(cx);
         self.sync_os_integrations();
-        self.begin_active_candidate_resolution(cx);
+        if let Some(direct_url) = prewarmed_direct_url {
+            self.load_url_into_active_session(direct_url, cx);
+            self.sync_player_from_core_model(cx);
+        } else {
+            self.begin_active_candidate_resolution(cx);
+        }
         cx.notify();
     }
 
@@ -1683,6 +1794,11 @@ impl AppShell {
             return;
         };
 
+        let prewarmed_direct_url = self
+            .prewarmed_next_direct_url
+            .take()
+            .and_then(|(vid, url)| (vid == next_vid.id).then_some(url));
+
         let resolved_opt = self
             .prewarmed_next
             .take()
@@ -1704,13 +1820,24 @@ impl AppShell {
             });
             let stream_req = resolved.player_selected.stream_request.clone();
             let meta_req = resolved.player_selected.meta_request.or(cur.meta_request);
-            let cand = PlaybackCandidate::from_stream_and_request(
-                resolved.stream,
+            let mut candidates = Vec::new();
+            candidates.push(PlaybackCandidate::from_stream_and_request(
+                resolved.stream.clone(),
                 stream_req,
                 &installed_addons,
-            );
+            ));
+            for (cand_stream, cand_req) in resolved.ranked_candidates {
+                if cand_stream == resolved.stream {
+                    continue;
+                }
+                candidates.push(PlaybackCandidate::from_stream_and_request(
+                    cand_stream,
+                    cand_req,
+                    &installed_addons,
+                ));
+            }
 
-            self.start_playback_session(
+            self.start_playback_session_inner(
                 cur.type_name,
                 cur.meta_id,
                 resolved.next_video.id,
@@ -1718,9 +1845,10 @@ impl AppShell {
                 ep_label,
                 meta_req,
                 subs,
-                Arc::new(vec![cand]),
+                Arc::new(candidates),
                 0,
                 None,
+                prewarmed_direct_url,
                 cx,
             );
         } else {
@@ -1731,20 +1859,146 @@ impl AppShell {
         }
     }
 
-    fn maybe_prewarm_next_episode(&mut self) -> bool {
+    fn maybe_prewarm_next_episode(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(resolved) = self.core.resolve_next_episode_playback_url() else {
             return false;
         };
         let url_to_warm = resolved.url.clone();
+        let next_vid_id = resolved.next_video.id.clone();
+        let next_stream = resolved.stream.clone();
         self.next_episode_prewarmed = true;
         self.prewarmed_next = Some(resolved);
 
+        let gen_id = self
+            .playback_session
+            .as_ref()
+            .map(|s| s.generation)
+            .unwrap_or(0);
+        let meta_id = self
+            .playback_session
+            .as_ref()
+            .map(|s| s.meta_id.clone())
+            .unwrap_or_default();
+        let type_name = self
+            .playback_session
+            .as_ref()
+            .map(|s| s.type_name.clone())
+            .unwrap_or_else(|| "series".to_owned());
+
+        let cfg = self.core.private_integrations();
         let engine = self.engine.clone();
-        self.tokio_handle.spawn(async move {
-            let _ = engine
-                .prewarm_stream(&url_to_warm, PREWARM_HEAD_BYTES)
-                .await;
-        });
+        let core = self.core.clone();
+        let tokio_handle = self.tokio_handle.clone();
+
+        match &next_stream.source {
+            StreamSource::Torrent {
+                info_hash,
+                file_idx,
+                announce,
+                ..
+            } if cfg.direct_rust_unrestrict && cfg.has_local_debrid_configured() => {
+                let hash = *info_hash;
+                let file_idx_u32 = file_idx.map(u32::from);
+                let file_idx_usize = file_idx.map(usize::from);
+                let trackers = announce.clone();
+                let season_ep = parse_season_episode_from_video_id(Some(&next_vid_id));
+                let cached_only = cfg.debrid_cached_only_filter;
+                let next_vid_for_state = next_vid_id.clone();
+
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    let debrid_res = core
+                        .resolve_torrent_via_local_debrid(hash, file_idx_u32, trackers.clone(), season_ep)
+                        .await;
+                    match debrid_res {
+                        Ok(debrid) => {
+                            let warm_url = debrid.url.clone();
+                            let warm_url_str = debrid.url.to_string();
+                            let engine_clone = engine.clone();
+                            let _ = tokio_handle
+                                .spawn(async move {
+                                    let _ = engine_clone
+                                        .prewarm_stream(&warm_url, PREWARM_HEAD_BYTES)
+                                        .await;
+                                })
+                                .await;
+                            let _ = this.update(cx, |shell, cx| {
+                                if shell.route.is_player()
+                                    && shell
+                                        .playback_session
+                                        .as_ref()
+                                        .is_some_and(|s| s.generation == gen_id)
+                                {
+                                    shell.prewarmed_next_direct_url =
+                                        Some((next_vid_for_state, warm_url_str));
+                                    cx.notify();
+                                }
+                            });
+                        }
+                        Err(_) if !cached_only => {
+                            let hash_hex = hex::encode(hash);
+                            let _ = tokio_handle
+                                .spawn(async move {
+                                    let _ = engine
+                                        .prebuffer_episode(&hash_hex, file_idx_usize, trackers)
+                                        .await;
+                                })
+                                .await;
+                        }
+                        Err(_) => {}
+                    }
+                })
+                .detach();
+            }
+            StreamSource::Torrent {
+                info_hash,
+                file_idx,
+                announce,
+                ..
+            } => {
+                let hash_hex = hex::encode(info_hash);
+                let file_idx_usize = file_idx.map(usize::from);
+                let trackers = announce.clone();
+                self.tokio_handle.spawn(async move {
+                    let _ = engine
+                        .prebuffer_episode(&hash_hex, file_idx_usize, trackers)
+                        .await;
+                });
+            }
+            _ => {
+                self.tokio_handle.spawn(async move {
+                    let _ = engine
+                        .prewarm_stream(&url_to_warm, PREWARM_HEAD_BYTES)
+                        .await;
+                });
+            }
+        }
+
+        // Pre-warm Episode N+1 native subtitles into the local cache
+        if self.preferences.auto_match_native_subtitles && cfg.native_subtitles_enabled && !meta_id.is_empty() {
+            let (season, episode) = parse_season_episode_from_video_id(Some(&next_vid_id))
+                .map(|(s, e)| (Some(s), Some(e)))
+                .unwrap_or((None, None));
+            let pref_lang = self.normalized_preferred_sub_lang();
+            let sub_query = NativeSubtitleQuery {
+                imdb_id: meta_id,
+                media_type: type_name,
+                season,
+                episode,
+                opensubhash: None,
+                video_byte_size: next_stream.behavior_hints.video_size,
+                video_filename: next_stream
+                    .behavior_hints
+                    .filename
+                    .clone()
+                    .or_else(|| next_stream.name.clone())
+                    .or_else(|| next_stream.description.clone()),
+                preferred_langs: vec![pref_lang],
+            };
+            let core_subs = self.core.clone();
+            self.tokio_handle.spawn(async move {
+                let _ = core_subs.search_and_fetch_native_subtitles(sub_query, 2).await;
+            });
+        }
         true
     }
 
@@ -1788,7 +2042,13 @@ impl AppShell {
         self.scrub_hover_metrics = None;
         self.replace_hover_thumbnail(None, None);
         self.in_flight_thumb_key = None;
+        self.next_episode_prewarmed = false;
         self.prewarmed_next = None;
+        self.prewarm_fetch_requested_vid = None;
+        self.prewarmed_next_direct_url = None;
+        self.native_sub_match.reset();
+        self.pending_auto_select_sub_title = None;
+        self.user_picked_subtitle = false;
         self.sync_os_integrations();
         trim_process_heap();
     }
@@ -2059,6 +2319,8 @@ impl AppShell {
     }
 
     pub fn user_select_subtitle_track(&mut self, track_id: Option<i64>, cx: &mut Context<Self>) {
+        self.user_picked_subtitle = true;
+        self.pending_auto_select_sub_title = None;
         if let Some(mpv) = &self.mpv {
             let _ = mpv.select_subtitle_track(track_id);
         }
@@ -2348,6 +2610,472 @@ impl AppShell {
         cx.notify();
     }
 
+    pub fn update_subtitle_style_prefs(&mut self, cx: &mut Context<Self>) {
+        let _ = self.preferences.save();
+        if let Some(mpv) = &self.mpv {
+            let _ = mpv.set_subtitle_style(self.preferences.to_mpv_subtitle_style());
+        }
+        cx.notify();
+    }
+
+    pub fn set_subtitle_color_hex(&mut self, hex: &str, cx: &mut Context<Self>) {
+        self.preferences.subtitle_color_hex = hex.trim().to_ascii_uppercase();
+        self.update_subtitle_style_prefs(cx);
+    }
+
+    pub fn set_subtitle_background_pill(&mut self, pill: bool, cx: &mut Context<Self>) {
+        self.preferences.subtitle_background_pill = pill;
+        self.update_subtitle_style_prefs(cx);
+    }
+
+    pub fn set_subtitle_font_size(&mut self, size: u32, cx: &mut Context<Self>) {
+        self.preferences.subtitle_font_size = size.clamp(22, 96);
+        self.update_subtitle_style_prefs(cx);
+    }
+
+    pub fn step_subtitle_font_size(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let next = i32::try_from(self.preferences.subtitle_font_size)
+            .unwrap_or(46)
+            .saturating_add(delta)
+            .clamp(22, 96) as u32;
+        self.set_subtitle_font_size(next, cx);
+    }
+
+    pub fn set_subtitle_vertical_pos(&mut self, pos: u32, cx: &mut Context<Self>) {
+        self.preferences.subtitle_vertical_pos = pos.clamp(60, 100);
+        self.update_subtitle_style_prefs(cx);
+    }
+
+    pub fn step_subtitle_vertical_pos(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let next = i32::try_from(self.preferences.subtitle_vertical_pos)
+            .unwrap_or(96)
+            .saturating_add(delta)
+            .clamp(60, 100) as u32;
+        self.set_subtitle_vertical_pos(next, cx);
+    }
+
+    pub fn toggle_subtitle_ass_scale_override(&mut self, cx: &mut Context<Self>) {
+        self.preferences.subtitle_ass_scale_override = !self.preferences.subtitle_ass_scale_override;
+        self.update_subtitle_style_prefs(cx);
+    }
+
+    pub fn reset_subtitle_style_prefs(&mut self, cx: &mut Context<Self>) {
+        self.preferences.reset_subtitle_style();
+        self.update_subtitle_style_prefs(cx);
+    }
+
+    pub fn toggle_auto_match_native_subtitles(&mut self, cx: &mut Context<Self>) {
+        self.preferences.auto_match_native_subtitles = !self.preferences.auto_match_native_subtitles;
+        let _ = self.preferences.save();
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn toggle_auto_play_next_episode(&mut self, cx: &mut Context<Self>) {
+        self.preferences.auto_play_next_episode = !self.preferences.auto_play_next_episode;
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    fn normalized_preferred_sub_lang(&self) -> String {
+        let pref = self.preferences.preferred_subtitle_lang.trim();
+        if pref.is_empty()
+            || pref.eq_ignore_ascii_case("auto")
+            || pref.eq_ignore_ascii_case("off")
+            || pref.eq_ignore_ascii_case("none")
+        {
+            "eng".to_owned()
+        } else {
+            pref.to_ascii_lowercase()
+        }
+    }
+
+    fn format_native_sub_label(sub: &FetchedNativeSubtitle, aligned: Option<&SubtitleAlignmentResult>) -> String {
+        let lang = sub.lang.to_ascii_uppercase();
+        if let Some(align) = aligned {
+            let badge = Self::format_alignment_badge(align);
+            format!("{lang} · {badge}")
+        } else {
+            format!(
+                "{lang} · {} ({}ms)",
+                sub.match_tier.display_label(),
+                sub.lookup_elapsed_ms
+            )
+        }
+    }
+
+    fn format_alignment_badge(align: &SubtitleAlignmentResult) -> String {
+        if (align.drift_ratio - 1.0).abs() > 0.01 {
+            "Auto-Synced (PAL 25→23.976)".to_owned()
+        } else {
+            let secs = (align.offset_ms as f64) / 1000.0;
+            format!("Auto-Synced ({secs:+.2}s)")
+        }
+    }
+
+    pub fn trigger_native_subtitle_auto_match(&mut self, force_rematch: bool, cx: &mut Context<Self>) {
+        if !force_rematch && !self.preferences.auto_match_native_subtitles {
+            return;
+        }
+        let Some(session) = self.playback_session.as_ref() else {
+            return;
+        };
+
+        let gen_id = session.generation;
+        let imdb_id = session.meta_id.clone();
+        let media_type = session.type_name.clone();
+        let (season, episode) = parse_season_episode_from_video_id(Some(&session.video_id))
+            .map(|(s, e)| (Some(s), Some(e)))
+            .unwrap_or((None, None));
+        let resolved_url = session.resolved_url.clone();
+        let active_cand = session.active_candidate();
+        let video_byte_size = active_cand.and_then(|c| c.stream.behavior_hints.video_size);
+        let video_filename = active_cand
+            .and_then(|c| {
+                c.stream
+                    .behavior_hints
+                    .filename
+                    .clone()
+                    .or_else(|| Some(c.parsed.display_title.clone()))
+                    .or_else(|| c.stream.name.clone())
+            })
+            .or_else(|| {
+                resolved_url.as_deref().and_then(|u| {
+                    Url::parse(u).ok().and_then(|parsed| {
+                        parsed
+                            .path_segments()
+                            .and_then(|mut segs| segs.next_back())
+                            .map(str::to_owned)
+                            .filter(|s| !s.is_empty())
+                    })
+                })
+            });
+        let preferred_lang = self.normalized_preferred_sub_lang();
+        let local_target_to_align = if force_rematch
+            && matches!(
+                self.native_sub_match.status,
+                NativeSubtitleMatchStatus::LocalFile { .. }
+            ) {
+            self.native_sub_match.active_local_sub_path.clone()
+        } else {
+            None
+        };
+        let align_local_mode = local_target_to_align.is_some();
+
+        self.native_sub_match.status = NativeSubtitleMatchStatus::Searching;
+        if force_rematch {
+            self.native_sub_match.last_alignment_badge = None;
+        }
+        cx.notify();
+
+        let core = self.core.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let outcome = tokio_handle
+                .spawn(async move {
+                    let hash_res = if let Some(url_str) = resolved_url.as_deref() {
+                        if let Ok(parsed) = Url::parse(url_str) {
+                            if parsed.scheme() == "http" || parsed.scheme() == "https" {
+                                if let Ok(client) = reqwest13::Client::builder()
+                                    .timeout(Duration::from_millis(1200))
+                                    .build()
+                                {
+                                    tokio::time::timeout(
+                                        Duration::from_millis(1200),
+                                        compute_opensubhash_http(&client, &parsed),
+                                    )
+                                    .await
+                                    .ok()
+                                    .and_then(Result::ok)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let query = NativeSubtitleQuery {
+                        imdb_id,
+                        media_type,
+                        season,
+                        episode,
+                        opensubhash: hash_res.as_ref().map(|r| r.hash.clone()),
+                        video_byte_size: hash_res.as_ref().map(|r| r.size).or(video_byte_size),
+                        video_filename,
+                        preferred_langs: vec![preferred_lang],
+                    };
+                    let fetched = core.search_and_fetch_native_subtitles(query, 4).await;
+                    let exact_ref = fetched
+                        .iter()
+                        .find(|s| s.match_tier == SubtitleMatchTier::ExactHash)
+                        .cloned();
+
+                    let auto_aligned = if let (Some(top), Some(ref_sub)) =
+                        (fetched.first(), exact_ref.as_ref())
+                    {
+                        if let Some(local_path) = local_target_to_align.as_ref() {
+                            core.align_subtitle_to_reference(local_path, &ref_sub.local_path)
+                                .ok()
+                        } else if top.match_tier != SubtitleMatchTier::ExactHash
+                            && top.local_path != ref_sub.local_path
+                        {
+                            core.align_subtitle_to_reference(&top.local_path, &ref_sub.local_path)
+                                .ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    (fetched, exact_ref.map(|r| r.local_path), auto_aligned)
+                })
+                .await;
+
+            let _ = this.update(cx, |shell, cx| {
+                let still_active = shell.route.is_player()
+                    && shell
+                        .playback_session
+                        .as_ref()
+                        .is_some_and(|s| s.generation == gen_id);
+                if !still_active {
+                    return;
+                }
+
+                let Ok((fetched, exact_ref_path, auto_aligned)) = outcome else {
+                    shell.native_sub_match.status =
+                        NativeSubtitleMatchStatus::Failed("Subtitle search task failed".to_owned());
+                    cx.notify();
+                    return;
+                };
+
+                shell.native_sub_match.reference_sub_path = exact_ref_path;
+                shell.native_sub_match.fetched_subs = fetched.clone();
+
+                if fetched.is_empty() {
+                    if !matches!(
+                        shell.native_sub_match.status,
+                        NativeSubtitleMatchStatus::LocalFile { .. }
+                    ) {
+                        shell.native_sub_match.status = NativeSubtitleMatchStatus::NoMatches;
+                    }
+                    if force_rematch {
+                        shell.push_toast(
+                            ToastKind::Info,
+                            "No native subtitles found",
+                            Some("Try dropping an .srt or .ass file onto the player".to_owned()),
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                    return;
+                }
+
+                let top_sub = &fetched[0];
+                let should_select_top =
+                    (force_rematch || !shell.user_picked_subtitle) && shell.preferences.auto_select_subtitles;
+                let mut chosen_title: Option<String> = None;
+
+                if let Some((aligned_path, alignment)) = auto_aligned {
+                    let badge = Self::format_alignment_badge(&alignment);
+                    let label = Self::format_native_sub_label(top_sub, Some(&alignment));
+                    if let Some(mpv) = &shell.mpv {
+                        let _ = mpv.add_local_subtitle_file(
+                            &aligned_path,
+                            Some(&label),
+                            Some(&top_sub.lang),
+                        );
+                        let _ = mpv.set_subtitle_delay(0.0);
+                    }
+                    shell.native_sub_match.active_local_sub_path = Some(aligned_path);
+                    shell.native_sub_match.last_alignment_badge = Some(badge.clone());
+                    if !align_local_mode {
+                        shell.native_sub_match.status = NativeSubtitleMatchStatus::Matched {
+                            tier: top_sub.match_tier,
+                            elapsed_ms: top_sub.lookup_elapsed_ms,
+                        };
+                    }
+                    chosen_title = Some(label);
+                    if force_rematch {
+                        shell.push_toast(ToastKind::Success, "Subtitles auto-synced", Some(badge), cx);
+                    }
+                }
+
+                for (idx, sub) in fetched.iter().enumerate() {
+                    let label = Self::format_native_sub_label(sub, None);
+                    if idx == 0 && chosen_title.is_some() {
+                        // Already attached aligned top track above
+                        continue;
+                    }
+                    if let Some(mpv) = &shell.mpv {
+                        let _ =
+                            mpv.add_local_subtitle_file(&sub.local_path, Some(&label), Some(&sub.lang));
+                    }
+                    if idx == 0 && chosen_title.is_none() {
+                        shell.native_sub_match.active_local_sub_path = Some(sub.local_path.clone());
+                        shell.native_sub_match.status = NativeSubtitleMatchStatus::Matched {
+                            tier: sub.match_tier,
+                            elapsed_ms: sub.lookup_elapsed_ms,
+                        };
+                        chosen_title = Some(label);
+                    }
+                }
+
+                if should_select_top {
+                    if let Some(title) = chosen_title {
+                        if let Some(track) = shell.player_snapshot.tracks.iter().find(|t| {
+                            t.track_type == TrackType::Sub && t.title.as_deref() == Some(&title)
+                        }) {
+                            if let Some(mpv) = &shell.mpv {
+                                let _ = mpv.select_subtitle_track(Some(track.id));
+                            }
+                            shell.pending_auto_select_sub_title = None;
+                        } else {
+                            shell.pending_auto_select_sub_title = Some(title);
+                        }
+                    }
+                }
+                if force_rematch && !align_local_mode {
+                    shell.push_toast(
+                        ToastKind::Success,
+                        format!("Matched {} subtitles", fetched.len()),
+                        shell.native_sub_match.status_badge(),
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn auto_sync_active_subtitle(&mut self, cx: &mut Context<Self>) {
+        let Some(active_path) = self.native_sub_match.active_local_sub_path.clone() else {
+            self.push_toast(
+                ToastKind::Info,
+                "Searching native hash subtitles for Auto-Sync...",
+                None,
+                cx,
+            );
+            self.trigger_native_subtitle_auto_match(true, cx);
+            return;
+        };
+        let Some(ref_path) = self.native_sub_match.reference_sub_path.clone() else {
+            self.push_toast(
+                ToastKind::Info,
+                "Fetching hash reference for Auto-Sync...",
+                None,
+                cx,
+            );
+            self.trigger_native_subtitle_auto_match(true, cx);
+            return;
+        };
+
+        if active_path == ref_path {
+            self.native_sub_match.last_alignment_badge = Some("Hash-Aligned (0ms)".to_owned());
+            if let Some(mpv) = &self.mpv {
+                let _ = mpv.set_subtitle_delay(0.0);
+            }
+            self.push_toast(
+                ToastKind::Info,
+                "Already hash-aligned to exact video rip",
+                None,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+
+        match self.core.align_subtitle_to_reference(&active_path, &ref_path) {
+            Ok((aligned_path, alignment)) => {
+                let badge = Self::format_alignment_badge(&alignment);
+                let filename = aligned_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("aligned.srt");
+                let label = format!("{badge} · {filename}");
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.add_local_subtitle_file(&aligned_path, Some(&label), None);
+                    let _ = mpv.set_subtitle_delay(0.0);
+                }
+                self.pending_auto_select_sub_title = Some(label);
+                self.native_sub_match.active_local_sub_path = Some(aligned_path);
+                self.native_sub_match.last_alignment_badge = Some(badge.clone());
+                self.push_toast(ToastKind::Success, "Subtitles auto-synced", Some(badge), cx);
+            }
+            Err(err) => {
+                self.push_toast(ToastKind::Warning, "Auto-sync failed", Some(err), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn handle_dropped_subtitle_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if !self.route.is_player() || paths.is_empty() {
+            return;
+        }
+
+        let mut loaded_count = 0usize;
+        let mut last_loaded: Option<(PathBuf, String)> = None;
+        let mut last_err: Option<String> = None;
+
+        for path in paths {
+            match gpui_mpv::validate_local_subtitle_path(path) {
+                Ok(canonical) => {
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Local Subtitle")
+                        .to_owned();
+                    let label = format!("Local · {filename}");
+                    if let Some(mpv) = &self.mpv {
+                        if let Err(err) = mpv.add_local_subtitle_file(&canonical, Some(&label), None)
+                        {
+                            last_err = Some(err.to_string());
+                            continue;
+                        }
+                    }
+                    loaded_count += 1;
+                    last_loaded = Some((canonical, filename));
+                    self.pending_auto_select_sub_title = Some(label);
+                }
+                Err(err) => {
+                    last_err = Some(err.to_string());
+                }
+            }
+        }
+
+        if let Some((canonical, filename)) = last_loaded {
+            self.user_picked_subtitle = true;
+            self.native_sub_match.active_local_sub_path = Some(canonical);
+            self.native_sub_match.status = NativeSubtitleMatchStatus::LocalFile {
+                filename: filename.clone(),
+            };
+            self.native_sub_match.last_alignment_badge = None;
+            let title = if loaded_count == 1 {
+                "Loaded local subtitle".to_owned()
+            } else {
+                format!("Loaded {loaded_count} local subtitles")
+            };
+            self.push_toast(ToastKind::Success, title, Some(filename), cx);
+        } else {
+            self.push_toast(
+                ToastKind::Warning,
+                "Unsupported subtitle file",
+                last_err.or_else(|| {
+                    Some("Drop a .srt, .ass, .ssa, .vtt, or .sub file".to_owned())
+                }),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
     pub fn set_local_debrid_provider(&mut self, idx: usize, cx: &mut Context<Self>) {
         self.local_debrid_provider_idx = idx.min(3);
         self.debrid_verify_status = None;
@@ -2529,6 +3257,18 @@ impl AppShell {
         self.persist_private_integrations_draft(cx);
     }
 
+    pub fn clear_opensubtitles_key(&mut self, cx: &mut Context<Self>) {
+        self.opensubtitles_key_input.clear();
+        self.opensubtitles_key_configured = false;
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn clear_subdl_key(&mut self, cx: &mut Context<Self>) {
+        self.subdl_key_input.clear();
+        self.subdl_key_configured = false;
+        self.persist_private_integrations_draft(cx);
+    }
+
     pub fn focus_settings_input(&mut self, input: FocusedInput, cx: &mut Context<Self>) {
         self.settings_open_dropdown = None;
         self.focused_input = Some(input);
@@ -2564,6 +3304,17 @@ impl AppShell {
                 existing.prowlarr_api_key,
             ),
             prowlarr_timeout_ms: self.prowlarr_timeout_ms.clamp(1000, 15000),
+            native_subtitles_enabled: self.preferences.auto_match_native_subtitles,
+            opensubtitles_api_key: merge_secret_key_draft(
+                &self.opensubtitles_key_input,
+                &mut self.opensubtitles_key_configured,
+                existing.opensubtitles_api_key,
+            ),
+            subdl_api_key: merge_secret_key_draft(
+                &self.subdl_key_input,
+                &mut self.subdl_key_configured,
+                existing.subdl_api_key,
+            ),
         };
 
         if let Err(err) = self.core.update_private_integrations(next) {
@@ -3100,7 +3851,11 @@ impl AppShell {
                         FocusedInput::TorBoxApiKey => Some(FocusedInput::AllDebridApiKey),
                         FocusedInput::AllDebridApiKey => Some(FocusedInput::ProwlarrUrl),
                         FocusedInput::ProwlarrUrl => Some(FocusedInput::ProwlarrApiKey),
-                        FocusedInput::ProwlarrApiKey => Some(FocusedInput::RealDebridApiKey),
+                        FocusedInput::ProwlarrApiKey => Some(FocusedInput::SettingsOpenSubtitlesKey),
+                        FocusedInput::SettingsOpenSubtitlesKey => {
+                            Some(FocusedInput::SettingsSubdlKey)
+                        }
+                        FocusedInput::SettingsSubdlKey => Some(FocusedInput::RealDebridApiKey),
                         other => Some(other),
                     };
                     cx.notify();
@@ -3124,7 +3879,9 @@ impl AppShell {
                         | FocusedInput::TorBoxApiKey
                         | FocusedInput::AllDebridApiKey
                         | FocusedInput::ProwlarrUrl
-                        | FocusedInput::ProwlarrApiKey => {
+                        | FocusedInput::ProwlarrApiKey
+                        | FocusedInput::SettingsOpenSubtitlesKey
+                        | FocusedInput::SettingsSubdlKey => {
                             self.focused_input = None;
                             self.persist_private_integrations_draft(cx);
                         }
@@ -3204,6 +3961,29 @@ impl AppShell {
                             if c {
                                 self.prowlarr_key_configured =
                                     !self.prowlarr_key_input.trim().is_empty();
+                                integration_edited = true;
+                            }
+                            c
+                        }
+                        FocusedInput::SettingsOpenSubtitlesKey => {
+                            let c = apply_key_to_text_buffer(
+                                &mut self.opensubtitles_key_input,
+                                event,
+                                clip,
+                            );
+                            if c {
+                                self.opensubtitles_key_configured =
+                                    !self.opensubtitles_key_input.trim().is_empty();
+                                integration_edited = true;
+                            }
+                            c
+                        }
+                        FocusedInput::SettingsSubdlKey => {
+                            let c =
+                                apply_key_to_text_buffer(&mut self.subdl_key_input, event, clip);
+                            if c {
+                                self.subdl_key_configured =
+                                    !self.subdl_key_input.trim().is_empty();
                                 integration_edited = true;
                             }
                             c

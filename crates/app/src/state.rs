@@ -10,7 +10,7 @@ use std::{
 use gpui::{px, ClipboardItem, KeyDownEvent, ScrollHandle};
 use gpui_mpv::{
     DebandConfig, HdrBackendOptions, MpvController, PlayerSnapshot, ShaderPreset,
-    ToneMappingPreset, UpscalePreset,
+    SubtitleAssOverride, SubtitleBackgroundMode, SubtitleStyle, ToneMappingPreset, UpscalePreset,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -32,8 +32,9 @@ use stremio_core_runtime::{
             resource::{MetaItem, MetaItemPreview, Stream, StreamSource},
         },
     },
-    AddonCategory, CoreController, DebridCacheStatus, DesktopModel, LocalDebridProvider,
-    ParsedStream, Resolution, RichStreamItem, StreamFilter,
+    AddonCategory, CoreController, DebridCacheStatus, DesktopModel, FetchedNativeSubtitle,
+    LocalDebridProvider, ParsedStream, Resolution, RichStreamItem, StreamFilter,
+    SubtitleMatchTier,
 };
 use stremio_stream_engine::{
     StorageMode, StreamEngine, StreamEngineConfig, StreamEngineError, StreamEngineHandle,
@@ -498,6 +499,10 @@ pub enum SettingsDropdown {
     ShaderPreset,
 }
 
+pub const DEFAULT_SUBTITLE_FONT_SIZE: u32 = 46;
+pub const DEFAULT_SUBTITLE_VERTICAL_POS: u32 = 96;
+pub const DEFAULT_SUBTITLE_COLOR_HEX: &str = "#F5F1E8";
+
 const fn default_true() -> bool {
     true
 }
@@ -508,6 +513,18 @@ const fn default_osd_autohide_secs() -> u8 {
 
 fn default_lang_eng() -> String {
     "eng".to_owned()
+}
+
+const fn default_subtitle_font_size() -> u32 {
+    DEFAULT_SUBTITLE_FONT_SIZE
+}
+
+const fn default_subtitle_vertical_pos() -> u32 {
+    DEFAULT_SUBTITLE_VERTICAL_POS
+}
+
+fn default_subtitle_color_hex() -> String {
+    DEFAULT_SUBTITLE_COLOR_HEX.to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +557,20 @@ pub struct AppPreferences {
     pub auto_select_subtitles: bool,
     #[serde(default)]
     pub default_subtitle_delay_ms: i32,
+    #[serde(default = "default_subtitle_font_size")]
+    pub subtitle_font_size: u32,
+    #[serde(default = "default_subtitle_vertical_pos")]
+    pub subtitle_vertical_pos: u32,
+    #[serde(default = "default_subtitle_color_hex")]
+    pub subtitle_color_hex: String,
+    #[serde(default)]
+    pub subtitle_background_pill: bool,
+    #[serde(default = "default_true")]
+    pub subtitle_ass_scale_override: bool,
+    #[serde(default = "default_true")]
+    pub auto_match_native_subtitles: bool,
+    #[serde(default = "default_true")]
+    pub auto_play_next_episode: bool,
 }
 
 impl Default for AppPreferences {
@@ -563,11 +594,45 @@ impl Default for AppPreferences {
             preferred_subtitle_lang: "eng".to_owned(),
             auto_select_subtitles: true,
             default_subtitle_delay_ms: 0,
+            subtitle_font_size: DEFAULT_SUBTITLE_FONT_SIZE,
+            subtitle_vertical_pos: DEFAULT_SUBTITLE_VERTICAL_POS,
+            subtitle_color_hex: DEFAULT_SUBTITLE_COLOR_HEX.to_owned(),
+            subtitle_background_pill: false,
+            subtitle_ass_scale_override: true,
+            auto_match_native_subtitles: true,
+            auto_play_next_episode: true,
         }
     }
 }
 
 impl AppPreferences {
+    pub fn to_mpv_subtitle_style(&self) -> SubtitleStyle {
+        SubtitleStyle {
+            font_size: self.subtitle_font_size,
+            vertical_pos: self.subtitle_vertical_pos,
+            color_hex: self.subtitle_color_hex.clone(),
+            background: if self.subtitle_background_pill {
+                SubtitleBackgroundMode::TranslucentPill
+            } else {
+                SubtitleBackgroundMode::DropShadow
+            },
+            ass_override: if self.subtitle_ass_scale_override {
+                SubtitleAssOverride::Scale
+            } else {
+                SubtitleAssOverride::No
+            },
+        }
+        .sanitized()
+    }
+
+    pub fn reset_subtitle_style(&mut self) {
+        self.subtitle_font_size = DEFAULT_SUBTITLE_FONT_SIZE;
+        self.subtitle_vertical_pos = DEFAULT_SUBTITLE_VERTICAL_POS;
+        self.subtitle_color_hex = DEFAULT_SUBTITLE_COLOR_HEX.to_owned();
+        self.subtitle_background_pill = false;
+        self.subtitle_ass_scale_override = true;
+    }
+
     pub fn default_path() -> PathBuf {
         Self::config_path_for_app_dir("ferrite")
     }
@@ -1426,6 +1491,55 @@ impl PlaybackSession {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum NativeSubtitleMatchStatus {
+    #[default]
+    Idle,
+    Searching,
+    Matched {
+        tier: SubtitleMatchTier,
+        elapsed_ms: u64,
+    },
+    LocalFile {
+        filename: String,
+    },
+    NoMatches,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NativeSubtitleMatchState {
+    pub status: NativeSubtitleMatchStatus,
+    pub fetched_subs: Vec<FetchedNativeSubtitle>,
+    pub active_local_sub_path: Option<PathBuf>,
+    pub reference_sub_path: Option<PathBuf>,
+    pub last_alignment_badge: Option<String>,
+}
+
+impl NativeSubtitleMatchState {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn status_badge(&self) -> Option<String> {
+        if let Some(badge) = &self.last_alignment_badge {
+            return Some(badge.clone());
+        }
+        match &self.status {
+            NativeSubtitleMatchStatus::Idle => None,
+            NativeSubtitleMatchStatus::Searching => Some("Matching...".to_owned()),
+            NativeSubtitleMatchStatus::Matched { tier, elapsed_ms } => {
+                Some(format!("{} · {}ms", tier.display_label(), elapsed_ms))
+            }
+            NativeSubtitleMatchStatus::LocalFile { filename } => {
+                Some(format!("Local · {filename}"))
+            }
+            NativeSubtitleMatchStatus::NoMatches => Some("No Native Matches".to_owned()),
+            NativeSubtitleMatchStatus::Failed(_) => Some("Match Unavailable".to_owned()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerPopover {
     Volume,
@@ -1483,6 +1597,8 @@ pub enum FocusedInput {
     AllDebridApiKey,
     ProwlarrUrl,
     ProwlarrApiKey,
+    SettingsOpenSubtitlesKey,
+    SettingsSubdlKey,
 }
 
 pub fn settings_row_matches_query(
@@ -2546,6 +2662,48 @@ mod tests {
         assert_eq!(loaded.preferred_subtitle_lang, "eng");
         assert!(loaded.auto_select_subtitles);
         assert_eq!(loaded.default_subtitle_delay_ms, 0);
+
+        // v0.3.0 Subtitle Studio & Binge defaults
+        assert_eq!(loaded.subtitle_font_size, 46);
+        assert_eq!(loaded.subtitle_vertical_pos, 96);
+        assert_eq!(loaded.subtitle_color_hex, "#F5F1E8");
+        assert!(!loaded.subtitle_background_pill);
+        assert!(loaded.subtitle_ass_scale_override);
+        assert!(loaded.auto_match_native_subtitles);
+        assert!(loaded.auto_play_next_episode);
+    }
+
+    #[test]
+    fn app_preferences_v020_json_deserializes_with_v030_defaults() {
+        let v020_json = r#"{
+            "storage_mode": { "mode": "disk_lru", "budget_gb": 50 },
+            "enable_upnp": true,
+            "dead_swarm_failover": true,
+            "dead_swarm_timeout_secs": 10,
+            "debrid_access_mode": "auto_detect",
+            "sidebar_collapsed": false,
+            "tone_mapping": "auto",
+            "upscale_mode": "bilinear",
+            "preferred_audio_lang": "eng",
+            "preferred_subtitle_lang": "eng",
+            "auto_select_subtitles": true,
+            "default_subtitle_delay_ms": 0
+        }"#;
+        let loaded: AppPreferences =
+            serde_json::from_str(v020_json).expect("v0.2.0 preferences JSON should deserialize");
+
+        assert_eq!(loaded.subtitle_color_hex, "#F5F1E8");
+        assert_eq!(loaded.subtitle_font_size, 46);
+        assert_eq!(loaded.subtitle_vertical_pos, 96);
+        assert!(!loaded.subtitle_background_pill);
+        assert!(loaded.subtitle_ass_scale_override);
+        assert!(loaded.auto_match_native_subtitles);
+        assert!(loaded.auto_play_next_episode);
+
+        let mpv_style = loaded.to_mpv_subtitle_style();
+        assert_eq!(mpv_style.font_size, 46);
+        assert_eq!(mpv_style.vertical_pos, 96);
+        assert_eq!(mpv_style.color_hex, "#F5F1E8");
     }
 
     #[test]

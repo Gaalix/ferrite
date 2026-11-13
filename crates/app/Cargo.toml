@@ -1,6 +1,6 @@
 [package]
 name = "ferrite"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Gaalix/ferrite"
@@ -28,6 +28,7 @@ hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

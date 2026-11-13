@@ -982,7 +982,7 @@ mod tests {
                 let req_line = String::from_utf8_lossy(&req_buf[..n]);
                 let (ct, body): (&str, Vec<u8>) = if req_line.starts_with("GET /latest ") {
                     let json = format!(
-                        r#"{{"tag_name":"v0.2.0","name":"Ferrite v0.2.0","body":"- Faster startup","html_url":"http://127.0.0.1:{port}/release","draft":false,"prerelease":false,"assets":[{{"name":"SHA256SUMS.txt","browser_download_url":"http://127.0.0.1:{port}/SHA256SUMS.txt","size":80}},{{"name":"ferrite-linux-x86_64.tar.gz","browser_download_url":"http://127.0.0.1:{port}/ferrite-linux-x86_64.tar.gz","size":{sz}}}]}}"#,
+                        r#"{{"tag_name":"v0.4.0","name":"Ferrite v0.4.0","body":"- Faster startup","html_url":"http://127.0.0.1:{port}/release","draft":false,"prerelease":false,"assets":[{{"name":"SHA256SUMS.txt","browser_download_url":"http://127.0.0.1:{port}/SHA256SUMS.txt","size":80}},{{"name":"ferrite-linux-x86_64.tar.gz","browser_download_url":"http://127.0.0.1:{port}/ferrite-linux-x86_64.tar.gz","size":{sz}}}]}}"#,
                         port = addr.port(),
                         sz = tar_clone.len()
                     );
@@ -1005,18 +1005,18 @@ mod tests {
             .expect("parse mock url");
         let found = check_for_updates_from_url(
             &endpoint,
-            "0.1.0",
+            "0.3.0",
             InstallTargetKind::LinuxTarGz,
             true,
         )
         .await
         .expect("check succeeds")
         .expect("update available");
-        assert_eq!(found.version, "0.2.0");
+        assert_eq!(found.version, "0.4.0");
 
         let tmp_dir = tempfile::tempdir().expect("tempdir");
         let fake_exe = tmp_dir.path().join("ferrite");
-        fs::write(&fake_exe, b"\x7fELFold-0.1.0").expect("seed old exe");
+        fs::write(&fake_exe, b"\x7fELFold-0.3.0").expect("seed old exe");
 
         let outcome = download_and_apply_update_inner(
             &found,
@@ -1029,7 +1029,7 @@ mod tests {
         assert_eq!(
             outcome,
             AppliedUpdateOutcome::ReadyToRestart {
-                version: "0.2.0".to_owned()
+                version: "0.4.0".to_owned()
             }
         );
         assert_eq!(fs::read(&fake_exe).expect("read updated exe"), new_elf);

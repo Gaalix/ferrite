@@ -36,9 +36,12 @@ pub enum SettingsRowId {
     DynamicHdrPeak,
     PreventDisplaySleep,
     OsMediaControls,
+    AutoPlayNextEpisode,
     PreferredAudioLang,
     PreferredSubtitleLang,
     AutoSelectSubtitles,
+    AutoMatchNativeSubtitles,
+    SubtitleStyleSummary,
     DefaultSubtitleDelay,
     LocalDebridProvider,
     LocalDebridDirectUnrestrict,
@@ -53,6 +56,8 @@ pub enum SettingsRowId {
     ProwlarrUrl,
     ProwlarrApiKey,
     ProwlarrTimeoutAndTest,
+    OpenSubtitlesApiKey,
+    SubdlApiKey,
     OpenAddonsStudio,
     PieceCacheMode,
     ClearMetadataImageCache,
@@ -170,6 +175,14 @@ pub const SETTINGS_ROWS: &[SettingsRowSpec] = &[
         keywords: &["mpris", "mpris2", "smtc", "media", "keys", "os", "transport"],
     },
     SettingsRowSpec {
+        id: SettingsRowId::AutoPlayNextEpisode,
+        category: SettingsCategory::PlaybackAndVideo,
+        group: "Binge & Continuation",
+        label: "Auto-play & pre-buffer next episode",
+        description: "Pre-match and pre-buffer Episode N+1 45s before credits and auto-play at end of stream.",
+        keywords: &["auto", "play", "next", "episode", "binge", "prebuffer", "credits"],
+    },
+    SettingsRowSpec {
         id: SettingsRowId::PreferredAudioLang,
         category: SettingsCategory::AudioAndSubtitles,
         group: "Language Preferences",
@@ -192,6 +205,22 @@ pub const SETTINGS_ROWS: &[SettingsRowSpec] = &[
         label: "Auto-select subtitles",
         description: "Automatically enable matching subtitle tracks when playback begins.",
         keywords: &["subtitle", "auto", "select", "captions", "cc"],
+    },
+    SettingsRowSpec {
+        id: SettingsRowId::AutoMatchNativeSubtitles,
+        category: SettingsCategory::AudioAndSubtitles,
+        group: "Subtitle Behavior",
+        label: "Auto-match native hash subtitles (OpenSubtitles + SubDL)",
+        description: "Compute 64 KiB stream hash and auto-align matching subtitles when playback starts.",
+        keywords: &["opensubtitles", "subdl", "hash", "opensubhash", "native", "subtitle", "sync"],
+    },
+    SettingsRowSpec {
+        id: SettingsRowId::SubtitleStyleSummary,
+        category: SettingsCategory::AudioAndSubtitles,
+        group: "Subtitle Behavior",
+        label: "Subtitle style",
+        description: "Current Subtitle Studio typography, HDR-safe color, backdrop, and vertical position.",
+        keywords: &["subtitle", "style", "font", "size", "color", "hdr", "cream", "pill", "reset"],
     },
     SettingsRowSpec {
         id: SettingsRowId::DefaultSubtitleDelay,
@@ -304,6 +333,22 @@ pub const SETTINGS_ROWS: &[SettingsRowSpec] = &[
         label: "Prowlarr timeout & connection test",
         description: "Configure local indexer request timeout (1000-15000 ms) and test connectivity.",
         keywords: &["prowlarr", "timeout", "test", "indexer", "torznab", "latency"],
+    },
+    SettingsRowSpec {
+        id: SettingsRowId::OpenSubtitlesApiKey,
+        category: SettingsCategory::IntegrationsAndKeys,
+        group: "Native Subtitle API Keys",
+        label: "OpenSubtitles API key",
+        description: "Optional personal OpenSubtitles REST API key for higher search/download quotas.",
+        keywords: &["opensubtitles", "subtitles", "api", "key", "token", "0600"],
+    },
+    SettingsRowSpec {
+        id: SettingsRowId::SubdlApiKey,
+        category: SettingsCategory::IntegrationsAndKeys,
+        group: "Native Subtitle API Keys",
+        label: "SubDL API key",
+        description: "Optional SubDL API key for expanded hash and release subtitle matching.",
+        keywords: &["subdl", "subtitles", "api", "key", "token", "0600"],
     },
     SettingsRowSpec {
         id: SettingsRowId::OpenAddonsStudio,
@@ -473,7 +518,7 @@ impl AppShell {
                             .font(mono_font())
                             .text_xs()
                             .text_color(rgb(TEXT_MUTED))
-                            .child("v0.2.0"),
+                            .child(format!("v{CURRENT_APP_VERSION}")),
                     ),
             )
             .child(
@@ -1079,7 +1124,7 @@ impl AppShell {
                             .font(editorial_serif())
                             .text_size(px(26.0))
                             .text_color(rgb(TEXT_PRIMARY))
-                            .child("Ferrite v0.2.0"),
+                            .child(format!("Ferrite v{CURRENT_APP_VERSION}")),
                     )
                     .child(neutral_chip(format!("Build v{CURRENT_APP_VERSION}"))),
             )
@@ -1338,6 +1383,17 @@ impl AppShell {
                     }),
                 ),
             ),
+            SettingsRowId::AutoPlayNextEpisode => render_control_row(
+                "Auto-play & pre-buffer next episode",
+                "Pre-match and pre-buffer Episode N+1 45s before credits and auto-play at end of stream.",
+                render_movietracker_switch(
+                    "toggle-auto-play-next-episode",
+                    prefs.auto_play_next_episode,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_auto_play_next_episode(cx);
+                    }),
+                ),
+            ),
             SettingsRowId::PreferredAudioLang => render_control_row(
                 "Preferred audio language",
                 "Default ISO-639-2 audio stream preference when starting playback.",
@@ -1381,6 +1437,54 @@ impl AppShell {
                     }),
                 ),
             ),
+            SettingsRowId::AutoMatchNativeSubtitles => render_control_row(
+                "Auto-match native hash subtitles (OpenSubtitles + SubDL)",
+                "Compute 64 KiB stream hash and auto-align matching subtitles when playback starts.",
+                render_movietracker_switch(
+                    "toggle-auto-match-native-subs",
+                    prefs.auto_match_native_subtitles,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_auto_match_native_subtitles(cx);
+                    }),
+                ),
+            ),
+            SettingsRowId::SubtitleStyleSummary => {
+                let color_upper = prefs.subtitle_color_hex.to_ascii_uppercase();
+                let color_name = match color_upper.as_str() {
+                    "#F5F1E8" => "Warm Cream #F5F1E8",
+                    "#E5E7EB" => "Soft Silver #E5E7EB",
+                    "#FDE68A" => "Cinema Amber #FDE68A",
+                    "#BAE6FD" => "Cool Ice #BAE6FD",
+                    "#FFFFFF" => "Pure White #FFFFFF",
+                    other => other,
+                };
+                let backdrop = if prefs.subtitle_background_pill {
+                    "Translucent Pill"
+                } else {
+                    "Drop Shadow"
+                };
+                let summary = format!(
+                    "{color_name} · {backdrop} · {}px · {}%",
+                    prefs.subtitle_font_size, prefs.subtitle_vertical_pos
+                );
+                render_control_row(
+                    "Subtitle style",
+                    "Current Subtitle Studio typography, HDR-safe color, backdrop, and vertical position.",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(neutral_chip(summary))
+                        .child(render_choice_pill(
+                            "btn-reset-sub-style",
+                            "Reset default",
+                            false,
+                            cx.listener(|this, _, _, cx| {
+                                this.reset_subtitle_style_prefs(cx);
+                            }),
+                        )),
+                )
+            }
             SettingsRowId::DefaultSubtitleDelay => {
                 let delay = prefs.default_subtitle_delay_ms;
                 let value_label = if delay > 0 {
@@ -1617,84 +1721,48 @@ impl AppShell {
                         ),
                 )
             }
-            SettingsRowId::ProwlarrApiKey => {
-                let focused = self.focused_input == Some(FocusedInput::ProwlarrApiKey);
-                let preview =
-                    mask_api_key_preview(&self.prowlarr_key_input, self.prowlarr_key_configured);
-                let display: SharedString = if preview.is_empty() {
-                    if focused {
-                        "|".into()
-                    } else {
-                        "Paste Prowlarr / Torznab key...".into()
-                    }
-                } else if focused {
-                    format!("{preview}|").into()
-                } else {
-                    preview.into()
-                };
-                let has_any =
-                    !self.prowlarr_key_input.is_empty() || self.prowlarr_key_configured;
-
-                render_control_row(
-                    "Prowlarr / Torznab API key",
-                    "X-Api-Key or Torznab apikey sent strictly to your local indexer endpoint.",
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .id("input-prowlarr-key")
-                                .cursor_text()
-                                .w(px(210.0))
-                                .h(px(34.0))
-                                .px(px(10.0))
-                                .rounded(px(6.0))
-                                .bg(rgb(BG_INPUT))
-                                .border_1()
-                                .border_color(if focused {
-                                    rgba(BORDER_POSTER_HOVER)
-                                } else {
-                                    rgba(BORDER_SUBTLE)
-                                })
-                                .flex()
-                                .items_center()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.focus_settings_input(
-                                            FocusedInput::ProwlarrApiKey,
-                                            cx,
-                                        );
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .truncate()
-                                        .font(mono_font())
-                                        .text_xs()
-                                        .text_color(if !has_any && !focused {
-                                            rgb(TEXT_MUTED)
-                                        } else {
-                                            rgb(TEXT_PRIMARY)
-                                        })
-                                        .child(display),
-                                ),
-                        )
-                        .when(has_any, |el| {
-                            el.child(render_choice_pill(
-                                "btn-clear-prowlarr-key",
-                                "Clear",
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.clear_prowlarr_key(cx);
-                                }),
-                            ))
-                        }),
-                )
-            }
+            SettingsRowId::ProwlarrApiKey => self.render_masked_key_row(
+                "input-prowlarr-key",
+                "btn-clear-prowlarr-key",
+                "Prowlarr / Torznab API key",
+                "X-Api-Key or Torznab apikey sent strictly to your local indexer endpoint.",
+                FocusedInput::ProwlarrApiKey,
+                &self.prowlarr_key_input,
+                self.prowlarr_key_configured,
+                "Paste Prowlarr / Torznab key...",
+                cx.listener(|this, _, _, cx| {
+                    this.clear_prowlarr_key(cx);
+                }),
+                cx,
+            ),
+            SettingsRowId::OpenSubtitlesApiKey => self.render_masked_key_row(
+                "input-opensubtitles-key",
+                "btn-clear-opensubtitles-key",
+                "OpenSubtitles API key",
+                "Optional personal OpenSubtitles REST API key stored locally with 0600 permissions.",
+                FocusedInput::SettingsOpenSubtitlesKey,
+                &self.opensubtitles_key_input,
+                self.opensubtitles_key_configured,
+                "Paste OpenSubtitles API key...",
+                cx.listener(|this, _, _, cx| {
+                    this.clear_opensubtitles_key(cx);
+                }),
+                cx,
+            ),
+            SettingsRowId::SubdlApiKey => self.render_masked_key_row(
+                "input-subdl-key",
+                "btn-clear-subdl-key",
+                "SubDL API key",
+                "Optional SubDL API key stored locally with 0600 permissions.",
+                FocusedInput::SettingsSubdlKey,
+                &self.subdl_key_input,
+                self.subdl_key_configured,
+                "Paste SubDL API key...",
+                cx.listener(|this, _, _, cx| {
+                    this.clear_subdl_key(cx);
+                }),
+                cx,
+            ),
             SettingsRowId::ProwlarrTimeoutAndTest => {
                 let status_note = self.prowlarr_test_status.clone().unwrap_or_else(|| {
                     "Configure local indexer request timeout (1000-15000 ms) and test connectivity."
@@ -1861,6 +1929,86 @@ impl AppShell {
                     .child(neutral_chip("Zero Telemetry")),
             ),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_masked_key_row(
+        &self,
+        input_id: &'static str,
+        clear_id: &'static str,
+        label: &'static str,
+        description: &'static str,
+        focus_target: FocusedInput,
+        input_value: &str,
+        configured: bool,
+        placeholder: &'static str,
+        on_clear: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focused = self.focused_input == Some(focus_target);
+        let preview = mask_api_key_preview(input_value, configured);
+        let display: SharedString = if preview.is_empty() {
+            if focused {
+                "|".into()
+            } else {
+                placeholder.into()
+            }
+        } else if focused {
+            format!("{preview}|").into()
+        } else {
+            preview.into()
+        };
+        let has_any = !input_value.is_empty() || configured;
+
+        render_control_row(
+            label,
+            description,
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .id(input_id)
+                        .cursor_text()
+                        .w(px(210.0))
+                        .h(px(34.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .bg(rgb(BG_INPUT))
+                        .border_1()
+                        .border_color(if focused {
+                            rgba(BORDER_POSTER_HOVER)
+                        } else {
+                            rgba(BORDER_SUBTLE)
+                        })
+                        .flex()
+                        .items_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.focus_settings_input(focus_target, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .font(mono_font())
+                                .text_xs()
+                                .text_color(if !has_any && !focused {
+                                    rgb(TEXT_MUTED)
+                                } else {
+                                    rgb(TEXT_PRIMARY)
+                                })
+                                .child(display),
+                        ),
+                )
+                .when(has_any, |el| {
+                    el.child(render_choice_pill(clear_id, "Clear", false, on_clear))
+                }),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
