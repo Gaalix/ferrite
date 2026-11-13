@@ -1,6 +1,8 @@
+use std::{ops::Range, sync::Arc};
+
 use gpui::{
     div, img, point, prelude::*, px, relative, rgb, rgba, Context, FontWeight, MouseButton,
-    ScrollDelta, ScrollEvent, SharedString,
+    SharedString, Window,
 };
 use stremio_core_runtime::stremio_core::types::library::LibraryItem;
 
@@ -8,8 +10,8 @@ use crate::{
     icons::{svg_icon, IconName},
     shell::AppShell,
     state::{
-        classify_library_item_status, format_movietracker_episode_code, scroll_near_bottom,
-        LibrarySortOrder, LibraryStatusTab, LibraryTypeFilter, SidebarTab, LIBRARY_PAGE_SIZE,
+        classify_library_item_status, format_movietracker_episode_code, LibrarySortOrder,
+        LibraryStatusTab, LibraryTypeFilter, SidebarTab,
     },
     theme::{
         editorial_serif, meta_divider, mono_font, placeholder_tint_for_id, poster_card_shadow,
@@ -18,10 +20,15 @@ use crate::{
         STATUS_WATCHED, STATUS_WATCHING, STATUS_WATCHLIST, TEXT_MUTED, TEXT_PRIMARY,
         TEXT_SECONDARY,
     },
+    virtual_grid::{compute_poster_grid_columns, slice_row_items, VirtualGridLayout},
 };
 
 impl AppShell {
-    pub fn render_library_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub fn render_library_view(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let all_items: Vec<(LibraryItem, LibraryStatusTab)> = self.core.with_model(|model| {
             let source: Vec<LibraryItem> = if !model.ctx.library.items.is_empty() {
                 model.ctx.library.items.values().cloned().collect()
@@ -83,49 +90,38 @@ impl AppShell {
             }
         }
 
-        let total_filtered = filtered.len();
-        let lib_limit = self.visible_library_limit.max(LIBRARY_PAGE_SIZE);
-        let visible_count = total_filtered.min(lib_limit);
-        let remaining_lib = total_filtered.saturating_sub(visible_count);
+        let filtered_arc = Arc::new(filtered);
+        let total_filtered = filtered_arc.len();
+        let viewport_w = f32::from(window.viewport_size().width);
+        let columns = if viewport_w > 0.0 && viewport_w.is_finite() {
+            compute_poster_grid_columns(viewport_w.min(1440.0), 0.0, 64.0, 176.0, 18.0)
+        } else {
+            6
+        };
+        let row_count = VirtualGridLayout::new(total_filtered, columns, 336.0).row_count;
 
         div()
-            .id("library-view-scroll")
-            .track_scroll(&self.library_scroll_handle)
-            .size_full()
-            .overflow_y_scroll()
-            .on_scroll(cx.listener(move |this, ev: &ScrollEvent, _, cx| {
-                if this.visible_library_limit >= total_filtered {
-                    return;
-                }
-                let down_px = match ev.delta {
-                    ScrollDelta::Pixels(p) => (-p.y) / px(1.0),
-                    ScrollDelta::Lines(l) => (-l.y) * 36.0,
-                };
-                if down_px > 0.0
-                    && scroll_near_bottom(&this.library_scroll_handle, down_px, 380.0)
-                {
-                    let next = (this.visible_library_limit.max(LIBRARY_PAGE_SIZE)
-                        + LIBRARY_PAGE_SIZE)
-                        .min(total_filtered);
-                    if next > this.visible_library_limit {
-                        this.visible_library_limit = next;
-                        cx.notify();
-                    }
-                }
-            }))
+            .id("library-view-root")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
             .child(
                 div()
                     .w_full()
                     .max_w(px(1440.0))
                     .mx_auto()
                     .px(px(32.0))
-                    .pt(px(32.0))
-                    .pb(px(72.0))
+                    .pt(px(28.0))
+                    .flex_1()
+                    .min_h(px(0.0))
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .mb(px(28.0))
+                            .flex_shrink_0()
+                            .mb(px(24.0))
                             .flex()
                             .items_end()
                             .justify_between()
@@ -150,7 +146,8 @@ impl AppShell {
                     )
                     .child(
                         div()
-                            .mb(px(28.0))
+                            .flex_shrink_0()
+                            .mb(px(24.0))
                             .border_b_1()
                             .border_color(rgba(BORDER_SOFT))
                             .flex()
@@ -196,9 +193,10 @@ impl AppShell {
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _, _, cx| {
                                                         this.library_status_tab = tab;
-                                                        this.visible_library_limit =
-                                                            LIBRARY_PAGE_SIZE;
-                                                        this.library_scroll_handle
+                                                        this.library_grid_scroll_handle
+                                                            .0
+                                                            .borrow()
+                                                            .base_handle
                                                             .set_offset(point(px(0.0), px(0.0)));
                                                         cx.notify();
                                                     }),
@@ -268,9 +266,10 @@ impl AppShell {
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _, _, cx| {
                                                         this.library_type_filter = tf;
-                                                        this.visible_library_limit =
-                                                            LIBRARY_PAGE_SIZE;
-                                                        this.library_scroll_handle
+                                                        this.library_grid_scroll_handle
+                                                            .0
+                                                            .borrow()
+                                                            .base_handle
                                                             .set_offset(point(px(0.0), px(0.0)));
                                                         cx.notify();
                                                     }),
@@ -300,6 +299,11 @@ impl AppShell {
                                                 cx.listener(|this, _, _, cx| {
                                                     this.library_sort_order =
                                                         this.library_sort_order.next();
+                                                    this.library_grid_scroll_handle
+                                                        .0
+                                                        .borrow()
+                                                        .base_handle
+                                                        .set_offset(point(px(0.0), px(0.0)));
                                                     cx.notify();
                                                 }),
                                             )
@@ -312,7 +316,7 @@ impl AppShell {
                                     ),
                             ),
                     )
-                    .child(if filtered.is_empty() {
+                    .child(if total_filtered == 0 {
                         let (empty_title, empty_sub) = match active_tab {
                             LibraryStatusTab::Watching => (
                                 "Nothing in progress",
@@ -377,21 +381,26 @@ impl AppShell {
                             )
                             .into_any_element()
                     } else {
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap(px(28.0))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .grid()
-                                    .grid_cols(6)
-                                    .gap(px(18.0))
-                                    .children(
-                                        filtered.into_iter().take(lib_limit).enumerate().map(
-                                            |(idx, (li, st))| {
-                                                let poster_tex = self
+                        gpui::uniform_list(
+                            "library-poster-grid",
+                            row_count,
+                            cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
+                                visible_rows
+                                    .map(|row_idx| {
+                                        let range = slice_row_items(total_filtered, columns, row_idx);
+                                        let empty_slots = columns.saturating_sub(range.len());
+
+                                        div()
+                                            .id(("library-row", row_idx))
+                                            .w_full()
+                                            .h(px(336.0))
+                                            .pb(px(16.0))
+                                            .flex()
+                                            .items_start()
+                                            .gap(px(18.0))
+                                            .children(range.map(|idx| {
+                                                let (li, st) = &filtered_arc[idx];
+                                                let poster_tex = this
                                                     .poster_cache
                                                     .resolve_poster_url(li.poster.as_ref());
                                                 let ep_code = format_movietracker_episode_code(
@@ -413,205 +422,182 @@ impl AppShell {
                                                 let open_type = li.r#type.clone();
                                                 let open_id = li.id.clone();
                                                 let open_vid = li.state.video_id.clone();
+                                                let li_id = li.id.clone();
+                                                let li_name = li.name.clone();
+                                                let li_type = li.r#type.clone();
                                                 let grp: SharedString =
                                                     format!("lib-poster-grp-{idx}").into();
 
                                                 div()
-                                                    .id(("library-card", idx))
-                                                    .group(grp.clone())
-                                                    .cursor_pointer()
-                                                    .w_full()
+                                                    .flex_1()
                                                     .min_w(px(0.0))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(10.0))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            this.open_meta_details(
-                                                                open_type.clone(),
-                                                                open_id.clone(),
-                                                                open_vid.clone(),
-                                                                cx,
-                                                            );
-                                                        }),
-                                                    )
+                                                    .h_full()
+                                                    .overflow_hidden()
                                                     .child(
                                                         div()
-                                                            .w_full()
-                                                            .aspect_ratio(2.0 / 3.0)
-                                                            .rounded(px(4.0))
-                                                            .overflow_hidden()
-                                                            .relative()
-                                                            .bg(rgb(placeholder_tint_for_id(
-                                                                &li.id,
-                                                            )))
-                                                            .border_1()
-                                                            .border_color(rgba(BORDER_SOFT))
-                                                            .shadow(poster_card_shadow())
-                                                            .group_hover(grp, |s| {
-                                                                s.border_color(rgba(
-                                                                    BORDER_POSTER_HOVER,
-                                                                ))
-                                                            })
-                                                            .when_some(poster_tex, |el, tex| {
-                                                                el.child(
-                                                                    img(tex).size_full().object_fit(
-                                                                        gpui::ObjectFit::Cover,
-                                                                    ),
-                                                                )
-                                                            })
-                                                            .child(
-                                                                div()
-                                                                    .absolute()
-                                                                    .top(px(8.0))
-                                                                    .right(px(8.0))
-                                                                    .w(px(26.0))
-                                                                    .h(px(26.0))
-                                                                    .rounded(px(999.0))
-                                                                    .bg(rgb(badge_col))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .child(svg_icon(
-                                                                        badge_icon,
-                                                                        12.5,
-                                                                        rgb(BG_OBSIDIAN),
-                                                                    )),
-                                                            )
-                                                            .when(
-                                                                pct > 1.0
-                                                                    && st
-                                                                        == LibraryStatusTab::Watching,
-                                                                |el| {
-                                                                    el.child(
-                                                                        div()
-                                                                            .absolute()
-                                                                            .bottom_0()
-                                                                            .left_0()
-                                                                            .right_0()
-                                                                            .h(px(3.0))
-                                                                            .bg(rgba(0xffffff2e))
-                                                                            .child(
-                                                                                div()
-                                                                                    .h_full()
-                                                                                    .w(relative(
-                                                                                        pct / 100.0,
-                                                                                    ))
-                                                                                    .bg(rgb(ACCENT)),
-                                                                            ),
-                                                                    )
-                                                                },
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
+                                                            .id(("library-card", idx))
+                                                            .group(grp.clone())
+                                                            .cursor_pointer()
                                                             .w_full()
                                                             .min_w(px(0.0))
                                                             .flex()
                                                             .flex_col()
-                                                            .gap(px(2.0))
-                                                            .child(
-                                                                div()
-                                                                    .font(ui_sans(
-                                                                        FontWeight::MEDIUM,
-                                                                    ))
-                                                                    .text_size(px(14.0))
-                                                                    .text_color(rgb(TEXT_PRIMARY))
-                                                                    .truncate()
-                                                                    .child(li.name),
+                                                            .gap(px(10.0))
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(move |this, _, _, cx| {
+                                                                    this.open_meta_details(
+                                                                        open_type.clone(),
+                                                                        open_id.clone(),
+                                                                        open_vid.clone(),
+                                                                        cx,
+                                                                    );
+                                                                }),
                                                             )
                                                             .child(
                                                                 div()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .gap(px(7.0))
-                                                                    .text_xs()
-                                                                    .font_features(tabular_nums())
-                                                                    .text_color(rgb(TEXT_MUTED))
-                                                                    .child(sentence_case_label(
-                                                                        &li.r#type,
-                                                                    ))
+                                                                    .w_full()
+                                                                    .aspect_ratio(2.0 / 3.0)
+                                                                    .rounded(px(4.0))
+                                                                    .overflow_hidden()
+                                                                    .relative()
+                                                                    .bg(rgb(placeholder_tint_for_id(
+                                                                        &li_id,
+                                                                    )))
+                                                                    .border_1()
+                                                                    .border_color(rgba(BORDER_SOFT))
+                                                                    .shadow(poster_card_shadow())
+                                                                    .group_hover(grp, |s| {
+                                                                        s.border_color(rgba(
+                                                                            BORDER_POSTER_HOVER,
+                                                                        ))
+                                                                    })
                                                                     .when_some(
-                                                                        ep_code,
-                                                                        |el, ep| {
-                                                                            el.child(meta_divider())
-                                                                                .child(
-                                                                                    div()
-                                                                                        .font(mono_font())
-                                                                                        .text_color(rgb(ACCENT))
-                                                                                        .child(ep),
-                                                                                )
+                                                                        poster_tex,
+                                                                        |el, tex| {
+                                                                            el.child(
+                                                                                img(tex)
+                                                                                    .size_full()
+                                                                                    .object_fit(
+                                                                                        gpui::ObjectFit::Cover,
+                                                                                    ),
+                                                                            )
                                                                         },
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .absolute()
+                                                                            .top(px(8.0))
+                                                                            .right(px(8.0))
+                                                                            .w(px(26.0))
+                                                                            .h(px(26.0))
+                                                                            .rounded(px(999.0))
+                                                                            .bg(rgb(badge_col))
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .justify_center()
+                                                                            .child(svg_icon(
+                                                                                badge_icon,
+                                                                                12.5,
+                                                                                rgb(BG_OBSIDIAN),
+                                                                            )),
+                                                                    )
+                                                                    .when(
+                                                                        pct > 1.0
+                                                                            && *st
+                                                                                == LibraryStatusTab::Watching,
+                                                                        |el| {
+                                                                            el.child(
+                                                                                div()
+                                                                                    .absolute()
+                                                                                    .bottom_0()
+                                                                                    .left_0()
+                                                                                    .right_0()
+                                                                                    .h(px(3.0))
+                                                                                    .bg(rgba(
+                                                                                        0xffffff2e,
+                                                                                    ))
+                                                                                    .child(
+                                                                                        div()
+                                                                                            .h_full()
+                                                                                            .w(relative(
+                                                                                                pct / 100.0,
+                                                                                            ))
+                                                                                            .bg(rgb(
+                                                                                                ACCENT,
+                                                                                            )),
+                                                                                    ),
+                                                                            )
+                                                                        },
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .w_full()
+                                                                    .min_w(px(0.0))
+                                                                    .flex()
+                                                                    .flex_col()
+                                                                    .gap(px(2.0))
+                                                                    .child(
+                                                                        div()
+                                                                            .font(ui_sans(
+                                                                                FontWeight::MEDIUM,
+                                                                            ))
+                                                                            .text_size(px(14.0))
+                                                                            .text_color(rgb(
+                                                                                TEXT_PRIMARY,
+                                                                            ))
+                                                                            .truncate()
+                                                                            .child(li_name),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .gap(px(7.0))
+                                                                            .text_xs()
+                                                                            .font_features(
+                                                                                tabular_nums(),
+                                                                            )
+                                                                            .text_color(rgb(
+                                                                                TEXT_MUTED,
+                                                                            ))
+                                                                            .child(
+                                                                                sentence_case_label(
+                                                                                    &li_type,
+                                                                                ),
+                                                                            )
+                                                                            .when_some(
+                                                                                ep_code,
+                                                                                |el, ep| {
+                                                                                    el.child(
+                                                                                        meta_divider(),
+                                                                                    )
+                                                                                    .child(
+                                                                                        div()
+                                                                                            .font(mono_font())
+                                                                                            .text_color(rgb(ACCENT))
+                                                                                            .child(ep),
+                                                                                    )
+                                                                                },
+                                                                            ),
                                                                     ),
                                                             ),
                                                     )
-                                            },
-                                        ),
-                                    ),
-                            )
-                            .when(remaining_lib > 0, |col| {
-                                col.child(
-                                    div()
-                                        .pt(px(4.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(16.0))
-                                        .child(
-                                            div()
-                                                .font(mono_font())
-                                                .text_xs()
-                                                .text_color(rgb(TEXT_MUTED))
-                                                .child(format!(
-                                                    "Showing {visible_count} of {total_filtered} titles"
-                                                )),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("btn-library-show-more")
-                                                .cursor_pointer()
-                                                .h(px(36.0))
-                                                .px(px(16.0))
-                                                .rounded(px(999.0))
-                                                .bg(rgb(BG_SURFACE))
-                                                .border_1()
-                                                .border_color(rgba(BORDER_SUBTLE))
-                                                .hover(|s| {
-                                                    s.bg(rgb(BG_ELEVATED))
-                                                        .border_color(rgba(BORDER_STRONG))
-                                                        .text_color(rgb(TEXT_PRIMARY))
-                                                })
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(6.0))
-                                                .font(ui_sans(FontWeight::MEDIUM))
-                                                .text_size(px(13.0))
-                                                .text_color(rgb(TEXT_SECONDARY))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        this.visible_library_limit = (this
-                                                            .visible_library_limit
-                                                            .max(LIBRARY_PAGE_SIZE)
-                                                            + LIBRARY_PAGE_SIZE)
-                                                            .min(total_filtered);
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                                .child(format!(
-                                                    "Show {} more",
-                                                    remaining_lib.min(LIBRARY_PAGE_SIZE)
-                                                ))
-                                                .child(svg_icon(
-                                                    IconName::ChevronDown,
-                                                    13.0,
-                                                    rgb(TEXT_MUTED),
-                                                )),
-                                        ),
-                                )
-                            })
-                            .into_any_element()
+                                            }))
+                                            .children(
+                                                (0..empty_slots)
+                                                    .map(|_| div().flex_1().min_w(px(0.0))),
+                                            )
+                                    })
+                                    .collect()
+                            }),
+                        )
+                        .track_scroll(&self.library_grid_scroll_handle)
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.0))
+                        .into_any_element()
                     }),
             )
     }

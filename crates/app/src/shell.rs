@@ -107,6 +107,10 @@ pub struct AppShell {
     pub meta_scroll_handle: ScrollHandle,
     pub board_scroll_handle: ScrollHandle,
     pub library_scroll_handle: ScrollHandle,
+    pub discover_grid_scroll_handle: gpui::UniformListScrollHandle,
+    pub library_grid_scroll_handle: gpui::UniformListScrollHandle,
+    pub episode_list_scroll_handle: gpui::UniformListScrollHandle,
+    pub episode_list_scrolled_key: Option<(String, String)>,
     pub meta_addon_dropdown_open: bool,
     pub discover_open_dropdown: Option<DiscoverDropdown>,
     pub discover_catalog_search: String,
@@ -312,6 +316,10 @@ impl AppShell {
             meta_scroll_handle: ScrollHandle::new(),
             board_scroll_handle: ScrollHandle::new(),
             library_scroll_handle: ScrollHandle::new(),
+            discover_grid_scroll_handle: gpui::UniformListScrollHandle::new(),
+            library_grid_scroll_handle: gpui::UniformListScrollHandle::new(),
+            episode_list_scroll_handle: gpui::UniformListScrollHandle::new(),
+            episode_list_scrolled_key: None,
             meta_addon_dropdown_open: false,
             discover_open_dropdown: None,
             discover_catalog_search: String::new(),
@@ -4232,8 +4240,12 @@ impl Render for AppShell {
         let active_content = match self.route.clone() {
             AppRoute::Player => self.render_player_view(window, cx).into_any_element(),
             AppRoute::Tab(SidebarTab::Home) => self.render_board_view(cx).into_any_element(),
-            AppRoute::Tab(SidebarTab::Discover) => self.render_discover_view(cx).into_any_element(),
-            AppRoute::Tab(SidebarTab::Library) => self.render_library_view(cx).into_any_element(),
+            AppRoute::Tab(SidebarTab::Discover) => {
+                self.render_discover_view(window, cx).into_any_element()
+            }
+            AppRoute::Tab(SidebarTab::Library) => {
+                self.render_library_view(window, cx).into_any_element()
+            }
             AppRoute::Tab(SidebarTab::Addons) => self.render_addons_view(cx).into_any_element(),
             AppRoute::Tab(SidebarTab::Settings) => self.render_settings_view(cx).into_any_element(),
             AppRoute::Tab(SidebarTab::Account) => self.render_auth_view(cx).into_any_element(),
@@ -4271,6 +4283,9 @@ impl Render for AppShell {
                     } else {
                         div()
                             .size_full()
+                            .flex()
+                            .flex_col()
+                            .min_h(px(0.0))
                             .child(active_content)
                             .with_animation(transition_key, obsidian_fade_in(), |el, delta| {
                                 el.opacity(delta)

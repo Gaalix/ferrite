@@ -348,6 +348,116 @@ pub fn sentence_case_label(raw: &str) -> String {
     }
 }
 
+pub fn compact_hdr_badge(hdr: HdrFormat) -> Option<&'static str> {
+    match hdr {
+        HdrFormat::DolbyVision => Some("DV"),
+        HdrFormat::Hdr10Plus => Some("HDR10+"),
+        HdrFormat::Hdr10 | HdrFormat::Hlg => Some("HDR"),
+        HdrFormat::Sdr => None,
+    }
+}
+
+pub fn compact_audio_badge(audio: AudioCodec) -> Option<&'static str> {
+    match audio {
+        AudioCodec::Atmos => Some("Atmos"),
+        AudioCodec::TrueHD => Some("TrueHD"),
+        AudioCodec::DtsHdMa => Some("DTS-HD"),
+        AudioCodec::Dts | AudioCodec::DdPlus | AudioCodec::Ac3 => Some("5.1"),
+        AudioCodec::Flac => Some("FLAC"),
+        AudioCodec::Opus => Some("Opus"),
+        AudioCodec::Aac => Some("AAC"),
+        AudioCodec::Mp3 | AudioCodec::Unknown => None,
+    }
+}
+
+pub fn compact_codec_badge(codec: VideoCodec) -> Option<&'static str> {
+    match codec {
+        VideoCodec::AV1 => Some("AV1"),
+        VideoCodec::HEVC => Some("HEVC"),
+        VideoCodec::AVC => Some("AVC"),
+        VideoCodec::VC1 => Some("VC-1"),
+        VideoCodec::Xvid => Some("XviD"),
+        VideoCodec::Mpeg2 => Some("MPEG-2"),
+        VideoCodec::Unknown => None,
+    }
+}
+
+pub fn parse_runtime_minutes(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(plain) = trimmed.parse::<u32>() {
+        return (plain > 0).then_some(plain);
+    }
+
+    let mut total_mins: u32 = 0;
+    let mut num_buf = String::new();
+    let mut chars = trimmed.chars().peekable();
+    let mut found_unit = false;
+
+    while let Some(ch) = chars.next() {
+        if ch.is_ascii_digit() {
+            num_buf.push(ch);
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            continue;
+        }
+        if !num_buf.is_empty() {
+            let val = num_buf.parse::<u32>().ok()?;
+            num_buf.clear();
+            let mut unit = String::new();
+            unit.push(ch);
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphabetic() {
+                    unit.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if unit.starts_with('h') {
+                total_mins = total_mins.saturating_add(val.saturating_mul(60));
+                found_unit = true;
+            } else if unit.starts_with('m') {
+                total_mins = total_mins.saturating_add(val);
+                found_unit = true;
+            }
+        }
+    }
+
+    if !num_buf.is_empty() && !found_unit {
+        if let Ok(val) = num_buf.parse::<u32>() {
+            total_mins = total_mins.saturating_add(val);
+        }
+    }
+
+    (total_mins > 0).then_some(total_mins)
+}
+
+pub fn estimate_bitrate_mbps(size_bytes: Option<u64>, duration_minutes: Option<u32>) -> Option<f64> {
+    let bytes = size_bytes?;
+    let mins = duration_minutes?;
+    if bytes == 0 || mins == 0 {
+        return None;
+    }
+    let mbps = (bytes as f64 * 8.0) / (f64::from(mins) * 60.0 * 1_000_000.0);
+    (mbps.is_finite() && mbps > 0.0).then_some(mbps)
+}
+
+pub fn format_bitrate_mbps(mbps: f64) -> String {
+    if !mbps.is_finite() || mbps <= 0.0 {
+        return "~0.0 Mbps".to_owned();
+    }
+    format!("~{mbps:.1} Mbps")
+}
+
+pub fn format_episode_air_date(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%b %-d, %Y").to_string()
+}
+
 pub fn placeholder_tint_for_id(id: &str) -> u32 {
     let mut hash: u32 = 2166136261;
     for b in id.bytes() {
@@ -356,4 +466,26 @@ pub fn placeholder_tint_for_id(id: &str) -> u32 {
     }
     const PALETTE: [u32; 4] = [0x1c1c20, 0x201e20, 0x1d1f23, 0x222024];
     PALETTE[(hash as usize) % PALETTE.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_and_bitrate_helpers_parse_and_estimate_cleanly() {
+        assert_eq!(parse_runtime_minutes("52 min"), Some(52));
+        assert_eq!(parse_runtime_minutes("1h 42m"), Some(102));
+        assert_eq!(parse_runtime_minutes("2h"), Some(120));
+        assert_eq!(parse_runtime_minutes("102"), Some(102));
+        assert_eq!(parse_runtime_minutes("0 min"), None);
+        assert_eq!(parse_runtime_minutes(""), None);
+
+        let bytes_18_4_gb = (18.4_f64 * 1_000_000_000.0) as u64;
+        let mbps = estimate_bitrate_mbps(Some(bytes_18_4_gb), Some(100)).unwrap();
+        assert!((mbps - 24.533).abs() < 0.1);
+        assert_eq!(format_bitrate_mbps(mbps), "~24.5 Mbps");
+        assert_eq!(estimate_bitrate_mbps(None, Some(100)), None);
+        assert_eq!(estimate_bitrate_mbps(Some(1024), None), None);
+    }
 }
