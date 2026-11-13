@@ -4,5 +4,7 @@ pub mod board_view;
 pub mod discover_view;
 pub mod library_view;
 pub mod meta_details_view;
+pub mod person_view;
 pub mod player_view;
+pub mod search_view;
 pub mod settings_view;

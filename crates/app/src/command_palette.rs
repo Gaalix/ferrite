@@ -18,6 +18,9 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub enum PaletteEntry {
+    OpenFullSearch {
+        query: String,
+    },
     QuickNav {
         tab: SidebarTab,
         title: &'static str,
@@ -91,6 +94,10 @@ impl AppShell {
         }
 
         let q_lower = query.to_ascii_lowercase();
+        entries.push(PaletteEntry::OpenFullSearch {
+            query: query.to_owned(),
+        });
+
         for tab in SidebarTab::ALL {
             if tab.label().to_ascii_lowercase().contains(&q_lower) {
                 entries.push(PaletteEntry::QuickNav {
@@ -101,9 +108,35 @@ impl AppShell {
             }
         }
 
+        let (local_fts_hits, _local_people) = self.core.metadata_engine().search_local_fts(query, 6);
+
         let media_hits = self.core.with_model(|model| {
             let mut seen = std::collections::HashSet::new();
             let mut hits = Vec::new();
+
+            for fts in local_fts_hits {
+                let canonical = fts.imdb_id.as_deref().unwrap_or(&fts.canonical_id);
+                if seen.insert(canonical.to_owned())
+                    && (canonical == fts.canonical_id || seen.insert(fts.canonical_id.clone()))
+                {
+                    let lib_status = model
+                        .ctx
+                        .library
+                        .items
+                        .get(canonical)
+                        .or_else(|| model.ctx.library.items.get(&fts.canonical_id))
+                        .and_then(classify_library_item_status);
+                    hits.push(PaletteEntry::MediaHit {
+                        id: fts.canonical_id,
+                        type_name: fts.media_type,
+                        name: fts.title,
+                        release_info: fts.year,
+                        imdb_rating: fts.imdb_rating,
+                        poster_url: fts.poster_url,
+                        library_status: lib_status,
+                    });
+                }
+            }
 
             for item in model.local_search.search_results.iter().take(10) {
                 if !item.name.is_empty() && seen.insert(item.id.clone()) {
@@ -166,6 +199,10 @@ impl AppShell {
 
     pub fn execute_palette_entry(&mut self, entry: PaletteEntry, cx: &mut Context<Self>) {
         match entry {
+            PaletteEntry::OpenFullSearch { query } => {
+                self.close_command_palette(cx);
+                self.open_full_search(query, cx);
+            }
             PaletteEntry::QuickNav { tab, .. } => {
                 self.close_command_palette(cx);
                 self.navigate_tab(tab, cx);
@@ -193,7 +230,7 @@ impl AppShell {
                 ..
             } => {
                 self.close_command_palette(cx);
-                self.open_meta_details(type_name, id, None, cx);
+                self.open_editorial_media_hit(type_name, id, None, cx);
             }
         }
     }
@@ -322,11 +359,12 @@ impl AppShell {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
+                                        let query = this.palette_query.clone();
                                         this.close_command_palette(cx);
-                                        this.navigate_tab(SidebarTab::Discover, cx);
+                                        this.open_full_search(query, cx);
                                     }),
                                 )
-                                .child("Explore full catalog in Discover")
+                                .child("See all deduplicated results (Enter)")
                                 .child(svg_icon(IconName::ChevronRight, 13.5, rgb(ACCENT))),
                         )
                     })
@@ -338,6 +376,35 @@ impl AppShell {
 
     fn render_palette_row_left(&self, entry: &PaletteEntry) -> impl IntoElement {
         match entry {
+            PaletteEntry::OpenFullSearch { query } => div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(svg_icon(IconName::Search, 15.5, rgb(ACCENT)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .font(ui_sans(FontWeight::SEMIBOLD))
+                                .text_size(px(13.5))
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .truncate()
+                                .child(format!("Search everything for \"{query}\"")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .truncate()
+                                .child("Deduplicated Top Match, Movies, Series & People"),
+                        ),
+                ),
             PaletteEntry::QuickNav {
                 tab,
                 title,
@@ -467,6 +534,9 @@ impl AppShell {
 
     fn render_palette_row_right(entry: &PaletteEntry) -> impl IntoElement {
         match entry {
+            PaletteEntry::OpenFullSearch { .. } => div()
+                .flex_shrink_0()
+                .child(keycap("Enter")),
             PaletteEntry::QuickNav { tab, .. } => div()
                 .flex_shrink_0()
                 .child(keycap(format!("Alt {}", tab.shortcut_label()))),

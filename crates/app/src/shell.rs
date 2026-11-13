@@ -25,14 +25,15 @@ use stremio_core_runtime::{
         },
         types::{
             addon::{ResourcePath, ResourceRequest},
-            resource::{StreamSource, Video},
+            resource::{MetaItem, StreamSource, Video},
         },
     },
-    subtitle_lang_matches, AudioSpeechFingerprint, AudioSpeechWindow, CoreController,
-    DebridCacheStatus, DesktopModelField, FetchedNativeSubtitle, LocalDebridProvider,
-    NativeSubtitleQuery, PrivateIntegrationsConfig, ProwlarrFallbackMode, ResolvedNextEpisode,
+    build_unified_editorial_search, subtitle_lang_matches, AudioSpeechFingerprint,
+    AudioSpeechWindow, CoreController, DebridCacheStatus, DesktopModelField, EditorialMediaHit,
+    EditorialPersonHit, FetchedNativeSubtitle, LocalDebridProvider, NativeSubtitleQuery,
+    PersonFilmography, PrivateIntegrationsConfig, ProwlarrFallbackMode, ResolvedNextEpisode,
     SecretApiKey, SeriesTrackPreference, SubtitleAlignmentResult, SubtitleMatchTier,
-    SubtitleSyncAligner, TrackCandidate, INITIAL_BOARD_SHELVES,
+    SubtitleSyncAligner, TrackCandidate, UnifiedEditorialSearch, INITIAL_BOARD_SHELVES,
 };
 use stremio_stream_engine::{opensubhash::compute_opensubhash_http, StreamEngineHandle};
 use url::Url;
@@ -209,6 +210,24 @@ pub struct AppShell {
     pub prowlarr_fallback_streams: Vec<PlaybackCandidate>,
     pub prowlarr_fallback_error: Option<String>,
     pub prowlarr_request_seq: u64,
+
+    pub tmdb_key_input: String,
+    pub tmdb_key_configured: bool,
+    pub tmdb_verify_status: Option<String>,
+    pub full_search_query: String,
+    pub full_search_results: UnifiedEditorialSearch,
+    pub full_search_tmdb_hits: Vec<EditorialMediaHit>,
+    pub full_search_tmdb_people: Vec<EditorialPersonHit>,
+    pub full_search_loading_tmdb: bool,
+    pub full_search_seq: u64,
+    pub search_scroll_handle: ScrollHandle,
+    pub active_person_filmography: Option<PersonFilmography>,
+    pub person_loading: bool,
+    pub person_request_seq: u64,
+    pub person_scroll_handle: ScrollHandle,
+    pub board_spotlight_idx: usize,
+    pub enriched_attempted: HashSet<String>,
+    pub synthetic_tmdb_meta: Option<(String, MetaItem)>,
 }
 
 impl Focusable for AppShell {
@@ -423,6 +442,23 @@ impl AppShell {
             prowlarr_fallback_streams: Vec::new(),
             prowlarr_fallback_error: None,
             prowlarr_request_seq: 0,
+            tmdb_key_input: String::new(),
+            tmdb_key_configured: !private_cfg.tmdb_api_key.is_empty(),
+            tmdb_verify_status: None,
+            full_search_query: String::new(),
+            full_search_results: UnifiedEditorialSearch::default(),
+            full_search_tmdb_hits: Vec::new(),
+            full_search_tmdb_people: Vec::new(),
+            full_search_loading_tmdb: false,
+            full_search_seq: 0,
+            search_scroll_handle: ScrollHandle::new(),
+            active_person_filmography: None,
+            person_loading: false,
+            person_request_seq: 0,
+            person_scroll_handle: ScrollHandle::new(),
+            board_spotlight_idx: 0,
+            enriched_attempted: HashSet::new(),
+            synthetic_tmdb_meta: None,
         };
 
         if cli_addon_url.is_some() {
@@ -720,6 +756,13 @@ impl AppShell {
                     self.ensure_series_default_episode_streams(cx);
                     self.maybe_trigger_stream_enrichments(cx);
                     self.try_complete_pending_quick_resume(cx);
+                }
+
+                if (fields.contains(&DesktopModelField::Search)
+                    || fields.contains(&DesktopModelField::LocalSearch))
+                    && matches!(self.route, AppRoute::Search { .. })
+                {
+                    self.recompute_full_search_merged();
                 }
 
                 if fields.contains(&DesktopModelField::Player) {
@@ -1353,19 +1396,279 @@ impl AppShell {
             .map(|vid| (id.clone(), vid.clone()));
         self.stream_filter.reset();
         self.memoized_meta_streams = None;
+        self.synthetic_tmdb_meta = None;
         self.visible_stream_limit = STREAM_PAGE_SIZE;
         self.expanded_stream_rows.clear();
         self.meta_scroll_handle.set_offset(point(px(0.0), px(0.0)));
         self.core
             .load_meta_details(&type_name, &id, resolved_video_id.as_deref());
         self.route = AppRoute::MetaDetails {
-            type_name,
-            id,
+            type_name: type_name.clone(),
+            id: id.clone(),
             video_id: resolved_video_id,
         };
+        self.request_background_enrichment_if_needed(&type_name, &id, cx);
         self.ensure_series_default_episode_streams(cx);
         self.maybe_trigger_stream_enrichments(cx);
         cx.notify();
+    }
+
+    pub fn open_full_search(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.route.is_player() {
+            self.teardown_active_playback();
+        }
+        if !matches!(self.route, AppRoute::Player | AppRoute::Search { .. }) {
+            self.nav_history.push(self.route.clone());
+        }
+        self.avatar_menu_open = false;
+        self.command_palette_open = false;
+        self.discover_open_dropdown = None;
+        self.meta_addon_dropdown_open = false;
+        self.settings_open_dropdown = None;
+
+        let trimmed = query.trim().to_owned();
+        self.full_search_query = trimmed.clone();
+        self.palette_query = trimmed.clone();
+        self.route = AppRoute::Search { query: trimmed };
+        self.focused_input = Some(FocusedInput::FullSearchInput);
+        self.search_scroll_handle.set_offset(point(px(0.0), px(0.0)));
+        self.refresh_full_search(cx);
+    }
+
+    pub fn refresh_full_search(&mut self, cx: &mut Context<Self>) {
+        self.full_search_seq = self.full_search_seq.wrapping_add(1);
+        let seq = self.full_search_seq;
+        let q = self.full_search_query.trim().to_owned();
+        self.route = AppRoute::Search { query: q.clone() };
+        self.full_search_tmdb_hits.clear();
+        self.full_search_tmdb_people.clear();
+
+        if q.is_empty() {
+            self.full_search_results = UnifiedEditorialSearch::default();
+            self.full_search_loading_tmdb = false;
+            self.core.unload_search();
+            cx.notify();
+            return;
+        }
+
+        self.full_search_results = self.core.editorial_search_snapshot(&q);
+        self.core.search(q.clone());
+
+        let has_tmdb = {
+            let cfg = self.core.private_integrations();
+            cfg.tmdb_enabled && cfg.has_tmdb_configured()
+        };
+        self.full_search_loading_tmdb = has_tmdb;
+        if let Some(top) = self.full_search_results.top_match.clone() {
+            self.request_background_enrichment_if_needed(&top.media_type, &top.canonical_id, cx);
+        }
+        cx.notify();
+
+        if has_tmdb {
+            let core = self.core.clone();
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let res = core.editorial_search_live_tmdb(q).await;
+                let _ = this.update(cx, |shell, cx| {
+                    if shell.full_search_seq != seq {
+                        return;
+                    }
+                    shell.full_search_loading_tmdb = false;
+                    if let Ok((tmdb_hits, tmdb_people)) = res {
+                        shell.full_search_tmdb_hits = tmdb_hits;
+                        shell.full_search_tmdb_people = tmdb_people;
+                        shell.recompute_full_search_merged();
+                        if let Some(top) = shell.full_search_results.top_match.clone() {
+                            shell.request_background_enrichment_if_needed(
+                                &top.media_type,
+                                &top.canonical_id,
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    pub fn recompute_full_search_merged(&mut self) {
+        let snap = self.core.editorial_search_snapshot(&self.full_search_query);
+        if self.full_search_tmdb_hits.is_empty() && self.full_search_tmdb_people.is_empty() {
+            self.full_search_results = snap;
+            return;
+        }
+        let local_hits: Vec<EditorialMediaHit> = snap
+            .movies
+            .into_iter()
+            .chain(snap.series)
+            .collect();
+        let merged_people: Vec<EditorialPersonHit> = self
+            .full_search_tmdb_people
+            .iter()
+            .cloned()
+            .chain(snap.people)
+            .collect();
+        self.full_search_results = build_unified_editorial_search(
+            &self.full_search_query,
+            local_hits,
+            self.full_search_tmdb_hits.clone(),
+            Vec::new(),
+            merged_people,
+            snap.elapsed_us,
+        );
+    }
+
+    pub fn open_person_details(
+        &mut self,
+        person_key: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.route.is_player() {
+            self.teardown_active_playback();
+        }
+        if !matches!(self.route, AppRoute::Player) {
+            self.nav_history.push(self.route.clone());
+        }
+        self.avatar_menu_open = false;
+        self.command_palette_open = false;
+        self.discover_open_dropdown = None;
+        self.meta_addon_dropdown_open = false;
+        self.settings_open_dropdown = None;
+
+        self.person_request_seq = self.person_request_seq.wrapping_add(1);
+        let seq = self.person_request_seq;
+        self.person_loading = true;
+        self.active_person_filmography = None;
+        self.person_scroll_handle.set_offset(point(px(0.0), px(0.0)));
+        self.route = AppRoute::Person {
+            person_key: person_key.clone(),
+            name: name.clone(),
+        };
+        cx.notify();
+
+        let core = self.core.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let filmo = core.fetch_person_filmography(person_key, name).await;
+            let _ = this.update(cx, |shell, cx| {
+                if shell.person_request_seq == seq {
+                    shell.person_loading = false;
+                    shell.active_person_filmography = Some(filmo);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn open_editorial_media_hit(
+        &mut self,
+        type_name: String,
+        id: String,
+        video_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !id.starts_with("tmdb:") {
+            self.open_meta_details(type_name, id, video_id, cx);
+            return;
+        }
+
+        self.open_meta_details(type_name.clone(), id.clone(), video_id.clone(), cx);
+        let core = self.core.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            if let Some(imdb_id) = core
+                .resolve_canonical_imdb_id(type_name.clone(), id.clone())
+                .await
+            {
+                if imdb_id != id {
+                    let _ = this.update(cx, |shell, cx| {
+                        let still_on_tmdb_route = matches!(
+                            &shell.route,
+                            AppRoute::MetaDetails { id: cur_id, .. } if cur_id == &id
+                        );
+                        if !still_on_tmdb_route {
+                            return;
+                        }
+                        let resolved_vid = video_id.clone().filter(|v| !v.trim().is_empty()).or_else(|| {
+                            shell.core.with_model(|m| {
+                                m.ctx
+                                    .library
+                                    .items
+                                    .get(&imdb_id)
+                                    .and_then(|li| li.state.video_id.clone())
+                                    .filter(|v| !v.trim().is_empty())
+                            })
+                        });
+                        shell.auto_selected_episode_for_meta = resolved_vid
+                            .as_ref()
+                            .map(|vid| (imdb_id.clone(), vid.clone()));
+                        shell.memoized_meta_streams = None;
+                        shell.synthetic_tmdb_meta = None;
+                        shell.core.load_meta_details(
+                            &type_name,
+                            &imdb_id,
+                            resolved_vid.as_deref(),
+                        );
+                        shell.route = AppRoute::MetaDetails {
+                            type_name: type_name.clone(),
+                            id: imdb_id.clone(),
+                            video_id: resolved_vid,
+                        };
+                        shell.request_background_enrichment_if_needed(&type_name, &imdb_id, cx);
+                        shell.ensure_series_default_episode_streams(cx);
+                        shell.maybe_trigger_stream_enrichments(cx);
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+
+            if let Some(synthetic) = core
+                .fetch_synthetic_tmdb_meta(type_name.clone(), id.clone())
+                .await
+            {
+                let _ = this.update(cx, |shell, cx| {
+                    let still_on_tmdb_route = matches!(
+                        &shell.route,
+                        AppRoute::MetaDetails { id: cur_id, .. } if cur_id == &id
+                    );
+                    if still_on_tmdb_route {
+                        shell.synthetic_tmdb_meta = Some((id, synthetic));
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn request_background_enrichment_if_needed(
+        &mut self,
+        media_type: &str,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let trimmed = id.trim();
+        if trimmed.is_empty() || self.core.cached_enriched_meta(trimmed).is_some() {
+            return;
+        }
+        let has_tmdb = {
+            let cfg = self.core.private_integrations();
+            cfg.tmdb_enabled && cfg.has_tmdb_configured()
+        };
+        if !has_tmdb || !self.enriched_attempted.insert(trimmed.to_owned()) {
+            return;
+        }
+        let core = self.core.clone();
+        let mt = media_type.to_owned();
+        let req_id = trimmed.to_owned();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            if core.ensure_title_enrichment(mt, req_id).await.is_some() {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
     }
 
     pub fn toggle_stream_row_details(&mut self, row_idx: usize, cx: &mut Context<Self>) {
@@ -1600,7 +1903,31 @@ impl AppShell {
             AppRoute::MetaDetails { .. } | AppRoute::Player
         );
         self.unload_meta_details_if_leaving(keep_meta);
-        self.route = next_route;
+        self.route = next_route.clone();
+        if let AppRoute::Person { person_key, name } = next_route {
+            if self
+                .active_person_filmography
+                .as_ref()
+                .is_none_or(|f| f.person_key != person_key)
+            {
+                self.person_request_seq = self.person_request_seq.wrapping_add(1);
+                let seq = self.person_request_seq;
+                self.person_loading = true;
+                self.active_person_filmography = None;
+                let core = self.core.clone();
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    let filmo = core.fetch_person_filmography(person_key, name).await;
+                    let _ = this.update(cx, |shell, cx| {
+                        if shell.person_request_seq == seq {
+                            shell.person_loading = false;
+                            shell.active_person_filmography = Some(filmo);
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
         cx.notify();
     }
 
@@ -2740,6 +3067,12 @@ impl AppShell {
         if !self.preferences.clipboard_addon_detect {
             self.clipboard_addon_suggestion = None;
         }
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn toggle_show_home_spotlight(&mut self, cx: &mut Context<Self>) {
+        self.preferences.show_home_spotlight = !self.preferences.show_home_spotlight;
         let _ = self.preferences.save();
         cx.notify();
     }
@@ -3897,6 +4230,45 @@ impl AppShell {
         self.persist_private_integrations_draft(cx);
     }
 
+    pub fn clear_tmdb_key(&mut self, cx: &mut Context<Self>) {
+        self.tmdb_key_input.clear();
+        self.tmdb_key_configured = false;
+        self.tmdb_verify_status = None;
+        self.persist_private_integrations_draft(cx);
+    }
+
+    pub fn verify_tmdb_clicked(&mut self, cx: &mut Context<Self>) {
+        self.persist_private_integrations_draft(cx);
+        let override_key = (!self.tmdb_key_input.trim().is_empty())
+            .then(|| self.tmdb_key_input.trim().to_owned());
+        if override_key.is_none() && !self.tmdb_key_configured {
+            let msg = "Enter a TMDB v3 API key or v4 Read Access Token first.".to_owned();
+            self.tmdb_verify_status = Some(msg.clone());
+            self.push_toast(ToastKind::Warning, msg, None, cx);
+            return;
+        }
+        self.tmdb_verify_status = Some("Verifying TMDB credentials over HTTP/2...".to_owned());
+        cx.notify();
+
+        let core = self.core.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = core.verify_tmdb(override_key).await;
+            let _ = this.update(cx, |shell, cx| match res {
+                Ok(status) => {
+                    let msg = format!("Verified ({}) · Image CDN ready", status.auth_mode);
+                    shell.tmdb_verify_status = Some(msg.clone());
+                    shell.enriched_attempted.clear();
+                    shell.push_toast(ToastKind::Success, "TMDB API verified", Some(msg), cx);
+                }
+                Err(err) => {
+                    shell.tmdb_verify_status = Some(format!("Verification failed: {err}"));
+                    shell.push_toast(ToastKind::Error, "TMDB verification failed", Some(err), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn focus_settings_input(&mut self, input: FocusedInput, cx: &mut Context<Self>) {
         self.settings_open_dropdown = None;
         self.focused_input = Some(input);
@@ -3906,6 +4278,12 @@ impl AppShell {
     pub fn persist_private_integrations_draft(&mut self, cx: &mut Context<Self>) {
         let existing = self.core.private_integrations();
         let next = PrivateIntegrationsConfig {
+            tmdb_enabled: true,
+            tmdb_api_key: merge_secret_key_draft(
+                &self.tmdb_key_input,
+                &mut self.tmdb_key_configured,
+                existing.tmdb_api_key,
+            ),
             active_debrid: idx_to_local_debrid_provider(self.local_debrid_provider_idx),
             direct_rust_unrestrict: self.local_debrid_direct_unrestrict,
             debrid_cached_only_filter: self.local_debrid_cached_only,
@@ -3956,12 +4334,15 @@ impl AppShell {
             self.memoized_meta_streams = None;
             self.prowlarr_fallback_key = None;
             self.prowlarr_fallback_attempted = false;
+            self.enriched_attempted.clear();
         }
         cx.notify();
     }
 
     pub fn clear_metadata_and_image_cache(&mut self, cx: &mut Context<Self>) {
         self.core.clear_addon_cache();
+        self.enriched_attempted.clear();
+        self.synthetic_tmdb_meta = None;
         self.poster_cache.clear_failures();
         self.poster_cache.trim_for_playback();
         let cache_root = self.poster_cache.cache_root().to_path_buf();
@@ -4482,7 +4863,12 @@ impl AppShell {
                         FocusedInput::SettingsOpenSubtitlesKey => {
                             Some(FocusedInput::SettingsSubdlKey)
                         }
-                        FocusedInput::SettingsSubdlKey => Some(FocusedInput::RealDebridApiKey),
+                        FocusedInput::SettingsSubdlKey => {
+                            Some(FocusedInput::SettingsTmdbApiKey)
+                        }
+                        FocusedInput::SettingsTmdbApiKey => {
+                            Some(FocusedInput::RealDebridApiKey)
+                        }
                         other => Some(other),
                     };
                     cx.notify();
@@ -4496,6 +4882,9 @@ impl AppShell {
                         FocusedInput::AddonManifestUrl => {
                             self.submit_addon_manifest_lookup(cx);
                         }
+                        FocusedInput::FullSearchInput => {
+                            self.refresh_full_search(cx);
+                        }
                         FocusedInput::AddonSearch
                         | FocusedInput::DiscoverCatalogSearch
                         | FocusedInput::SettingsSearch => {
@@ -4508,7 +4897,8 @@ impl AppShell {
                         | FocusedInput::ProwlarrUrl
                         | FocusedInput::ProwlarrApiKey
                         | FocusedInput::SettingsOpenSubtitlesKey
-                        | FocusedInput::SettingsSubdlKey => {
+                        | FocusedInput::SettingsSubdlKey
+                        | FocusedInput::SettingsTmdbApiKey => {
                             self.focused_input = None;
                             self.persist_private_integrations_draft(cx);
                         }
@@ -4614,6 +5004,27 @@ impl AppShell {
                                 integration_edited = true;
                             }
                             c
+                        }
+                        FocusedInput::SettingsTmdbApiKey => {
+                            let c =
+                                apply_key_to_text_buffer(&mut self.tmdb_key_input, event, clip);
+                            if c {
+                                self.tmdb_key_configured = !self.tmdb_key_input.trim().is_empty();
+                                integration_edited = true;
+                            }
+                            c
+                        }
+                        FocusedInput::FullSearchInput => {
+                            let c = apply_key_to_text_buffer(
+                                &mut self.full_search_query,
+                                event,
+                                clip,
+                            );
+                            if c {
+                                self.palette_query = self.full_search_query.clone();
+                                self.refresh_full_search(cx);
+                            }
+                            false
                         }
                         FocusedInput::CommandPalette => false,
                     };
@@ -5032,13 +5443,7 @@ impl AppShell {
             (email, init)
         });
 
-        let nav_tabs = [
-            (SidebarTab::Home, "Home"),
-            (SidebarTab::Discover, "Discover"),
-            (SidebarTab::Library, "Library"),
-            (SidebarTab::Addons, "Addons"),
-            (SidebarTab::Settings, "Settings"),
-        ];
+        let nav_tabs = SidebarTab::TITLEBAR_TABS.into_iter().map(|t| (t, t.label()));
 
         let query_empty = self.palette_query.is_empty();
         let search_text: SharedString = if self.command_palette_open {
@@ -5460,7 +5865,7 @@ impl AppShell {
                     )
                     .child(
                         div()
-                            .id("avatar-menu-library")
+                            .id("avatar-menu-addons")
                             .cursor_pointer()
                             .px(px(10.0))
                             .py(px(8.0))
@@ -5474,11 +5879,11 @@ impl AppShell {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
-                                    this.navigate_tab(SidebarTab::Library, cx);
+                                    this.navigate_tab(SidebarTab::Addons, cx);
                                 }),
                             )
-                            .child(svg_icon(IconName::Bookmark, 14.5, rgb(TEXT_SECONDARY)))
-                            .child("Your library"),
+                            .child(svg_icon(IconName::Layers, 14.5, rgb(TEXT_SECONDARY)))
+                            .child("Addons"),
                     )
                     .child(
                         div()
@@ -5661,6 +6066,10 @@ impl Render for AppShell {
                 video_id,
             } => self
                 .render_meta_details_view(&type_name, &id, video_id.as_deref(), cx)
+                .into_any_element(),
+            AppRoute::Search { query } => self.render_search_view(&query, cx).into_any_element(),
+            AppRoute::Person { person_key, name } => self
+                .render_person_view(&person_key, &name, cx)
                 .into_any_element(),
         };
 

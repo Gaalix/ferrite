@@ -165,6 +165,10 @@ pub struct PrivateIntegrationsConfig {
     pub opensubtitles_api_key: SecretApiKey,
     #[serde(default)]
     pub subdl_api_key: SecretApiKey,
+    #[serde(default = "default_true")]
+    pub tmdb_enabled: bool,
+    #[serde(default)]
+    pub tmdb_api_key: SecretApiKey,
 }
 
 impl Default for PrivateIntegrationsConfig {
@@ -183,6 +187,8 @@ impl Default for PrivateIntegrationsConfig {
             native_subtitles_enabled: true,
             opensubtitles_api_key: SecretApiKey::default(),
             subdl_api_key: SecretApiKey::default(),
+            tmdb_enabled: true,
+            tmdb_api_key: SecretApiKey::default(),
         }
     }
 }
@@ -199,6 +205,7 @@ impl PrivateIntegrationsConfig {
         self.prowlarr_api_key = SecretApiKey::new(self.prowlarr_api_key.expose());
         self.opensubtitles_api_key = SecretApiKey::new(self.opensubtitles_api_key.expose());
         self.subdl_api_key = SecretApiKey::new(self.subdl_api_key.expose());
+        self.tmdb_api_key = SecretApiKey::new(self.tmdb_api_key.expose());
         self
     }
 
@@ -227,6 +234,10 @@ impl PrivateIntegrationsConfig {
             && !self.prowlarr_url.trim().is_empty()
     }
 
+    pub fn has_tmdb_configured(&self) -> bool {
+        self.tmdb_enabled && !self.tmdb_api_key.is_empty()
+    }
+
     pub fn all_secrets(&self) -> Vec<&str> {
         [
             self.real_debrid_api_key.expose(),
@@ -235,6 +246,7 @@ impl PrivateIntegrationsConfig {
             self.prowlarr_api_key.expose(),
             self.opensubtitles_api_key.expose(),
             self.subdl_api_key.expose(),
+            self.tmdb_api_key.expose(),
         ]
         .into_iter()
         .filter(|s| !s.is_empty())
@@ -462,6 +474,8 @@ mod tests {
             native_subtitles_enabled: true,
             opensubtitles_api_key: SecretApiKey::new("os_secret_key_42"),
             subdl_api_key: SecretApiKey::new("subdl_secret_key_99"),
+            tmdb_enabled: true,
+            tmdb_api_key: SecretApiKey::new("tmdb_secret_key_11"),
         };
 
         cfg.save_to_path(&nested).unwrap();
@@ -470,7 +484,9 @@ mod tests {
         assert_eq!(loaded.prowlarr_timeout_ms, MAX_PROWLARR_TIMEOUT_MS);
         assert_eq!(loaded.prowlarr_url, "http://127.0.0.1:9696");
         assert_eq!(loaded.real_debrid_api_key.expose(), "rd_secret_abcd");
+        assert_eq!(loaded.tmdb_api_key.expose(), "tmdb_secret_key_11");
         assert!(loaded.has_local_debrid_configured());
+        assert!(loaded.has_tmdb_configured());
 
         #[cfg(unix)]
         {
@@ -518,17 +534,22 @@ mod tests {
         assert!(loaded.native_subtitles_enabled);
         assert!(loaded.opensubtitles_api_key.is_empty());
         assert!(loaded.subdl_api_key.is_empty());
+        assert!(loaded.tmdb_enabled);
+        assert!(loaded.tmdb_api_key.is_empty());
 
         let with_sub_keys = PrivateIntegrationsConfig {
             opensubtitles_api_key: SecretApiKey::new("os_ultra_secret_777"),
             subdl_api_key: SecretApiKey::new("subdl_ultra_secret_888"),
+            tmdb_api_key: SecretApiKey::new("tmdb_ultra_secret_999"),
             ..loaded
         };
         let dbg = format!("{with_sub_keys:?}");
         assert!(!dbg.contains("os_ultra_secret_777"));
         assert!(!dbg.contains("subdl_ultra_secret_888"));
+        assert!(!dbg.contains("tmdb_ultra_secret_999"));
         assert!(!dbg.contains("tb_legacy_key"));
         assert!(with_sub_keys.all_secrets().contains(&"os_ultra_secret_777"));
         assert!(with_sub_keys.all_secrets().contains(&"subdl_ultra_secret_888"));
+        assert!(with_sub_keys.all_secrets().contains(&"tmdb_ultra_secret_999"));
     }
 }

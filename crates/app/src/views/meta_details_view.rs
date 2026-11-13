@@ -4,20 +4,25 @@ use gpui::{
     deferred, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb,
     rgba, Context, FontWeight, MouseButton, ScrollDelta, ScrollEvent, SharedString, Window,
 };
-use stremio_core_runtime::stremio_core::{
-    models::common::Loadable,
-    types::{
-        addon::ResourceRequest, library::LibraryItem, resource::Video,
-        watched_bitfield::WatchedBitField,
+use stremio_core_runtime::{
+    stremio_core::{
+        constants::CINEMETA_URL,
+        models::common::Loadable,
+        types::{
+            addon::ResourceRequest, library::LibraryItem, resource::Video,
+            watched_bitfield::WatchedBitField,
+        },
     },
+    PersonCreditChip,
 };
 
 use crate::{
     icons::{svg_icon, IconName},
     shell::AppShell,
     state::{
-        build_subtitles_resource_path, classify_library_item_status, extract_genres,
-        extract_imdb_rating, find_cached_preview_in_model, format_movietracker_episode_code,
+        build_default_meta_request, build_subtitles_resource_path, classify_library_item_status,
+        extract_cast_and_directors_from_links, extract_genres, extract_imdb_rating,
+        find_cached_preview_in_model, format_movietracker_episode_code,
         merge_and_enrich_stream_candidates, pick_default_series_episode_id,
         resolve_ready_meta_item, resume_offset_for_library_item, scroll_near_bottom,
         sync_memoized_meta_streams, CachedTitlePreview, LibraryStatusTab, PlaybackCandidate,
@@ -30,10 +35,11 @@ use crate::{
         parse_runtime_minutes, placeholder_tint_for_id, poster_card_shadow,
         semantic_status_pill, sentence_case_label, summarize_stream_for_humans, tabular_nums,
         ui_sans, ACCENT, ACCENT_AMBER, ACCENT_HOVER, ACCENT_SOFT, BG_ELEVATED, BG_INPUT,
-        BG_OBSIDIAN, BG_POPOVER_GLASS, BG_SURFACE, BORDER_SOFT, BORDER_STRONG, BORDER_SUBTLE,
-        STATUS_WATCHED, STATUS_WATCHING, STATUS_WATCHLIST, TEXT_MUTED, TEXT_PRIMARY,
-        TEXT_SECONDARY,
+        BG_OBSIDIAN, BG_POPOVER_GLASS, BG_SURFACE, BORDER_POSTER_HOVER, BORDER_SOFT,
+        BORDER_STRONG, BORDER_SUBTLE, STATUS_WATCHED, STATUS_WATCHING, STATUS_WATCHLIST,
+        TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
     },
+    views::search_view::person_initials,
 };
 
 #[derive(Clone)]
@@ -59,11 +65,32 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_debrid = self.has_debrid_access();
+        let synthetic_fallback = self
+            .synthetic_tmdb_meta
+            .as_ref()
+            .and_then(|(sid, m)| (sid == route_id).then(|| m.clone()));
         let memo_slot = &mut self.memoized_meta_streams;
 
         let details_snap = self.core.with_model(|model| {
             let meta_pair = resolve_ready_meta_item(&model.meta_details.meta_items)
-                .map(|(m, req)| (m.clone(), req));
+                .map(|(m, req)| (m.clone(), req))
+                .or_else(|| {
+                    synthetic_fallback.map(|m| {
+                        let req = model
+                            .meta_details
+                            .meta_items
+                            .first()
+                            .map(|r| r.request.clone())
+                            .unwrap_or_else(|| {
+                                build_default_meta_request(
+                                    &CINEMETA_URL,
+                                    &m.preview.r#type,
+                                    &m.preview.id,
+                                )
+                            });
+                        (m, req)
+                    })
+                });
             let is_meta_loading = model
                 .meta_details
                 .meta_items
@@ -166,6 +193,8 @@ impl AppShell {
         };
 
         self.maybe_trigger_stream_enrichments(cx);
+        self.request_background_enrichment_if_needed(&meta.preview.r#type, &meta.preview.id, cx);
+        let enriched = self.core.cached_enriched_meta(&meta.preview.id);
         let private_cfg = self.core.private_integrations();
         let prowlarr_slice = if self.prowlarr_fallback_key.as_ref()
             == Some(&(
@@ -242,25 +271,89 @@ impl AppShell {
             .collect();
         let filtered_total = filtered_indices.len();
 
-        let metahub_bg = format!(
-            "https://images.metahub.space/background/medium/{}/img",
-            meta.preview.id
-        );
-        let preblurred_backdrop = self
-            .poster_cache
-            .resolve_ambient_url(meta.preview.background.as_ref())
-            .or_else(|| self.poster_cache.resolve_ambient_bleed(&metahub_bg))
+        let metahub_bg = meta
+            .preview
+            .id
+            .starts_with("tt")
+            .then(|| {
+                format!(
+                    "https://images.metahub.space/background/medium/{}/img",
+                    meta.preview.id
+                )
+            });
+        let metahub_logo = meta
+            .preview
+            .id
+            .starts_with("tt")
+            .then(|| {
+                format!(
+                    "https://images.metahub.space/logo/medium/{}/img",
+                    meta.preview.id
+                )
+            });
+
+        let preblurred_backdrop = enriched
+            .as_ref()
+            .and_then(|e| e.backdrop_url.as_deref())
+            .and_then(|u| self.poster_cache.resolve_ambient_bleed(u))
+            .or_else(|| {
+                self.poster_cache
+                    .resolve_ambient_url(meta.preview.background.as_ref())
+            })
+            .or_else(|| {
+                metahub_bg
+                    .as_deref()
+                    .and_then(|u| self.poster_cache.resolve_ambient_bleed(u))
+            })
             .or_else(|| {
                 self.poster_cache
                     .resolve_ambient_url(meta.preview.poster.as_ref())
             });
-        let hero_backdrop = self
-            .poster_cache
-            .resolve_hero_backdrop_url(meta.preview.background.as_ref())
-            .or_else(|| self.poster_cache.resolve_widescreen_image(&metahub_bg));
+        let hero_backdrop = enriched
+            .as_ref()
+            .and_then(|e| e.backdrop_url.as_deref())
+            .and_then(|u| {
+                self.poster_cache
+                    .resolve_hero_backdrop_image(u)
+                    .or_else(|| self.poster_cache.resolve_widescreen_image(u))
+            })
+            .or_else(|| {
+                self.poster_cache
+                    .resolve_hero_backdrop_url(meta.preview.background.as_ref())
+            })
+            .or_else(|| {
+                metahub_bg
+                    .as_deref()
+                    .and_then(|u| self.poster_cache.resolve_widescreen_image(u))
+            });
+        let title_logo_tex = enriched
+            .as_ref()
+            .and_then(|e| e.logo_url.as_deref())
+            .and_then(|u| self.poster_cache.resolve_logo_image(u))
+            .or_else(|| self.poster_cache.resolve_logo_url(meta.preview.logo.as_ref()))
+            .or_else(|| {
+                metahub_logo
+                    .as_deref()
+                    .and_then(|u| self.poster_cache.resolve_logo_image(u))
+            });
         let poster_tex = self
             .poster_cache
             .resolve_poster_url(meta.preview.poster.as_ref());
+
+        let (mut credit_directors, mut credit_cast) = enriched
+            .as_ref()
+            .filter(|e| !e.directors.is_empty() || !e.cast.is_empty())
+            .map(|e| (e.directors.clone(), e.cast.clone()))
+            .unwrap_or_else(|| extract_cast_and_directors_from_links(&meta.preview.links));
+        if credit_directors.is_empty() && credit_cast.is_empty() {
+            let (fallback_dir, fallback_cast) =
+                extract_cast_and_directors_from_links(&meta.preview.links);
+            credit_directors = fallback_dir;
+            credit_cast = fallback_cast;
+        }
+        let mut combined_credits: Vec<PersonCreditChip> =
+            credit_directors.into_iter().take(2).collect();
+        combined_credits.extend(credit_cast.into_iter().take(12));
 
         let imdb = extract_imdb_rating(&meta.preview);
         let genres = extract_genres(&meta.preview, 3);
@@ -533,7 +626,15 @@ impl AppShell {
                                                                         },
                                                                     ),
                                                             )
-                                                            .child(
+                                                            .child(if let Some(logo_img) = title_logo_tex {
+                                                                img(logo_img)
+                                                                    .h(px(84.0))
+                                                                    .max_w(px(420.0))
+                                                                    .object_fit(
+                                                                        gpui::ObjectFit::Contain,
+                                                                    )
+                                                                    .into_any_element()
+                                                            } else {
                                                                 div()
                                                                     .font(editorial_serif())
                                                                     .text_size(px(58.0))
@@ -543,10 +644,15 @@ impl AppShell {
                                                                     .text_color(rgb(TEXT_PRIMARY))
                                                                     .child(
                                                                         meta.preview.name.clone(),
-                                                                    ),
-                                                            )
+                                                                    )
+                                                                    .into_any_element()
+                                                            })
                                                             .when_some(
-                                                                meta.preview.description.clone(),
+                                                                meta.preview.description.clone().or_else(|| {
+                                                                    enriched
+                                                                        .as_ref()
+                                                                        .and_then(|e| e.overview.clone())
+                                                                }),
                                                                 |el, desc| {
                                                                     el.child(
                                                                         div()
@@ -731,6 +837,156 @@ impl AppShell {
                                     ),
                             ),
                     )
+                    .when(!combined_credits.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .flex_shrink_0()
+                                .max_w(px(1440.0))
+                                .mx_auto()
+                                .px(px(32.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(14.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_baseline()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .font(editorial_serif())
+                                                .text_size(px(26.0))
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .child("Cast & Crew"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_MUTED))
+                                                .child("Click any name for filmography"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap(px(10.0))
+                                        .children(combined_credits.into_iter().enumerate().map(
+                                            |(idx, chip)| {
+                                                let pk = chip.person_key.clone();
+                                                let pname = chip.name.clone();
+                                                let headshot_tex = chip
+                                                    .headshot_url
+                                                    .as_deref()
+                                                    .and_then(|u| {
+                                                        self.poster_cache.resolve_thumbnail_image(u)
+                                                    });
+                                                let initials = person_initials(&chip.name);
+                                                let role_label = chip
+                                                    .role_or_character
+                                                    .clone()
+                                                    .unwrap_or_else(|| {
+                                                        if chip.is_director {
+                                                            "Director".to_owned()
+                                                        } else {
+                                                            "Cast".to_owned()
+                                                        }
+                                                    });
+
+                                                div()
+                                                    .id(("meta-cast-chip", idx))
+                                                    .cursor_pointer()
+                                                    .h(px(54.0))
+                                                    .pl(px(8.0))
+                                                    .pr(px(14.0))
+                                                    .rounded(px(999.0))
+                                                    .bg(rgb(BG_SURFACE))
+                                                    .border_1()
+                                                    .border_color(rgba(BORDER_SUBTLE))
+                                                    .hover(|s| {
+                                                        s.bg(rgb(BG_ELEVATED))
+                                                            .border_color(rgba(BORDER_POSTER_HOVER))
+                                                    })
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(10.0))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.open_person_details(
+                                                                pk.clone(),
+                                                                pname.clone(),
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(38.0))
+                                                            .h(px(38.0))
+                                                            .flex_shrink_0()
+                                                            .rounded(px(999.0))
+                                                            .overflow_hidden()
+                                                            .bg(rgb(BG_ELEVATED))
+                                                            .border_1()
+                                                            .border_color(rgba(BORDER_SUBTLE))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(if let Some(tex) = headshot_tex {
+                                                                img(tex)
+                                                                    .size_full()
+                                                                    .object_fit(
+                                                                        gpui::ObjectFit::Cover,
+                                                                    )
+                                                                    .into_any_element()
+                                                            } else {
+                                                                div()
+                                                                    .font(editorial_serif())
+                                                                    .text_size(px(15.0))
+                                                                    .text_color(rgb(TEXT_SECONDARY))
+                                                                    .child(initials)
+                                                                    .into_any_element()
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap(px(1.5))
+                                                            .child(
+                                                                div()
+                                                                    .font(ui_sans(
+                                                                        FontWeight::SEMIBOLD,
+                                                                    ))
+                                                                    .text_size(px(13.0))
+                                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                                    .max_w(px(180.0))
+                                                                    .truncate()
+                                                                    .child(chip.name),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .font(mono_font())
+                                                                    .text_size(px(11.0))
+                                                                    .text_color(
+                                                                        if chip.is_director {
+                                                                            rgb(ACCENT)
+                                                                        } else {
+                                                                            rgb(TEXT_MUTED)
+                                                                        },
+                                                                    )
+                                                                    .max_w(px(180.0))
+                                                                    .truncate()
+                                                                    .child(role_label),
+                                                            ),
+                                                    )
+                                            },
+                                        )),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .w_full()

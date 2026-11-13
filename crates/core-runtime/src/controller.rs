@@ -30,12 +30,13 @@ use stremio_core::{
         Effect, Env, Runtime, RuntimeAction, RuntimeEvent,
     },
     types::{
-        addon::{Descriptor, DescriptorFlags, ExtraValue, Manifest, ResourcePath},
+        addon::{Descriptor, DescriptorFlags, ExtraValue, Manifest, ResourcePath, ResourceResponse},
         api::AuthRequest,
         profile::Settings as ProfileSettings,
-        resource::{MetaItemPreview, Stream},
+        resource::{MetaItem, MetaItemPreview, Stream},
     },
 };
+use stremio_core::models::common::Loadable;
 use tokio::sync::broadcast;
 use tracing::error;
 use url::Url;
@@ -44,8 +45,8 @@ use crate::{
     addon_engine::{
         addon_configure_url, addon_has_debrid_configured, curated_addon_directory,
         detect_clipboard_addon_url, has_debrid_configured_addons, normalize_addon_url, redact_url,
-        AddonCacheStats, AddonHttpEngine, AddonTelemetrySnapshot, CuratedAddonEntry,
-        InstallAddonOutcome, MutedAddonEntry,
+        url_sha256_hex, AddonCacheStats, AddonHttpEngine, AddonResourceKind,
+        AddonTelemetrySnapshot, CuratedAddonEntry, InstallAddonOutcome, MutedAddonEntry,
     },
     debrid::{
         DebridAccountStatus, DebridBaseUrls, DebridCacheStatus, LocalDebridResolver,
@@ -66,6 +67,12 @@ use crate::{
     subtitles::{
         FetchedNativeSubtitle, NativeSubtitleClient, NativeSubtitleEndpoints, NativeSubtitleQuery,
         SubtitleAlignmentResult, SubtitleSyncAligner,
+    },
+    tmdb::{
+        build_unified_editorial_search, format_addon_resource_url, meta_resource_matches_url,
+        normalize_title_for_dedup, preview_to_editorial_hit, EditorialMediaHit, EditorialPersonHit,
+        EnrichedTitleMeta, MetadataEngine, PersonFilmography, TmdbAccountStatus,
+        UnifiedEditorialSearch,
     },
     track_prefs::{
         delete_series_track_pref, load_all_series_track_prefs, load_series_track_pref,
@@ -98,6 +105,7 @@ pub struct CoreController {
     debrid_resolver: Arc<LocalDebridResolver>,
     prowlarr_client: Arc<ProwlarrClient>,
     native_subtitles: NativeSubtitleClient,
+    metadata_engine: Arc<MetadataEngine>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -147,6 +155,15 @@ impl CoreController {
             })
             .unwrap_or_else(|| std::env::temp_dir().join("ferrite"));
         let native_subtitles = NativeSubtitleClient::new(data_dir.join("native_subtitles"));
+        let is_memory_db = DesktopEnv::storage_path()
+            .ok()
+            .is_some_and(|p| p == Path::new(":memory:"));
+        let metadata_db_path = if is_memory_db {
+            PathBuf::from(":memory:")
+        } else {
+            data_dir.join("metadata_fts.db")
+        };
+        let metadata_engine = Arc::new(MetadataEngine::open(&metadata_db_path)?);
         let loaded_private_config =
             match PrivateIntegrationsConfig::load_from_path(&private_config_path) {
                 Ok(cfg) => cfg,
@@ -166,21 +183,14 @@ impl CoreController {
         );
 
         let (event_tx, _) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
-        let pump_tx = event_tx.clone();
 
-        DesktopEnv::exec_concurrent(async move {
-            while let Some(event) = rx.next().await {
-                let _ = pump_tx.send(Arc::new(event));
-            }
-        });
-
-        Ok(Self {
+        let controller = Self {
             runtime,
-            event_tx,
+            event_tx: event_tx.clone(),
             storage,
-            addon_engine,
+            addon_engine: Arc::clone(&addon_engine),
             http_client,
-            runtime_handle,
+            runtime_handle: runtime_handle.clone(),
             mutation_queue,
             mutation_gate: Arc::new(Mutex::new(())),
             private_config: Arc::new(RwLock::new(loaded_private_config)),
@@ -188,7 +198,150 @@ impl CoreController {
             debrid_resolver: Arc::new(LocalDebridResolver::new()),
             prowlarr_client: Arc::new(ProwlarrClient::new()),
             native_subtitles,
-        })
+            metadata_engine: Arc::clone(&metadata_engine),
+        };
+
+        // Seed library titles into local FTS5 index asynchronously
+        let seed_lib = controller.with_model(|m| {
+            m.ctx.library.items.values().cloned().collect::<Vec<_>>()
+        });
+        if !seed_lib.is_empty() {
+            let meta_seed = Arc::clone(&metadata_engine);
+            runtime_handle.spawn_blocking(move || {
+                meta_seed.ingest_library_items(&seed_lib);
+            });
+        }
+
+        // Pump core runtime events + auto-ingest ready catalog/meta items into local FTS5
+        let pump_tx = event_tx;
+        let pump_ctrl = controller.clone();
+        let pump_handle = runtime_handle.clone();
+        DesktopEnv::exec_concurrent(async move {
+            while let Some(event) = rx.next().await {
+                if let RuntimeEvent::NewState(ref fields) = event {
+                    let needs_ingest = fields.iter().any(|f| {
+                        matches!(
+                            f,
+                            DesktopModelField::Board
+                                | DesktopModelField::Discover
+                                | DesktopModelField::Search
+                                | DesktopModelField::MetaDetails
+                                | DesktopModelField::Ctx
+                        )
+                    });
+                    if needs_ingest {
+                        let (previews, full_items, lib_items) =
+                            collect_ingest_batch(&pump_ctrl, fields);
+                        if !previews.is_empty() || !full_items.is_empty() || !lib_items.is_empty() {
+                            let eng = Arc::clone(&pump_ctrl.metadata_engine);
+                            pump_handle.spawn_blocking(move || {
+                                if !previews.is_empty() {
+                                    eng.ingest_stremio_previews(&previews);
+                                }
+                                for item in &full_items {
+                                    eng.ingest_stremio_meta_item(item);
+                                }
+                                if !lib_items.is_empty() {
+                                    eng.ingest_library_items(&lib_items);
+                                }
+                            });
+                        }
+                    }
+                }
+                let _ = pump_tx.send(Arc::new(event));
+            }
+        });
+
+        // SWR background revalidation -> hot-swap Board/Discover/MetaDetails in DesktopModel
+        let mut reval_rx = addon_engine.subscribe_revalidations();
+        let swr_ctrl = controller.clone();
+        let swr_handle = runtime_handle;
+        DesktopEnv::exec_concurrent(async move {
+            loop {
+                match reval_rx.recv().await {
+                    Ok(payload) => {
+                        let sha = payload.url_sha256;
+                        match payload.resource_kind {
+                            AddonResourceKind::Catalog => {
+                                if let Ok(ResourceResponse::Metas { metas }) =
+                                    serde_json::from_slice::<ResourceResponse>(&payload.bytes)
+                                {
+                                    let eng = Arc::clone(&swr_ctrl.metadata_engine);
+                                    let metas_ingest = metas.clone();
+                                    swr_handle.spawn_blocking(move || {
+                                        eng.ingest_stremio_previews(&metas_ingest);
+                                    });
+                                    swr_ctrl.mutate_model_sync(move |model| {
+                                        let mut changed = Vec::new();
+                                        let mut board_hit = false;
+                                        for cat in &mut model.board.catalogs {
+                                            for page in cat.iter_mut() {
+                                                if format_addon_resource_url(&page.request)
+                                                    .is_some_and(|u| url_sha256_hex(&u) == sha)
+                                                {
+                                                    page.content =
+                                                        Some(Loadable::Ready(metas.clone()));
+                                                    board_hit = true;
+                                                }
+                                            }
+                                        }
+                                        if board_hit {
+                                            changed.push(DesktopModelField::Board);
+                                        }
+                                        let mut discover_hit = false;
+                                        for page in model.discover.catalog.iter_mut() {
+                                            if format_addon_resource_url(&page.request)
+                                                .is_some_and(|u| url_sha256_hex(&u) == sha)
+                                            {
+                                                page.content =
+                                                    Some(Loadable::Ready(metas.clone()));
+                                                discover_hit = true;
+                                            }
+                                        }
+                                        if discover_hit {
+                                            changed.push(DesktopModelField::Discover);
+                                        }
+                                        ((), vec![], changed)
+                                    });
+                                }
+                            }
+                            AddonResourceKind::Meta => {
+                                if let Ok(ResourceResponse::Meta { meta }) =
+                                    serde_json::from_slice::<ResourceResponse>(&payload.bytes)
+                                {
+                                    let eng = Arc::clone(&swr_ctrl.metadata_engine);
+                                    let meta_ingest = meta.clone();
+                                    swr_handle.spawn_blocking(move || {
+                                        eng.ingest_stremio_meta_item(&meta_ingest);
+                                    });
+                                    swr_ctrl.mutate_model_sync(move |model| {
+                                        let mut hit = false;
+                                        for loadable in model.meta_details.meta_items.iter_mut() {
+                                            if meta_resource_matches_url(&loadable.request, &sha) {
+                                                loadable.content =
+                                                    Some(Loadable::Ready(meta.clone()));
+                                                hit = true;
+                                            }
+                                        }
+                                        let changed = if hit {
+                                            vec![DesktopModelField::MetaDetails]
+                                        } else {
+                                            vec![]
+                                        };
+                                        ((), vec![], changed)
+                                    });
+                                }
+                            }
+                            AddonResourceKind::Manifest => {}
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        Ok(controller)
     }
 
     fn mutate_model_sync<R: Send + 'static>(
@@ -1112,6 +1265,251 @@ impl CoreController {
 
     pub fn clear_addon_cache(&self) {
         self.addon_engine.clear_cache();
+        self.metadata_engine.clear_caches();
+    }
+
+    pub fn metadata_engine(&self) -> &Arc<MetadataEngine> {
+        &self.metadata_engine
+    }
+
+    pub fn set_tmdb_base_urls(&self, api_base: impl Into<String>, image_base: impl Into<String>) {
+        self.metadata_engine.set_base_urls(api_base, image_base);
+    }
+
+    pub async fn verify_tmdb(
+        &self,
+        override_key: Option<String>,
+    ) -> Result<TmdbAccountStatus, String> {
+        let cfg = self.private_integrations();
+        let key = override_key
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| cfg.tmdb_api_key.expose().to_owned());
+        let eng = Arc::clone(&self.metadata_engine);
+        self.runtime_handle
+            .spawn(async move { eng.verify_credentials(&key).await })
+            .await
+            .map_err(|err| format!("TMDB verify task failed: {err}"))?
+    }
+
+    pub fn editorial_search_snapshot(&self, query: &str) -> UnifiedEditorialSearch {
+        let started = std::time::Instant::now();
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return UnifiedEditorialSearch::default();
+        }
+        let norm_q = normalize_title_for_dedup(trimmed);
+        let (local_fts, local_people) = self.metadata_engine.search_local_fts(trimmed, 40);
+
+        let addon_and_library_hits = self.with_model(|model| {
+            let mut hits = Vec::new();
+            for item in model.local_search.search_results.iter().take(25) {
+                if !item.name.trim().is_empty() {
+                    hits.push(EditorialMediaHit {
+                        canonical_id: item.id.clone(),
+                        imdb_id: item.id.starts_with("tt").then(|| item.id.clone()),
+                        tmdb_id: item.id.strip_prefix("tmdb:").and_then(|s| s.parse().ok()),
+                        media_type: crate::tmdb::canonical_stremio_type(&item.r#type).to_owned(),
+                        title: item.name.clone(),
+                        year: item
+                            .release_info
+                            .as_deref()
+                            .and_then(crate::tmdb::extract_4_digit_year),
+                        imdb_rating: item.imdb_rating.map(|r| format!("{:.1}", r.to_f64())),
+                        overview: None,
+                        poster_url: item.poster.as_ref().map(Url::to_string),
+                        backdrop_url: None,
+                        logo_url: None,
+                        genres: Vec::new(),
+                        score: crate::tmdb::score_title_relevance(&item.name, &norm_q) + 10,
+                    });
+                }
+            }
+            for li in model.ctx.library.items.values() {
+                let norm_name = normalize_title_for_dedup(&li.name);
+                if !norm_name.is_empty() && norm_name.contains(&norm_q) {
+                    let fake_preview = MetaItemPreview {
+                        id: li.id.clone(),
+                        r#type: li.r#type.clone(),
+                        name: li.name.clone(),
+                        poster: li.poster.clone(),
+                        background: None,
+                        logo: None,
+                        description: None,
+                        release_info: None,
+                        runtime: None,
+                        released: None,
+                        poster_shape: stremio_core::types::resource::PosterShape::Poster,
+                        links: Vec::new(),
+                        trailer_streams: Vec::new(),
+                        behavior_hints: stremio_core::types::resource::MetaItemBehaviorHints::default(),
+                    };
+                    hits.push(preview_to_editorial_hit(&fake_preview, &norm_q, 40));
+                }
+            }
+            for cat in &model.search.catalogs {
+                for page in cat {
+                    if let Some(Loadable::Ready(items)) = &page.content {
+                        for item in items.iter().take(25) {
+                            if !item.name.trim().is_empty() {
+                                hits.push(preview_to_editorial_hit(item, &norm_q, 15));
+                            }
+                        }
+                    }
+                }
+            }
+            hits
+        });
+
+        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        build_unified_editorial_search(
+            trimmed,
+            local_fts,
+            Vec::new(),
+            addon_and_library_hits,
+            local_people,
+            elapsed_us,
+        )
+    }
+
+    pub async fn editorial_search_live_tmdb(
+        &self,
+        query: String,
+    ) -> Result<(Vec<EditorialMediaHit>, Vec<EditorialPersonHit>), String> {
+        let cfg = self.private_integrations();
+        if !cfg.tmdb_enabled || !cfg.has_tmdb_configured() || query.trim().is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let key = cfg.tmdb_api_key.expose().to_owned();
+        let eng = Arc::clone(&self.metadata_engine);
+        self.runtime_handle
+            .spawn(async move { eng.search_multi(&key, &query).await })
+            .await
+            .map_err(|err| format!("TMDB search task failed: {err}"))?
+    }
+
+    pub async fn editorial_search_live(&self, query: String) -> UnifiedEditorialSearch {
+        let started = std::time::Instant::now();
+        let (tmdb_hits, tmdb_people) = self
+            .editorial_search_live_tmdb(query.clone())
+            .await
+            .unwrap_or_default();
+        let snap = self.editorial_search_snapshot(&query);
+        let merged_local = snap
+            .movies
+            .into_iter()
+            .chain(snap.series)
+            .collect::<Vec<_>>();
+        let merged_people = tmdb_people.into_iter().chain(snap.people).collect();
+        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        build_unified_editorial_search(
+            &query,
+            merged_local,
+            tmdb_hits,
+            Vec::new(),
+            merged_people,
+            elapsed_us,
+        )
+    }
+
+    pub fn cached_enriched_meta(&self, id: &str) -> Option<EnrichedTitleMeta> {
+        self.metadata_engine.cached_enriched_meta(id)
+    }
+
+    pub async fn ensure_title_enrichment(
+        &self,
+        media_type: String,
+        id: String,
+    ) -> Option<EnrichedTitleMeta> {
+        let cfg = self.private_integrations();
+        if !cfg.tmdb_enabled || !cfg.has_tmdb_configured() {
+            return self.metadata_engine.cached_enriched_meta(&id);
+        }
+        let key = cfg.tmdb_api_key.expose().to_owned();
+        let eng = Arc::clone(&self.metadata_engine);
+        let fallback_id = id.clone();
+        self.runtime_handle
+            .spawn(async move { eng.enrich_title(&key, &media_type, &id).await })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .or_else(|| self.metadata_engine.cached_enriched_meta(&fallback_id))
+    }
+
+    pub async fn resolve_canonical_imdb_id(
+        &self,
+        media_type: String,
+        id: String,
+    ) -> Option<String> {
+        if id.starts_with("tt") {
+            return Some(id);
+        }
+        let tmdb_id = id.strip_prefix("tmdb:")?.parse::<u64>().ok()?;
+        let cfg = self.private_integrations();
+        let key = (cfg.tmdb_enabled && cfg.has_tmdb_configured())
+            .then(|| cfg.tmdb_api_key.expose().to_owned());
+        let eng = Arc::clone(&self.metadata_engine);
+        self.runtime_handle
+            .spawn(async move {
+                eng.resolve_tmdb_to_imdb(key.as_deref(), &media_type, tmdb_id)
+                    .await
+            })
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn fetch_synthetic_tmdb_meta(
+        &self,
+        media_type: String,
+        id: String,
+    ) -> Option<MetaItem> {
+        let cfg = self.private_integrations();
+        let key = (cfg.tmdb_enabled && cfg.has_tmdb_configured())
+            .then(|| cfg.tmdb_api_key.expose().to_owned());
+        let eng = Arc::clone(&self.metadata_engine);
+        self.runtime_handle
+            .spawn(async move {
+                eng.build_synthetic_meta_item(key.as_deref(), &media_type, &id)
+                    .await
+            })
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn fetch_person_filmography(
+        &self,
+        person_key: String,
+        name: String,
+    ) -> PersonFilmography {
+        let cfg = self.private_integrations();
+        let key = (cfg.tmdb_enabled && cfg.has_tmdb_configured())
+            .then(|| cfg.tmdb_api_key.expose().to_owned());
+        let eng = Arc::clone(&self.metadata_engine);
+        match self
+            .runtime_handle
+            .spawn(async move {
+                eng.fetch_person_filmography(key.as_deref(), &person_key, &name)
+                    .await
+            })
+            .await
+        {
+            Ok(filmo) => filmo,
+            Err(_) => PersonFilmography {
+                person_key: String::new(),
+                tmdb_person_id: None,
+                name: String::new(),
+                department: "Acting".to_owned(),
+                biography: None,
+                birthday: None,
+                place_of_birth: None,
+                headshot_url: None,
+                movies: Vec::new(),
+                series: Vec::new(),
+            },
+        }
     }
 
     pub fn addon_cache_stats(&self) -> AddonCacheStats {
@@ -1257,6 +1655,8 @@ impl CoreController {
         let normalized = next.normalized();
         normalized.save_to_path(&self.private_config_path)?;
         if let Ok(mut guard) = self.private_config.write() {
+            let tmdb_changed = guard.tmdb_api_key != normalized.tmdb_api_key
+                || guard.tmdb_enabled != normalized.tmdb_enabled;
             let key_or_provider_changed = guard.active_debrid != normalized.active_debrid
                 || guard.real_debrid_api_key != normalized.real_debrid_api_key
                 || guard.torbox_api_key != normalized.torbox_api_key
@@ -1264,6 +1664,9 @@ impl CoreController {
             *guard = normalized;
             if key_or_provider_changed {
                 self.debrid_resolver.clear_caches();
+            }
+            if tmdb_changed {
+                self.metadata_engine.clear_caches();
             }
         }
         Ok(())
@@ -1561,6 +1964,59 @@ impl CoreController {
 
         Ok((best_idx, out_path, alignment))
     }
+}
+
+fn collect_ingest_batch(
+    ctrl: &CoreController,
+    fields: &[DesktopModelField],
+) -> (
+    Vec<MetaItemPreview>,
+    Vec<MetaItem>,
+    Vec<stremio_core::types::library::LibraryItem>,
+) {
+    ctrl.with_model(|model| {
+        let mut previews = Vec::new();
+        let mut full_items = Vec::new();
+        let mut lib_items = Vec::new();
+
+        if fields.contains(&DesktopModelField::Board) {
+            for cat in &model.board.catalogs {
+                for page in cat {
+                    if let Some(Loadable::Ready(items)) = &page.content {
+                        previews.extend(items.iter().take(24).cloned());
+                    }
+                }
+            }
+        }
+        if fields.contains(&DesktopModelField::Discover) {
+            for page in &model.discover.catalog {
+                if let Some(Loadable::Ready(items)) = &page.content {
+                    previews.extend(items.iter().take(48).cloned());
+                }
+            }
+        }
+        if fields.contains(&DesktopModelField::Search) {
+            for cat in &model.search.catalogs {
+                for page in cat {
+                    if let Some(Loadable::Ready(items)) = &page.content {
+                        previews.extend(items.iter().take(24).cloned());
+                    }
+                }
+            }
+        }
+        if fields.contains(&DesktopModelField::MetaDetails) {
+            for loadable in &model.meta_details.meta_items {
+                if let Some(Loadable::Ready(item)) = &loadable.content {
+                    full_items.push(item.clone());
+                }
+            }
+        }
+        if fields.contains(&DesktopModelField::Ctx) {
+            lib_items.extend(model.ctx.library.items.values().cloned());
+        }
+
+        (previews, full_items, lib_items)
+    })
 }
 
 fn aligned_output_stem(path: &Path) -> String {

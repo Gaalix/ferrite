@@ -26,6 +26,7 @@ use crate::{
 pub enum SettingsRowId {
     CheckUpdatesOnStartup,
     ClipboardAddonDetect,
+    ShowHomeSpotlight,
     OsdAutohideSecs,
     HardwareZeroCopyStatus,
     HdrToneMapping,
@@ -56,6 +57,7 @@ pub enum SettingsRowId {
     ProwlarrUrl,
     ProwlarrApiKey,
     ProwlarrTimeoutAndTest,
+    TmdbApiKey,
     OpenSubtitlesApiKey,
     SubdlApiKey,
     OpenAddonsStudio,
@@ -93,6 +95,22 @@ pub const SETTINGS_ROWS: &[SettingsRowSpec] = &[
         label: "Clipboard addon link detection",
         description: "Detect copied stremio:// or manifest.json addon URLs when opening Addons Studio.",
         keywords: &["clipboard", "addon", "manifest", "stremio://", "paste"],
+    },
+    SettingsRowSpec {
+        id: SettingsRowId::ShowHomeSpotlight,
+        category: SettingsCategory::GeneralAndAppearance,
+        group: "Interface",
+        label: "Featured cinema spotlight on Home",
+        description: "Show an editorial hero spotlight banner above your Home shelves (disable for pure poster grids).",
+        keywords: &[
+            "home",
+            "spotlight",
+            "hero",
+            "banner",
+            "featured",
+            "editorial",
+            "poster",
+        ],
     },
     SettingsRowSpec {
         id: SettingsRowId::OsdAutohideSecs,
@@ -333,6 +351,25 @@ pub const SETTINGS_ROWS: &[SettingsRowSpec] = &[
         label: "Prowlarr timeout & connection test",
         description: "Configure local indexer request timeout (1000-15000 ms) and test connectivity.",
         keywords: &["prowlarr", "timeout", "test", "indexer", "torznab", "latency"],
+    },
+    SettingsRowSpec {
+        id: SettingsRowId::TmdbApiKey,
+        category: SettingsCategory::IntegrationsAndKeys,
+        group: "Native Metadata & Search",
+        label: "TMDB API key / Read Access Token",
+        description: "Optional TMDB v3 API key or v4 Bearer token for native HTTP/2 logos, backdrops, cast photos, and filmographies (0600).",
+        keywords: &[
+            "tmdb",
+            "metadata",
+            "logos",
+            "cast",
+            "director",
+            "search",
+            "fts5",
+            "0600",
+            "api",
+            "key",
+        ],
     },
     SettingsRowSpec {
         id: SettingsRowId::OpenSubtitlesApiKey,
@@ -1171,6 +1208,17 @@ impl AppShell {
                     }),
                 ),
             ),
+            SettingsRowId::ShowHomeSpotlight => render_control_row(
+                "Featured cinema spotlight on Home",
+                "Display a subtle vignette hero header with crisp title logo and quick Resume / Details actions on Home.",
+                render_movietracker_switch(
+                    "switch-home-spotlight",
+                    prefs.show_home_spotlight,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_show_home_spotlight(cx);
+                    }),
+                ),
+            ),
             SettingsRowId::OsdAutohideSecs => render_control_row(
                 "Player OSD auto-hide",
                 "Idle duration before player transport controls fade away during playback.",
@@ -1735,6 +1783,92 @@ impl AppShell {
                 }),
                 cx,
             ),
+            SettingsRowId::TmdbApiKey => {
+                let focused = self.focused_input == Some(FocusedInput::SettingsTmdbApiKey);
+                let preview = mask_api_key_preview(&self.tmdb_key_input, self.tmdb_key_configured);
+                let display: SharedString = if preview.is_empty() {
+                    if focused {
+                        "|".into()
+                    } else {
+                        "Paste TMDB v3 key or v4 token...".into()
+                    }
+                } else if focused {
+                    format!("{preview}|").into()
+                } else {
+                    preview.into()
+                };
+                let has_any = !self.tmdb_key_input.is_empty() || self.tmdb_key_configured;
+                let desc = self.tmdb_verify_status.clone().unwrap_or_else(|| {
+                    "Optional personal TMDB key or Read Access Token stored locally with 0600 permissions for crisp title logos, backdrops, cast photos & filmographies.".to_owned()
+                });
+                render_control_row(
+                    "TMDB API key / Read Access Token",
+                    desc,
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id("input-tmdb-key")
+                                .cursor_text()
+                                .w(px(196.0))
+                                .h(px(34.0))
+                                .px(px(10.0))
+                                .rounded(px(6.0))
+                                .bg(rgb(BG_INPUT))
+                                .border_1()
+                                .border_color(if focused {
+                                    rgba(BORDER_POSTER_HOVER)
+                                } else {
+                                    rgba(BORDER_SUBTLE)
+                                })
+                                .flex()
+                                .items_center()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.focus_settings_input(
+                                            FocusedInput::SettingsTmdbApiKey,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .font(mono_font())
+                                        .text_xs()
+                                        .text_color(if !has_any && !focused {
+                                            rgb(TEXT_MUTED)
+                                        } else {
+                                            rgb(TEXT_PRIMARY)
+                                        })
+                                        .child(display),
+                                ),
+                        )
+                        .when(has_any, |el| {
+                            el.child(render_choice_pill(
+                                "btn-clear-tmdb-key",
+                                "Clear",
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.clear_tmdb_key(cx);
+                                }),
+                            ))
+                        })
+                        .child(render_choice_pill(
+                            "btn-verify-tmdb",
+                            "Verify TMDB",
+                            true,
+                            cx.listener(|this, _, _, cx| {
+                                this.verify_tmdb_clicked(cx);
+                            }),
+                        )),
+                )
+            }
             SettingsRowId::OpenSubtitlesApiKey => self.render_masked_key_row(
                 "input-opensubtitles-key",
                 "btn-clear-opensubtitles-key",
@@ -2882,6 +3016,14 @@ mod tests {
             0
         );
         assert!(count_matching_settings_rows("0600", Some(SettingsCategory::IntegrationsAndKeys)) >= 3);
+        assert_eq!(
+            count_matching_settings_rows("spotlight", Some(SettingsCategory::GeneralAndAppearance)),
+            1
+        );
+        assert_eq!(
+            count_matching_settings_rows("tmdb", Some(SettingsCategory::IntegrationsAndKeys)),
+            1
+        );
         assert!(count_matching_settings_rows("subtitle delay", Some(SettingsCategory::AudioAndSubtitles)) >= 1);
         assert_eq!(count_matching_settings_rows("nonexistent_xyzzy_setting", None), 0);
     }

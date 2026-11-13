@@ -9,6 +9,7 @@ pub mod private_config;
 pub mod prowlarr;
 pub mod stream_parser;
 pub mod subtitles;
+pub mod tmdb;
 pub mod track_prefs;
 
 pub use addon_engine::{
@@ -16,9 +17,10 @@ pub use addon_engine::{
     classify_cache_ttl, classify_descriptor_categories, classify_request_deadline,
     curated_addon_directory, detect_clipboard_addon_url, has_debrid_configured_addons,
     normalize_addon_url, redact_sensitive_text, redact_url, redact_url_str,
-    resolve_addon_for_request_base, AddonCacheStats, AddonCategory, AddonEngineConfig,
-    AddonHealthStatus, AddonHttpEngine, AddonTelemetrySnapshot, CuratedAddonEntry,
-    InstallAddonOutcome, MutedAddonEntry, ADDON_CACHE_MAX_BYTES, ADDON_CACHE_MAX_ENTRIES,
+    resolve_addon_for_request_base, url_sha256_hex, AddonCacheStats, AddonCategory,
+    AddonEngineConfig, AddonHealthStatus, AddonHttpEngine, AddonResourceKind,
+    AddonTelemetrySnapshot, CuratedAddonEntry, InstallAddonOutcome, MutedAddonEntry,
+    RevalidatedPayload, ADDON_CACHE_MAX_BYTES, ADDON_CACHE_MAX_ENTRIES,
     ADDON_CACHE_MAX_SINGLE_ENTRY_BYTES, ADDON_MANIFEST_TIMEOUT, ADDON_RESOURCE_TIMEOUT,
     CIRCUIT_BREAKER_FAILURE_THRESHOLD, DEFAULT_CIRCUIT_BREAKER_COOLDOWN, LOCALHOST_TIMEOUT,
     SLOW_ADDON_LATENCY_MS, STREMIO_API_TIMEOUT, TTL_CATALOG, TTL_MANIFEST, TTL_META, TTL_STREAM,
@@ -73,6 +75,13 @@ pub use subtitles::{
     DEFAULT_SUBDL_API_BASE, DEFAULT_SUBDL_DL_BASE, MAX_SUBTITLE_ARCHIVE_BYTES,
     MAX_SUBTITLE_CACHE_BYTES, MAX_SUBTITLE_CACHE_FILES, MAX_UNCOMPRESSED_SUBTITLE_BYTES,
     NATIVE_SUBTITLE_HTTP_TIMEOUT_MS, NATIVE_SUBTITLE_POOL_IDLE_SECS,
+};
+pub use tmdb::{
+    build_unified_editorial_search, enriched_to_stremio_meta_item, extract_4_digit_year,
+    format_addon_resource_url, meta_resource_matches_url, normalize_person_slug,
+    normalize_title_for_dedup, preview_to_editorial_hit, EditorialMediaHit, EditorialPersonHit,
+    EnrichedTitleMeta, MetadataEngine, PersonCreditChip, PersonFilmography, TmdbAccountStatus,
+    UnifiedEditorialSearch, DEFAULT_TMDB_API_BASE_URL, DEFAULT_TMDB_IMAGE_BASE_URL,
 };
 pub use track_prefs::{
     extract_track_keywords, has_full_embedded_subtitle_for_lang, parse_lang_tag,

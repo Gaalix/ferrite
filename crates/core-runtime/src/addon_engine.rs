@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    io::{Read, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -7,10 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::Utc;
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use http::{HeaderMap, Method};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use stremio_core::{
     constants::{
         CATALOG_RESOURCE_NAME, META_RESOURCE_NAME, STREAM_RESOURCE_NAME, SUBTITLES_RESOURCE_NAME,
@@ -18,9 +22,11 @@ use stremio_core::{
     runtime::EnvError,
     types::addon::{Descriptor, ManifestResource},
 };
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tracing::{debug, trace};
 use url::Url;
+
+use crate::env::{DiskCacheRow, SqliteStorage};
 
 pub const ADDON_CACHE_MAX_ENTRIES: usize = 256;
 
@@ -181,6 +187,127 @@ pub struct AddonCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub coalesced: u64,
+    pub disk_hits: u64,
+    pub stale_revalidations: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AddonResourceKind {
+    Manifest,
+    Catalog,
+    Meta,
+}
+
+impl AddonResourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Catalog => "catalog",
+            Self::Meta => "meta",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RevalidatedPayload {
+    pub url_sha256: String,
+    pub resource_kind: AddonResourceKind,
+    pub bytes: Arc<[u8]>,
+}
+
+#[derive(Clone, Debug)]
+struct DiskSnapshotEntry {
+    resource_kind: AddonResourceKind,
+    body_zlib: Vec<u8>,
+    fetched_at: i64,
+    soft_ttl_secs: u64,
+    hard_ttl_secs: u64,
+}
+
+pub fn url_sha256_hex(url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn compress_zlib(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(bytes)?;
+    encoder.finish()
+}
+
+fn decompress_zlib(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut decoder = ZlibDecoder::new(bytes);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+const DISK_CACHE_PRELOAD_LIMIT: usize = 96;
+const DISK_CACHE_MAX_ENTRY_BYTES: usize = 1024 * 1024;
+const DISK_TTL_MANIFEST_SOFT_SECS: u64 = 30 * 60;
+const DISK_TTL_MANIFEST_HARD_SECS: u64 = 14 * 24 * 3600;
+const DISK_TTL_CATALOG_SOFT_SECS: u64 = 10 * 60;
+const DISK_TTL_CATALOG_HARD_SECS: u64 = 7 * 24 * 3600;
+const DISK_TTL_META_SOFT_SECS: u64 = 60 * 60;
+const DISK_TTL_META_HARD_SECS: u64 = 14 * 24 * 3600;
+
+fn parse_resource_kind(raw: &str) -> Option<AddonResourceKind> {
+    match raw {
+        "manifest" => Some(AddonResourceKind::Manifest),
+        "catalog" => Some(AddonResourceKind::Catalog),
+        "meta" => Some(AddonResourceKind::Meta),
+        _ => None,
+    }
+}
+
+fn classify_disk_cache_policy(
+    method: &Method,
+    url: &Url,
+    headers: &HeaderMap,
+    loopback_as_remote: bool,
+) -> Option<(AddonResourceKind, u64, u64)> {
+    if method != Method::GET
+        || headers.contains_key(http::header::AUTHORIZATION)
+        || headers.contains_key(http::header::COOKIE)
+        || is_stremio_api_url(url)
+    {
+        return None;
+    }
+    if is_localhost_url(url) && !loopback_as_remote {
+        return None;
+    }
+    let lower = url.path().to_ascii_lowercase();
+    let lower_query = url.query().unwrap_or_default().to_ascii_lowercase();
+    if lower.contains("/stream/")
+        || lower.ends_with("/stream.json")
+        || lower.contains("/subtitles/")
+        || lower.contains("search=")
+        || lower_query.contains("search=")
+    {
+        return None;
+    }
+    if lower.ends_with("/manifest.json") {
+        Some((
+            AddonResourceKind::Manifest,
+            DISK_TTL_MANIFEST_SOFT_SECS,
+            DISK_TTL_MANIFEST_HARD_SECS,
+        ))
+    } else if lower.contains("/catalog/") {
+        Some((
+            AddonResourceKind::Catalog,
+            DISK_TTL_CATALOG_SOFT_SECS,
+            DISK_TTL_CATALOG_HARD_SECS,
+        ))
+    } else if lower.contains("/meta/") {
+        Some((
+            AddonResourceKind::Meta,
+            DISK_TTL_META_SOFT_SECS,
+            DISK_TTL_META_HARD_SECS,
+        ))
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1339,38 +1466,109 @@ impl Default for AddonEngineConfig {
     }
 }
 
+struct RevalidatingKeyGuard {
+    key: String,
+    keys: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for RevalidatingKeyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.keys.lock() {
+            guard.remove(&self.key);
+        }
+    }
+}
+
 pub struct AddonHttpEngine {
     config: AddonEngineConfig,
-    cache: Mutex<CacheInner>,
+    cache: Arc<Mutex<CacheInner>>,
     in_flight: Arc<Mutex<HashMap<String, watch::Receiver<Option<InFlightOutcome>>>>>,
-    telemetry: Mutex<HashMap<String, OriginTelemetryState>>,
+    telemetry: Arc<Mutex<HashMap<String, OriginTelemetryState>>>,
+    storage: Option<SqliteStorage>,
+    runtime_handle: Option<tokio::runtime::Handle>,
+    disk_snapshots: Arc<Mutex<HashMap<String, DiskSnapshotEntry>>>,
+    revalidating_keys: Arc<Mutex<HashSet<String>>>,
+    revalidate_tx: broadcast::Sender<RevalidatedPayload>,
     hits: AtomicU64,
     misses: AtomicU64,
     coalesced: AtomicU64,
+    disk_hits: AtomicU64,
+    stale_revalidations: Arc<AtomicU64>,
 }
+
+type DiskSnapshotLookup = (Arc<[u8]>, AddonResourceKind, u64, u64, bool);
 
 impl AddonHttpEngine {
     pub fn new(config: AddonEngineConfig) -> Self {
+        Self::with_storage(config, None, None)
+    }
+
+    pub fn with_storage(
+        config: AddonEngineConfig,
+        storage: Option<SqliteStorage>,
+        runtime_handle: Option<tokio::runtime::Handle>,
+    ) -> Self {
+        let mut preloaded = HashMap::new();
+        if let Some(ref store) = storage {
+            if let Ok(rows) = store.load_recent_http_cache(DISK_CACHE_PRELOAD_LIMIT) {
+                for row in rows {
+                    if let Some(kind) = parse_resource_kind(&row.resource_kind) {
+                        preloaded.insert(
+                            row.url_sha256,
+                            DiskSnapshotEntry {
+                                resource_kind: kind,
+                                body_zlib: row.body_zlib,
+                                fetched_at: row.fetched_at,
+                                soft_ttl_secs: row.soft_ttl_secs,
+                                hard_ttl_secs: row.hard_ttl_secs,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        let (revalidate_tx, _) = broadcast::channel(128);
         Self {
             config,
-            cache: Mutex::new(CacheInner::default()),
+            cache: Arc::new(Mutex::new(CacheInner::default())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
-            telemetry: Mutex::new(HashMap::new()),
+            telemetry: Arc::new(Mutex::new(HashMap::new())),
+            storage,
+            runtime_handle,
+            disk_snapshots: Arc::new(Mutex::new(preloaded)),
+            revalidating_keys: Arc::new(Mutex::new(HashSet::new())),
+            revalidate_tx,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             coalesced: AtomicU64::new(0),
+            disk_hits: AtomicU64::new(0),
+            stale_revalidations: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn subscribe_revalidations(&self) -> broadcast::Receiver<RevalidatedPayload> {
+        self.revalidate_tx.subscribe()
     }
 
     pub fn clear_cache(&self) {
         if let Ok(mut guard) = self.cache.lock() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.disk_snapshots.lock() {
+            guard.clear();
+        }
+        if let Some(ref storage) = self.storage {
+            let _ = storage.clear_http_disk_cache();
+        }
     }
 
     pub fn invalidate_url(&self, url: &str) {
         if let Ok(mut guard) = self.cache.lock() {
             guard.remove_entry(url);
+        }
+        let sha = url_sha256_hex(url);
+        if let Ok(mut guard) = self.disk_snapshots.lock() {
+            guard.remove(&sha);
         }
     }
 
@@ -1389,6 +1587,8 @@ impl AddonHttpEngine {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
+            disk_hits: self.disk_hits.load(Ordering::Relaxed),
+            stale_revalidations: self.stale_revalidations.load(Ordering::Relaxed),
         }
     }
 
@@ -1488,19 +1688,7 @@ impl AddonHttpEngine {
     }
 
     fn record_network_success(&self, origin: &str, elapsed: Duration) {
-        let sample_ms = (elapsed.as_millis() as u64).min(u32::MAX as u64) as u32;
-        if let Ok(mut guard) = self.telemetry.lock() {
-            let entry = guard.entry(origin.to_owned()).or_default();
-            entry.total_requests += 1;
-            entry.last_latency_ms = Some(sample_ms);
-            entry.ema_latency_ms = Some(match entry.ema_latency_ms {
-                Some(prev) => prev * 0.7 + (sample_ms as f64) * 0.3,
-                None => sample_ms as f64,
-            });
-            entry.consecutive_failures = 0;
-            entry.circuit_open_until = None;
-            entry.last_error = None;
-        }
+        record_network_success_map(&self.telemetry, origin, elapsed);
     }
 
     fn record_network_failure(
@@ -1533,6 +1721,168 @@ impl AddonHttpEngine {
         }
     }
 
+    fn lookup_disk_snapshot(
+        &self,
+        url_sha256: &str,
+        now_unix: i64,
+    ) -> Option<DiskSnapshotLookup> {
+        let in_ram = self.disk_snapshots.lock().ok().and_then(|mut guard| {
+            let entry = guard.get(url_sha256)?;
+            let hard_expiry = entry.fetched_at.saturating_add(entry.hard_ttl_secs as i64);
+            if now_unix > hard_expiry {
+                guard.remove(url_sha256);
+                return None;
+            }
+            let is_stale = now_unix > entry.fetched_at.saturating_add(entry.soft_ttl_secs as i64);
+            Some((
+                entry.body_zlib.clone(),
+                entry.resource_kind,
+                entry.soft_ttl_secs,
+                entry.hard_ttl_secs,
+                is_stale,
+            ))
+        });
+
+        let found = if let Some(hit) = in_ram {
+            Some(hit)
+        } else if let Some(ref storage) = self.storage {
+            storage
+                .get_http_cache_row(url_sha256)
+                .ok()
+                .flatten()
+                .and_then(|row| {
+                    let kind = parse_resource_kind(&row.resource_kind)?;
+                    let hard_expiry = row.fetched_at.saturating_add(row.hard_ttl_secs as i64);
+                    if now_unix > hard_expiry {
+                        return None;
+                    }
+                    let is_stale =
+                        now_unix > row.fetched_at.saturating_add(row.soft_ttl_secs as i64);
+                    let entry = DiskSnapshotEntry {
+                        resource_kind: kind,
+                        body_zlib: row.body_zlib.clone(),
+                        fetched_at: row.fetched_at,
+                        soft_ttl_secs: row.soft_ttl_secs,
+                        hard_ttl_secs: row.hard_ttl_secs,
+                    };
+                    if let Ok(mut guard) = self.disk_snapshots.lock() {
+                        guard.insert(url_sha256.to_owned(), entry);
+                    }
+                    Some((
+                        row.body_zlib,
+                        kind,
+                        row.soft_ttl_secs,
+                        row.hard_ttl_secs,
+                        is_stale,
+                    ))
+                })
+        } else {
+            None
+        }?;
+
+        let (body_zlib, kind, soft_ttl, hard_ttl, is_stale) = found;
+        let decompressed = decompress_zlib(&body_zlib).ok()?;
+        Some((
+            Arc::<[u8]>::from(decompressed.as_slice()),
+            kind,
+            soft_ttl,
+            hard_ttl,
+            is_stale,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_background_revalidation(
+        &self,
+        client: &reqwest::Client,
+        url_str: String,
+        url_sha256: String,
+        origin: String,
+        kind: AddonResourceKind,
+        soft_ttl: u64,
+        hard_ttl: u64,
+        headers: HeaderMap,
+        deadline: Duration,
+        redacted_target: String,
+        prev_bytes: Arc<[u8]>,
+    ) {
+        let Some(ref handle) = self.runtime_handle else {
+            return;
+        };
+        {
+            let Ok(mut keys) = self.revalidating_keys.lock() else {
+                return;
+            };
+            if !keys.insert(url_sha256.clone()) {
+                return;
+            }
+        }
+
+        let client = client.clone();
+        let cache = Arc::clone(&self.cache);
+        let telemetry = Arc::clone(&self.telemetry);
+        let storage = self.storage.clone();
+        let disk_snapshots = Arc::clone(&self.disk_snapshots);
+        let revalidating_keys = Arc::clone(&self.revalidating_keys);
+        let revalidate_tx = self.revalidate_tx.clone();
+        let stale_revalidations = Arc::clone(&self.stale_revalidations);
+
+        handle.spawn(async move {
+            let _guard = RevalidatingKeyGuard {
+                key: url_sha256.clone(),
+                keys: revalidating_keys,
+            };
+            stale_revalidations.fetch_add(1, Ordering::Relaxed);
+            let (outcome, elapsed) = fetch_http_bytes(
+                &client,
+                Method::GET,
+                &url_str,
+                &headers,
+                None,
+                deadline,
+                &redacted_target,
+            )
+            .await;
+
+            match outcome {
+                Ok(fresh_bytes) => {
+                    record_network_success_map(&telemetry, &origin, elapsed);
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.insert(
+                            url_str,
+                            Arc::clone(&fresh_bytes),
+                            Duration::from_secs(soft_ttl),
+                            Instant::now(),
+                        );
+                    }
+                    persist_disk_snapshot(
+                        &disk_snapshots,
+                        storage.as_ref(),
+                        &url_sha256,
+                        kind,
+                        soft_ttl,
+                        hard_ttl,
+                        &fresh_bytes,
+                    );
+                    if fresh_bytes.as_ref() != prev_bytes.as_ref() {
+                        let _ = revalidate_tx.send(RevalidatedPayload {
+                            url_sha256,
+                            resource_kind: kind,
+                            bytes: fresh_bytes,
+                        });
+                    }
+                }
+                Err((err_msg, _counts)) => {
+                    debug!(
+                        target = %redacted_target,
+                        error = %err_msg,
+                        "Silent background SWR revalidation failed; keeping last disk snapshot"
+                    );
+                }
+            }
+        });
+    }
+
     pub async fn execute_bytes(
         &self,
         client: &reqwest::Client,
@@ -1551,10 +1901,6 @@ impl AddonHttpEngine {
         let loopback_as_remote = self.effective_loopback_as_remote(&origin);
         let allow_circuit = self.is_remote_third_party(&parsed_url, &origin);
 
-        if allow_circuit {
-            self.check_circuit_before_request(&origin)?;
-        }
-
         let cache_ttl = if bypass_cache {
             None
         } else {
@@ -1572,6 +1918,62 @@ impl AddonHttpEngine {
                 self.record_cache_hit(&origin);
                 return Ok(bytes);
             }
+        }
+
+        let disk_policy = if bypass_cache {
+            None
+        } else {
+            classify_disk_cache_policy(&method, &parsed_url, &headers, loopback_as_remote)
+        };
+        let url_sha256 = disk_policy.as_ref().map(|_| url_sha256_hex(&url_str));
+
+        let deadline = self.config.timeout_override.unwrap_or_else(|| {
+            classify_request_deadline(&method, &parsed_url, loopback_as_remote)
+        });
+
+        if let (Some((_policy_kind, _policy_soft, _policy_hard)), Some(ref sha)) =
+            (disk_policy, &url_sha256)
+        {
+            let now_unix = Utc::now().timestamp();
+            if let Some((bytes, kind, soft_ttl, hard_ttl, is_stale)) =
+                self.lookup_disk_snapshot(sha, now_unix)
+            {
+                self.disk_hits.fetch_add(1, Ordering::Relaxed);
+                self.record_cache_hit(&origin);
+                let ram_grace = if is_stale {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_secs(soft_ttl.min(TTL_META.as_secs()))
+                };
+                if let Ok(mut guard) = self.cache.lock() {
+                    guard.insert(
+                        url_str.clone(),
+                        Arc::clone(&bytes),
+                        ram_grace,
+                        Instant::now(),
+                    );
+                }
+                if is_stale {
+                    self.spawn_background_revalidation(
+                        client,
+                        url_str,
+                        sha.clone(),
+                        origin,
+                        kind,
+                        soft_ttl,
+                        hard_ttl,
+                        headers,
+                        deadline,
+                        redacted_target,
+                        Arc::clone(&bytes),
+                    );
+                }
+                return Ok(bytes);
+            }
+        }
+
+        if allow_circuit {
+            self.check_circuit_before_request(&origin)?;
         }
 
         let can_coalesce = method == Method::GET
@@ -1621,64 +2023,22 @@ impl AddonHttpEngine {
             self.misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        let deadline = self.config.timeout_override.unwrap_or_else(|| {
-            classify_request_deadline(&method, &parsed_url, loopback_as_remote)
-        });
-
-        let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
-            .map_err(|err| EnvError::Fetch(format!("Invalid HTTP method: {err}")))?;
-
-        let mut req_builder = client.request(reqwest_method, &url_str).timeout(deadline);
-
-        for (name, value) in &headers {
-            req_builder = req_builder.header(name, value);
-        }
-        if let Some(body_bytes) = serialized_body {
-            if !headers.contains_key(http::header::CONTENT_TYPE) {
-                req_builder = req_builder.header(http::header::CONTENT_TYPE, "application/json");
-            }
-            req_builder = req_builder.body(body_bytes);
-        }
-
         trace!(
             %method,
             url = %redacted_target,
             timeout_ms = deadline.as_millis(),
             "DesktopEnv HTTP fetch"
         );
-        let started_at = Instant::now();
-        let send_res = req_builder.send().await;
-
-        let network_outcome: Result<Arc<[u8]>, (String, bool)> = match send_res {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    let is_server_fault = status.is_server_error() || status.as_u16() == 408;
-                    Err((
-                        format!(
-                            "Unexpected HTTP status code {} for {}",
-                            status.as_u16(),
-                            redacted_target
-                        ),
-                        is_server_fault,
-                    ))
-                } else {
-                    match response.bytes().await {
-                        Ok(bytes) => Ok(Arc::<[u8]>::from(bytes.as_ref())),
-                        Err(err) => {
-                            let clean = err.without_url();
-                            Err((format!("{clean} ({redacted_target})"), true))
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                let clean = err.without_url();
-                Err((format!("{clean} ({redacted_target})"), true))
-            }
-        };
-
-        let elapsed = started_at.elapsed();
+        let (network_outcome, elapsed) = fetch_http_bytes(
+            client,
+            method,
+            &url_str,
+            &headers,
+            serialized_body,
+            deadline,
+            &redacted_target,
+        )
+        .await;
 
         match network_outcome {
             Ok(shared_bytes) => {
@@ -1692,6 +2052,19 @@ impl AddonHttpEngine {
                             Instant::now(),
                         );
                     }
+                }
+                if let (Some((kind, soft_ttl, hard_ttl)), Some(ref sha)) =
+                    (disk_policy, &url_sha256)
+                {
+                    persist_disk_snapshot(
+                        &self.disk_snapshots,
+                        self.storage.as_ref(),
+                        sha,
+                        kind,
+                        soft_ttl,
+                        hard_ttl,
+                        &shared_bytes,
+                    );
                 }
                 if let Some(leader) = leader_guard {
                     leader.complete(Ok(Arc::clone(&shared_bytes)));
@@ -1712,6 +2085,130 @@ impl AddonHttpEngine {
             }
         }
     }
+}
+
+fn record_network_success_map(
+    telemetry: &Mutex<HashMap<String, OriginTelemetryState>>,
+    origin: &str,
+    elapsed: Duration,
+) {
+    let sample_ms = (elapsed.as_millis() as u64).min(u32::MAX as u64) as u32;
+    if let Ok(mut guard) = telemetry.lock() {
+        let entry = guard.entry(origin.to_owned()).or_default();
+        entry.total_requests += 1;
+        entry.last_latency_ms = Some(sample_ms);
+        entry.ema_latency_ms = Some(match entry.ema_latency_ms {
+            Some(prev) => prev * 0.7 + (sample_ms as f64) * 0.3,
+            None => sample_ms as f64,
+        });
+        entry.consecutive_failures = 0;
+        entry.circuit_open_until = None;
+        entry.last_error = None;
+    }
+}
+
+fn persist_disk_snapshot(
+    disk_snapshots: &Mutex<HashMap<String, DiskSnapshotEntry>>,
+    storage: Option<&SqliteStorage>,
+    url_sha256: &str,
+    kind: AddonResourceKind,
+    soft_ttl: u64,
+    hard_ttl: u64,
+    bytes: &[u8],
+) {
+    if bytes.len() > DISK_CACHE_MAX_ENTRY_BYTES {
+        return;
+    }
+    let Ok(body_zlib) = compress_zlib(bytes) else {
+        return;
+    };
+    let fetched_at = Utc::now().timestamp();
+    if let Ok(mut guard) = disk_snapshots.lock() {
+        guard.insert(
+            url_sha256.to_owned(),
+            DiskSnapshotEntry {
+                resource_kind: kind,
+                body_zlib: body_zlib.clone(),
+                fetched_at,
+                soft_ttl_secs: soft_ttl,
+                hard_ttl_secs: hard_ttl,
+            },
+        );
+    }
+    if let Some(storage) = storage {
+        let _ = storage.upsert_http_cache_row(&DiskCacheRow {
+            url_sha256: url_sha256.to_owned(),
+            resource_kind: kind.as_str().to_owned(),
+            status_code: 200,
+            body_zlib,
+            body_len: bytes.len(),
+            fetched_at,
+            soft_ttl_secs: soft_ttl,
+            hard_ttl_secs: hard_ttl,
+        });
+    }
+}
+
+async fn fetch_http_bytes(
+    client: &reqwest::Client,
+    method: Method,
+    url_str: &str,
+    headers: &HeaderMap,
+    serialized_body: Option<Vec<u8>>,
+    deadline: Duration,
+    redacted_target: &str,
+) -> (Result<Arc<[u8]>, (String, bool)>, Duration) {
+    let reqwest_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(err) => {
+            return (
+                Err((format!("Invalid HTTP method: {err}"), false)),
+                Duration::ZERO,
+            )
+        }
+    };
+    let mut req_builder = client.request(reqwest_method, url_str).timeout(deadline);
+    for (name, value) in headers {
+        req_builder = req_builder.header(name, value);
+    }
+    if let Some(body_bytes) = serialized_body {
+        if !headers.contains_key(http::header::CONTENT_TYPE) {
+            req_builder = req_builder.header(http::header::CONTENT_TYPE, "application/json");
+        }
+        req_builder = req_builder.body(body_bytes);
+    }
+
+    let started_at = Instant::now();
+    let send_res = req_builder.send().await;
+    let outcome = match send_res {
+        Ok(response) => {
+            let status = response.status();
+            if !status.is_success() {
+                let is_server_fault = status.is_server_error() || status.as_u16() == 408;
+                Err((
+                    format!(
+                        "Unexpected HTTP status code {} for {}",
+                        status.as_u16(),
+                        redacted_target
+                    ),
+                    is_server_fault,
+                ))
+            } else {
+                match response.bytes().await {
+                    Ok(bytes) => Ok(Arc::<[u8]>::from(bytes.as_ref())),
+                    Err(err) => {
+                        let clean = err.without_url();
+                        Err((format!("{clean} ({redacted_target})"), true))
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            let clean = err.without_url();
+            Err((format!("{clean} ({redacted_target})"), true))
+        }
+    };
+    (outcome, started_at.elapsed())
 }
 
 #[cfg(test)]
@@ -2096,5 +2593,248 @@ mod tests {
         assert!(!sanitized.contains("eyJ0b2tlbiI6InNlY3JldCJ9"));
         assert!(sanitized.contains("https://comet.elfhosted.com/..."));
         assert!(sanitized.contains("AuthKey(\"[REDACTED]\")"));
+    }
+
+    #[test]
+    fn disk_cache_cold_boot_offline_and_swr_revalidates_in_background() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("storage.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let client = reqwest::Client::new();
+
+        // Session 1: populate compressed disk snapshot from mock HTTP server.
+        let (addr1, handle1) = rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let jh = tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = br#"{"metas":[{"id":"tt0133093","type":"movie","name":"Snapshot v1"}]}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                }
+            });
+            (addr, jh)
+        });
+
+        let url1 = format!("http://{addr1}/catalog/movie/top.json");
+        let cfg = AddonEngineConfig {
+            treat_loopback_as_remote: true,
+            ..Default::default()
+        };
+        let engine1 = AddonHttpEngine::with_storage(
+            cfg.clone(),
+            Some(storage.clone()),
+            Some(rt.handle().clone()),
+        );
+        let first_bytes = rt
+            .block_on(engine1.execute_bytes(
+                &client,
+                Method::GET,
+                url1.clone(),
+                HeaderMap::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        assert!(std::str::from_utf8(&first_bytes)
+            .unwrap()
+            .contains("Snapshot v1"));
+        let _ = rt.block_on(handle1);
+        drop(engine1);
+
+        // Session 2: server is offline; fresh engine preloads from SQLite and serves instantly.
+        let storage2 = SqliteStorage::open(&db_path).unwrap();
+        let boot_t0 = Instant::now();
+        let engine2 = AddonHttpEngine::with_storage(
+            cfg.clone(),
+            Some(storage2.clone()),
+            Some(rt.handle().clone()),
+        );
+        let offline_bytes = rt
+            .block_on(engine2.execute_bytes(
+                &client,
+                Method::GET,
+                url1.clone(),
+                HeaderMap::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        let boot_elapsed = boot_t0.elapsed();
+        assert!(
+            boot_elapsed < Duration::from_millis(50),
+            "expected cold offline disk hit in milliseconds, took {boot_elapsed:?}"
+        );
+        assert_eq!(offline_bytes.as_ref(), first_bytes.as_ref());
+        assert_eq!(engine2.cache_stats().disk_hits, 1);
+
+        // Session 3: write a stale snapshot directly and verify background SWR refresh.
+        let (addr3, _handle3) = rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let jh = tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = br#"{"metas":[{"id":"tt0133093","type":"movie","name":"Fresh v2"}]}"#;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                }
+            });
+            (addr, jh)
+        });
+        let url3 = format!("http://{addr3}/catalog/movie/popular.json");
+        let sha3 = url_sha256_hex(&url3);
+        let stale_body = br#"{"metas":[{"id":"tt0133093","type":"movie","name":"Stale v1"}]}"#;
+        storage2
+            .upsert_http_cache_row(&DiskCacheRow {
+                url_sha256: sha3.clone(),
+                resource_kind: "catalog".to_owned(),
+                status_code: 200,
+                body_zlib: compress_zlib(stale_body).unwrap(),
+                body_len: stale_body.len(),
+                fetched_at: Utc::now().timestamp() - 3_600,
+                soft_ttl_secs: 600,
+                hard_ttl_secs: 7 * 24 * 3600,
+            })
+            .unwrap();
+
+        let engine3 = AddonHttpEngine::with_storage(
+            cfg,
+            Some(storage2),
+            Some(rt.handle().clone()),
+        );
+        let mut rx = engine3.subscribe_revalidations();
+        let stale_served = rt
+            .block_on(engine3.execute_bytes(
+                &client,
+                Method::GET,
+                url3.clone(),
+                HeaderMap::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        assert!(std::str::from_utf8(&stale_served)
+            .unwrap()
+            .contains("Stale v1"));
+
+        let revalidated = rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(3), rx.recv()).await })
+            .unwrap()
+            .unwrap();
+        assert_eq!(revalidated.url_sha256, sha3);
+        assert_eq!(revalidated.resource_kind, AddonResourceKind::Catalog);
+        assert!(std::str::from_utf8(&revalidated.bytes)
+            .unwrap()
+            .contains("Fresh v2"));
+        assert_eq!(engine3.cache_stats().stale_revalidations, 1);
+
+        let updated_bytes = rt
+            .block_on(engine3.execute_bytes(
+                &client,
+                Method::GET,
+                url3,
+                HeaderMap::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        assert!(std::str::from_utf8(&updated_bytes)
+            .unwrap()
+            .contains("Fresh v2"));
+    }
+
+    #[test]
+    fn disk_cache_excludes_streams_search_auth_and_never_persists_raw_urls() {
+        let empty = HeaderMap::new();
+        assert_eq!(
+            classify_disk_cache_policy(
+                &Method::GET,
+                &Url::parse("https://torrentio.strem.fun/stream/movie/tt0133093.json").unwrap(),
+                &empty,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_disk_cache_policy(
+                &Method::GET,
+                &Url::parse("https://v3-cinemeta.strem.io/catalog/movie/top/search=matrix.json")
+                    .unwrap(),
+                &empty,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_disk_cache_policy(
+                &Method::GET,
+                &Url::parse("https://api.strem.io/api/addonCollectionGet").unwrap(),
+                &empty,
+                false,
+            ),
+            None
+        );
+        let mut auth_headers = HeaderMap::new();
+        auth_headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer secret"),
+        );
+        assert_eq!(
+            classify_disk_cache_policy(
+                &Method::GET,
+                &Url::parse("https://comet.elfhosted.com/catalog/movie/top.json").unwrap(),
+                &auth_headers,
+                false,
+            ),
+            None
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("storage.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let secret_url =
+            "https://torrentio.strem.fun/realdebrid=SECRET_RD_TOKEN_999/catalog/movie/top.json";
+        let sha = url_sha256_hex(secret_url);
+        let payload = br#"{"metas":[]}"#;
+        storage
+            .upsert_http_cache_row(&DiskCacheRow {
+                url_sha256: sha.clone(),
+                resource_kind: "catalog".to_owned(),
+                status_code: 200,
+                body_zlib: compress_zlib(payload).unwrap(),
+                body_len: payload.len(),
+                fetched_at: Utc::now().timestamp(),
+                soft_ttl_secs: 600,
+                hard_ttl_secs: 3600,
+            })
+            .unwrap();
+
+        let rows = storage.load_recent_http_cache(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].url_sha256, sha);
+        let db_bytes = std::fs::read(&db_path).unwrap();
+        let db_text = String::from_utf8_lossy(&db_bytes);
+        assert!(!db_text.contains("SECRET_RD_TOKEN_999"));
     }
 }

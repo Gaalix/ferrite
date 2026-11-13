@@ -39,6 +39,8 @@ const WIDESCREEN_MAX_W: u32 = 640;
 const WIDESCREEN_MAX_H: u32 = 360;
 const HERO_MAX_W: u32 = 960;
 const HERO_MAX_H: u32 = 540;
+const LOGO_DECODE_MAX_WIDTH: u32 = 520;
+const LOGO_DECODE_MAX_HEIGHT: u32 = 200;
 
 pub const AMBIENT_BLEED_WIDTH: u32 = 48;
 pub const AMBIENT_BLEED_HEIGHT: u32 = 27;
@@ -531,6 +533,20 @@ impl PosterCache {
 
     pub fn resolve_hero_backdrop_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
         self.resolve_hero_backdrop_image(url?.as_str())
+    }
+
+    pub fn resolve_logo_image(&self, url: &str) -> Option<Arc<RenderImage>> {
+        self.resolve_scaled_into_target(
+            url,
+            "logo",
+            LOGO_DECODE_MAX_WIDTH,
+            LOGO_DECODE_MAX_HEIGHT,
+            LruTarget::Decoded,
+        )
+    }
+
+    pub fn resolve_logo_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
+        self.resolve_logo_image(url?.as_str())
     }
 
     pub fn push_evicted_image(&self, image: Arc<RenderImage>) {
@@ -1131,5 +1147,26 @@ mod tests {
             .unwrap();
         assert_eq!(cache2.resolve_or_fetch(&url), Some(resolved));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn logo_decoder_preserves_transparent_png_alpha() {
+        let mut rgba = RgbaImage::new(2, 1);
+        rgba.put_pixel(0, 0, image::Rgba([0, 0, 0, 0]));
+        rgba.put_pixel(1, 0, image::Rgba([255, 255, 255, 255]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+
+        let rendered = decode_scaled_render_image(
+            &png_bytes,
+            LOGO_DECODE_MAX_WIDTH,
+            LOGO_DECODE_MAX_HEIGHT,
+        )
+        .expect("PNG logo decoded");
+        let bytes = rendered.as_bytes(0).expect("frame bytes");
+        assert_eq!(&bytes[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&bytes[4..8], &[255, 255, 255, 255]);
     }
 }

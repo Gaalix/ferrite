@@ -30,11 +30,12 @@ use stremio_core_runtime::{
         types::{
             addon::{Descriptor, ExtraValue, ResourcePath, ResourceRequest},
             library::LibraryItem,
-            resource::{MetaItem, MetaItemPreview, Stream, StreamSource},
+            resource::{Link, MetaItem, MetaItemPreview, Stream, StreamSource},
         },
     },
-    AddonCategory, CoreController, DebridCacheStatus, DesktopModel, FetchedNativeSubtitle,
-    LocalDebridProvider, ParsedStream, Resolution, RichStreamItem, StreamFilter, SubtitleMatchTier,
+    normalize_person_slug, AddonCategory, CoreController, DebridCacheStatus, DesktopModel,
+    FetchedNativeSubtitle, LocalDebridProvider, ParsedStream, PersonCreditChip, Resolution,
+    RichStreamItem, StreamFilter, SubtitleMatchTier,
 };
 use stremio_stream_engine::{
     StorageMode, StreamEngine, StreamEngineConfig, StreamEngineError, StreamEngineHandle,
@@ -102,6 +103,10 @@ impl SidebarTab {
         Self::Account,
     ];
 
+    pub const TITLEBAR_TABS: [Self; 3] = [Self::Home, Self::Discover, Self::Library];
+
+    pub const USER_MENU_TABS: [Self; 3] = [Self::Account, Self::Addons, Self::Settings];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Home => "Home",
@@ -139,6 +144,13 @@ impl SidebarTab {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppRoute {
     Tab(SidebarTab),
+    Search {
+        query: String,
+    },
+    Person {
+        person_key: String,
+        name: String,
+    },
     MetaDetails {
         type_name: String,
         id: String,
@@ -151,7 +163,10 @@ impl AppRoute {
     pub fn active_sidebar_tab(&self) -> Option<SidebarTab> {
         match self {
             Self::Tab(tab) => Some(*tab),
-            Self::MetaDetails { .. } | Self::Player => None,
+            Self::Search { .. }
+            | Self::Person { .. }
+            | Self::MetaDetails { .. }
+            | Self::Player => None,
         }
     }
 
@@ -162,6 +177,8 @@ impl AppRoute {
     pub fn transition_id(&self) -> String {
         match self {
             Self::Tab(tab) => format!("route-tab-{}", tab.label()),
+            Self::Search { .. } => "route-search".to_owned(),
+            Self::Person { person_key, .. } => format!("route-person-{person_key}"),
             Self::MetaDetails { id, video_id, .. } => {
                 format!("route-meta-{id}-{}", video_id.as_deref().unwrap_or("root"))
             }
@@ -571,6 +588,8 @@ pub struct AppPreferences {
     pub auto_match_native_subtitles: bool,
     #[serde(default = "default_true")]
     pub auto_play_next_episode: bool,
+    #[serde(default = "default_true")]
+    pub show_home_spotlight: bool,
 }
 
 impl Default for AppPreferences {
@@ -601,6 +620,7 @@ impl Default for AppPreferences {
             subtitle_ass_scale_override: true,
             auto_match_native_subtitles: true,
             auto_play_next_episode: true,
+            show_home_spotlight: true,
         }
     }
 }
@@ -1678,6 +1698,7 @@ pub struct ToastMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedInput {
     CommandPalette,
+    FullSearchInput,
     AuthEmail,
     AuthPassword,
     AddonManifestUrl,
@@ -1691,6 +1712,7 @@ pub enum FocusedInput {
     ProwlarrApiKey,
     SettingsOpenSubtitlesKey,
     SettingsSubdlKey,
+    SettingsTmdbApiKey,
 }
 
 pub fn settings_row_matches_query(
@@ -2041,6 +2063,7 @@ pub struct CachedTitlePreview {
     pub name: String,
     pub poster: Option<Url>,
     pub background: Option<Url>,
+    pub logo: Option<Url>,
     pub release_info: Option<String>,
     pub runtime: Option<String>,
     pub description: Option<String>,
@@ -2056,6 +2079,7 @@ impl CachedTitlePreview {
             name: p.name.clone(),
             poster: p.poster.clone(),
             background: p.background.clone(),
+            logo: p.logo.clone(),
             release_info: p.release_info.clone(),
             runtime: p.runtime.clone(),
             description: p.description.clone(),
@@ -2063,6 +2087,61 @@ impl CachedTitlePreview {
             genres: extract_genres(p, 3),
         }
     }
+}
+
+pub fn extract_cast_and_directors_from_links(
+    links: &[Link],
+) -> (Vec<PersonCreditChip>, Vec<PersonCreditChip>) {
+    let mut directors = Vec::new();
+    let mut cast = Vec::new();
+    let mut seen_dir = HashSet::new();
+    let mut seen_cast = HashSet::new();
+    for link in links {
+        let name = link.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let cat = link.category.trim();
+        let slug = normalize_person_slug(name);
+        if slug.is_empty() {
+            continue;
+        }
+        let person_key = format!("name:{slug}");
+        if cat.eq_ignore_ascii_case("Directors")
+            || cat.eq_ignore_ascii_case("Director")
+            || cat.eq_ignore_ascii_case("Writers")
+            || cat.eq_ignore_ascii_case("Writer")
+        {
+            if seen_dir.insert(slug) {
+                directors.push(PersonCreditChip {
+                    person_key,
+                    tmdb_person_id: None,
+                    name: name.to_owned(),
+                    role_or_character: Some(
+                        if cat.eq_ignore_ascii_case("Writers") || cat.eq_ignore_ascii_case("Writer") {
+                            "Writer".to_owned()
+                        } else {
+                            "Director".to_owned()
+                        },
+                    ),
+                    is_director: true,
+                    headshot_url: None,
+                });
+            }
+        } else if (cat.eq_ignore_ascii_case("Cast") || cat.eq_ignore_ascii_case("Actors"))
+            && seen_cast.insert(slug)
+        {
+            cast.push(PersonCreditChip {
+                person_key,
+                tmdb_person_id: None,
+                name: name.to_owned(),
+                role_or_character: Some("Cast".to_owned()),
+                is_director: false,
+                headshot_url: None,
+            });
+        }
+    }
+    (directors, cast)
 }
 
 pub fn find_cached_preview_in_model(
@@ -2101,6 +2180,7 @@ pub fn find_cached_preview_in_model(
             name: li.name.clone(),
             poster: li.poster.clone(),
             background: None,
+            logo: None,
             release_info: None,
             runtime: None,
             description: None,
@@ -3042,5 +3122,43 @@ mod tests {
         );
         assert_eq!(ranked.len(), 1);
         assert!(matches!(ranked[0].stream.source, StreamSource::Url { .. }));
+    }
+
+    #[test]
+    fn navigation_tabs_home_spotlight_default_and_cast_links_work() {
+        assert_eq!(
+            SidebarTab::TITLEBAR_TABS,
+            [SidebarTab::Home, SidebarTab::Discover, SidebarTab::Library]
+        );
+        assert!(!SidebarTab::USER_MENU_TABS.contains(&SidebarTab::Library));
+        assert!(SidebarTab::USER_MENU_TABS.contains(&SidebarTab::Addons));
+        assert!(SidebarTab::USER_MENU_TABS.contains(&SidebarTab::Settings));
+        assert!(AppPreferences::default().show_home_spotlight);
+
+        let base = Url::parse("https://v3-cinemeta.strem.io/").unwrap();
+        let links = vec![
+            Link {
+                name: "Denis Villeneuve".to_owned(),
+                category: "Directors".to_owned(),
+                url: base.clone(),
+            },
+            Link {
+                name: "Timothée Chalamet".to_owned(),
+                category: "Cast".to_owned(),
+                url: base.clone(),
+            },
+            Link {
+                name: "Zendaya".to_owned(),
+                category: "Cast".to_owned(),
+                url: base,
+            },
+        ];
+        let (directors, cast) = extract_cast_and_directors_from_links(&links);
+        assert_eq!(directors.len(), 1);
+        assert_eq!(directors[0].name, "Denis Villeneuve");
+        assert!(directors[0].is_director);
+        assert_eq!(cast.len(), 2);
+        assert_eq!(cast[0].name, "Timothée Chalamet");
+        assert_eq!(cast[1].name, "Zendaya");
     }
 }

@@ -182,7 +182,7 @@ fn is_shared_system_dir(dir: &Path) -> bool {
         || dir == temp_root.as_path()
 }
 
-fn ensure_private_data_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_private_data_dir(dir: &Path) -> std::io::Result<()> {
     if dir.as_os_str().is_empty() {
         return Ok(());
     }
@@ -206,7 +206,7 @@ fn ensure_private_data_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-fn precreate_private_db_file(path: &Path) -> std::io::Result<()> {
+pub(crate) fn precreate_private_db_file(path: &Path) -> std::io::Result<()> {
     if path == Path::new(":memory:") || path.as_os_str().is_empty() {
         return Ok(());
     }
@@ -224,7 +224,7 @@ fn precreate_private_db_file(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn tighten_sqlite_file_permissions(db_path: &Path) {
+pub(crate) fn tighten_sqlite_file_permissions(db_path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -290,6 +290,18 @@ pub fn migrate_legacy_storage_file(legacy_db: &Path, target_db: &Path) -> std::i
     Ok(true)
 }
 
+#[derive(Debug, Clone)]
+pub struct DiskCacheRow {
+    pub url_sha256: String,
+    pub resource_kind: String,
+    pub status_code: u16,
+    pub body_zlib: Vec<u8>,
+    pub body_len: usize,
+    pub fetched_at: i64,
+    pub soft_ttl_secs: u64,
+    pub hard_ttl_secs: u64,
+}
+
 #[derive(Clone)]
 pub struct SqliteStorage {
     path: PathBuf,
@@ -344,7 +356,19 @@ impl SqliteStorage {
                  descriptor_json TEXT NOT NULL,
                  preferred_index INTEGER NOT NULL,
                  updated_at INTEGER NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS http_disk_cache (
+                 url_sha256 TEXT PRIMARY KEY NOT NULL,
+                 resource_kind TEXT NOT NULL,
+                 status_code INTEGER NOT NULL,
+                 body_zlib BLOB NOT NULL,
+                 body_len INTEGER NOT NULL,
+                 fetched_at INTEGER NOT NULL,
+                 soft_ttl_secs INTEGER NOT NULL,
+                 hard_ttl_secs INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_http_disk_cache_fetched
+                 ON http_disk_cache(fetched_at DESC);",
         )?;
 
         if !is_memory {
@@ -630,6 +654,135 @@ impl SqliteStorage {
             .map_err(|err| EnvError::StorageWriteError(err.to_string()))?;
         Ok(deleted > 0)
     }
+
+    pub fn load_recent_http_cache(&self, limit: usize) -> Result<Vec<DiskCacheRow>, EnvError> {
+        let now = Utc::now().timestamp();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| EnvError::StorageReadError("SQLite mutex poisoned".to_owned()))?;
+        let _ = conn.execute(
+            "DELETE FROM http_disk_cache WHERE (fetched_at + hard_ttl_secs) < ?1",
+            params![now],
+        );
+        let mut stmt = conn
+            .prepare(
+                "SELECT url_sha256, resource_kind, status_code, body_zlib, body_len, fetched_at, soft_ttl_secs, hard_ttl_secs
+                 FROM http_disk_cache
+                 ORDER BY fetched_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|err| EnvError::StorageReadError(err.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit.max(1) as i64], |row| {
+                let status_raw: i64 = row.get(2)?;
+                let body_len_raw: i64 = row.get(4)?;
+                let soft_raw: i64 = row.get(6)?;
+                let hard_raw: i64 = row.get(7)?;
+                Ok(DiskCacheRow {
+                    url_sha256: row.get(0)?,
+                    resource_kind: row.get(1)?,
+                    status_code: status_raw.clamp(0, u16::MAX as i64) as u16,
+                    body_zlib: row.get(3)?,
+                    body_len: body_len_raw.max(0) as usize,
+                    fetched_at: row.get(5)?,
+                    soft_ttl_secs: soft_raw.max(0) as u64,
+                    hard_ttl_secs: hard_raw.max(0) as u64,
+                })
+            })
+            .map_err(|err| EnvError::StorageReadError(err.to_string()))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| EnvError::StorageReadError(err.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_http_cache_row(&self, url_sha256: &str) -> Result<Option<DiskCacheRow>, EnvError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| EnvError::StorageReadError("SQLite mutex poisoned".to_owned()))?;
+        conn.query_row(
+            "SELECT url_sha256, resource_kind, status_code, body_zlib, body_len, fetched_at, soft_ttl_secs, hard_ttl_secs
+             FROM http_disk_cache
+             WHERE url_sha256 = ?1",
+            params![url_sha256],
+            |row| {
+                let status_raw: i64 = row.get(2)?;
+                let body_len_raw: i64 = row.get(4)?;
+                let soft_raw: i64 = row.get(6)?;
+                let hard_raw: i64 = row.get(7)?;
+                Ok(DiskCacheRow {
+                    url_sha256: row.get(0)?,
+                    resource_kind: row.get(1)?,
+                    status_code: status_raw.clamp(0, u16::MAX as i64) as u16,
+                    body_zlib: row.get(3)?,
+                    body_len: body_len_raw.max(0) as usize,
+                    fetched_at: row.get(5)?,
+                    soft_ttl_secs: soft_raw.max(0) as u64,
+                    hard_ttl_secs: hard_raw.max(0) as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| EnvError::StorageReadError(err.to_string()))
+    }
+
+    pub fn upsert_http_cache_row(&self, row: &DiskCacheRow) -> Result<(), EnvError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| EnvError::StorageWriteError("SQLite mutex poisoned".to_owned()))?;
+        conn.execute(
+            "INSERT INTO http_disk_cache (
+                 url_sha256, resource_kind, status_code, body_zlib, body_len, fetched_at, soft_ttl_secs, hard_ttl_secs
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(url_sha256) DO UPDATE SET
+                 resource_kind = excluded.resource_kind,
+                 status_code = excluded.status_code,
+                 body_zlib = excluded.body_zlib,
+                 body_len = excluded.body_len,
+                 fetched_at = excluded.fetched_at,
+                 soft_ttl_secs = excluded.soft_ttl_secs,
+                 hard_ttl_secs = excluded.hard_ttl_secs",
+            params![
+                row.url_sha256,
+                row.resource_kind,
+                row.status_code as i64,
+                row.body_zlib,
+                row.body_len as i64,
+                row.fetched_at,
+                row.soft_ttl_secs as i64,
+                row.hard_ttl_secs as i64,
+            ],
+        )
+        .map_err(|err| EnvError::StorageWriteError(err.to_string()))?;
+        let _ = conn.execute(
+            "DELETE FROM http_disk_cache
+             WHERE url_sha256 IN (
+                 SELECT url_sha256 FROM http_disk_cache
+                 ORDER BY fetched_at DESC
+                 LIMIT -1 OFFSET 512
+             )",
+            [],
+        );
+        if self.path != Path::new(":memory:") {
+            tighten_sqlite_file_permissions(&self.path);
+        }
+        Ok(())
+    }
+
+    pub fn clear_http_disk_cache(&self) -> Result<(), EnvError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| EnvError::StorageWriteError("SQLite mutex poisoned".to_owned()))?;
+        conn.execute("DELETE FROM http_disk_cache", [])
+            .map_err(|err| EnvError::StorageWriteError(err.to_string()))?;
+        Ok(())
+    }
 }
 
 struct EnvState {
@@ -670,16 +823,6 @@ impl EnvState {
             .deflate(true)
             .build()?;
 
-        let addon_engine = Arc::new(AddonHttpEngine::new(AddonEngineConfig {
-            timeout_override,
-            circuit_breaker_cooldown: config.circuit_breaker_cooldown,
-            treat_loopback_as_remote: config.treat_loopback_as_remote_addon,
-            streaming_server_origin: config
-                .streaming_server_url
-                .as_ref()
-                .map(addon_origin_from_url),
-        }));
-
         let (handle, owned_runtime) = match config.runtime_handle {
             Some(handle) => (handle, None),
             None => {
@@ -693,6 +836,20 @@ impl EnvState {
                 (handle, Some(runtime))
             }
         };
+
+        let addon_engine = Arc::new(AddonHttpEngine::with_storage(
+            AddonEngineConfig {
+                timeout_override,
+                circuit_breaker_cooldown: config.circuit_breaker_cooldown,
+                treat_loopback_as_remote: config.treat_loopback_as_remote_addon,
+                streaming_server_origin: config
+                    .streaming_server_url
+                    .as_ref()
+                    .map(addon_origin_from_url),
+            },
+            Some(storage.clone()),
+            Some(handle.clone()),
+        ));
 
         let (sequential_tx, mut sequential_rx) = mpsc::unbounded_channel::<BoxedTask>();
         handle.spawn(async move {

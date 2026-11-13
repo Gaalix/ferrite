@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{
     div, img, linear_color_stop, linear_gradient, prelude::*, px, relative, rgb, rgba, Context,
@@ -17,7 +17,8 @@ use crate::{
     shell::AppShell,
     state::{
         classify_library_item_status, extract_genres, extract_imdb_rating,
-        format_movietracker_episode_code, scroll_near_bottom, LibraryStatusTab, SidebarTab,
+        find_cached_preview_in_model, format_movietracker_episode_code, scroll_near_bottom,
+        LibraryStatusTab, SidebarTab,
     },
     theme::{
         editorial_serif, meta_divider, mono_font, placeholder_tint_for_id, poster_card_shadow,
@@ -28,6 +29,22 @@ use crate::{
     },
 };
 
+#[derive(Clone)]
+struct HomeSpotlightCandidate {
+    id: String,
+    r#type: String,
+    name: String,
+    video_id: Option<String>,
+    is_resume: bool,
+    eyebrow: String,
+    description: Option<String>,
+    year: Option<String>,
+    imdb_rating: Option<String>,
+    genres: Vec<String>,
+    backdrop_url: Option<String>,
+    logo_url: Option<String>,
+}
+
 struct BoardRowSnapshot {
     index: usize,
     title: String,
@@ -37,9 +54,10 @@ struct BoardRowSnapshot {
 }
 
 impl AppShell {
-    pub fn render_board_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub fn render_board_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let shelf_limit = self.visible_board_shelves.max(INITIAL_BOARD_SHELVES);
-        let (cw_items, catalog_rows, total_board_catalogs, library_statuses) =
+        let want_spotlight = self.preferences.show_home_spotlight;
+        let (cw_items, catalog_rows, total_board_catalogs, library_statuses, spotlight_candidates) =
             self.core.with_model(|model| {
                 let cw: Vec<LibraryItem> = model
                     .continue_watching_preview
@@ -113,8 +131,102 @@ impl AppShell {
                     })
                     .collect();
 
-                (cw, rows, total_catalogs, statuses)
+                let mut spots: Vec<HomeSpotlightCandidate> = Vec::new();
+                if want_spotlight {
+                    let mut seen_spot = HashSet::new();
+                    if let Some(li) = cw.first() {
+                        if seen_spot.insert(li.id.clone()) {
+                            let cached = find_cached_preview_in_model(model, &li.id);
+                            spots.push(HomeSpotlightCandidate {
+                                id: li.id.clone(),
+                                r#type: li.r#type.clone(),
+                                name: li.name.clone(),
+                                video_id: li.state.video_id.clone(),
+                                is_resume: true,
+                                eyebrow: "CONTINUE WATCHING".to_owned(),
+                                description: cached.as_ref().and_then(|c| c.description.clone()),
+                                year: cached.as_ref().and_then(|c| c.release_info.clone()),
+                                imdb_rating: cached.as_ref().and_then(|c| c.imdb_rating.clone()),
+                                genres: cached
+                                    .as_ref()
+                                    .map(|c| c.genres.clone())
+                                    .unwrap_or_default(),
+                                backdrop_url: cached
+                                    .as_ref()
+                                    .and_then(|c| c.background.as_ref().map(|u| u.to_string())),
+                                logo_url: cached
+                                    .as_ref()
+                                    .and_then(|c| c.logo.as_ref().map(|u| u.to_string())),
+                            });
+                        }
+                    }
+                    for row in &rows {
+                        for item in row.items.iter().take(3) {
+                            if spots.len() >= 6 {
+                                break;
+                            }
+                            if seen_spot.insert(item.id.clone()) {
+                                spots.push(HomeSpotlightCandidate {
+                                    id: item.id.clone(),
+                                    r#type: item.r#type.clone(),
+                                    name: item.name.clone(),
+                                    video_id: None,
+                                    is_resume: false,
+                                    eyebrow: format!(
+                                        "FEATURED · {}",
+                                        row.title.to_ascii_uppercase()
+                                    ),
+                                    description: item.description.clone(),
+                                    year: item
+                                        .release_info
+                                        .clone()
+                                        .map(|s| s.trim().to_owned())
+                                        .filter(|s| !s.is_empty()),
+                                    imdb_rating: extract_imdb_rating(item),
+                                    genres: extract_genres(item, 3),
+                                    backdrop_url: item.background.as_ref().map(|u| u.to_string()),
+                                    logo_url: item.logo.as_ref().map(|u| u.to_string()),
+                                });
+                            }
+                        }
+                        if spots.len() >= 6 {
+                            break;
+                        }
+                    }
+                }
+
+                (cw, rows, total_catalogs, statuses, spots)
             });
+
+        let spotlight_el = if want_spotlight && !spotlight_candidates.is_empty() {
+            let spot_count = spotlight_candidates.len();
+            let active_idx = self.board_spotlight_idx % spot_count;
+            let mut active = spotlight_candidates[active_idx].clone();
+            self.request_background_enrichment_if_needed(&active.r#type, &active.id, cx);
+            if let Some(enr) = self.core.cached_enriched_meta(&active.id) {
+                if active.logo_url.is_none() {
+                    active.logo_url = enr.logo_url;
+                }
+                if active.backdrop_url.is_none() {
+                    active.backdrop_url = enr.backdrop_url;
+                }
+                if active.description.is_none() {
+                    active.description = enr.overview;
+                }
+                if active.year.is_none() {
+                    active.year = enr.year;
+                }
+                if active.imdb_rating.is_none() {
+                    active.imdb_rating = enr.imdb_rating;
+                }
+                if active.genres.is_empty() {
+                    active.genres = enr.genres;
+                }
+            }
+            Some(self.render_home_spotlight_banner(&active, active_idx, spot_count, cx))
+        } else {
+            None
+        };
 
         let has_any_content = !cw_items.is_empty() || !catalog_rows.is_empty();
         let has_more_shelves = shelf_limit < total_board_catalogs;
@@ -159,6 +271,7 @@ impl AppShell {
                     .when(!has_any_content, |el| {
                         el.child(Self::render_empty_board_banner(cx))
                     })
+                    .when_some(spotlight_el, |el, banner| el.child(banner))
                     .when(!cw_items.is_empty(), |el| {
                         el.child(self.render_continue_watching_section(&cw_items, cx))
                     })
@@ -227,6 +340,342 @@ impl AppShell {
                                             IconName::ChevronDown,
                                             13.0,
                                             rgb(TEXT_MUTED),
+                                        )),
+                                ),
+                        )
+                    }),
+            )
+    }
+
+    fn render_home_spotlight_banner(
+        &self,
+        spot: &HomeSpotlightCandidate,
+        active_idx: usize,
+        spot_count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let metahub_bg = spot
+            .id
+            .starts_with("tt")
+            .then(|| format!("https://images.metahub.space/background/medium/{}/img", spot.id));
+        let metahub_logo = spot
+            .id
+            .starts_with("tt")
+            .then(|| format!("https://images.metahub.space/logo/medium/{}/img", spot.id));
+
+        let backdrop_tex = spot
+            .backdrop_url
+            .as_deref()
+            .and_then(|u| {
+                self.poster_cache
+                    .resolve_hero_backdrop_image(u)
+                    .or_else(|| self.poster_cache.resolve_widescreen_image(u))
+            })
+            .or_else(|| {
+                metahub_bg
+                    .as_deref()
+                    .and_then(|u| self.poster_cache.resolve_widescreen_image(u))
+            });
+        let logo_tex = spot
+            .logo_url
+            .as_deref()
+            .and_then(|u| self.poster_cache.resolve_logo_image(u))
+            .or_else(|| {
+                metahub_logo
+                    .as_deref()
+                    .and_then(|u| self.poster_cache.resolve_logo_image(u))
+            });
+
+        let play_type = spot.r#type.clone();
+        let play_id = spot.id.clone();
+        let play_vid = spot.video_id.clone();
+        let is_resume = spot.is_resume;
+        let det_type = spot.r#type.clone();
+        let det_id = spot.id.clone();
+        let det_vid = spot.video_id.clone();
+
+        div()
+            .id("home-editorial-spotlight")
+            .w_full()
+            .h(px(336.0))
+            .rounded(px(14.0))
+            .overflow_hidden()
+            .relative()
+            .bg(rgb(placeholder_tint_for_id(&spot.id)))
+            .border_1()
+            .border_color(rgba(BORDER_SUBTLE))
+            .when_some(backdrop_tex, |el, tex| {
+                el.child(
+                    img(tex)
+                        .size_full()
+                        .absolute()
+                        .inset_0()
+                        .object_fit(gpui::ObjectFit::Cover),
+                )
+            })
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(rgba(0x0b0b0d2e), 0.1),
+                        linear_color_stop(rgba(0x0b0b0df2), 1.0),
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(linear_gradient(
+                        90.0,
+                        linear_color_stop(rgba(0x0b0b0de8), 0.25),
+                        linear_color_stop(rgba(0x0b0b0d1f), 0.95),
+                    )),
+            )
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .p(px(32.0))
+                    .flex()
+                    .items_end()
+                    .justify_between()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .max_w(px(640.0))
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .font(mono_font())
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(ACCENT))
+                                            .child(spot.eyebrow.clone()),
+                                    )
+                                    .when_some(spot.year.clone(), |el, yr| {
+                                        el.child(meta_divider()).child(yr)
+                                    })
+                                    .when_some(spot.imdb_rating.clone(), |el, r| {
+                                        el.child(meta_divider()).child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(4.0))
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .child(svg_icon(
+                                                    IconName::Star,
+                                                    11.5,
+                                                    rgb(ACCENT_AMBER),
+                                                ))
+                                                .child(r),
+                                        )
+                                    })
+                                    .when(!spot.genres.is_empty(), |el| {
+                                        el.child(meta_divider()).child(spot.genres.join(" · "))
+                                    }),
+                            )
+                            .child(if let Some(ltex) = logo_tex {
+                                img(ltex)
+                                    .h(px(78.0))
+                                    .max_w(px(380.0))
+                                    .object_fit(gpui::ObjectFit::Contain)
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .font(editorial_serif())
+                                    .text_size(px(46.0))
+                                    .line_height(gpui::relative(1.04))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .truncate()
+                                    .child(spot.name.clone())
+                                    .into_any_element()
+                            })
+                            .when_some(spot.description.clone(), |el, desc| {
+                                el.child(
+                                    div()
+                                        .max_w(px(560.0))
+                                        .text_size(px(14.0))
+                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .max_h(px(42.0))
+                                        .overflow_hidden()
+                                        .child(desc),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .mt(px(4.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .child(
+                                        div()
+                                            .id("spotlight-primary-btn")
+                                            .cursor_pointer()
+                                            .h(px(40.0))
+                                            .px(px(20.0))
+                                            .rounded(px(999.0))
+                                            .bg(rgb(ACCENT))
+                                            .hover(|s| s.bg(rgb(ACCENT_HOVER)))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .font(ui_sans(FontWeight::SEMIBOLD))
+                                            .text_size(px(13.5))
+                                            .text_color(rgb(BG_OBSIDIAN))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    if is_resume {
+                                                        this.quick_resume_or_open(
+                                                            play_type.clone(),
+                                                            play_id.clone(),
+                                                            play_vid.clone(),
+                                                            cx,
+                                                        );
+                                                    } else {
+                                                        this.open_meta_details(
+                                                            play_type.clone(),
+                                                            play_id.clone(),
+                                                            play_vid.clone(),
+                                                            cx,
+                                                        );
+                                                    }
+                                                }),
+                                            )
+                                            .child(svg_icon(
+                                                IconName::Play,
+                                                14.0,
+                                                rgb(BG_OBSIDIAN),
+                                            ))
+                                            .child(if is_resume { "Resume" } else { "Watch" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("spotlight-details-btn")
+                                            .cursor_pointer()
+                                            .h(px(40.0))
+                                            .px(px(18.0))
+                                            .rounded(px(999.0))
+                                            .bg(rgba(0x141417cc))
+                                            .border_1()
+                                            .border_color(rgba(BORDER_SUBTLE))
+                                            .hover(|s| {
+                                                s.bg(rgb(BG_ELEVATED))
+                                                    .border_color(rgba(BORDER_STRONG))
+                                            })
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .font(ui_sans(FontWeight::MEDIUM))
+                                            .text_size(px(13.5))
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_meta_details(
+                                                        det_type.clone(),
+                                                        det_id.clone(),
+                                                        det_vid.clone(),
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                            .child(svg_icon(
+                                                IconName::Info,
+                                                14.0,
+                                                rgb(TEXT_SECONDARY),
+                                            ))
+                                            .child("Details"),
+                                    ),
+                            ),
+                    )
+                    .when(spot_count > 1, |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .id("spotlight-prev")
+                                        .cursor_pointer()
+                                        .w(px(32.0))
+                                        .h(px(32.0))
+                                        .rounded(px(999.0))
+                                        .bg(rgba(0x141417cc))
+                                        .border_1()
+                                        .border_color(rgba(BORDER_SUBTLE))
+                                        .hover(|s| {
+                                            s.bg(rgb(BG_ELEVATED))
+                                                .border_color(rgba(BORDER_STRONG))
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.board_spotlight_idx =
+                                                    (this.board_spotlight_idx + spot_count - 1)
+                                                        % spot_count;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(svg_icon(
+                                            IconName::ChevronLeft,
+                                            14.0,
+                                            rgb(TEXT_PRIMARY),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(6.0))
+                                        .font(mono_font())
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(format!("{}/{}", active_idx + 1, spot_count)),
+                                )
+                                .child(
+                                    div()
+                                        .id("spotlight-next")
+                                        .cursor_pointer()
+                                        .w(px(32.0))
+                                        .h(px(32.0))
+                                        .rounded(px(999.0))
+                                        .bg(rgba(0x141417cc))
+                                        .border_1()
+                                        .border_color(rgba(BORDER_SUBTLE))
+                                        .hover(|s| {
+                                            s.bg(rgb(BG_ELEVATED))
+                                                .border_color(rgba(BORDER_STRONG))
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.board_spotlight_idx =
+                                                    (this.board_spotlight_idx + 1) % spot_count;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(svg_icon(
+                                            IconName::ChevronRight,
+                                            14.0,
+                                            rgb(TEXT_PRIMARY),
                                         )),
                                 ),
                         )
