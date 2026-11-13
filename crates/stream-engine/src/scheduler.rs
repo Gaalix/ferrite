@@ -125,12 +125,38 @@ struct EpisodeScheduleState {
     warmer_cancel: CancellationToken,
     head_warmed: Arc<AtomicBool>,
     tail_warmed: Arc<AtomicBool>,
+    prebuffered_file_idx: Option<usize>,
+    prebuffer_warmer_cancel: Option<CancellationToken>,
+    retiring_streams: HashMap<usize, HashSet<u64>>,
+    session_handle: Option<(Arc<Session>, Arc<ManagedTorrent>)>,
+}
+
+impl EpisodeScheduleState {
+    fn desired_only_files(&self) -> HashSet<usize> {
+        let mut files = HashSet::new();
+        files.insert(self.file_idx);
+        if let Some(pre_idx) = self.prebuffered_file_idx {
+            files.insert(pre_idx);
+        }
+        for &retiring_idx in self.retiring_streams.keys() {
+            files.insert(retiring_idx);
+        }
+        files
+    }
+}
+
+fn only_files_matches(handle: &ManagedTorrent, desired: &HashSet<usize>) -> bool {
+    handle.only_files().is_some_and(|existing| {
+        let existing_set: HashSet<usize> = existing.into_iter().collect();
+        existing_set == *desired
+    })
 }
 
 pub struct PlayheadScheduler {
     next_cursor_id: AtomicU64,
     torrents: DashMap<[u8; 20], Arc<RwLock<EpisodeScheduleState>>>,
     cursor_closed_notify: tokio::sync::Notify,
+    shutdown_token: CancellationToken,
 }
 
 impl Default for PlayheadScheduler {
@@ -145,6 +171,7 @@ impl PlayheadScheduler {
             next_cursor_id: AtomicU64::new(1),
             torrents: DashMap::new(),
             cursor_closed_notify: tokio::sync::Notify::new(),
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -223,42 +250,34 @@ impl PlayheadScheduler {
             ))
         })?;
 
-        let already_isolated = handle
-            .only_files()
-            .is_some_and(|of| of.len() == 1 && of[0] == file_idx);
-        if !already_isolated {
-            let mut selected = HashSet::with_capacity(1);
-            selected.insert(file_idx);
-            session
-                .update_only_files(handle, &selected)
-                .await
-                .map_err(|e| {
-                    crate::StreamEngineError::Torrent(format!(
-                        "failed updating librqbit only_files for episode isolation: {e:#}"
-                    ))
-                })?;
-            debug!(
-                info_hash = %hex::encode(info_hash),
-                file_idx,
-                "isolated torrent download to selected episode via only_files"
-            );
-        }
-
         let mut should_spawn_warmers = false;
         let warmer_cancel;
         let head_warmed;
         let tail_warmed;
+        let desired_only_files;
 
         if let Some(existing) = self.torrents.get(&info_hash) {
             let mut guard = existing.write();
+            guard.session_handle = Some((Arc::clone(session), Arc::clone(handle)));
             if guard.file_idx != file_idx {
+                let prev_file_idx = guard.file_idx;
+                if !guard.active_streams.is_empty() {
+                    let prev_cursor_ids: Vec<u64> = guard.active_streams.keys().copied().collect();
+                    let retiring = guard.retiring_streams.entry(prev_file_idx).or_default();
+                    retiring.extend(prev_cursor_ids);
+                }
                 guard.warmer_cancel.cancel();
+                if let Some(prebuf_cancel) = guard.prebuffer_warmer_cancel.take() {
+                    prebuf_cancel.cancel();
+                }
                 let next_cancel = shutdown_token.child_token();
                 let next_head = Arc::new(AtomicBool::new(false));
                 let next_tail = Arc::new(AtomicBool::new(false));
                 warmer_cancel = next_cancel.clone();
                 head_warmed = next_head.clone();
                 tail_warmed = next_tail.clone();
+                let retiring_streams = core::mem::take(&mut guard.retiring_streams);
+                let session_handle = guard.session_handle.clone();
                 *guard = EpisodeScheduleState {
                     file_idx,
                     file_offset: fi.offset_in_torrent,
@@ -270,6 +289,10 @@ impl PlayheadScheduler {
                     warmer_cancel: next_cancel,
                     head_warmed: next_head,
                     tail_warmed: next_tail,
+                    prebuffered_file_idx: None,
+                    prebuffer_warmer_cancel: None,
+                    retiring_streams,
+                    session_handle,
                 };
                 should_spawn_warmers = fi.len > 0;
             } else {
@@ -277,6 +300,7 @@ impl PlayheadScheduler {
                 head_warmed = guard.head_warmed.clone();
                 tail_warmed = guard.tail_warmed.clone();
             }
+            desired_only_files = guard.desired_only_files();
         } else {
             let next_cancel = shutdown_token.child_token();
             let next_head = Arc::new(AtomicBool::new(false));
@@ -284,7 +308,7 @@ impl PlayheadScheduler {
             warmer_cancel = next_cancel.clone();
             head_warmed = next_head.clone();
             tail_warmed = next_tail.clone();
-            let state = Arc::new(RwLock::new(EpisodeScheduleState {
+            let state = EpisodeScheduleState {
                 file_idx,
                 file_offset: fi.offset_in_torrent,
                 file_len: fi.len,
@@ -295,9 +319,31 @@ impl PlayheadScheduler {
                 warmer_cancel: next_cancel,
                 head_warmed: next_head,
                 tail_warmed: next_tail,
-            }));
-            self.torrents.insert(info_hash, state);
+                prebuffered_file_idx: None,
+                prebuffer_warmer_cancel: None,
+                retiring_streams: HashMap::new(),
+                session_handle: Some((Arc::clone(session), Arc::clone(handle))),
+            };
+            desired_only_files = state.desired_only_files();
+            self.torrents.insert(info_hash, Arc::new(RwLock::new(state)));
             should_spawn_warmers = fi.len > 0;
+        }
+
+        if !only_files_matches(handle, &desired_only_files) {
+            session
+                .update_only_files(handle, &desired_only_files)
+                .await
+                .map_err(|e| {
+                    crate::StreamEngineError::Torrent(format!(
+                        "failed updating librqbit only_files for episode isolation: {e:#}"
+                    ))
+                })?;
+            debug!(
+                info_hash = %hex::encode(info_hash),
+                file_idx,
+                only_files = ?desired_only_files,
+                "updated torrent only_files for active episode"
+            );
         }
 
         if should_spawn_warmers {
@@ -316,6 +362,129 @@ impl PlayheadScheduler {
             .unwrap_or_else(|| {
                 Self::compute_priority_window(fi.offset_in_torrent, fi.len, piece_len, 0, None)
             }))
+    }
+
+    /// Pre-buffers an episode on a torrent without cancelling or deselecting an active episode on the same pack.
+    pub async fn prebuffer_episode(
+        &self,
+        session: &Arc<Session>,
+        info_hash: [u8; 20],
+        handle: &Arc<ManagedTorrent>,
+        file_idx: usize,
+    ) -> Result<PriorityPlan, crate::StreamEngineError> {
+        handle
+            .wait_until_initialized()
+            .await
+            .map_err(|e| crate::StreamEngineError::Torrent(format!("torrent init failed: {e:#}")))?;
+
+        let (fi_opt, piece_len, total_files) = handle
+            .with_metadata(|meta| {
+                let total_files = meta.file_infos.len();
+                let fi = meta.file_infos.get(file_idx).cloned();
+                let piece_len = meta.lengths().default_piece_length() as u64;
+                (fi, piece_len, total_files)
+            })
+            .map_err(|e| crate::StreamEngineError::Torrent(format!("{e:#}")))?;
+
+        let fi = fi_opt.ok_or_else(|| {
+            crate::StreamEngineError::Torrent(format!(
+                "file_idx {file_idx} out of range (torrent has {total_files} files)"
+            ))
+        })?;
+
+        let mut should_spawn_warmers = false;
+        let mut warmer_cancel = None;
+        let mut head_warmed = None;
+        let mut tail_warmed = None;
+        let desired_only_files;
+
+        if let Some(existing) = self.torrents.get(&info_hash) {
+            let mut guard = existing.write();
+            guard.session_handle = Some((Arc::clone(session), Arc::clone(handle)));
+            if guard.file_idx != file_idx && guard.prebuffered_file_idx != Some(file_idx) {
+                if let Some(prev_cancel) = guard.prebuffer_warmer_cancel.take() {
+                    prev_cancel.cancel();
+                }
+                guard.prebuffered_file_idx = Some(file_idx);
+                let next_cancel = self.shutdown_token.child_token();
+                guard.prebuffer_warmer_cancel = Some(next_cancel.clone());
+                if fi.len > 0 {
+                    should_spawn_warmers = true;
+                    warmer_cancel = Some(next_cancel);
+                    head_warmed = Some(Arc::new(AtomicBool::new(false)));
+                    tail_warmed = Some(Arc::new(AtomicBool::new(false)));
+                }
+            }
+            desired_only_files = guard.desired_only_files();
+        } else {
+            let next_cancel = self.shutdown_token.child_token();
+            let next_head = Arc::new(AtomicBool::new(false));
+            let next_tail = Arc::new(AtomicBool::new(false));
+            if fi.len > 0 {
+                should_spawn_warmers = true;
+                warmer_cancel = Some(next_cancel.clone());
+                head_warmed = Some(next_head.clone());
+                tail_warmed = Some(next_tail.clone());
+            }
+            let state = EpisodeScheduleState {
+                file_idx,
+                file_offset: fi.offset_in_torrent,
+                file_len: fi.len,
+                piece_len,
+                playhead_byte_offset: 0,
+                bitrate_estimate_bps: None,
+                active_streams: HashMap::new(),
+                warmer_cancel: next_cancel,
+                head_warmed: next_head,
+                tail_warmed: next_tail,
+                prebuffered_file_idx: None,
+                prebuffer_warmer_cancel: None,
+                retiring_streams: HashMap::new(),
+                session_handle: Some((Arc::clone(session), Arc::clone(handle))),
+            };
+            desired_only_files = state.desired_only_files();
+            self.torrents.insert(info_hash, Arc::new(RwLock::new(state)));
+        }
+
+        if !only_files_matches(handle, &desired_only_files) {
+            session
+                .update_only_files(handle, &desired_only_files)
+                .await
+                .map_err(|e| {
+                    crate::StreamEngineError::Torrent(format!(
+                        "failed updating librqbit only_files for episode prebuffering: {e:#}"
+                    ))
+                })?;
+            debug!(
+                info_hash = %hex::encode(info_hash),
+                file_idx,
+                only_files = ?desired_only_files,
+                "updated torrent only_files for prebuffered episode"
+            );
+        }
+
+        if should_spawn_warmers {
+            if let (Some(cancel), Some(head), Some(tail)) =
+                (warmer_cancel, head_warmed, tail_warmed)
+            {
+                spawn_critical_head_tail_warmers(
+                    handle.clone(),
+                    file_idx,
+                    fi.len,
+                    cancel,
+                    head,
+                    tail,
+                );
+            }
+        }
+
+        Ok(Self::compute_priority_window(
+            fi.offset_in_torrent,
+            fi.len,
+            piece_len,
+            0,
+            None,
+        ))
     }
 
     pub fn open_range_cursor(
@@ -402,13 +571,32 @@ impl PlayheadScheduler {
     }
 
     fn close_cursor(&self, info_hash: &[u8; 20], file_idx: usize, cursor_id: u64) {
+        let mut narrow_target: Option<(Arc<Session>, Arc<ManagedTorrent>)> = None;
         if let Some(entry) = self.torrents.get(info_hash) {
             let mut state = entry.write();
             if state.file_idx == file_idx {
                 state.active_streams.remove(&cursor_id);
+            } else if let Some(retiring) = state.retiring_streams.get_mut(&file_idx) {
+                retiring.remove(&cursor_id);
+                if retiring.is_empty() {
+                    state.retiring_streams.remove(&file_idx);
+                    narrow_target = state.session_handle.clone();
+                }
             }
         }
         self.cursor_closed_notify.notify_waiters();
+        if let Some((session, handle)) = narrow_target {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                if let Some(entry) = self.torrents.get(info_hash).map(|e| Arc::clone(e.value())) {
+                    rt.spawn(async move {
+                        let desired = entry.read().desired_only_files();
+                        if !only_files_matches(&handle, &desired) {
+                            let _ = session.update_only_files(&handle, &desired).await;
+                        }
+                    });
+                }
+            }
+        }
     }
 
     pub fn cursor_closed(&self) -> &tokio::sync::Notify {
@@ -416,21 +604,30 @@ impl PlayheadScheduler {
     }
 
     pub fn has_active_streams_for_torrent(&self, info_hash: &[u8; 20]) -> bool {
-        self.torrents
-            .get(info_hash)
-            .is_some_and(|e| !e.read().active_streams.is_empty())
+        self.torrents.get(info_hash).is_some_and(|e| {
+            let s = e.read();
+            !s.active_streams.is_empty() || s.retiring_streams.values().any(|r| !r.is_empty())
+        })
     }
 
     pub fn total_active_streams_for_torrent(&self, info_hash: &[u8; 20]) -> usize {
         self.torrents
             .get(info_hash)
-            .map(|e| e.read().active_streams.len())
+            .map(|e| {
+                let s = e.read();
+                let retiring: usize = s.retiring_streams.values().map(HashSet::len).sum();
+                s.active_streams.len() + retiring
+            })
             .unwrap_or(0)
     }
 
     pub fn remove_torrent(&self, info_hash: &[u8; 20]) {
         if let Some((_, entry)) = self.torrents.remove(info_hash) {
-            entry.read().warmer_cancel.cancel();
+            let guard = entry.read();
+            guard.warmer_cancel.cancel();
+            if let Some(prebuf) = &guard.prebuffer_warmer_cancel {
+                prebuf.cancel();
+            }
         }
     }
 
@@ -462,6 +659,12 @@ impl PlayheadScheduler {
         self.torrents.get(info_hash).map(|e| e.read().file_idx)
     }
 
+    pub fn prebuffered_file(&self, info_hash: &[u8; 20]) -> Option<usize> {
+        self.torrents
+            .get(info_hash)
+            .and_then(|e| e.read().prebuffered_file_idx)
+    }
+
     pub fn active_stream_count(&self, info_hash: &[u8; 20], file_idx: usize) -> usize {
         self.torrents
             .get(info_hash)
@@ -470,7 +673,7 @@ impl PlayheadScheduler {
                 if s.file_idx == file_idx {
                     s.active_streams.len()
                 } else {
-                    0
+                    s.retiring_streams.get(&file_idx).map_or(0, HashSet::len)
                 }
             })
             .unwrap_or(0)
@@ -478,15 +681,24 @@ impl PlayheadScheduler {
 
     pub fn clear_all(&self) {
         for entry in self.torrents.iter() {
-            entry.read().warmer_cancel.cancel();
+            let guard = entry.read();
+            guard.warmer_cancel.cancel();
+            if let Some(prebuf) = &guard.prebuffer_warmer_cancel {
+                prebuf.cancel();
+            }
         }
         self.torrents.clear();
         self.cursor_closed_notify.notify_waiters();
     }
 
     pub fn shutdown(&self) {
+        self.shutdown_token.cancel();
         for entry in self.torrents.iter() {
-            entry.read().warmer_cancel.cancel();
+            let guard = entry.read();
+            guard.warmer_cancel.cancel();
+            if let Some(prebuf) = &guard.prebuffer_warmer_cancel {
+                prebuf.cancel();
+            }
         }
     }
 }
@@ -610,5 +822,195 @@ mod tests {
             assert_eq!(small.priority_of(p), PiecePriority::Critical);
         }
         assert_eq!(small.priority_of(5), PiecePriority::Ignore);
+    }
+
+    #[tokio::test]
+    async fn season_pack_prebuffer_preserves_only_files_union_and_narrows_after_old_streams_close() {
+        use librqbit::{AddTorrent, AddTorrentOptions, CreateTorrentOptions, SessionOptions};
+        use tempfile::TempDir;
+
+        let seed_dir = TempDir::new().unwrap();
+        let pack_dir = seed_dir.path().join("Show.S01");
+        tokio::fs::create_dir_all(&pack_dir).await.unwrap();
+        tokio::fs::write(pack_dir.join("01_ep1.mkv"), vec![1u8; 64 * 1024])
+            .await
+            .unwrap();
+        tokio::fs::write(pack_dir.join("02_ep2.mkv"), vec![2u8; 64 * 1024])
+            .await
+            .unwrap();
+        tokio::fs::write(pack_dir.join("03_ep3.mkv"), vec![3u8; 64 * 1024])
+            .await
+            .unwrap();
+
+        let seeder = Session::new_with_opts(
+            seed_dir.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (created_meta, _seed_handle) = seeder
+            .create_and_serve_torrent(
+                &pack_dir,
+                CreateTorrentOptions {
+                    name: Some("Show.S01"),
+                    piece_length: Some(32 * 1024),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let torrent_bytes = created_meta.as_bytes().unwrap().to_vec();
+
+        let leech_dir = TempDir::new().unwrap();
+        let session = Arc::new(
+            Session::new_with_opts(
+                leech_dir.path().to_path_buf(),
+                SessionOptions {
+                    dht: None,
+                    disable_trackers: true,
+                    disable_local_service_discovery: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+
+        let resp = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent_bytes),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let handle = resp.into_handle().unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        let info_hash = handle.info_hash().0;
+
+        let scheduler = Arc::new(PlayheadScheduler::new());
+        let shutdown = CancellationToken::new();
+
+        // 1. Activate Episode 0 and open an active stream cursor on it.
+        scheduler
+            .activate_episode(&session, &handle, info_hash, 0, &shutdown)
+            .await
+            .unwrap();
+        assert_eq!(scheduler.selected_file(&info_hash), Some(0));
+        assert_eq!(
+            handle
+                .only_files()
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([0])
+        );
+
+        let ep0_cursor = scheduler.open_range_cursor(info_hash, 0, 0, 64 * 1024);
+        assert_eq!(scheduler.active_stream_count(&info_hash, 0), 1);
+
+        let ep0_warmer_cancelled = {
+            let entry = scheduler.torrents.get(&info_hash).unwrap();
+            let tok = entry.read().warmer_cancel.clone();
+            tok
+        };
+
+        // 2. Prebuffer Episode 1 while Episode 0 is actively streaming.
+        scheduler
+            .prebuffer_episode(&session, info_hash, &handle, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(scheduler.selected_file(&info_hash), Some(0));
+        assert_eq!(scheduler.prebuffered_file(&info_hash), Some(1));
+        assert!(
+            !ep0_warmer_cancelled.is_cancelled(),
+            "prebuffer_episode must not cancel active episode warmer"
+        );
+        assert_eq!(
+            handle
+                .only_files()
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([0, 1]),
+            "only_files must keep both active episode 0 and prebuffered episode 1"
+        );
+
+        // 3. Activate Episode 1 while Episode 0 still has active_streams > 0 -> keep {0, 1}.
+        scheduler
+            .activate_episode(&session, &handle, info_hash, 1, &shutdown)
+            .await
+            .unwrap();
+        assert_eq!(scheduler.selected_file(&info_hash), Some(1));
+        assert_eq!(scheduler.prebuffered_file(&info_hash), None);
+        assert_eq!(scheduler.active_stream_count(&info_hash, 0), 1);
+        assert_eq!(
+            handle
+                .only_files()
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([0, 1]),
+            "only_files must retain retiring episode 0 while its cursor is still open"
+        );
+
+        // 4. Drop Episode 0 cursor -> retiring stream closes and only_files narrows cleanly to {1}.
+        drop(ep0_cursor);
+        assert_eq!(scheduler.active_stream_count(&info_hash, 0), 0);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let cur: HashSet<usize> = handle.only_files().unwrap().into_iter().collect();
+            if cur == HashSet::from([1]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for only_files to narrow to {{1}}, got {cur:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // 5. Prebuffer Episode 2, then activate Episode 2 with 0 active streams -> immediately narrows to {2}.
+        scheduler
+            .prebuffer_episode(&session, info_hash, &handle, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle
+                .only_files()
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([1, 2])
+        );
+
+        scheduler
+            .activate_episode(&session, &handle, info_hash, 2, &shutdown)
+            .await
+            .unwrap();
+        assert_eq!(scheduler.prebuffered_file(&info_hash), None);
+        assert_eq!(
+            handle
+                .only_files()
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([2])
+        );
+
+        scheduler.shutdown();
+        session.cancellation_token().cancel();
+        seeder.cancellation_token().cancel();
     }
 }

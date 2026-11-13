@@ -234,6 +234,90 @@ pub fn validate_stream_url(raw: &str) -> Result<&str, MpvError> {
     validate_stream_url_impl(raw, cfg!(test))
 }
 
+const MAX_LOCAL_SUBTITLE_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_SUBTITLE_COLOR_HEX: &str = "#F5F1E8";
+
+/// Validate and canonicalize a local subtitle file path for `sub-add`.
+///
+/// Security invariants: rejects empty paths, control characters (`\0`, `\r`, `\n`),
+/// URI scheme substrings (`://`), leading `-` option prefixes, unsupported extensions,
+/// non-regular files, and files exceeding 32 MiB.
+pub fn validate_local_subtitle_path(path: &Path) -> Result<PathBuf, MpvError> {
+    if path.as_os_str().is_empty() {
+        return Err(MpvError::Command("rejected empty local subtitle path".into()));
+    }
+    let raw = path
+        .to_str()
+        .ok_or_else(|| MpvError::Command("rejected non-UTF-8 local subtitle path".into()))?;
+    if raw.trim().is_empty() {
+        return Err(MpvError::Command("rejected empty local subtitle path".into()));
+    }
+    if raw.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) {
+        return Err(MpvError::Command(
+            "rejected local subtitle path containing control characters".into(),
+        ));
+    }
+    if raw.starts_with('-') || raw.trim_start().starts_with('-') {
+        return Err(MpvError::Command(
+            "rejected local subtitle path starting with '-'".into(),
+        ));
+    }
+    if raw.contains("://") {
+        return Err(MpvError::Command(
+            "rejected local subtitle path containing URI scheme".into(),
+        ));
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| {
+            MpvError::Command("rejected local subtitle path without an extension".into())
+        })?;
+    let supported = ext.eq_ignore_ascii_case("srt")
+        || ext.eq_ignore_ascii_case("ass")
+        || ext.eq_ignore_ascii_case("ssa")
+        || ext.eq_ignore_ascii_case("vtt")
+        || ext.eq_ignore_ascii_case("sub");
+    if !supported {
+        return Err(MpvError::Command(format!(
+            "rejected unsupported local subtitle extension `.{ext}`"
+        )));
+    }
+
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        MpvError::Command(format!("failed to canonicalize local subtitle path: {e}"))
+    })?;
+    let canonical_str = canonical.to_str().ok_or_else(|| {
+        MpvError::Command("rejected non-UTF-8 canonical local subtitle path".into())
+    })?;
+    if canonical_str.chars().any(|c| matches!(c, '\0' | '\r' | '\n'))
+        || canonical_str.contains("://")
+        || canonical_str.starts_with('-')
+    {
+        return Err(MpvError::Command(
+            "rejected unsafe canonical local subtitle path".into(),
+        ));
+    }
+
+    let metadata = std::fs::metadata(&canonical).map_err(|e| {
+        MpvError::Command(format!("failed to stat local subtitle file: {e}"))
+    })?;
+    if !metadata.is_file() {
+        return Err(MpvError::Command(
+            "rejected local subtitle path that is not a regular file".into(),
+        ));
+    }
+    if metadata.len() > MAX_LOCAL_SUBTITLE_BYTES {
+        return Err(MpvError::Command(format!(
+            "rejected local subtitle file exceeding {} bytes",
+            MAX_LOCAL_SUBTITLE_BYTES
+        )));
+    }
+
+    Ok(canonical)
+}
+
 fn redact_log_urls(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -337,6 +421,81 @@ impl UpscalePreset {
             Self::Lanczos => ("lanczos", "lanczos", "mitchell"),
             Self::EwaLanczos => ("ewa_lanczossharp", "ewa_lanczossharp", "mitchell"),
         }
+    }
+}
+
+/// Subtitle background rendering style applied live via libmpv properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubtitleBackgroundMode {
+    #[default]
+    DropShadow,
+    TranslucentPill,
+}
+
+/// How ASS/SSA embedded styles interact with user subtitle style overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubtitleAssOverride {
+    #[default]
+    Scale,
+    Force,
+    No,
+}
+
+impl SubtitleAssOverride {
+    /// Returns the libmpv `sub-ass-override` string representation.
+    pub fn as_mpv_str(self) -> &'static str {
+        match self {
+            Self::Scale => "scale",
+            Self::Force => "force",
+            Self::No => "no",
+        }
+    }
+}
+
+/// Live HDR-safe subtitle styling configuration for libmpv.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleStyle {
+    pub font_size: u32,
+    pub vertical_pos: u32,
+    pub color_hex: String,
+    pub background: SubtitleBackgroundMode,
+    pub ass_override: SubtitleAssOverride,
+}
+
+impl Default for SubtitleStyle {
+    fn default() -> Self {
+        Self {
+            font_size: 46,
+            vertical_pos: 96,
+            color_hex: DEFAULT_SUBTITLE_COLOR_HEX.to_string(),
+            background: SubtitleBackgroundMode::DropShadow,
+            ass_override: SubtitleAssOverride::Scale,
+        }
+    }
+}
+
+fn validate_subtitle_color_hex(raw: &str) -> String {
+    if raw.chars().any(|c| c.is_control()) {
+        return DEFAULT_SUBTITLE_COLOR_HEX.to_string();
+    }
+    let trimmed = raw.trim();
+    if trimmed.starts_with('#')
+        && matches!(trimmed.len(), 7 | 9)
+        && trimmed[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        trimmed.to_owned()
+    } else {
+        DEFAULT_SUBTITLE_COLOR_HEX.to_string()
+    }
+}
+
+impl SubtitleStyle {
+    /// Clamps numeric fields and normalizes `color_hex` to a valid `#RRGGBB`/`#AARRGGBB` hex string.
+    pub fn sanitized(mut self) -> Self {
+        self.font_size = self.font_size.clamp(20, 96);
+        self.vertical_pos = self.vertical_pos.clamp(50, 105);
+        self.color_hex = validate_subtitle_color_hex(&self.color_hex);
+        self
     }
 }
 
@@ -710,8 +869,13 @@ struct PendingLoad {
     sub_delay_secs: Option<f64>,
 }
 
+enum PendingSubSource {
+    RemoteUrl(String),
+    LocalFile(PathBuf),
+}
+
 struct PendingSub {
-    url: String,
+    source: PendingSubSource,
     title: Option<String>,
     lang: Option<String>,
 }
@@ -729,6 +893,7 @@ struct PersistedSettings {
     muted: bool,
     speed: f64,
     sub_delay: f64,
+    subtitle_style: SubtitleStyle,
     tone_mapping: ToneMappingPreset,
     upscale_mode: UpscalePreset,
     deband: DebandConfig,
@@ -744,6 +909,7 @@ impl Default for PersistedSettings {
             muted: false,
             speed: 1.0,
             sub_delay: 0.0,
+            subtitle_style: SubtitleStyle::default(),
             tone_mapping: ToneMappingPreset::default(),
             upscale_mode: UpscalePreset::default(),
             deband: DebandConfig::default(),
@@ -1199,7 +1365,9 @@ impl MpvController {
                 event_thread: Mutex::new(Some(event_join)),
             });
 
-            Ok(Self { inner })
+            let controller = Self { inner };
+            controller.apply_subtitle_style(&SubtitleStyle::default())?;
+            Ok(controller)
         }
     }
 
@@ -1769,8 +1937,27 @@ impl MpvController {
         if let Some(load) = pending_load {
             self.dispatch_loadfile_now(&load.url, load.start_time_secs, load.sub_delay_secs)?;
         }
+        self.drain_pending_subtitles(pending_subs)
+    }
+
+    fn drain_pending_subtitles(&self, pending_subs: Vec<PendingSub>) -> Result<(), MpvError> {
         for sub in pending_subs {
-            self.dispatch_add_subtitle_now(&sub.url, sub.title.as_deref(), sub.lang.as_deref())?;
+            match sub.source {
+                PendingSubSource::RemoteUrl(url) => {
+                    self.dispatch_add_subtitle_now(
+                        &url,
+                        sub.title.as_deref(),
+                        sub.lang.as_deref(),
+                    )?;
+                }
+                PendingSubSource::LocalFile(path) => {
+                    self.dispatch_add_local_subtitle_now(
+                        &path,
+                        sub.title.as_deref(),
+                        sub.lang.as_deref(),
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -1853,7 +2040,7 @@ impl MpvController {
                 .unwrap_or_else(|e| e.into_inner());
             if !q.render_ready {
                 q.subs.push(PendingSub {
-                    url: clean_url.to_owned(),
+                    source: PendingSubSource::RemoteUrl(clean_url.to_owned()),
                     title: title.map(str::to_owned),
                     lang: lang.map(str::to_owned),
                 });
@@ -1861,6 +2048,32 @@ impl MpvController {
             }
         }
         self.dispatch_add_subtitle_now(clean_url, title, lang)
+    }
+
+    /// Safely validates and loads a local `.srt`/`.ass`/`.ssa`/`.vtt`/`.sub` subtitle file via `sub-add <path> auto`.
+    pub fn add_local_subtitle_file(
+        &self,
+        path: &Path,
+        title: Option<&str>,
+        lang: Option<&str>,
+    ) -> Result<(), MpvError> {
+        let canonical = validate_local_subtitle_path(path)?;
+        {
+            let mut q = self
+                .inner
+                .pending_media
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !q.render_ready {
+                q.subs.push(PendingSub {
+                    source: PendingSubSource::LocalFile(canonical),
+                    title: title.map(str::to_owned),
+                    lang: lang.map(str::to_owned),
+                });
+                return Ok(());
+            }
+        }
+        self.dispatch_add_local_subtitle_now(&canonical, title, lang)
     }
 
     fn dispatch_add_subtitle_now(
@@ -1881,6 +2094,27 @@ impl MpvController {
         }
     }
 
+    fn dispatch_add_local_subtitle_now(
+        &self,
+        path: &Path,
+        title: Option<&str>,
+        lang: Option<&str>,
+    ) -> Result<(), MpvError> {
+        let canonical = validate_local_subtitle_path(path)?;
+        let path_str = canonical.to_str().ok_or_else(|| {
+            MpvError::Command("rejected non-UTF-8 canonical local subtitle path".into())
+        })?;
+        let t = title.unwrap_or("");
+        let l = lang.unwrap_or("");
+        if !l.is_empty() {
+            self.command_async(&["sub-add", path_str, "auto", t, l])
+        } else if !t.is_empty() {
+            self.command_async(&["sub-add", path_str, "auto", t])
+        } else {
+            self.command_async(&["sub-add", path_str, "auto"])
+        }
+    }
+
     pub fn set_subtitle_delay(&self, delay_secs: f64) -> Result<(), MpvError> {
         if !delay_secs.is_finite() {
             return Ok(());
@@ -1889,6 +2123,51 @@ impl MpvController {
             p.sub_delay = delay_secs;
         }
         self.set_property_double("sub-delay", delay_secs)
+    }
+
+    /// Applies and persists a sanitized HDR-safe subtitle style to the live libmpv instance.
+    pub fn set_subtitle_style(&self, style: SubtitleStyle) -> Result<(), MpvError> {
+        let sanitized = style.sanitized();
+        if let Ok(mut p) = self.inner.persisted.lock() {
+            p.subtitle_style = sanitized.clone();
+        }
+        self.apply_subtitle_style(&sanitized)
+    }
+
+    /// Returns the currently persisted subtitle style.
+    pub fn subtitle_style(&self) -> SubtitleStyle {
+        self.inner
+            .persisted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subtitle_style
+            .clone()
+    }
+
+    fn apply_subtitle_style(&self, style: &SubtitleStyle) -> Result<(), MpvError> {
+        self.set_property_double("sub-font-size", f64::from(style.font_size))?;
+        self.set_property_double("sub-pos", f64::from(style.vertical_pos))?;
+        self.set_property_string("sub-color", &style.color_hex)?;
+        self.set_property_string("sub-ass-override", style.ass_override.as_mpv_str())?;
+
+        match style.background {
+            SubtitleBackgroundMode::DropShadow => {
+                self.set_property_string("sub-border-style", "outline-and-shadow")?;
+                self.set_property_string("sub-back-color", "#00000000")?;
+                self.set_property_double("sub-border-size", 2.0_f64)?;
+                self.set_property_string("sub-border-color", "#E008080A")?;
+                self.set_property_double("sub-shadow-offset", 2.5_f64)?;
+                self.set_property_string("sub-shadow-color", "#C0000000")?;
+            }
+            SubtitleBackgroundMode::TranslucentPill => {
+                self.set_property_string("sub-border-style", "background-box")?;
+                self.set_property_string("sub-back-color", "#B8141417")?;
+                self.set_property_double("sub-border-size", 6.0_f64)?;
+                self.set_property_string("sub-border-color", "#00000000")?;
+                self.set_property_double("sub-shadow-offset", 0.0_f64)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn set_hdr_tone_mapping(&self, preset: ToneMappingPreset) -> Result<(), MpvError> {
@@ -2056,6 +2335,7 @@ impl MpvController {
         self.set_property_flag("mute", saved.muted)?;
         self.set_property_double("speed", saved.speed)?;
         self.set_property_double("sub-delay", saved.sub_delay)?;
+        self.apply_subtitle_style(&saved.subtitle_style)?;
         self.set_property_string("tone-mapping", saved.tone_mapping.as_mpv_str())?;
 
         let (scale, cscale, dscale) = saved.upscale_mode.scalers();
@@ -3863,5 +4143,159 @@ mod tests {
         assert!(!forced_null.uses_libmpv_vo);
         assert!(!forced_null.defer_media_until_attach);
         assert!(!should_probe_d3d11_composition(forced_null, &[]));
+    }
+
+    #[test]
+    fn subtitle_style_defaults_validation_clamping_and_live_persistence() {
+        let def = SubtitleStyle::default();
+        assert_eq!(def.font_size, 46);
+        assert_eq!(def.vertical_pos, 96);
+        assert_eq!(def.color_hex, "#F5F1E8");
+        assert_eq!(def.background, SubtitleBackgroundMode::DropShadow);
+        assert_eq!(def.ass_override, SubtitleAssOverride::Scale);
+
+        // Valid #RRGGBB and #AARRGGBB pass, invalid hex falls back to #F5F1E8, bounds clamp.
+        let valid_6 = SubtitleStyle {
+            font_size: 10,
+            vertical_pos: 200,
+            color_hex: "#E8DFC8".to_string(),
+            background: SubtitleBackgroundMode::TranslucentPill,
+            ass_override: SubtitleAssOverride::Force,
+        }
+        .sanitized();
+        assert_eq!(valid_6.font_size, 20);
+        assert_eq!(valid_6.vertical_pos, 105);
+        assert_eq!(valid_6.color_hex, "#E8DFC8");
+
+        let valid_8 = SubtitleStyle {
+            font_size: 120,
+            vertical_pos: 10,
+            color_hex: "#D0F5F1E8".to_string(),
+            background: SubtitleBackgroundMode::DropShadow,
+            ass_override: SubtitleAssOverride::No,
+        }
+        .sanitized();
+        assert_eq!(valid_8.font_size, 96);
+        assert_eq!(valid_8.vertical_pos, 50);
+        assert_eq!(valid_8.color_hex, "#D0F5F1E8");
+
+        for bad_hex in [
+            "",
+            "F5F1E8",
+            "#FFF",
+            "#12345",
+            "#1234567",
+            "#123456789",
+            "#GGGGGG",
+            "#F5F1E8\n",
+            "red",
+        ] {
+            let s = SubtitleStyle {
+                color_hex: bad_hex.to_string(),
+                ..SubtitleStyle::default()
+            }
+            .sanitized();
+            assert_eq!(
+                s.color_hex, "#F5F1E8",
+                "bad color {bad_hex:?} must fall back to #F5F1E8"
+            );
+        }
+
+        let ctrl = MpvController::with_extra_options(&[("vo", "null"), ("ao", "null")])
+            .expect("headless controller");
+        assert_eq!(ctrl.subtitle_style(), SubtitleStyle::default());
+
+        let custom = SubtitleStyle {
+            font_size: 12,
+            vertical_pos: 140,
+            color_hex: "#invalid".to_string(),
+            background: SubtitleBackgroundMode::TranslucentPill,
+            ass_override: SubtitleAssOverride::Force,
+        };
+        ctrl.set_subtitle_style(custom).expect("set_subtitle_style");
+        let applied = ctrl.subtitle_style();
+        assert_eq!(applied.font_size, 20);
+        assert_eq!(applied.vertical_pos, 105);
+        assert_eq!(applied.color_hex, "#F5F1E8");
+        assert_eq!(applied.background, SubtitleBackgroundMode::TranslucentPill);
+        assert_eq!(applied.ass_override, SubtitleAssOverride::Force);
+
+        let drop_shadow = SubtitleStyle {
+            font_size: 54,
+            vertical_pos: 92,
+            color_hex: "#CCFFFFFF".to_string(),
+            background: SubtitleBackgroundMode::DropShadow,
+            ass_override: SubtitleAssOverride::No,
+        };
+        ctrl.set_subtitle_style(drop_shadow.clone())
+            .expect("set_subtitle_style drop shadow");
+        assert_eq!(ctrl.subtitle_style(), drop_shadow);
+
+        ctrl.switch_stream_seamless("av://lavfi:testsrc=s=64x64:d=1.0:r=25", 0.0)
+            .expect("switch_stream_seamless preserves subtitle_style");
+        assert_eq!(ctrl.subtitle_style(), drop_shadow);
+
+        ctrl.shutdown_blocking();
+    }
+
+    #[test]
+    fn validate_local_subtitle_path_enforces_security_and_extension_rules() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "gpui_mpv_sub_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let srt_path = base_dir.join("episode.srt");
+        let ass_path = base_dir.join("episode.ASS");
+        let vtt_path = base_dir.join("episode.vtt");
+        let mkv_path = base_dir.join("episode.mkv");
+        let mp4_path = base_dir.join("episode.mp4");
+        std::fs::write(&srt_path, "1\n00:00:01,000 --> 00:00:02,000\nHello\n").unwrap();
+        std::fs::write(&ass_path, "[Script Info]\nTitle: Test\n").unwrap();
+        std::fs::write(&vtt_path, "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi\n").unwrap();
+        std::fs::write(&mkv_path, b"not a subtitle").unwrap();
+        std::fs::write(&mp4_path, b"not a subtitle").unwrap();
+
+        let canon_srt = validate_local_subtitle_path(&srt_path).expect("valid .srt");
+        assert!(canon_srt.is_absolute());
+        assert!(validate_local_subtitle_path(&ass_path).is_ok());
+        assert!(validate_local_subtitle_path(&vtt_path).is_ok());
+
+        // Security invariant: validate_stream_url must STILL reject local file paths.
+        assert!(validate_stream_url_impl(&srt_path.to_string_lossy(), false).is_err());
+        assert!(validate_stream_url("file:///tmp/episode.srt").is_err());
+        assert!(validate_stream_url("/etc/passwd").is_err());
+        assert!(validate_stream_url("/opt/ferrite/episode.srt").is_err());
+
+        // Reject unsupported extensions, schemes, dirs, non-existent files, leading '-', and control chars.
+        assert!(validate_local_subtitle_path(&mkv_path).is_err());
+        assert!(validate_local_subtitle_path(&mp4_path).is_err());
+        assert!(validate_local_subtitle_path(&base_dir).is_err());
+        assert!(validate_local_subtitle_path(&base_dir.join("missing.srt")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("-sub.srt")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("edl://!new_stream.srt")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("lavfi://test.srt")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("memory://payload.srt")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("archive:///a.zip|b.srt")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("fd://0.srt")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("bad\npath.srt")).is_err());
+        assert!(validate_local_subtitle_path(Path::new("bad\0path.srt")).is_err());
+
+        // Verify deferred queue drain on default libmpv controller without passing local path to validate_stream_url.
+        let ctrl = MpvController::new().expect("default streaming MpvController::new()");
+        ctrl.add_local_subtitle_file(&srt_path, Some("English"), Some("en"))
+            .expect("deferred add_local_subtitle_file before render attach");
+        assert!(ctrl.add_local_subtitle_file(&mkv_path, None, None).is_err());
+        ctrl.set_viewport_rect(0, 0, 320, 180, 1.0);
+        ctrl.attach_software_renderer()
+            .expect("attach_software_renderer drains local subtitle queue");
+        ctrl.add_local_subtitle_file(&ass_path, Some("Styled"), None)
+            .expect("immediate add_local_subtitle_file after render attach");
+        ctrl.shutdown_blocking();
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 }

@@ -15,8 +15,10 @@ pub use dcomp::{
 };
 pub use element::{mpv_viewport, MpvViewport};
 pub use player::{
-    drain_evicted_video_images, shorten_codec_label, validate_stream_url, MediaTrack,
-    MpvController, PlayerEvent, PlayerSnapshot, ToneMappingPreset, TrackType, UpscalePreset,
+    drain_evicted_video_images, shorten_codec_label, validate_local_subtitle_path,
+    validate_stream_url, MediaTrack, MpvController, PlayerEvent, PlayerSnapshot,
+    SubtitleAssOverride, SubtitleBackgroundMode, SubtitleStyle, ToneMappingPreset, TrackType,
+    UpscalePreset,
 };
 pub use shaders::{
     default_shader_cache_dir, materialize_shader_preset_in_dir, DebandConfig, HdrBackendOptions,

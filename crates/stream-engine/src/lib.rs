@@ -1869,6 +1869,105 @@ impl StreamEngineHandle {
         Ok(total)
     }
 
+    /// Pre-buffers a single episode or season-pack file without interrupting an active stream.
+    pub async fn prebuffer_episode(
+        &self,
+        info_hash_hex: &str,
+        file_idx: Option<usize>,
+        trackers: Vec<String>,
+    ) -> Result<String, StreamEngineError> {
+        let info_hash =
+            validate_info_hash_str(info_hash_hex).map_err(StreamEngineError::Torrent)?;
+        let normalized_trackers = routes::extract_trackers_from_sources(&trackers);
+        let handle = self
+            .inner
+            .ensure_torrent_resolved(info_hash, normalized_trackers)
+            .await
+            .map_err(|e| {
+                if e.status == axum::http::StatusCode::GATEWAY_TIMEOUT {
+                    StreamEngineError::MetadataTimeout(self.inner.config.metadata_timeout)
+                } else {
+                    StreamEngineError::Torrent(e.message)
+                }
+            })?;
+
+        tokio::time::timeout(
+            self.inner.config.metadata_timeout,
+            handle.wait_until_initialized(),
+        )
+        .await
+        .map_err(|_| StreamEngineError::MetadataTimeout(self.inner.config.metadata_timeout))?
+        .map_err(|e| StreamEngineError::Torrent(format!("torrent init failed: {e:#}")))?;
+
+        let requested_idx = match file_idx {
+            Some(idx) => i32::try_from(idx).map_err(|_| {
+                StreamEngineError::Torrent(format!("file_idx {idx} exceeds supported range"))
+            })?,
+            None => -1,
+        };
+        let (resolved_idx, file_len) = handle
+            .with_metadata(|meta| {
+                let idx = routes::select_best_file_index(&meta.file_infos, requested_idx, &[])
+                    .map_err(|e| StreamEngineError::Torrent(e.message))?;
+                Ok::<_, StreamEngineError>((idx, meta.file_infos[idx].len))
+            })
+            .map_err(|e| StreamEngineError::Torrent(format!("{e:#}")))??;
+
+        let tstats = handle.stats();
+        let file_have = tstats.file_progress.get(resolved_idx).copied().unwrap_or(0);
+        if handle.is_paused() && file_have < file_len {
+            let _ = self.inner.session.unpause(&handle).await;
+        }
+
+        self.inner
+            .scheduler
+            .prebuffer_episode(&self.inner.session, info_hash, &handle, resolved_idx)
+            .await?;
+
+        let default_loc = if self.inner.cache_tracker.mode().is_ram_only() {
+            TorrentStorageLocation::Ram
+        } else {
+            TorrentStorageLocation::Disk
+        };
+        let loc = self
+            .inner
+            .cache_tracker
+            .location_of(&info_hash)
+            .unwrap_or(default_loc);
+        let out_folder = self
+            .inner
+            .cache_tracker
+            .output_folder_of(&info_hash)
+            .unwrap_or_else(|| {
+                self.inner
+                    .cache_tracker
+                    .output_folder_for_new_torrent(&info_hash)
+                    .0
+            });
+        let tracked_idx = self
+            .inner
+            .scheduler
+            .selected_file(&info_hash)
+            .or(Some(resolved_idx));
+        self.inner.cache_tracker.record_or_touch(
+            info_hash,
+            loc,
+            out_folder,
+            handle.name(),
+            tstats.progress_bytes,
+            tracked_idx,
+        );
+        self.inner
+            .persist_torrent_metadata_backup(&info_hash, &handle)
+            .await;
+
+        let stream_url = self
+            .inner
+            .base_url
+            .join(&format!("{}/{resolved_idx}", hex::encode(info_hash)))?;
+        Ok(stream_url.into())
+    }
+
     pub fn session(&self) -> &Arc<Session> {
         &self.inner.session
     }
