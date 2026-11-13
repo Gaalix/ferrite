@@ -7,5 +7,6 @@ pub mod state;
 pub mod theme;
 pub mod updater;
 pub mod views;
+pub mod virtual_grid;
 
 pub type CoreRuntimeEventAlias = stremio_core_runtime::DesktopRuntimeEvent;

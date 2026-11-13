@@ -905,6 +905,7 @@ async fn core_controller_end_to_end_private_config_debrid_and_prowlarr() {
             prowlarr_url: prowl_base.to_string(),
             prowlarr_api_key: SecretApiKey::new("ctrl_prowl_secret_2222"),
             prowlarr_timeout_ms: 500, // clamped to 1000
+            ..Default::default()
         };
         controller.update_private_integrations(next).unwrap();
 

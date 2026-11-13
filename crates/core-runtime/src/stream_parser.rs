@@ -908,6 +908,70 @@ pub fn format_bytes(bytes: u64) -> String {
     format!("{trimmed} {unit}")
 }
 
+static RE_RUNTIME_HOURS_MINS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:^|[^a-z0-9])(\d+)\s*h(?:ours?|rs?)?(?:\s*(\d+)\s*m(?:ins?|inutes?)?)?(?:$|[^a-z0-9])")
+        .unwrap()
+});
+static RE_RUNTIME_HOURS_BARE_MINS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:^|[^a-z0-9])(\d+)\s*h(?:ours?|rs?)?\s*(\d+)(?:$|[^a-z0-9])").unwrap()
+});
+static RE_RUNTIME_MINS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:^|[^a-z0-9])(\d+)\s*m(?:ins?|inutes?)?(?:$|[^a-z0-9])").unwrap()
+});
+
+/// Parses runtime strings such as `"52 min"`, `"1h 42m"`, or `"102"` into total minutes.
+pub fn parse_runtime_minutes(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(plain) = trimmed.parse::<u32>() {
+        return (plain > 0).then_some(plain);
+    }
+
+    if let Some(caps) = RE_RUNTIME_HOURS_BARE_MINS.captures(trimmed) {
+        let hours = caps.get(1)?.as_str().parse::<u32>().ok()?;
+        let mins = caps.get(2)?.as_str().parse::<u32>().ok()?;
+        let total = hours.saturating_mul(60).saturating_add(mins);
+        return (total > 0).then_some(total);
+    }
+
+    if let Some(caps) = RE_RUNTIME_HOURS_MINS.captures(trimmed) {
+        let hours = caps.get(1)?.as_str().parse::<u32>().ok()?;
+        let mins = caps
+            .get(2)
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
+        let total = hours.saturating_mul(60).saturating_add(mins);
+        return (total > 0).then_some(total);
+    }
+
+    if let Some(caps) = RE_RUNTIME_MINS.captures(trimmed) {
+        let mins = caps.get(1)?.as_str().parse::<u32>().ok()?;
+        return (mins > 0).then_some(mins);
+    }
+
+    None
+}
+
+/// Estimates average stream bitrate in Mbps from file size in bytes and duration in minutes.
+pub fn estimate_bitrate_mbps(size_bytes: Option<u64>, duration_minutes: Option<u32>) -> Option<f64> {
+    let bytes = size_bytes.filter(|&b| b > 0)?;
+    let mins = duration_minutes.filter(|&m| m > 0)?;
+    let duration_secs = f64::from(mins) * 60.0;
+    let mbps = (bytes as f64 * 8.0) / (duration_secs * 1_000_000.0);
+    (mbps.is_finite() && mbps > 0.0).then_some(mbps)
+}
+
+/// Formats an estimated bitrate in Mbps for display (e.g. `"~24.8 Mbps"`).
+pub fn format_bitrate_mbps(mbps: f64) -> String {
+    if !mbps.is_finite() || mbps <= 0.0 {
+        return String::new();
+    }
+    format!("~{mbps:.1} Mbps")
+}
+
 fn normalize_debrid_code(raw: &str) -> String {
     let upper = raw.to_ascii_uppercase();
     match upper.as_str() {
@@ -1601,5 +1665,32 @@ mod tests {
         let ranked = filter_and_rank_streams(&combined, &StreamFilter::default());
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].1.resolution, Resolution::Fhd1080p);
+    }
+
+    #[test]
+    fn parses_runtime_minutes_and_estimates_bitrate_mbps() {
+        assert_eq!(parse_runtime_minutes("52 min"), Some(52));
+        assert_eq!(parse_runtime_minutes("52m"), Some(52));
+        assert_eq!(parse_runtime_minutes("1h 42m"), Some(102));
+        assert_eq!(parse_runtime_minutes("2h"), Some(120));
+        assert_eq!(parse_runtime_minutes("1 hr 15 min"), Some(75));
+        assert_eq!(parse_runtime_minutes("102"), Some(102));
+        assert_eq!(parse_runtime_minutes(" 45 "), Some(45));
+        assert_eq!(parse_runtime_minutes("0"), None);
+        assert_eq!(parse_runtime_minutes("0 min"), None);
+        assert_eq!(parse_runtime_minutes("N/A"), None);
+        assert_eq!(parse_runtime_minutes(""), None);
+
+        // ~18.6 GB over 100 minutes => (18_600_000_000 * 8) / (6000 * 1_000_000) = 24.8 Mbps
+        let mbps = estimate_bitrate_mbps(Some(18_600_000_000), Some(100)).unwrap();
+        assert!((mbps - 24.8).abs() < 0.001);
+        assert_eq!(format_bitrate_mbps(mbps), "~24.8 Mbps");
+
+        assert_eq!(estimate_bitrate_mbps(None, Some(100)), None);
+        assert_eq!(estimate_bitrate_mbps(Some(0), Some(100)), None);
+        assert_eq!(estimate_bitrate_mbps(Some(1_000_000), None), None);
+        assert_eq!(estimate_bitrate_mbps(Some(1_000_000), Some(0)), None);
+        assert_eq!(format_bitrate_mbps(0.0), "");
+        assert_eq!(format_bitrate_mbps(f64::NAN), "");
     }
 }

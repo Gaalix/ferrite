@@ -1,12 +1,15 @@
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use gpui::{
-    deferred, div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, Context,
-    FontWeight, MouseButton, ScrollDelta, ScrollEvent, SharedString, Window,
+    deferred, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb,
+    rgba, Context, FontWeight, MouseButton, ScrollDelta, ScrollEvent, SharedString, Window,
 };
 use stremio_core_runtime::stremio_core::{
     models::common::Loadable,
-    types::{addon::ResourceRequest, resource::Video, watched_bitfield::WatchedBitField},
+    types::{
+        addon::ResourceRequest, library::LibraryItem, resource::Video,
+        watched_bitfield::WatchedBitField,
+    },
 };
 
 use crate::{
@@ -21,14 +24,31 @@ use crate::{
         StreamResolutionChoice, STREAM_PAGE_SIZE,
     },
     theme::{
-        editorial_serif, format_timestamp_secs, glass_capsule_shadow, meta_divider, mono_font,
-        neutral_chip, placeholder_tint_for_id, poster_card_shadow, semantic_status_pill,
-        sentence_case_label, summarize_stream_for_humans, tabular_nums, ui_sans, ACCENT,
-        ACCENT_AMBER, ACCENT_HOVER, ACCENT_SOFT, BG_ELEVATED, BG_INPUT, BG_OBSIDIAN,
-        BG_POPOVER_GLASS, BG_SURFACE, BORDER_SOFT, BORDER_STRONG, BORDER_SUBTLE, STATUS_WATCHED,
-        STATUS_WATCHING, STATUS_WATCHLIST, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+        compact_audio_badge, compact_codec_badge, compact_hdr_badge, editorial_serif,
+        estimate_bitrate_mbps, format_bitrate_mbps, format_episode_air_date,
+        format_timestamp_secs, glass_capsule_shadow, meta_divider, mono_font,
+        parse_runtime_minutes, placeholder_tint_for_id, poster_card_shadow,
+        semantic_status_pill, sentence_case_label, summarize_stream_for_humans, tabular_nums,
+        ui_sans, ACCENT, ACCENT_AMBER, ACCENT_HOVER, ACCENT_SOFT, BG_ELEVATED, BG_INPUT,
+        BG_OBSIDIAN, BG_POPOVER_GLASS, BG_SURFACE, BORDER_SOFT, BORDER_STRONG, BORDER_SUBTLE,
+        STATUS_WATCHED, STATUS_WATCHING, STATUS_WATCHLIST, TEXT_MUTED, TEXT_PRIMARY,
+        TEXT_SECONDARY,
     },
 };
+
+#[derive(Clone)]
+struct EpisodeRowData {
+    video_id: String,
+    ep_code: String,
+    title: String,
+    thumb_url: Option<String>,
+    air_date: Option<String>,
+    runtime_label: Option<String>,
+    synopsis: Option<String>,
+    is_selected: bool,
+    is_watched: bool,
+    progress_fraction: Option<f32>,
+}
 
 impl AppShell {
     pub fn render_meta_details_view(
@@ -248,6 +268,25 @@ impl AppShell {
         let resume_secs = resume_offset_for_library_item(library_item.as_ref(), &active_video_id);
         let lib_status = library_item.as_ref().and_then(classify_library_item_status);
         let has_seasons = !seasons.is_empty();
+        let runtime_minutes = meta
+            .preview
+            .runtime
+            .as_deref()
+            .and_then(parse_runtime_minutes);
+        let seasons_panel = has_seasons.then(|| {
+            self.render_series_seasons_panel(
+                &meta.preview.r#type,
+                &meta.preview.id,
+                &seasons,
+                active_season,
+                &season_episodes,
+                &active_video_id,
+                meta.preview.runtime.as_deref(),
+                library_item.as_ref(),
+                watched.as_ref(),
+                cx,
+            )
+        });
 
         let primary_cta_label = match (&active_ep_code, resume_secs) {
             (Some(code), Some(_)) => format!("Continue {code}"),
@@ -702,24 +741,14 @@ impl AppShell {
                             .flex()
                             .items_start()
                             .gap(px(32.0))
-                            .when(has_seasons, |el| {
-                                el.child(self.render_series_seasons_panel(
-                                    &meta.preview.r#type,
-                                    &meta.preview.id,
-                                    &seasons,
-                                    active_season,
-                                    &season_episodes,
-                                    &active_video_id,
-                                    watched.as_ref(),
-                                    cx,
-                                ))
-                            })
+                            .when_some(seasons_panel, |el, panel| el.child(panel))
                             .child(self.render_stream_picker_panel(
                                 &meta.preview.r#type,
                                 &meta.preview.id,
                                 &active_video_id,
                                 &meta.preview.name,
                                 episode_header_label,
+                                runtime_minutes,
                                 meta_request,
                                 resume_secs,
                                 has_debrid,
@@ -1037,13 +1066,15 @@ impl AppShell {
 
     #[allow(clippy::too_many_arguments)]
     fn render_series_seasons_panel(
-        &self,
+        &mut self,
         type_name: &str,
         meta_id: &str,
         seasons: &[u32],
         active_season: Option<u32>,
         episodes: &[Video],
         active_video_id: &str,
+        series_runtime: Option<&str>,
+        library_item: Option<&LibraryItem>,
         watched: Option<&WatchedBitField>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1053,8 +1084,107 @@ impl AppShell {
             None => "Episodes".to_owned(),
         };
 
+        let runtime_label = series_runtime
+            .and_then(parse_runtime_minutes)
+            .map(|mins| format!("{mins}m"))
+            .or_else(|| {
+                series_runtime
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            });
+
+        let episode_rows: Vec<EpisodeRowData> = episodes
+            .iter()
+            .enumerate()
+            .map(|(idx, ep)| {
+                let is_selected = ep.id == active_video_id;
+                let is_watched = watched.is_some_and(|w| w.get_video(&ep.id));
+                let ep_code = ep
+                    .series_info
+                    .as_ref()
+                    .map(|s| format!("S{:02} E{:02}", s.season, s.episode))
+                    .unwrap_or_else(|| format!("E{:02}", idx + 1));
+                let title = if ep.title.trim().is_empty() {
+                    format!("Episode {}", idx + 1)
+                } else {
+                    ep.title.clone()
+                };
+                let thumb_url = ep
+                    .thumbnail
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        meta_id.starts_with("tt").then(|| {
+                            format!(
+                                "https://images.metahub.space/episode/medium/{meta_id}/{}/img",
+                                ep.id
+                            )
+                        })
+                    });
+                let air_date = ep.released.map(format_episode_air_date);
+                let synopsis = ep
+                    .overview
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let progress_fraction = if is_watched {
+                    Some(1.0)
+                } else if let Some(li) = library_item {
+                    if li.state.video_id.as_deref() == Some(ep.id.as_str())
+                        && li.state.time_offset > 0
+                        && li.state.duration > 0
+                    {
+                        Some(
+                            (li.state.time_offset as f32 / li.state.duration as f32)
+                                .clamp(0.02, 1.0),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                EpisodeRowData {
+                    video_id: ep.id.clone(),
+                    ep_code,
+                    title,
+                    thumb_url,
+                    air_date,
+                    runtime_label: runtime_label.clone(),
+                    synopsis,
+                    is_selected,
+                    is_watched,
+                    progress_fraction,
+                }
+            })
+            .collect();
+
+        let ep_count = episode_rows.len();
+        let scroll_key = (meta_id.to_owned(), active_video_id.to_owned());
+        if self.episode_list_scrolled_key.as_ref() != Some(&scroll_key) {
+            if let Some(active_idx) = episode_rows.iter().position(|row| row.is_selected) {
+                self.episode_list_scroll_handle
+                    .scroll_to_item(active_idx, gpui::ScrollStrategy::Center);
+            }
+            self.episode_list_scrolled_key = Some(scroll_key);
+        }
+
+        let episodes_arc = Arc::new(episode_rows);
+        let sel_type = type_name.to_owned();
+        let sel_id = meta_id.to_owned();
+        let list_height_px = if ep_count == 0 {
+            96.0
+        } else {
+            (ep_count as f32 * 112.0).min(560.0)
+        };
+
         div()
-            .w(px(400.0))
+            .w(px(468.0))
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -1076,7 +1206,7 @@ impl AppShell {
                             .font(mono_font())
                             .text_xs()
                             .text_color(rgb(TEXT_MUTED))
-                            .child(format!("{} episodes", episodes.len())),
+                            .child(format!("{ep_count} episodes")),
                     ),
             )
             .child(
@@ -1135,148 +1265,398 @@ impl AppShell {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     this.selected_season = Some(s_num);
+                                    this.episode_list_scroll_handle
+                                        .0
+                                        .borrow()
+                                        .base_handle
+                                        .set_offset(point(px(0.0), px(0.0)));
                                     cx.notify();
                                 }),
                             )
                             .child(label)
                     })),
             )
-            .child(
+            .child(if ep_count == 0 {
                 div()
-                    .id("episode-list-scroll")
-                    .max_h(px(560.0))
-                    .overflow_y_scroll()
+                    .w_full()
+                    .h(px(list_height_px))
                     .rounded(px(8.0))
                     .bg(rgb(BG_SURFACE))
                     .border_1()
                     .border_color(rgba(BORDER_SUBTLE))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child("No episodes listed for this season.")
+                    .into_any_element()
+            } else {
+                div()
+                    .w_full()
+                    .h(px(list_height_px))
+                    .flex()
+                    .flex_col()
                     .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .children(episodes.iter().enumerate().map(|(idx, ep)| {
-                                let is_selected = ep.id == active_video_id;
-                                let is_watched = watched.is_some_and(|w| w.get_video(&ep.id));
-                                let ep_code = ep
-                                    .series_info
-                                    .as_ref()
-                                    .map(|s| format!("S{} E{}", s.season, s.episode))
-                                    .unwrap_or_else(|| format!("E{}", idx + 1));
+                        gpui::uniform_list(
+                            "meta-season-episodes",
+                            ep_count,
+                            cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
+                                visible_rows
+                                    .map(|idx| {
+                                        let ep = &episodes_arc[idx];
+                                        let thumb_tex = ep.thumb_url.as_deref().and_then(|u| {
+                                            this.poster_cache.resolve_widescreen_image(u)
+                                        });
+                                        let click_type = sel_type.clone();
+                                        let click_id = sel_id.clone();
+                                        let click_vid = ep.video_id.clone();
+                                        let grp: SharedString =
+                                            format!("episode-card-grp-{idx}").into();
 
-                                let sel_type = type_name.to_owned();
-                                let sel_id = meta_id.to_owned();
-                                let sel_vid = ep.id.clone();
-
-                                div()
-                                    .id(("episode-row", idx))
-                                    .cursor_pointer()
-                                    .flex_shrink_0()
-                                    .px(px(16.0))
-                                    .py(px(13.0))
-                                    .when(idx > 0, |el| {
-                                        el.border_t_1().border_color(rgba(BORDER_SOFT))
-                                    })
-                                    .bg(if is_selected {
-                                        rgba(ACCENT_SOFT)
-                                    } else {
-                                        rgba(0x00000000)
-                                    })
-                                    .hover(|s| {
-                                        if is_selected {
-                                            s.bg(rgba(ACCENT_SOFT))
-                                        } else {
-                                            s.bg(rgb(BG_ELEVATED))
-                                        }
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(12.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.select_episode_for_streams(
-                                                sel_type.clone(),
-                                                sel_id.clone(),
-                                                sel_vid.clone(),
-                                                cx,
-                                            );
-                                        }),
-                                    )
-                                    .child(
                                         div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(14.0))
+                                            .w_full()
+                                            .h(px(112.0))
+                                            .pb(px(8.0))
                                             .child(
                                                 div()
-                                                    .w(px(50.0))
-                                                    .flex_shrink_0()
-                                                    .font(mono_font())
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_xs()
-                                                    .text_color(if is_selected {
+                                                    .id(("episode-row", idx))
+                                                    .group(grp.clone())
+                                                    .cursor_pointer()
+                                                    .w_full()
+                                                    .h(px(104.0))
+                                                    .p(px(9.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(if ep.is_selected {
+                                                        rgba(ACCENT_SOFT)
+                                                    } else {
+                                                        rgb(BG_SURFACE)
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if ep.is_selected {
                                                         rgb(ACCENT)
                                                     } else {
-                                                        rgb(TEXT_MUTED)
+                                                        rgba(BORDER_SUBTLE)
                                                     })
-                                                    .child(ep_code),
+                                                    .hover(|s| {
+                                                        if ep.is_selected {
+                                                            s.bg(rgba(ACCENT_SOFT))
+                                                        } else {
+                                                            s.bg(rgb(BG_ELEVATED))
+                                                                .border_color(rgba(BORDER_STRONG))
+                                                        }
+                                                    })
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(12.0))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.select_episode_for_streams(
+                                                                click_type.clone(),
+                                                                click_id.clone(),
+                                                                click_vid.clone(),
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(152.0))
+                                                            .h(px(86.0))
+                                                            .flex_shrink_0()
+                                                            .rounded(px(6.0))
+                                                            .overflow_hidden()
+                                                            .relative()
+                                                            .bg(rgb(placeholder_tint_for_id(
+                                                                &ep.video_id,
+                                                            )))
+                                                            .border_1()
+                                                            .border_color(rgba(BORDER_SOFT))
+                                                            .child(if let Some(tex) = thumb_tex {
+                                                                img(tex)
+                                                                    .size_full()
+                                                                    .object_fit(
+                                                                        gpui::ObjectFit::Cover,
+                                                                    )
+                                                                    .into_any_element()
+                                                            } else {
+                                                                div()
+                                                                    .size_full()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .font(mono_font())
+                                                                    .text_xs()
+                                                                    .text_color(rgb(TEXT_MUTED))
+                                                                    .child(ep.ep_code.clone())
+                                                                    .into_any_element()
+                                                            })
+                                                            .child(
+                                                                div()
+                                                                    .absolute()
+                                                                    .inset_0()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .bg(if ep.is_selected {
+                                                                        rgba(0x0b0b0d55)
+                                                                    } else {
+                                                                        rgba(0x00000000)
+                                                                    })
+                                                                    .opacity(if ep.is_selected {
+                                                                        1.0
+                                                                    } else {
+                                                                        0.0
+                                                                    })
+                                                                    .group_hover(grp, |s| {
+                                                                        s.opacity(1.0)
+                                                                            .bg(rgba(0x0b0b0d66))
+                                                                    })
+                                                                    .child(
+                                                                        div()
+                                                                            .w(px(28.0))
+                                                                            .h(px(28.0))
+                                                                            .rounded(px(999.0))
+                                                                            .bg(if ep.is_selected {
+                                                                                rgb(ACCENT)
+                                                                            } else {
+                                                                                rgba(0x141417e0)
+                                                                            })
+                                                                            .border_1()
+                                                                            .border_color(
+                                                                                if ep.is_selected {
+                                                                                    rgb(ACCENT)
+                                                                                } else {
+                                                                                    rgba(
+                                                                                        BORDER_STRONG,
+                                                                                    )
+                                                                                },
+                                                                            )
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .justify_center()
+                                                                            .child(svg_icon(
+                                                                                IconName::Play,
+                                                                                12.0,
+                                                                                if ep.is_selected {
+                                                                                    rgb(BG_OBSIDIAN)
+                                                                                } else {
+                                                                                    rgb(
+                                                                                        TEXT_PRIMARY,
+                                                                                    )
+                                                                                },
+                                                                            )),
+                                                                    ),
+                                                            )
+                                                            .when_some(
+                                                                ep.progress_fraction,
+                                                                |el, frac| {
+                                                                    let bar_color =
+                                                                        if ep.is_watched {
+                                                                            rgb(STATUS_WATCHED)
+                                                                        } else {
+                                                                            rgb(ACCENT)
+                                                                        };
+                                                                    el.child(
+                                                                        div()
+                                                                            .absolute()
+                                                                            .bottom_0()
+                                                                            .left_0()
+                                                                            .right_0()
+                                                                            .h(px(2.5))
+                                                                            .bg(rgba(0xffffff2e))
+                                                                            .child(
+                                                                                div()
+                                                                                    .h_full()
+                                                                                    .w(relative(
+                                                                                        frac,
+                                                                                    ))
+                                                                                    .bg(bar_color),
+                                                                            ),
+                                                                    )
+                                                                },
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.0))
+                                                            .h_full()
+                                                            .py(px(2.0))
+                                                            .flex()
+                                                            .flex_col()
+                                                            .justify_between()
+                                                            .child(
+                                                                div()
+                                                                    .w_full()
+                                                                    .min_w(px(0.0))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap(px(8.0))
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_shrink_0()
+                                                                            .px(px(6.0))
+                                                                            .py(px(1.5))
+                                                                            .rounded(px(4.0))
+                                                                            .bg(if ep.is_selected {
+                                                                                rgba(ACCENT_SOFT)
+                                                                            } else {
+                                                                                rgb(BG_ELEVATED)
+                                                                            })
+                                                                            .font(mono_font())
+                                                                            .font_weight(
+                                                                                FontWeight::SEMIBOLD,
+                                                                            )
+                                                                            .text_size(px(11.0))
+                                                                            .text_color(
+                                                                                if ep.is_selected {
+                                                                                    rgb(ACCENT)
+                                                                                } else {
+                                                                                    rgb(
+                                                                                        TEXT_SECONDARY,
+                                                                                    )
+                                                                                },
+                                                                            )
+                                                                            .child(
+                                                                                ep.ep_code.clone(),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_1()
+                                                                            .min_w(px(0.0))
+                                                                            .font(ui_sans(
+                                                                                FontWeight::BOLD,
+                                                                            ))
+                                                                            .text_size(px(13.5))
+                                                                            .text_color(rgb(
+                                                                                TEXT_PRIMARY,
+                                                                            ))
+                                                                            .truncate()
+                                                                            .child(
+                                                                                ep.title.clone(),
+                                                                            ),
+                                                                    )
+                                                                    .when(ep.is_watched, |row| {
+                                                                        row.child(
+                                                                            div()
+                                                                                .flex_shrink_0()
+                                                                                .px(px(7.0))
+                                                                                .py(px(2.0))
+                                                                                .rounded(px(999.0))
+                                                                                .bg(rgba(0x4ade801c))
+                                                                                .border_1()
+                                                                                .border_color(rgba(
+                                                                                    0x4ade804d,
+                                                                                ))
+                                                                                .flex()
+                                                                                .items_center()
+                                                                                .gap(px(4.0))
+                                                                                .text_size(px(10.5))
+                                                                                .font_weight(
+                                                                                    FontWeight::MEDIUM,
+                                                                                )
+                                                                                .text_color(rgb(
+                                                                                    STATUS_WATCHED,
+                                                                                ))
+                                                                                .child(svg_icon(
+                                                                                    IconName::Check,
+                                                                                    10.0,
+                                                                                    rgb(
+                                                                                        STATUS_WATCHED,
+                                                                                    ),
+                                                                                ))
+                                                                                .child("Watched"),
+                                                                        )
+                                                                    }),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .w_full()
+                                                                    .min_w(px(0.0))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap(px(8.0))
+                                                                    .text_xs()
+                                                                    .font_features(tabular_nums())
+                                                                    .text_color(rgb(TEXT_MUTED))
+                                                                    .when_some(
+                                                                        ep.air_date.clone(),
+                                                                        |row, date| {
+                                                                            row.child(
+                                                                                div()
+                                                                                    .font(mono_font())
+                                                                                    .text_size(px(
+                                                                                        11.0,
+                                                                                    ))
+                                                                                    .child(date),
+                                                                            )
+                                                                        },
+                                                                    )
+                                                                    .when_some(
+                                                                        ep.runtime_label.clone(),
+                                                                        |row, rt| {
+                                                                            row.child(
+                                                                                div()
+                                                                                    .px(px(6.0))
+                                                                                    .py(px(1.0))
+                                                                                    .rounded(px(
+                                                                                        4.0,
+                                                                                    ))
+                                                                                    .bg(rgb(
+                                                                                        BG_ELEVATED,
+                                                                                    ))
+                                                                                    .font(
+                                                                                        mono_font(),
+                                                                                    )
+                                                                                    .text_size(px(
+                                                                                        10.5,
+                                                                                    ))
+                                                                                    .text_color(rgb(
+                                                                                        TEXT_SECONDARY,
+                                                                                    ))
+                                                                                    .child(rt),
+                                                                            )
+                                                                        },
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .w_full()
+                                                                    .min_w(px(0.0))
+                                                                    .text_xs()
+                                                                    .text_color(
+                                                                        if ep.synopsis.is_some() {
+                                                                            rgb(TEXT_SECONDARY)
+                                                                        } else {
+                                                                            rgb(TEXT_MUTED)
+                                                                        },
+                                                                    )
+                                                                    .truncate()
+                                                                    .child(
+                                                                        ep.synopsis
+                                                                            .clone()
+                                                                            .unwrap_or_else(|| {
+                                                                                "No synopsis available."
+                                                                                    .to_owned()
+                                                                            }),
+                                                                    ),
+                                                            ),
+                                                    ),
                                             )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(0.0))
-                                                    .font(ui_sans(if is_selected {
-                                                        FontWeight::SEMIBOLD
-                                                    } else {
-                                                        FontWeight::MEDIUM
-                                                    }))
-                                                    .text_size(px(14.0))
-                                                    .text_color(rgb(TEXT_PRIMARY))
-                                                    .truncate()
-                                                    .child(if ep.title.trim().is_empty() {
-                                                        format!("Episode {}", idx + 1)
-                                                    } else {
-                                                        ep.title.clone()
-                                                    }),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(26.0))
-                                            .h(px(26.0))
-                                            .flex_shrink_0()
-                                            .rounded(px(999.0))
-                                            .bg(if is_watched {
-                                                rgb(STATUS_WATCHED)
-                                            } else {
-                                                rgba(0x00000000)
-                                            })
-                                            .border_1()
-                                            .border_color(if is_watched {
-                                                rgb(STATUS_WATCHED)
-                                            } else {
-                                                rgba(BORDER_SUBTLE)
-                                            })
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(svg_icon(
-                                                IconName::Check,
-                                                12.0,
-                                                if is_watched {
-                                                    rgb(BG_OBSIDIAN)
-                                                } else {
-                                                    rgb(TEXT_MUTED)
-                                                },
-                                            )),
-                                    )
-                            })),
-                    ),
-            )
+                                    })
+                                    .collect()
+                            }),
+                        )
+                        .track_scroll(&self.episode_list_scroll_handle)
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.0)),
+                    )
+                    .into_any_element()
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1287,6 +1667,7 @@ impl AppShell {
         active_video_id: &str,
         title: &str,
         episode_label: Option<String>,
+        runtime_minutes: Option<u32>,
         meta_request: ResourceRequest,
         resume_secs: Option<f64>,
         has_debrid: bool,
@@ -1783,6 +2164,30 @@ impl AppShell {
                             .map(|(row_pos, orig_idx)| {
                                 let cand = &all_playable_arc[orig_idx];
                                 let summary = summarize_stream_for_humans(&cand.parsed);
+                                let hdr_badge = compact_hdr_badge(cand.parsed.hdr);
+                                let audio_badge = compact_audio_badge(cand.parsed.audio);
+                                let codec_badge = compact_codec_badge(cand.parsed.codec);
+                                let release_group = cand
+                                    .parsed
+                                    .release_group
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned);
+                                let release_line = cand.raw_release_filename();
+                                let bitrate_text =
+                                    estimate_bitrate_mbps(cand.parsed.size_bytes, runtime_minutes)
+                                        .map(format_bitrate_mbps);
+                                let cache_or_peer_label = if cand.parsed.is_cached {
+                                    match cand.parsed.debrid_provider.as_deref() {
+                                        Some(p) if !p.is_empty() => format!("Cached · {p}"),
+                                        _ => "Cached".to_owned(),
+                                    }
+                                } else if let Some(seeds) = cand.parsed.seeders {
+                                    format!("{seeds} peers")
+                                } else {
+                                    summary.availability_text.clone()
+                                };
                                 let addon_display = summary.addon_label.or_else(|| {
                                     (!cand.addon_name.trim().is_empty())
                                         .then(|| cand.addon_name.clone())
@@ -1810,7 +2215,7 @@ impl AppShell {
                                             .id(("stream-row", orig_idx))
                                             .cursor_pointer()
                                             .px(px(18.0))
-                                            .py(px(14.0))
+                                            .py(px(13.0))
                                             .hover(|s| s.bg(rgb(BG_ELEVATED)))
                                             .flex()
                                             .items_center()
@@ -1842,64 +2247,157 @@ impl AppShell {
                                                     .flex_1()
                                                     .min_w(px(0.0))
                                                     .flex()
-                                                    .items_center()
-                                                    .gap(px(12.0))
-                                                    .child(svg_icon(
-                                                        IconName::Play,
-                                                        13.0,
-                                                        rgb(ACCENT),
-                                                    ))
+                                                    .flex_col()
+                                                    .gap(px(5.0))
                                                     .child(
                                                         div()
-                                                            .font(mono_font())
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_size(px(14.0))
-                                                            .text_color(rgb(TEXT_PRIMARY))
-                                                            .child(summary.resolution),
+                                                            .flex()
+                                                            .flex_wrap()
+                                                            .items_center()
+                                                            .gap(px(6.0))
+                                                            .child(svg_icon(
+                                                                IconName::Play,
+                                                                12.5,
+                                                                rgb(ACCENT),
+                                                            ))
+                                                            .child(
+                                                                div()
+                                                                    .font(mono_font())
+                                                                    .font_weight(FontWeight::BOLD)
+                                                                    .text_size(px(13.5))
+                                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                                    .child(summary.resolution),
+                                                            )
+                                                            .when_some(hdr_badge, |el, hdr| {
+                                                                el.child(render_stream_spec_badge(
+                                                                    hdr,
+                                                                    Some(ACCENT),
+                                                                ))
+                                                            })
+                                                            .when_some(audio_badge, |el, aud| {
+                                                                el.child(render_stream_spec_badge(
+                                                                    aud, None,
+                                                                ))
+                                                            })
+                                                            .child(
+                                                                div()
+                                                                    .px(px(7.0))
+                                                                    .py(px(2.0))
+                                                                    .rounded(px(999.0))
+                                                                    .bg(if cand.parsed.is_cached {
+                                                                        rgba(0x4ade801c)
+                                                                    } else {
+                                                                        rgb(BG_ELEVATED)
+                                                                    })
+                                                                    .border_1()
+                                                                    .border_color(
+                                                                        if cand.parsed.is_cached {
+                                                                            rgba(0x4ade804d)
+                                                                        } else {
+                                                                            rgba(BORDER_SUBTLE)
+                                                                        },
+                                                                    )
+                                                                    .font(mono_font())
+                                                                    .text_size(px(11.0))
+                                                                    .text_color(
+                                                                        if cand.parsed.is_cached {
+                                                                            rgb(STATUS_WATCHED)
+                                                                        } else {
+                                                                            rgb(TEXT_SECONDARY)
+                                                                        },
+                                                                    )
+                                                                    .child(cache_or_peer_label),
+                                                            )
+                                                            .when_some(codec_badge, |el, codec| {
+                                                                el.child(render_stream_spec_badge(
+                                                                    codec, None,
+                                                                ))
+                                                            })
+                                                            .when_some(
+                                                                addon_display,
+                                                                |el, addon| {
+                                                                    el.child(
+                                                                        div()
+                                                                            .min_w(px(0.0))
+                                                                            .text_xs()
+                                                                            .text_color(rgb(
+                                                                                TEXT_MUTED,
+                                                                            ))
+                                                                            .truncate()
+                                                                            .child(addon),
+                                                                    )
+                                                                },
+                                                            ),
                                                     )
-                                                    .when_some(summary.hdr_label, |el, hdr| {
-                                                        el.child(neutral_chip(hdr))
-                                                    })
-                                                    .when_some(summary.notable_audio, |el, aud| {
-                                                        el.child(neutral_chip(aud))
-                                                    })
-                                                    .when_some(addon_display, |el, addon| {
-                                                        el.child(
-                                                            div()
-                                                                .min_w(px(0.0))
-                                                                .text_xs()
-                                                                .text_color(rgb(TEXT_MUTED))
-                                                                .truncate()
-                                                                .child(addon),
-                                                        )
-                                                    }),
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .min_w(px(0.0))
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap(px(6.0))
+                                                            .when_some(
+                                                                release_group,
+                                                                |el, group| {
+                                                                    el.child(
+                                                                        div()
+                                                                            .flex_shrink_0()
+                                                                            .font(mono_font())
+                                                                            .text_size(px(11.0))
+                                                                            .text_color(rgb(
+                                                                                TEXT_SECONDARY,
+                                                                            ))
+                                                                            .child(format!(
+                                                                                "[{group}]"
+                                                                            )),
+                                                                    )
+                                                                },
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_w(px(0.0))
+                                                                    .font(mono_font())
+                                                                    .text_size(px(11.5))
+                                                                    .text_color(rgb(TEXT_MUTED))
+                                                                    .truncate()
+                                                                    .text_ellipsis()
+                                                                    .child(release_line),
+                                                            ),
+                                                    ),
                                             )
                                             .child(
                                                 div()
                                                     .flex_shrink_0()
                                                     .flex()
                                                     .items_center()
-                                                    .gap(px(16.0))
-                                                    .child(
-                                                        div()
-                                                            .font(mono_font())
-                                                            .text_xs()
-                                                            .text_color(if cand.parsed.is_cached {
-                                                                rgb(STATUS_WATCHED)
-                                                            } else {
-                                                                rgb(TEXT_SECONDARY)
-                                                            })
-                                                            .child(summary.availability_text),
-                                                    )
+                                                    .gap(px(12.0))
+                                                    .when_some(bitrate_text, |el, br| {
+                                                        el.child(
+                                                            div()
+                                                                .px(px(7.0))
+                                                                .py(px(2.0))
+                                                                .rounded(px(4.0))
+                                                                .bg(rgb(BG_ELEVATED))
+                                                                .border_1()
+                                                                .border_color(rgba(BORDER_SUBTLE))
+                                                                .font(mono_font())
+                                                                .font_features(tabular_nums())
+                                                                .text_size(px(11.0))
+                                                                .text_color(rgb(TEXT_SECONDARY))
+                                                                .child(br),
+                                                        )
+                                                    })
                                                     .when_some(summary.size_text, |el, sz| {
                                                         el.child(
                                                             div()
-                                                                .w(px(72.0))
+                                                                .w(px(74.0))
                                                                 .flex()
                                                                 .justify_end()
                                                                 .font(mono_font())
+                                                                .font_features(tabular_nums())
                                                                 .text_xs()
-                                                                .text_color(rgb(TEXT_SECONDARY))
+                                                                .text_color(rgb(TEXT_PRIMARY))
                                                                 .child(sz),
                                                         )
                                                     })
@@ -2088,6 +2586,23 @@ impl AppShell {
                     .into_any_element()
             })
     }
+}
+
+fn render_stream_spec_badge(
+    label: impl Into<SharedString>,
+    accent_fg: Option<u32>,
+) -> impl IntoElement {
+    div()
+        .px(px(7.0))
+        .py(px(2.0))
+        .rounded(px(999.0))
+        .bg(rgb(BG_ELEVATED))
+        .border_1()
+        .border_color(rgba(BORDER_SUBTLE))
+        .font(mono_font())
+        .text_size(px(11.0))
+        .text_color(rgb(accent_fg.unwrap_or(TEXT_PRIMARY)))
+        .child(label.into())
 }
 
 fn render_stream_filter_toggle(

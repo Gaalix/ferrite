@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
 
@@ -63,6 +63,10 @@ use crate::{
         LocalDebridProvider, PrivateIntegrationsConfig, ProwlarrFallbackMode,
     },
     prowlarr::{ProwlarrClient, ProwlarrTestResult, RichStreamItem},
+    subtitles::{
+        FetchedNativeSubtitle, NativeSubtitleClient, NativeSubtitleEndpoints, NativeSubtitleQuery,
+        SubtitleAlignmentResult, SubtitleSyncAligner,
+    },
     track_prefs::{
         delete_series_track_pref, load_all_series_track_prefs, load_series_track_pref,
         store_series_track_pref, SeriesTrackPreference,
@@ -93,6 +97,7 @@ pub struct CoreController {
     private_config_path: PathBuf,
     debrid_resolver: Arc<LocalDebridResolver>,
     prowlarr_client: Arc<ProwlarrClient>,
+    native_subtitles: NativeSubtitleClient,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -126,6 +131,22 @@ impl CoreController {
         let http_client = DesktopEnv::http_client()?;
         let runtime_handle = DesktopEnv::runtime_handle()?;
         let private_config_path = DesktopEnv::private_config_path()?;
+        let data_dir = DesktopEnv::storage_path()
+            .ok()
+            .filter(|p| p != Path::new(":memory:"))
+            .and_then(|p| {
+                p.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+            })
+            .or_else(|| {
+                private_config_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("ferrite"));
+        let native_subtitles = NativeSubtitleClient::new(data_dir.join("native_subtitles"));
         let loaded_private_config =
             match PrivateIntegrationsConfig::load_from_path(&private_config_path) {
                 Ok(cfg) => cfg,
@@ -166,6 +187,7 @@ impl CoreController {
             private_config_path,
             debrid_resolver: Arc::new(LocalDebridResolver::new()),
             prowlarr_client: Arc::new(ProwlarrClient::new()),
+            native_subtitles,
         })
     }
 
@@ -1389,6 +1411,88 @@ impl CoreController {
             .await
             .map_err(|err| format!("Prowlarr search task failed: {err}"))?
     }
+
+    pub fn set_native_subtitle_endpoints(&self, endpoints: NativeSubtitleEndpoints) {
+        self.native_subtitles.set_endpoints(endpoints);
+    }
+
+    pub async fn search_and_fetch_native_subtitles(
+        &self,
+        query: NativeSubtitleQuery,
+        max_downloads: usize,
+    ) -> Vec<FetchedNativeSubtitle> {
+        let cfg = self.private_integrations();
+        if !cfg.native_subtitles_enabled || max_downloads == 0 {
+            return Vec::new();
+        }
+        let os_key = {
+            let k = cfg.opensubtitles_api_key.expose();
+            (!k.is_empty()).then(|| k.to_owned())
+        };
+        let subdl_key = {
+            let k = cfg.subdl_api_key.expose();
+            (!k.is_empty()).then(|| k.to_owned())
+        };
+        let client = self.native_subtitles.clone();
+
+        self.runtime_handle
+            .spawn(async move {
+                client
+                    .search_and_fetch(
+                        &query,
+                        os_key.as_deref(),
+                        subdl_key.as_deref(),
+                        max_downloads,
+                    )
+                    .await
+            })
+            .await
+            .unwrap_or_default()
+    }
+
+    pub fn align_subtitle_to_reference(
+        &self,
+        target_path: &Path,
+        reference_path: &Path,
+    ) -> Result<(PathBuf, SubtitleAlignmentResult), String> {
+        let target_cues = SubtitleSyncAligner::parse_subtitle_file(target_path)?;
+        let reference_cues = SubtitleSyncAligner::parse_subtitle_file(reference_path)?;
+        let alignment = SubtitleSyncAligner::solve_subtitle_alignment(&target_cues, &reference_cues);
+
+        let ext = target_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .filter(|e| matches!(e.as_str(), "srt" | "ass" | "ssa" | "vtt"))
+            .unwrap_or_else(|| "srt".to_owned());
+        let stem_raw = target_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("subtitle");
+        let sanitized_stem: String = stem_raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(40)
+            .collect();
+        let stem = if sanitized_stem.is_empty() {
+            "subtitle"
+        } else {
+            &sanitized_stem
+        };
+        let out_path = self
+            .native_subtitles
+            .cache_dir()
+            .join(format!("{stem}.aligned.{ext}"));
+
+        SubtitleSyncAligner::write_aligned_subtitle_file(
+            target_path,
+            &out_path,
+            alignment.offset_ms,
+            alignment.drift_ratio,
+        )?;
+
+        Ok((out_path, alignment))
+    }
 }
 
 fn persist_profile_snapshot(
@@ -1423,5 +1527,126 @@ fn compute_addon_side_effects(model: &DesktopModel) -> AddonMutationSideEffects 
         has_auth,
         board_loaded,
         discover_needs_reload,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn controller_fetches_native_subtitles_and_aligns_to_reference() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("storage.db");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let base_clone = base.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, ctype, body) = if path.starts_with("/osv3/subtitles/") {
+                        let json = serde_json::json!({
+                            "subtitles": [{
+                                "id": "sub1",
+                                "url": format!("{base_clone}/dl/sub1.srt"),
+                                "lang": "eng",
+                                "SubFileName": "Film.2025.1080p.NF.WEB-DL-GRP.srt"
+                            }]
+                        });
+                        ("200 OK", "application/json", json.to_string())
+                    } else if path == "/dl/sub1.srt" {
+                        (
+                            "200 OK",
+                            "text/plain",
+                            "1\n00:00:05,000 --> 00:00:07,000\nLine one\n\n2\n00:00:10,000 --> 00:00:12,000\nLine two\n\n3\n00:00:15,000 --> 00:00:17,000\nLine three\n".to_owned(),
+                        )
+                    } else {
+                        ("404 Not Found", "text/plain", "nope".to_owned())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        DesktopEnv::run_isolated(EnvConfig::with_storage_path(&db_path), async move {
+            let controller = CoreController::from_initialized_env().await.unwrap();
+            controller.set_native_subtitle_endpoints(NativeSubtitleEndpoints {
+                opensubtitles_v3_base: format!("http://{addr}/osv3"),
+                opensubtitles_api_base: format!("http://{addr}/osapi"),
+                subdl_api_base: format!("http://{addr}/subdl"),
+                subdl_dl_base: format!("http://{addr}/subdl-dl"),
+            });
+
+            let query = NativeSubtitleQuery {
+                imdb_id: "tt1234567".to_owned(),
+                media_type: "movie".to_owned(),
+                video_filename: Some("Film.2025.1080p.NF.WEB-DL-GRP.mkv".to_owned()),
+                preferred_langs: vec!["eng".to_owned()],
+                ..Default::default()
+            };
+
+            let fetched = controller
+                .search_and_fetch_native_subtitles(query.clone(), 3)
+                .await;
+            assert_eq!(fetched.len(), 1);
+            assert!(fetched[0]
+                .local_path
+                .starts_with(dir.path().join("native_subtitles")));
+
+            // Create a reference subtitle shifted by -2000ms relative to target
+            let ref_path = dir.path().join("reference.srt");
+            std::fs::write(
+                &ref_path,
+                "1\n00:00:03,000 --> 00:00:05,000\nRef one\n\n2\n00:00:08,000 --> 00:00:10,000\nRef two\n\n3\n00:00:13,000 --> 00:00:15,000\nRef three\n",
+            )
+            .unwrap();
+
+            let (aligned_path, alignment) = controller
+                .align_subtitle_to_reference(&fetched[0].local_path, &ref_path)
+                .unwrap();
+            assert_eq!(alignment.offset_ms, -2_000);
+            assert!(aligned_path.exists());
+            let aligned_txt = std::fs::read_to_string(&aligned_path).unwrap();
+            assert!(aligned_txt.contains("00:00:03,000 --> 00:00:05,000"));
+
+            // Disabled via PrivateIntegrationsConfig returns empty
+            let mut cfg = controller.private_integrations();
+            cfg.native_subtitles_enabled = false;
+            controller.update_private_integrations(cfg).unwrap();
+            let disabled = controller
+                .search_and_fetch_native_subtitles(query, 3)
+                .await;
+            assert!(disabled.is_empty());
+        })
+        .await
+        .unwrap();
+
+        server.abort();
     }
 }

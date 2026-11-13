@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use gpui::{
-    deferred, div, prelude::*, px, rgb, rgba, Context, FontWeight, MouseButton, SharedString,
-    Window,
+    deferred, div, point, prelude::*, px, rgb, rgba, Context, FontWeight, MouseButton,
+    SharedString, Window,
 };
 use stremio_core_runtime::{
     resolve_addon_for_request_base,
@@ -28,10 +28,15 @@ use crate::{
         BORDER_POSTER_HOVER, BORDER_SOFT, BORDER_STRONG, BORDER_SUBTLE, TEXT_MUTED, TEXT_PRIMARY,
         TEXT_SECONDARY,
     },
+    virtual_grid::{compute_poster_grid_columns, slice_row_items, VirtualGridLayout},
 };
 
 impl AppShell {
-    pub fn render_discover_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub fn render_discover_view(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let (
             types,
             catalogs,
@@ -134,11 +139,24 @@ impl AppShell {
         let cat_search_focused = self.focused_input == Some(FocusedInput::DiscoverCatalogSearch);
         let total_catalogs_count = enriched_catalogs.len();
         let loaded_titles_count = items.len();
+        let viewport_w = f32::from(window.viewport_size().width);
+        let columns = if viewport_w > 0.0 && viewport_w.is_finite() {
+            compute_poster_grid_columns(viewport_w.min(1440.0), 0.0, 64.0, 176.0, 18.0)
+        } else {
+            6
+        };
+        let items_arc = Arc::new(items);
+        let statuses_arc = Arc::new(library_statuses);
+        let total_items = items_arc.len();
+        let row_count = VirtualGridLayout::new(total_items, columns, 336.0).row_count;
 
         div()
-            .id("discover-view-scroll")
-            .size_full()
-            .overflow_y_scroll()
+            .id("discover-view-root")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -162,13 +180,15 @@ impl AppShell {
                     .max_w(px(1440.0))
                     .mx_auto()
                     .px(px(32.0))
-                    .pt(px(32.0))
-                    .pb(px(72.0))
+                    .pt(px(28.0))
+                    .flex_1()
+                    .min_h(px(0.0))
                     .flex()
                     .flex_col()
-                    .gap(px(28.0))
+                    .gap(px(20.0))
                     .child(
                         div()
+                            .flex_shrink_0()
                             .flex()
                             .items_end()
                             .justify_between()
@@ -205,6 +225,7 @@ impl AppShell {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .px(px(16.0))
                             .py(px(12.0))
                             .rounded(px(10.0))
@@ -302,8 +323,13 @@ impl AppShell {
                                                                                         selected,
                                                                                         cx.listener(
                                                                                             move |this, _, _, cx| {
-                                                                                                this.discover_open_dropdown =
+                                                                                                 this.discover_open_dropdown =
                                                                                                     None;
+                                                                                                this.discover_grid_scroll_handle
+                                                                                                    .0
+                                                                                                    .borrow()
+                                                                                                    .base_handle
+                                                                                                    .set_offset(point(px(0.0), px(0.0)));
                                                                                                 this.core.load_discover(
                                                                                                     Some(
                                                                                                         CatalogWithFiltersSelected {
@@ -569,6 +595,11 @@ impl AppShell {
                                                                                                                 },
                                                                                                             ),
                                                                                                         );
+                                                                                                        this.discover_grid_scroll_handle
+                                                                                                            .0
+                                                                                                            .borrow()
+                                                                                                            .base_handle
+                                                                                                            .set_offset(point(px(0.0), px(0.0)));
                                                                                                         cx.notify();
                                                                                                     },
                                                                                                 ),
@@ -685,6 +716,11 @@ impl AppShell {
                                                                                                       cx| {
                                                                                                     this.discover_open_dropdown =
                                                                                                         None;
+                                                                                                    this.discover_grid_scroll_handle
+                                                                                                        .0
+                                                                                                        .borrow()
+                                                                                                        .base_handle
+                                                                                                        .set_offset(point(px(0.0), px(0.0)));
                                                                                                     this.core
                                                                                                         .load_discover(
                                                                                                             Some(
@@ -822,6 +858,11 @@ impl AppShell {
                                                                                                   cx| {
                                                                                                 this.discover_open_dropdown =
                                                                                                     None;
+                                                                                                this.discover_grid_scroll_handle
+                                                                                                    .0
+                                                                                                    .borrow()
+                                                                                                    .base_handle
+                                                                                                    .set_offset(point(px(0.0), px(0.0)));
                                                                                                 this.core
                                                                                                     .load_discover(
                                                                                                         Some(
@@ -861,63 +902,65 @@ impl AppShell {
                             ),
                     )
                     .child(
-                        div()
-                            .w_full()
-                            .grid()
-                            .grid_cols(6)
-                            .gap(px(18.0))
-                            .children(items.into_iter().enumerate().map(|(idx, item)| {
-                                let st = library_statuses.get(&item.id).copied();
-                                self.render_movietracker_poster_card(
-                                    ("discover-card", idx),
-                                    format!("discover-grp-{idx}"),
-                                    item,
-                                    st,
-                                    cx,
-                                )
-                            })),
-                    )
-                    .when(has_next_page, |el| {
-                        el.child(
-                            div()
-                                .pt(px(12.0))
-                                .flex()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .id("discover-load-next-page")
-                                        .cursor_pointer()
-                                        .h(px(40.0))
-                                        .px(px(22.0))
-                                        .rounded(px(999.0))
-                                        .bg(rgb(BG_SURFACE))
-                                        .border_1()
-                                        .border_color(rgba(BORDER_SUBTLE))
-                                        .hover(|s| {
-                                            s.bg(rgb(BG_ELEVATED))
-                                                .border_color(rgb(ACCENT))
-                                                .text_color(rgb(ACCENT))
-                                        })
-                                        .flex()
-                                        .items_center()
-                                        .font(ui_sans(FontWeight::MEDIUM))
-                                        .text_size(px(13.5))
-                                        .text_color(rgb(TEXT_PRIMARY))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, _cx| {
-                                                this.core.dispatch(
-                                                    Action::CatalogWithFilters(
-                                                        ActionCatalogWithFilters::LoadNextPage,
-                                                    ),
-                                                    Some(DesktopModelField::Discover),
-                                                );
-                                            }),
-                                        )
-                                        .child("Load more titles"),
-                                ),
+                        gpui::uniform_list(
+                            "discover-poster-grid",
+                            row_count,
+                            cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
+                                if row_count > 0
+                                    && visible_rows.end + 2 >= row_count
+                                    && has_next_page
+                                    && !is_loading
+                                {
+                                    this.core.dispatch(
+                                        Action::CatalogWithFilters(
+                                            ActionCatalogWithFilters::LoadNextPage,
+                                        ),
+                                        Some(DesktopModelField::Discover),
+                                    );
+                                }
+
+                                visible_rows
+                                    .map(|row_idx| {
+                                        let range = slice_row_items(total_items, columns, row_idx);
+                                        let empty_slots = columns.saturating_sub(range.len());
+
+                                        div()
+                                            .id(("discover-row", row_idx))
+                                            .w_full()
+                                            .h(px(336.0))
+                                            .pb(px(16.0))
+                                            .flex()
+                                            .items_start()
+                                            .gap(px(18.0))
+                                            .children(range.map(|item_idx| {
+                                                let item = items_arc[item_idx].clone();
+                                                let st = statuses_arc.get(&item.id).copied();
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .h_full()
+                                                    .overflow_hidden()
+                                                    .child(this.render_movietracker_poster_card(
+                                                        ("discover-card", item_idx),
+                                                        format!("discover-grp-{item_idx}"),
+                                                        item,
+                                                        st,
+                                                        cx,
+                                                    ))
+                                            }))
+                                            .children(
+                                                (0..empty_slots)
+                                                    .map(|_| div().flex_1().min_w(px(0.0))),
+                                            )
+                                    })
+                                    .collect()
+                            }),
                         )
-                    }),
+                        .track_scroll(&self.discover_grid_scroll_handle)
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.0)),
+                    ),
             )
     }
 }
