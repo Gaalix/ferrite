@@ -2260,6 +2260,38 @@ impl MpvController {
         Ok(())
     }
 
+    fn supports_sub_border_style(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        if self.inner.terminated.load(Ordering::Acquire) {
+            return false;
+        }
+        let mpv_guard = self
+            .inner
+            .mpv_slot
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(mpv_raw) = *mpv_guard else {
+            return false;
+        };
+        *SUPPORTED.get_or_init(|| {
+            let mut out_ptr: *mut c_char = ptr::null_mut();
+            let rc = unsafe {
+                mpv_get_property(
+                    mpv_raw.0,
+                    c"sub-border-style".as_ptr(),
+                    MPV_FORMAT_STRING,
+                    &mut out_ptr as *mut *mut c_char as *mut c_void,
+                )
+            };
+            if !out_ptr.is_null() {
+                unsafe {
+                    mpv_ffi::mpv_free(out_ptr as *mut c_void);
+                }
+            }
+            rc >= 0
+        })
+    }
+
     fn apply_subtitle_style(&self, style: &SubtitleStyle) -> Result<(), MpvError> {
         self.set_property_double("sub-font-size", f64::from(style.font_size))?;
         self.set_property_double(
@@ -2272,9 +2304,12 @@ impl MpvController {
         self.set_property_string("sub-color", &style.color_hex)?;
         self.set_property_string("sub-ass-override", style.ass_override.as_mpv_str())?;
 
+        let has_border_style = self.supports_sub_border_style();
         match style.background {
             SubtitleBackgroundMode::DropShadow => {
-                self.set_property_string("sub-border-style", "outline-and-shadow")?;
+                if has_border_style {
+                    self.set_property_string("sub-border-style", "outline-and-shadow")?;
+                }
                 self.set_property_string("sub-back-color", "#00000000")?;
                 self.set_property_double("sub-border-size", 2.0_f64)?;
                 self.set_property_string("sub-border-color", "#E008080A")?;
@@ -2282,14 +2317,19 @@ impl MpvController {
                 self.set_property_string("sub-shadow-color", "#C0000000")?;
             }
             SubtitleBackgroundMode::Outline => {
-                self.set_property_string("sub-border-style", "outline-and-shadow")?;
+                if has_border_style {
+                    self.set_property_string("sub-border-style", "outline-and-shadow")?;
+                }
                 self.set_property_string("sub-back-color", "#00000000")?;
                 self.set_property_double("sub-border-size", 3.2_f64)?;
                 self.set_property_string("sub-border-color", "#F008080A")?;
                 self.set_property_double("sub-shadow-offset", 0.0_f64)?;
+                self.set_property_string("sub-shadow-color", "#00000000")?;
             }
             SubtitleBackgroundMode::TranslucentPill => {
-                self.set_property_string("sub-border-style", "background-box")?;
+                if has_border_style {
+                    self.set_property_string("sub-border-style", "background-box")?;
+                }
                 self.set_property_string("sub-back-color", "#B8141417")?;
                 self.set_property_double("sub-border-size", 6.0_f64)?;
                 self.set_property_string("sub-border-color", "#00000000")?;
@@ -4820,9 +4860,19 @@ mod tests {
             ..SubtitleStyle::default()
         })
         .expect("apply outline subtitle style");
+        if ctrl.supports_sub_border_style() {
+            assert_eq!(
+                wait_mpv_string_prop(&ctrl, "sub-border-style", "outline-and-shadow"),
+                "outline-and-shadow"
+            );
+        }
         assert_eq!(
-            wait_mpv_string_prop(&ctrl, "sub-border-style", "outline-and-shadow"),
-            "outline-and-shadow"
+            wait_mpv_string_prop(&ctrl, "sub-back-color", "#00000000"),
+            "#00000000"
+        );
+        assert_eq!(
+            wait_mpv_string_prop(&ctrl, "sub-border-color", "#F008080A"),
+            "#F008080A"
         );
         assert!((wait_mpv_double_prop(&ctrl, "sub-border-size", 3.2) - 3.2).abs() < 0.05);
         assert!((wait_mpv_double_prop(&ctrl, "sub-shadow-offset", 0.0) - 0.0).abs() < 0.05);
