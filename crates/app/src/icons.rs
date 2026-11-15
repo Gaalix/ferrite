@@ -54,10 +54,14 @@ pub enum IconName {
     Clipboard,
     Trash2,
     FolderOpen,
+    Replay10,
+    Forward10,
+    ClosedCaption,
+    FileText,
 }
 
 impl IconName {
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 54] = [
         Self::Home,
         Self::Compass,
         Self::Bookmark,
@@ -108,6 +112,10 @@ impl IconName {
         Self::Clipboard,
         Self::Trash2,
         Self::FolderOpen,
+        Self::Replay10,
+        Self::Forward10,
+        Self::ClosedCaption,
+        Self::FileText,
     ];
 
     pub const fn path(self) -> &'static str {
@@ -162,6 +170,10 @@ impl IconName {
             Self::Clipboard => "icons/clipboard.svg",
             Self::Trash2 => "icons/trash-2.svg",
             Self::FolderOpen => "icons/folder-open.svg",
+            Self::Replay10 => "icons/replay-10.svg",
+            Self::Forward10 => "icons/forward-10.svg",
+            Self::ClosedCaption => "icons/closed-caption.svg",
+            Self::FileText => "icons/file-text.svg",
         }
     }
 
@@ -217,6 +229,10 @@ impl IconName {
             Self::Clipboard => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>"#,
             Self::Trash2 => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>"#,
             Self::FolderOpen => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>"#,
+            Self::Replay10 => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M9.5 10.5 10.8 9.5v5.5"/><rect x="12.6" y="9.5" width="3.2" height="5.5" rx="1.6"/></svg>"#,
+            Self::Forward10 => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M9.5 10.5 10.8 9.5v5.5"/><rect x="12.6" y="9.5" width="3.2" height="5.5" rx="1.6"/></svg>"#,
+            Self::ClosedCaption => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M10.5 9.8a2.4 2.4 0 0 0-3.8 1.9v.6a2.4 2.4 0 0 0 3.8 1.9"/><path d="M17.3 9.8a2.4 2.4 0 0 0-3.8 1.9v.6a2.4 2.4 0 0 0 3.8 1.9"/></svg>"#,
+            Self::FileText => br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>"#,
         }
     }
 }
@@ -264,7 +280,7 @@ mod tests {
         let assets = EmbeddedIconAssets;
         let listed = assets.list("icons").expect("list icons");
         assert_eq!(listed.len(), IconName::ALL.len());
-        assert!(listed.len() >= 30);
+        assert_eq!(listed.len(), 54);
 
         for icon in IconName::ALL {
             let raw = assets

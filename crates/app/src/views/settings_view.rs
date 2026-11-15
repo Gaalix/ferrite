@@ -1506,11 +1506,7 @@ impl AppShell {
                     "#FFFFFF" => "Pure White #FFFFFF",
                     other => other,
                 };
-                let backdrop = if prefs.subtitle_background_pill {
-                    "Translucent Pill"
-                } else {
-                    "Drop Shadow"
-                };
+                let backdrop = prefs.effective_subtitle_background().label();
                 let summary = format!(
                     "{color_name} · {backdrop} · {}px · {}%",
                     prefs.subtitle_font_size, prefs.subtitle_vertical_pos

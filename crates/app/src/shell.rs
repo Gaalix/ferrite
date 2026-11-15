@@ -56,8 +56,8 @@ use crate::{
         LibrarySortOrder, LibraryStatusTab, LibraryTypeFilter, MemoizedMetaStreams,
         NativeSubtitleMatchState, NativeSubtitleMatchStatus, PlaybackCandidate, PlaybackSession,
         PlayerPopover, SettingsCategory, SettingsDropdown, SidebarTab, StorageModeChoice,
-        StreamFilterState, ToastKind, ToastMessage, ToneMappingChoice, UpscaleChoice,
-        LIBRARY_PAGE_SIZE, MAX_AUTO_FAILOVER_ATTEMPTS, STREAM_PAGE_SIZE,
+        StreamFilterState, SubtitleBackgroundChoice, ToastKind, ToastMessage, ToneMappingChoice,
+        UpscaleChoice, LIBRARY_PAGE_SIZE, MAX_AUTO_FAILOVER_ATTEMPTS, STREAM_PAGE_SIZE,
     },
     theme::{
         editorial_serif, glass_capsule_shadow, keycap, movietracker_mark, obsidian_fade_in,
@@ -2822,7 +2822,12 @@ impl AppShell {
 
     pub fn toggle_player_popover(&mut self, pop: PlayerPopover, cx: &mut Context<Self>) {
         self.last_osd_activity = Instant::now();
-        if self.player_popover == Some(pop) {
+        let same_family = self.player_popover.is_some_and(|cur| {
+            cur == pop
+                || (pop == PlayerPopover::AudioAndSubtitles && cur.is_audio_subs_family())
+                || (pop == PlayerPopover::PictureAndPlayback && cur.is_picture_playback_family())
+        });
+        if same_family {
             self.player_popover = None;
             self.schedule_osd_autohide_timer(cx);
         } else {
@@ -2925,12 +2930,11 @@ impl AppShell {
     }
 
     pub fn set_playback_speed_user(&mut self, speed: f64, cx: &mut Context<Self>) {
+        self.bump_player_osd_activity(cx);
         self.playback_speed = speed.clamp(0.25, 4.0);
         if let Some(mpv) = &self.mpv {
             let _ = mpv.set_speed(self.playback_speed);
         }
-        self.player_popover = None;
-        self.schedule_osd_autohide_timer(cx);
         cx.notify();
     }
 
@@ -3155,9 +3159,23 @@ impl AppShell {
         self.update_subtitle_style_prefs(cx);
     }
 
-    pub fn set_subtitle_background_pill(&mut self, pill: bool, cx: &mut Context<Self>) {
-        self.preferences.subtitle_background_pill = pill;
+    pub fn set_subtitle_background_choice(
+        &mut self,
+        choice: SubtitleBackgroundChoice,
+        cx: &mut Context<Self>,
+    ) {
+        self.preferences.subtitle_background = Some(choice);
+        self.preferences.subtitle_background_pill = choice == SubtitleBackgroundChoice::Box;
         self.update_subtitle_style_prefs(cx);
+    }
+
+    pub fn set_subtitle_background_pill(&mut self, pill: bool, cx: &mut Context<Self>) {
+        let choice = if pill {
+            SubtitleBackgroundChoice::Box
+        } else {
+            SubtitleBackgroundChoice::Shadow
+        };
+        self.set_subtitle_background_choice(choice, cx);
     }
 
     pub fn set_subtitle_font_size(&mut self, size: u32, cx: &mut Context<Self>) {
@@ -5078,9 +5096,11 @@ impl AppShell {
                 "z" => self.adjust_subtitle_delay(-0.1, cx),
                 "x" => self.adjust_subtitle_delay(0.1, cx),
                 "escape" => {
-                    if self.player_popover.is_some() {
-                        self.player_popover = None;
-                        self.schedule_osd_autohide_timer(cx);
+                    if let Some(cur) = self.player_popover {
+                        self.player_popover = cur.parent_sheet();
+                        if self.player_popover.is_none() {
+                            self.schedule_osd_autohide_timer(cx);
+                        }
                         cx.notify();
                     } else if window.is_fullscreen() {
                         window.toggle_fullscreen();

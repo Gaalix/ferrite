@@ -435,6 +435,7 @@ impl UpscalePreset {
 pub enum SubtitleBackgroundMode {
     #[default]
     DropShadow,
+    Outline,
     TranslucentPill,
 }
 
@@ -1087,6 +1088,7 @@ struct MpvControllerInner {
     sw_video: Arc<Mutex<SoftwareVideoState>>,
     sw_frame_tx: watch::Sender<u64>,
     sw_notifier_attached: AtomicBool,
+    osd_controls_visible: AtomicBool,
     #[cfg(target_os = "windows")]
     dcomp: Arc<WindowsDCompCoordinator>,
     event_thread: Mutex<Option<JoinHandle<()>>>,
@@ -1389,6 +1391,7 @@ impl MpvController {
                 sw_video: Arc::new(Mutex::new(SoftwareVideoState::default())),
                 sw_frame_tx,
                 sw_notifier_attached: AtomicBool::new(false),
+                osd_controls_visible: AtomicBool::new(false),
                 #[cfg(target_os = "windows")]
                 dcomp,
                 event_thread: Mutex::new(Some(event_join)),
@@ -2212,9 +2215,60 @@ impl MpvController {
             .clone()
     }
 
+    pub const fn effective_sub_pos(base_pos: u32, osd_visible: bool) -> u32 {
+        let clamped = if base_pos < 50 {
+            50
+        } else if base_pos > 105 {
+            105
+        } else {
+            base_pos
+        };
+        if osd_visible {
+            let lifted = clamped.saturating_sub(8);
+            if lifted < 50 {
+                50
+            } else {
+                lifted
+            }
+        } else {
+            clamped
+        }
+    }
+
+    pub fn is_osd_controls_visible(&self) -> bool {
+        self.inner.osd_controls_visible.load(Ordering::Relaxed)
+    }
+
+    pub fn sync_osd_controls_visible(&self, visible: bool) -> Result<(), MpvError> {
+        let prev = self
+            .inner
+            .osd_controls_visible
+            .swap(visible, Ordering::Relaxed);
+        if prev != visible {
+            let base_pos = self
+                .inner
+                .persisted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .subtitle_style
+                .vertical_pos;
+            self.set_property_double(
+                "sub-pos",
+                f64::from(Self::effective_sub_pos(base_pos, visible)),
+            )?;
+        }
+        Ok(())
+    }
+
     fn apply_subtitle_style(&self, style: &SubtitleStyle) -> Result<(), MpvError> {
         self.set_property_double("sub-font-size", f64::from(style.font_size))?;
-        self.set_property_double("sub-pos", f64::from(style.vertical_pos))?;
+        self.set_property_double(
+            "sub-pos",
+            f64::from(Self::effective_sub_pos(
+                style.vertical_pos,
+                self.is_osd_controls_visible(),
+            )),
+        )?;
         self.set_property_string("sub-color", &style.color_hex)?;
         self.set_property_string("sub-ass-override", style.ass_override.as_mpv_str())?;
 
@@ -2226,6 +2280,13 @@ impl MpvController {
                 self.set_property_string("sub-border-color", "#E008080A")?;
                 self.set_property_double("sub-shadow-offset", 2.5_f64)?;
                 self.set_property_string("sub-shadow-color", "#C0000000")?;
+            }
+            SubtitleBackgroundMode::Outline => {
+                self.set_property_string("sub-border-style", "outline-and-shadow")?;
+                self.set_property_string("sub-back-color", "#00000000")?;
+                self.set_property_double("sub-border-size", 3.2_f64)?;
+                self.set_property_string("sub-border-color", "#F008080A")?;
+                self.set_property_double("sub-shadow-offset", 0.0_f64)?;
             }
             SubtitleBackgroundMode::TranslucentPill => {
                 self.set_property_string("sub-border-style", "background-box")?;
@@ -4663,6 +4724,132 @@ mod tests {
         ctrl.switch_stream_seamless("av://lavfi:testsrc=s=64x64:d=1.0:r=25", 0.0)
             .expect("switch_stream_seamless preserves subtitle_style");
         assert_eq!(ctrl.subtitle_style(), drop_shadow);
+
+        let outline = SubtitleStyle {
+            font_size: 48,
+            vertical_pos: 96,
+            color_hex: "#FFFFFF".to_string(),
+            background: SubtitleBackgroundMode::Outline,
+            ass_override: SubtitleAssOverride::Scale,
+        };
+        ctrl.set_subtitle_style(outline.clone())
+            .expect("set_subtitle_style outline");
+        assert_eq!(ctrl.subtitle_style(), outline);
+        assert_eq!(ctrl.subtitle_style().background, SubtitleBackgroundMode::Outline);
+
+        ctrl.shutdown_blocking();
+    }
+
+    fn wait_mpv_double_prop(ctrl: &MpvController, prop: &str, expected: f64) -> f64 {
+        let c_prop = CString::new(prop).expect("prop name");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut last = f64::NAN;
+        while Instant::now() < deadline {
+            if let Some(mpv_raw) = *ctrl.inner.mpv_slot.read().unwrap_or_else(|e| e.into_inner()) {
+                let mut val: f64 = f64::NAN;
+                let rc = unsafe {
+                    mpv_get_property(
+                        mpv_raw.0,
+                        c_prop.as_ptr(),
+                        MPV_FORMAT_DOUBLE,
+                        &mut val as *mut f64 as *mut c_void,
+                    )
+                };
+                if rc >= 0 {
+                    last = val;
+                    if (val - expected).abs() < 0.05 {
+                        return val;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        last
+    }
+
+    fn wait_mpv_string_prop(ctrl: &MpvController, prop: &str, expected: &str) -> String {
+        let c_prop = CString::new(prop).expect("prop name");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            if let Some(mpv_raw) = *ctrl.inner.mpv_slot.read().unwrap_or_else(|e| e.into_inner()) {
+                let mut out_ptr: *mut c_char = ptr::null_mut();
+                let rc = unsafe {
+                    mpv_get_property(
+                        mpv_raw.0,
+                        c_prop.as_ptr(),
+                        MPV_FORMAT_STRING,
+                        &mut out_ptr as *mut *mut c_char as *mut c_void,
+                    )
+                };
+                if rc >= 0 && !out_ptr.is_null() {
+                    let text = unsafe { CStr::from_ptr(out_ptr).to_string_lossy().into_owned() };
+                    unsafe {
+                        crate::mpv_ffi::mpv_free(out_ptr as *mut c_void);
+                    }
+                    last = text;
+                    if last == expected {
+                        return last;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        last
+    }
+
+    #[test]
+    fn subtitle_outline_mode_and_osd_lift_sync_mpv_properties() {
+        assert_eq!(MpvController::effective_sub_pos(10, false), 50);
+        assert_eq!(MpvController::effective_sub_pos(50, false), 50);
+        assert_eq!(MpvController::effective_sub_pos(50, true), 50);
+        assert_eq!(MpvController::effective_sub_pos(54, true), 50);
+        assert_eq!(MpvController::effective_sub_pos(96, false), 96);
+        assert_eq!(MpvController::effective_sub_pos(96, true), 88);
+        assert_eq!(MpvController::effective_sub_pos(105, false), 105);
+        assert_eq!(MpvController::effective_sub_pos(120, false), 105);
+        assert_eq!(MpvController::effective_sub_pos(120, true), 97);
+
+        let ctrl = MpvController::with_extra_options(&[("vo", "null"), ("ao", "null")])
+            .expect("headless controller");
+        assert!(!ctrl.is_osd_controls_visible());
+        assert!((wait_mpv_double_prop(&ctrl, "sub-pos", 96.0) - 96.0).abs() < 0.05);
+
+        ctrl.set_subtitle_style(SubtitleStyle {
+            background: SubtitleBackgroundMode::Outline,
+            ..SubtitleStyle::default()
+        })
+        .expect("apply outline subtitle style");
+        assert_eq!(
+            wait_mpv_string_prop(&ctrl, "sub-border-style", "outline-and-shadow"),
+            "outline-and-shadow"
+        );
+        assert!((wait_mpv_double_prop(&ctrl, "sub-border-size", 3.2) - 3.2).abs() < 0.05);
+        assert!((wait_mpv_double_prop(&ctrl, "sub-shadow-offset", 0.0) - 0.0).abs() < 0.05);
+
+        ctrl.sync_osd_controls_visible(true)
+            .expect("lift subtitles when OSD controls visible");
+        assert!(ctrl.is_osd_controls_visible());
+        assert!((wait_mpv_double_prop(&ctrl, "sub-pos", 88.0) - 88.0).abs() < 0.05);
+
+        // Idempotent call while already visible
+        ctrl.sync_osd_controls_visible(true)
+            .expect("repeated sync visible is no-op");
+
+        // Changing style while OSD is visible keeps the 8% lift while persisting raw vertical_pos
+        ctrl.set_subtitle_style(SubtitleStyle {
+            vertical_pos: 100,
+            background: SubtitleBackgroundMode::Outline,
+            ..SubtitleStyle::default()
+        })
+        .expect("update vertical_pos while OSD visible");
+        assert_eq!(ctrl.subtitle_style().vertical_pos, 100);
+        assert!((wait_mpv_double_prop(&ctrl, "sub-pos", 92.0) - 92.0).abs() < 0.05);
+
+        ctrl.sync_osd_controls_visible(false)
+            .expect("drop subtitles back when OSD controls hidden");
+        assert!(!ctrl.is_osd_controls_visible());
+        assert!((wait_mpv_double_prop(&ctrl, "sub-pos", 100.0) - 100.0).abs() < 0.05);
 
         ctrl.shutdown_blocking();
     }

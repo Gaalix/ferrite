@@ -516,6 +516,35 @@ pub enum SettingsDropdown {
     ShaderPreset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtitleBackgroundChoice {
+    #[default]
+    Shadow,
+    Outline,
+    Box,
+}
+
+impl SubtitleBackgroundChoice {
+    pub const ALL: [Self; 3] = [Self::Shadow, Self::Outline, Self::Box];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Shadow => "Shadow",
+            Self::Outline => "Outline",
+            Self::Box => "Box",
+        }
+    }
+
+    pub const fn to_mpv(self) -> SubtitleBackgroundMode {
+        match self {
+            Self::Shadow => SubtitleBackgroundMode::DropShadow,
+            Self::Outline => SubtitleBackgroundMode::Outline,
+            Self::Box => SubtitleBackgroundMode::TranslucentPill,
+        }
+    }
+}
+
 pub const DEFAULT_SUBTITLE_FONT_SIZE: u32 = 46;
 pub const DEFAULT_SUBTITLE_VERTICAL_POS: u32 = 96;
 pub const DEFAULT_SUBTITLE_COLOR_HEX: &str = "#F5F1E8";
@@ -582,6 +611,8 @@ pub struct AppPreferences {
     pub subtitle_color_hex: String,
     #[serde(default)]
     pub subtitle_background_pill: bool,
+    #[serde(default)]
+    pub subtitle_background: Option<SubtitleBackgroundChoice>,
     #[serde(default = "default_true")]
     pub subtitle_ass_scale_override: bool,
     #[serde(default = "default_true")]
@@ -617,6 +648,7 @@ impl Default for AppPreferences {
             subtitle_vertical_pos: DEFAULT_SUBTITLE_VERTICAL_POS,
             subtitle_color_hex: DEFAULT_SUBTITLE_COLOR_HEX.to_owned(),
             subtitle_background_pill: false,
+            subtitle_background: None,
             subtitle_ass_scale_override: true,
             auto_match_native_subtitles: true,
             auto_play_next_episode: true,
@@ -626,16 +658,20 @@ impl Default for AppPreferences {
 }
 
 impl AppPreferences {
+    pub fn effective_subtitle_background(&self) -> SubtitleBackgroundChoice {
+        self.subtitle_background.unwrap_or(if self.subtitle_background_pill {
+            SubtitleBackgroundChoice::Box
+        } else {
+            SubtitleBackgroundChoice::Shadow
+        })
+    }
+
     pub fn to_mpv_subtitle_style(&self) -> SubtitleStyle {
         SubtitleStyle {
             font_size: self.subtitle_font_size,
             vertical_pos: self.subtitle_vertical_pos,
             color_hex: self.subtitle_color_hex.clone(),
-            background: if self.subtitle_background_pill {
-                SubtitleBackgroundMode::TranslucentPill
-            } else {
-                SubtitleBackgroundMode::DropShadow
-            },
+            background: self.effective_subtitle_background().to_mpv(),
             ass_override: if self.subtitle_ass_scale_override {
                 SubtitleAssOverride::Scale
             } else {
@@ -650,6 +686,7 @@ impl AppPreferences {
         self.subtitle_vertical_pos = DEFAULT_SUBTITLE_VERTICAL_POS;
         self.subtitle_color_hex = DEFAULT_SUBTITLE_COLOR_HEX.to_owned();
         self.subtitle_background_pill = false;
+        self.subtitle_background = None;
         self.subtitle_ass_scale_override = true;
     }
 
@@ -1654,12 +1691,39 @@ impl NativeSubtitleMatchState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerPopover {
-    Volume,
     AudioAndSubtitles,
     SubtitleAppearance,
-    VideoShaders,
-    PlaybackSpeed,
+    PictureAndPlayback,
+    ToneMappingPicker,
+    UpscalerPicker,
+    ShaderPresetPicker,
     SwitchStream,
+}
+
+impl PlayerPopover {
+    pub const fn is_audio_subs_family(self) -> bool {
+        matches!(self, Self::AudioAndSubtitles | Self::SubtitleAppearance)
+    }
+
+    pub const fn is_picture_playback_family(self) -> bool {
+        matches!(
+            self,
+            Self::PictureAndPlayback
+                | Self::ToneMappingPicker
+                | Self::UpscalerPicker
+                | Self::ShaderPresetPicker
+        )
+    }
+
+    pub const fn parent_sheet(self) -> Option<Self> {
+        match self {
+            Self::SubtitleAppearance => Some(Self::AudioAndSubtitles),
+            Self::ToneMappingPicker | Self::UpscalerPicker | Self::ShaderPresetPicker => {
+                Some(Self::PictureAndPlayback)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[inline]
@@ -3160,5 +3224,79 @@ mod tests {
         assert_eq!(cast.len(), 2);
         assert_eq!(cast[0].name, "Timothée Chalamet");
         assert_eq!(cast[1].name, "Zendaya");
+    }
+
+    #[test]
+    fn subtitle_background_choice_is_backwards_compatible_and_supports_outline() {
+        let def = AppPreferences::default();
+        assert_eq!(def.subtitle_background, None);
+        assert!(!def.subtitle_background_pill);
+        assert_eq!(def.effective_subtitle_background(), SubtitleBackgroundChoice::Shadow);
+        assert_eq!(
+            def.to_mpv_subtitle_style().background,
+            SubtitleBackgroundMode::DropShadow
+        );
+
+        let legacy_pill_true: AppPreferences =
+            serde_json::from_str(r#"{"subtitle_background_pill": true}"#)
+                .expect("legacy pill=true json");
+        assert_eq!(legacy_pill_true.subtitle_background, None);
+        assert_eq!(
+            legacy_pill_true.effective_subtitle_background(),
+            SubtitleBackgroundChoice::Box
+        );
+        assert_eq!(
+            legacy_pill_true.to_mpv_subtitle_style().background,
+            SubtitleBackgroundMode::TranslucentPill
+        );
+
+        let legacy_pill_false: AppPreferences =
+            serde_json::from_str(r#"{"subtitle_background_pill": false}"#)
+                .expect("legacy pill=false json");
+        assert_eq!(
+            legacy_pill_false.effective_subtitle_background(),
+            SubtitleBackgroundChoice::Shadow
+        );
+
+        let outline_prefs: AppPreferences = serde_json::from_str(
+            r#"{"subtitle_background_pill": true, "subtitle_background": "outline"}"#,
+        )
+        .expect("explicit outline json");
+        assert_eq!(
+            outline_prefs.effective_subtitle_background(),
+            SubtitleBackgroundChoice::Outline
+        );
+        assert_eq!(outline_prefs.effective_subtitle_background().label(), "Outline");
+        assert_eq!(
+            outline_prefs.to_mpv_subtitle_style().background,
+            SubtitleBackgroundMode::Outline
+        );
+
+        let mut resettable = outline_prefs;
+        resettable.reset_subtitle_style();
+        assert_eq!(resettable.subtitle_background, None);
+        assert!(!resettable.subtitle_background_pill);
+        assert_eq!(
+            resettable.effective_subtitle_background(),
+            SubtitleBackgroundChoice::Shadow
+        );
+
+        assert!(PlayerPopover::AudioAndSubtitles.is_audio_subs_family());
+        assert!(PlayerPopover::SubtitleAppearance.is_audio_subs_family());
+        assert!(!PlayerPopover::PictureAndPlayback.is_audio_subs_family());
+        assert!(PlayerPopover::PictureAndPlayback.is_picture_playback_family());
+        assert!(PlayerPopover::ToneMappingPicker.is_picture_playback_family());
+        assert!(PlayerPopover::UpscalerPicker.is_picture_playback_family());
+        assert!(PlayerPopover::ShaderPresetPicker.is_picture_playback_family());
+        assert_eq!(
+            PlayerPopover::SubtitleAppearance.parent_sheet(),
+            Some(PlayerPopover::AudioAndSubtitles)
+        );
+        assert_eq!(
+            PlayerPopover::ToneMappingPicker.parent_sheet(),
+            Some(PlayerPopover::PictureAndPlayback)
+        );
+        assert_eq!(PlayerPopover::AudioAndSubtitles.parent_sheet(), None);
+        assert_eq!(PlayerPopover::SwitchStream.parent_sheet(), None);
     }
 }
