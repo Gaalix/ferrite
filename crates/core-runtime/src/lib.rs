@@ -80,8 +80,9 @@ pub use tmdb::{
     build_unified_editorial_search, enriched_to_stremio_meta_item, extract_4_digit_year,
     format_addon_resource_url, meta_resource_matches_url, normalize_person_slug,
     normalize_title_for_dedup, preview_to_editorial_hit, EditorialMediaHit, EditorialPersonHit,
-    EnrichedTitleMeta, MetadataEngine, PersonCreditChip, PersonFilmography, TmdbAccountStatus,
-    UnifiedEditorialSearch, DEFAULT_TMDB_API_BASE_URL, DEFAULT_TMDB_IMAGE_BASE_URL,
+    EnrichedCollection, EnrichedTitleMeta, MetadataEngine, PersonCreditChip, PersonFilmography,
+    TmdbAccountStatus, UnifiedEditorialSearch, DEFAULT_TMDB_API_BASE_URL,
+    DEFAULT_TMDB_IMAGE_BASE_URL,
 };
 pub use track_prefs::{
     extract_track_keywords, has_full_embedded_subtitle_for_lang, parse_lang_tag,

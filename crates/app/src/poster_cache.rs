@@ -1,44 +1,56 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    borrow::Cow,
+    collections::{HashMap, HashSet, VecDeque},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use gpui::RenderImage;
 use image::{imageops::FilterType, Frame, RgbaImage};
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
-use smallvec::smallvec;
-use tokio::sync::Semaphore;
+use smallvec::{smallvec, SmallVec};
+use tokio::sync::{Notify, Semaphore};
 use url::Url;
 
 const MAX_CONCURRENT_POSTER_DOWNLOADS: usize = 12;
 pub const MAX_CONCURRENT_IMAGE_DECODES: usize = 4;
+const MAX_CONCURRENT_DISK_IO: usize = 16;
 const HTTP_POSTER_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_POSTER_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FAILED_ENTRIES: usize = 256;
+const DISK_PRUNE_INTERVAL_WRITES: u64 = 200;
 
 pub const MAX_DECODED_TEXTURES: usize = 128;
 pub const MAX_THUMB_TEXTURES: usize = 32;
 pub const MAX_AMBIENT_TEXTURES: usize = 16;
-pub const MAX_HERO_TEXTURES: usize = 2;
+pub const MAX_HERO_TEXTURES: usize = 4;
+pub const MAX_STILL_TEXTURES: usize = 48;
 
 pub const PLAYBACK_RETAINED_DECODED_TEXTURES: usize = 16;
 pub const PLAYBACK_RETAINED_THUMB_TEXTURES: usize = 8;
 pub const PLAYBACK_RETAINED_HERO_TEXTURES: usize = 2;
 pub const PLAYBACK_RETAINED_AMBIENT_TEXTURES: usize = 2;
+pub const PLAYBACK_RETAINED_STILL_TEXTURES: usize = 8;
+
+pub const MAX_DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 const POSTER_MAX_W: u32 = 300;
 const POSTER_MAX_H: u32 = 450;
+const POSTER_CDN_MAX_W: u32 = 342;
 const THUMB_MAX_W: u32 = 80;
 const THUMB_MAX_H: u32 = 120;
 const WIDESCREEN_MAX_W: u32 = 640;
 const WIDESCREEN_MAX_H: u32 = 360;
-const HERO_MAX_W: u32 = 960;
-const HERO_MAX_H: u32 = 540;
+pub const STILL_MAX_W: u32 = 320;
+pub const STILL_MAX_H: u32 = 180;
+pub const HERO_MAX_W: u32 = 1280;
+pub const HERO_MAX_H: u32 = 720;
 const LOGO_DECODE_MAX_WIDTH: u32 = 520;
 const LOGO_DECODE_MAX_HEIGHT: u32 = 200;
 
@@ -47,11 +59,50 @@ pub const AMBIENT_BLEED_HEIGHT: u32 = 27;
 
 const PROTECTED_EPOCH_WINDOW: u64 = 2;
 
+const SIDECAR_MAGIC: &[u8; 4] = b"FBG1";
+const SIDECAR_HEADER_LEN: usize = 12;
+const SIDECAR_MAX_DIMENSION: u32 = 2048;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CacheEntry {
     Loading,
     Ready(PathBuf),
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum ImageVariant {
+    Raw = 0,
+    Poster = 1,
+    Thumb = 2,
+    Wide = 3,
+    Hero = 4,
+    Logo = 5,
+    Still = 6,
+    Ambient = 7,
+}
+
+impl ImageVariant {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Poster => "poster",
+            Self::Thumb => "thumb",
+            Self::Wide => "wide",
+            Self::Hero => "hero",
+            Self::Logo => "logo",
+            Self::Still => "still",
+            Self::Ambient => "ambient",
+        }
+    }
+
+    const fn uses_sidecar(self) -> bool {
+        matches!(
+            self,
+            Self::Poster | Self::Thumb | Self::Still | Self::Ambient
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -63,8 +114,19 @@ enum TextureSlot {
 
 #[derive(Clone)]
 struct TextureRecord {
+    variant: ImageVariant,
+    url: Arc<str>,
     slot: TextureSlot,
     last_used_epoch: u64,
+    access_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookupOutcome {
+    Ready,
+    Loading,
+    Spawned,
+    Failed,
 }
 
 #[inline]
@@ -72,10 +134,20 @@ fn is_epoch_protected(last_used_epoch: u64, current_epoch: u64) -> bool {
     last_used_epoch.saturating_add(PROTECTED_EPOCH_WINDOW) >= current_epoch
 }
 
+#[inline]
+fn hash_variant_url(variant: ImageVariant, url: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (variant as u8).hash(&mut hasher);
+    url.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub struct BoundedTextureLru {
     capacity: usize,
-    map: HashMap<String, TextureRecord>,
-    order: VecDeque<String>,
+    map: HashMap<u64, SmallVec<[TextureRecord; 1]>>,
+    ready_count: usize,
+    failed_count: usize,
+    next_seq: u64,
 }
 
 impl BoundedTextureLru {
@@ -83,19 +155,58 @@ impl BoundedTextureLru {
         Self {
             capacity: capacity.max(1),
             map: HashMap::with_capacity(capacity.saturating_add(16)),
-            order: VecDeque::with_capacity(capacity.saturating_add(16)),
+            ready_count: 0,
+            failed_count: 0,
+            next_seq: 0,
         }
     }
 
     pub fn len_ready(&self) -> usize {
-        self.order.len()
+        self.ready_count
     }
 
-    fn touch_order(&mut self, key: &str) {
-        if let Some(pos) = self.order.iter().position(|k| k == key) {
-            self.order.remove(pos);
+    #[inline]
+    fn bump_seq(&mut self) -> u64 {
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.next_seq
+    }
+
+    fn lookup_or_begin_variant(
+        &mut self,
+        variant: ImageVariant,
+        key: &str,
+        current_epoch: u64,
+    ) -> (Option<Arc<RenderImage>>, LookupOutcome) {
+        let key_hash = hash_variant_url(variant, key);
+        if let Some(bucket) = self.map.get_mut(&key_hash) {
+            if let Some(rec) = bucket
+                .iter_mut()
+                .find(|r| r.variant == variant && r.url.as_ref() == key)
+            {
+                rec.last_used_epoch = rec.last_used_epoch.max(current_epoch);
+                match &rec.slot {
+                    TextureSlot::Ready(img) => {
+                        let img = Arc::clone(img);
+                        self.next_seq = self.next_seq.wrapping_add(1);
+                        rec.access_seq = self.next_seq;
+                        return (Some(img), LookupOutcome::Ready);
+                    }
+                    TextureSlot::Loading => return (None, LookupOutcome::Loading),
+                    TextureSlot::Failed => return (None, LookupOutcome::Failed),
+                }
+            }
         }
-        self.order.push_back(key.to_owned());
+
+        let seq = self.bump_seq();
+        let rec = TextureRecord {
+            variant,
+            url: Arc::from(key),
+            slot: TextureSlot::Loading,
+            last_used_epoch: current_epoch,
+            access_seq: seq,
+        };
+        self.map.entry(key_hash).or_default().push(rec);
+        (None, LookupOutcome::Spawned)
     }
 
     pub fn lookup_or_begin(
@@ -103,25 +214,56 @@ impl BoundedTextureLru {
         key: &str,
         current_epoch: u64,
     ) -> (Option<Arc<RenderImage>>, bool) {
-        if let Some(rec) = self.map.get_mut(key) {
+        let (img, outcome) = self.lookup_or_begin_variant(ImageVariant::Raw, key, current_epoch);
+        (img, outcome == LookupOutcome::Spawned)
+    }
+
+    fn insert_ready_variant(
+        &mut self,
+        variant: ImageVariant,
+        key: &str,
+        image: Arc<RenderImage>,
+        current_epoch: u64,
+    ) -> Vec<Arc<RenderImage>> {
+        let mut evicted = Vec::new();
+        let key_hash = hash_variant_url(variant, key);
+        let seq = self.bump_seq();
+        let image_ptr = Arc::as_ptr(&image);
+
+        let bucket = self.map.entry(key_hash).or_default();
+        if let Some(rec) = bucket
+            .iter_mut()
+            .find(|r| r.variant == variant && r.url.as_ref() == key)
+        {
             rec.last_used_epoch = rec.last_used_epoch.max(current_epoch);
-            let slot = rec.slot.clone();
-            return match slot {
-                TextureSlot::Ready(img) => {
-                    self.touch_order(key);
-                    (Some(img), false)
+            rec.access_seq = seq;
+            match std::mem::replace(&mut rec.slot, TextureSlot::Ready(image)) {
+                TextureSlot::Ready(prev) => {
+                    if !std::ptr::eq(Arc::as_ptr(&prev), image_ptr) {
+                        evicted.push(prev);
+                    }
                 }
-                TextureSlot::Loading | TextureSlot::Failed => (None, false),
-            };
-        }
-        self.map.insert(
-            key.to_owned(),
-            TextureRecord {
-                slot: TextureSlot::Loading,
+                TextureSlot::Loading => {
+                    self.ready_count += 1;
+                }
+                TextureSlot::Failed => {
+                    self.failed_count = self.failed_count.saturating_sub(1);
+                    self.ready_count += 1;
+                }
+            }
+        } else {
+            bucket.push(TextureRecord {
+                variant,
+                url: Arc::from(key),
+                slot: TextureSlot::Ready(image),
                 last_used_epoch: current_epoch,
-            },
-        );
-        (None, true)
+                access_seq: seq,
+            });
+            self.ready_count += 1;
+        }
+
+        evicted.extend(self.evict_stale_excess(current_epoch, Some(image_ptr)));
+        evicted
     }
 
     pub fn insert_ready(
@@ -130,31 +272,7 @@ impl BoundedTextureLru {
         image: Arc<RenderImage>,
         current_epoch: u64,
     ) -> Vec<Arc<RenderImage>> {
-        let mut evicted = Vec::new();
-        self.touch_order(&key);
-        let merged_epoch = self
-            .map
-            .get(&key)
-            .map(|r| r.last_used_epoch.max(current_epoch))
-            .unwrap_or(current_epoch);
-        let image_ptr = Arc::as_ptr(&image);
-
-        if let Some(prev_rec) = self.map.insert(
-            key,
-            TextureRecord {
-                slot: TextureSlot::Ready(image),
-                last_used_epoch: merged_epoch,
-            },
-        ) {
-            if let TextureSlot::Ready(prev) = prev_rec.slot {
-                if !std::ptr::eq(Arc::as_ptr(&prev), image_ptr) {
-                    evicted.push(prev);
-                }
-            }
-        }
-
-        evicted.extend(self.evict_stale_excess(current_epoch, Some(image_ptr)));
-        evicted
+        self.insert_ready_variant(ImageVariant::Raw, &key, image, current_epoch)
     }
 
     pub fn sweep_to_capacity(&mut self, current_epoch: u64) -> Vec<Arc<RenderImage>> {
@@ -166,73 +284,240 @@ impl BoundedTextureLru {
         current_epoch: u64,
         protect_ptr: Option<*const RenderImage>,
     ) -> Vec<Arc<RenderImage>> {
-        let mut evicted = Vec::new();
-        let mut idx = 0;
-        while self.order.len() > self.capacity && idx < self.order.len() {
-            let candidate_epoch = self
-                .map
-                .get(&self.order[idx])
-                .map(|r| r.last_used_epoch)
-                .unwrap_or(0);
-            if is_epoch_protected(candidate_epoch, current_epoch) {
-                idx += 1;
-                continue;
+        if self.ready_count <= self.capacity {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(u64, u64)> = Vec::new();
+        for (&key_hash, bucket) in &self.map {
+            for rec in bucket {
+                if matches!(rec.slot, TextureSlot::Ready(_))
+                    && !is_epoch_protected(rec.last_used_epoch, current_epoch)
+                {
+                    candidates.push((rec.access_seq, key_hash));
+                }
             }
-            if let Some(stale_key) = self.order.remove(idx) {
-                if let Some(old_rec) = self.map.remove(&stale_key) {
+        }
+        self.evict_ready_candidates(candidates, self.capacity, protect_ptr)
+    }
+
+    pub fn trim_to_limit(&mut self, keep_mru: usize) -> Vec<Arc<RenderImage>> {
+        if self.ready_count <= keep_mru {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(u64, u64)> = Vec::with_capacity(self.ready_count);
+        for (&key_hash, bucket) in &self.map {
+            for rec in bucket {
+                if matches!(rec.slot, TextureSlot::Ready(_)) {
+                    candidates.push((rec.access_seq, key_hash));
+                }
+            }
+        }
+        self.evict_ready_candidates(candidates, keep_mru, None)
+    }
+
+    fn evict_ready_candidates(
+        &mut self,
+        mut candidates: Vec<(u64, u64)>,
+        target_limit: usize,
+        protect_ptr: Option<*const RenderImage>,
+    ) -> Vec<Arc<RenderImage>> {
+        if self.ready_count <= target_limit || candidates.is_empty() {
+            return Vec::new();
+        }
+        let excess = self.ready_count - target_limit;
+        if candidates.len() > excess {
+            candidates.select_nth_unstable_by_key(excess - 1, |&(seq, _)| seq);
+            candidates.truncate(excess);
+        }
+        candidates.sort_unstable_by_key(|&(seq, _)| seq);
+
+        let mut evicted = Vec::with_capacity(candidates.len());
+        for (target_seq, key_hash) in candidates {
+            if self.ready_count <= target_limit {
+                break;
+            }
+            let mut remove_bucket = false;
+            if let Some(bucket) = self.map.get_mut(&key_hash) {
+                if let Some(pos) = bucket.iter().position(|r| r.access_seq == target_seq) {
+                    let old_rec = bucket.swap_remove(pos);
+                    remove_bucket = bucket.is_empty();
                     if let TextureSlot::Ready(old_img) = old_rec.slot {
+                        self.ready_count = self.ready_count.saturating_sub(1);
                         if protect_ptr.is_none_or(|p| !std::ptr::eq(Arc::as_ptr(&old_img), p)) {
                             evicted.push(old_img);
                         }
                     }
                 }
             }
-        }
-        evicted
-    }
-
-    pub fn trim_to_limit(&mut self, keep_mru: usize) -> Vec<Arc<RenderImage>> {
-        let mut evicted = Vec::new();
-        while self.order.len() > keep_mru {
-            if let Some(oldest) = self.order.pop_front() {
-                if let Some(old_rec) = self.map.remove(&oldest) {
-                    if let TextureSlot::Ready(old_img) = old_rec.slot {
-                        evicted.push(old_img);
-                    }
-                }
+            if remove_bucket {
+                self.map.remove(&key_hash);
             }
         }
         evicted
     }
 
     pub fn drain_all(&mut self) -> Vec<Arc<RenderImage>> {
-        self.order.clear();
+        self.ready_count = 0;
+        self.failed_count = 0;
         let mut out = Vec::new();
-        for (_, rec) in self.map.drain() {
-            if let TextureSlot::Ready(img) = rec.slot {
-                out.push(img);
+        for (_, bucket) in self.map.drain() {
+            for rec in bucket {
+                if let TextureSlot::Ready(img) = rec.slot {
+                    out.push(img);
+                }
             }
         }
         out
     }
 
-    fn mark_failed(&mut self, key: String, current_epoch: u64) {
-        if let Some( pos ) = self.order.iter().position(|k| k == &key) {
-            self.order.remove(pos);
-        }
-        self.map.insert(
-            key,
-            TextureRecord {
+    fn mark_failed_variant(&mut self, variant: ImageVariant, key: &str, current_epoch: u64) {
+        let key_hash = hash_variant_url(variant, key);
+        let seq = self.bump_seq();
+        let bucket = self.map.entry(key_hash).or_default();
+        if let Some(rec) = bucket
+            .iter_mut()
+            .find(|r| r.variant == variant && r.url.as_ref() == key)
+        {
+            rec.last_used_epoch = rec.last_used_epoch.max(current_epoch);
+            rec.access_seq = seq;
+            match std::mem::replace(&mut rec.slot, TextureSlot::Failed) {
+                TextureSlot::Ready(_) => {
+                    self.ready_count = self.ready_count.saturating_sub(1);
+                    self.failed_count += 1;
+                }
+                TextureSlot::Loading => {
+                    self.failed_count += 1;
+                }
+                TextureSlot::Failed => {}
+            }
+        } else {
+            bucket.push(TextureRecord {
+                variant,
+                url: Arc::from(key),
                 slot: TextureSlot::Failed,
                 last_used_epoch: current_epoch,
-            },
-        );
+                access_seq: seq,
+            });
+            self.failed_count += 1;
+        }
+
+        self.evict_excess_failures();
     }
 
-    fn clear_failures(&mut self) {
-        self.map
-            .retain(|_, rec| !matches!(rec.slot, TextureSlot::Failed));
+    pub fn mark_failed(&mut self, key: &str, current_epoch: u64) {
+        self.mark_failed_variant(ImageVariant::Raw, key, current_epoch);
     }
+
+    fn evict_excess_failures(&mut self) {
+        while self.failed_count > MAX_FAILED_ENTRIES {
+            let mut oldest: Option<(u64, u64)> = None;
+            for (&key_hash, bucket) in &self.map {
+                for rec in bucket {
+                    if matches!(rec.slot, TextureSlot::Failed)
+                        && oldest.is_none_or(|(best_seq, _)| rec.access_seq < best_seq)
+                    {
+                        oldest = Some((rec.access_seq, key_hash));
+                    }
+                }
+            }
+            let Some((target_seq, key_hash)) = oldest else {
+                break;
+            };
+            let mut remove_bucket = false;
+            if let Some(bucket) = self.map.get_mut(&key_hash) {
+                if let Some(pos) = bucket.iter().position(|r| r.access_seq == target_seq) {
+                    bucket.swap_remove(pos);
+                    remove_bucket = bucket.is_empty();
+                    self.failed_count = self.failed_count.saturating_sub(1);
+                }
+            }
+            if remove_bucket {
+                self.map.remove(&key_hash);
+            }
+        }
+    }
+
+    pub fn clear_failures(&mut self) {
+        self.failed_count = 0;
+        self.map.retain(|_, bucket| {
+            bucket.retain(|rec| !matches!(rec.slot, TextureSlot::Failed));
+            !bucket.is_empty()
+        });
+    }
+}
+
+pub fn rewrite_cdn_image_url(url: &str, max_w: u32) -> Cow<'_, str> {
+    const TMDB_HTTPS: &str = "https://image.tmdb.org/t/p/";
+    const TMDB_HTTP: &str = "http://image.tmdb.org/t/p/";
+    const METAHUB_HTTPS: &str = "https://images.metahub.space/";
+    const METAHUB_HTTP: &str = "http://images.metahub.space/";
+
+    let tmdb_prefix = if url.starts_with(TMDB_HTTPS) {
+        Some(TMDB_HTTPS)
+    } else if url.starts_with(TMDB_HTTP) {
+        Some(TMDB_HTTP)
+    } else {
+        None
+    };
+
+    if let Some(prefix) = tmdb_prefix {
+        let rest = &url[prefix.len()..];
+        if let Some(slash_idx) = rest.find('/') {
+            let size_seg = &rest[..slash_idx];
+            let tail = &rest[slash_idx..];
+            let (target_w, target_seg) = if max_w <= 185 {
+                (185_u32, "w185")
+            } else if max_w <= 320 {
+                (300_u32, "w300")
+            } else if max_w <= 500 {
+                (342_u32, "w342")
+            } else if max_w <= 780 {
+                (780_u32, "w780")
+            } else {
+                (1280_u32, "w1280")
+            };
+
+            let should_rewrite = if size_seg == "original" {
+                true
+            } else if let Some(digits) = size_seg.strip_prefix('w') {
+                !digits.is_empty()
+                    && digits.bytes().all(|b| b.is_ascii_digit())
+                    && digits.parse::<u32>().is_ok_and(|w| w > target_w)
+            } else {
+                false
+            };
+
+            if should_rewrite {
+                return Cow::Owned(format!("{prefix}{target_seg}{tail}"));
+            }
+        }
+        return Cow::Borrowed(url);
+    }
+
+    let metahub_prefix = if url.starts_with(METAHUB_HTTPS) {
+        Some(METAHUB_HTTPS)
+    } else if url.starts_with(METAHUB_HTTP) {
+        Some(METAHUB_HTTP)
+    } else {
+        None
+    };
+
+    if let Some(prefix) = metahub_prefix {
+        let rest = &url[prefix.len()..];
+        if let Some(kind_slash) = rest.find('/') {
+            let kind = &rest[..kind_slash];
+            let after_kind = &rest[kind_slash..];
+            if !kind.is_empty() {
+                if let Some(tail) = after_kind.strip_prefix("/large/") {
+                    let target_size = if max_w <= 120 { "small" } else { "medium" };
+                    return Cow::Owned(format!("{prefix}{kind}/{target_size}/{tail}"));
+                }
+            }
+        }
+        return Cow::Borrowed(url);
+    }
+
+    Cow::Borrowed(url)
 }
 
 pub fn default_poster_cache_dir() -> PathBuf {
@@ -248,13 +533,26 @@ pub fn default_poster_cache_dir() -> PathBuf {
     std::env::temp_dir().join("ferrite").join("posters")
 }
 
-pub fn cache_path_for_url(cache_root: &Path, url: &str) -> PathBuf {
+#[inline]
+fn url_sha256_hex(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
-    let digest = hex::encode(hasher.finalize());
+    hex::encode(hasher.finalize())
+}
+
+pub fn cache_path_for_url(cache_root: &Path, url: &str) -> PathBuf {
+    let digest = url_sha256_hex(url);
     let shard = &digest[..2];
     let ext = infer_image_extension(url);
     cache_root.join(shard).join(format!("{digest}.{ext}"))
+}
+
+pub fn sidecar_path_for_url(cache_root: &Path, url: &str, variant: &str) -> PathBuf {
+    let digest = url_sha256_hex(url);
+    let shard = &digest[..2];
+    cache_root
+        .join(shard)
+        .join(format!("{digest}.{variant}.bin"))
 }
 
 fn infer_image_extension(url_str: &str) -> &'static str {
@@ -283,13 +581,22 @@ pub fn decode_scaled_render_image(bytes: &[u8], max_w: u32, max_h: u32) -> Optio
     };
     let mut rgba = resized.to_rgba8();
     for px_slice in rgba.as_chunks_mut::<4>().0 {
-        let r = px_slice[0] as u16;
-        let g = px_slice[1] as u16;
-        let b = px_slice[2] as u16;
-        let a = px_slice[3] as u16;
-        px_slice[0] = ((b * a + 127) / 255) as u8;
-        px_slice[1] = ((g * a + 127) / 255) as u8;
-        px_slice[2] = ((r * a + 127) / 255) as u8;
+        let a = px_slice[3];
+        if a == 255 {
+            px_slice.swap(0, 2);
+        } else if a == 0 {
+            px_slice[0] = 0;
+            px_slice[1] = 0;
+            px_slice[2] = 0;
+        } else {
+            let r = px_slice[0] as u16;
+            let g = px_slice[1] as u16;
+            let b = px_slice[2] as u16;
+            let a16 = a as u16;
+            px_slice[0] = ((b * a16 + 127) / 255) as u8;
+            px_slice[1] = ((g * a16 + 127) / 255) as u8;
+            px_slice[2] = ((r * a16 + 127) / 255) as u8;
+        }
     }
     let frame = Frame::new(rgba);
     Some(Arc::new(RenderImage::new(smallvec![frame])))
@@ -329,6 +636,118 @@ pub fn build_ambient_bleed_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     let bgra_buf = RgbaImage::from_raw(AMBIENT_BLEED_WIDTH, AMBIENT_BLEED_HEIGHT, src)?;
     let frame = Frame::new(bgra_buf);
     Some(Arc::new(RenderImage::new(smallvec![frame])))
+}
+
+fn encode_sidecar_bytes(image: &RenderImage) -> Option<Vec<u8>> {
+    let size = image.size(0);
+    if size.width.0 <= 0 || size.height.0 <= 0 {
+        return None;
+    }
+    let width = size.width.0 as u32;
+    let height = size.height.0 as u32;
+    let raw = image.as_bytes(0)?;
+    let expected_len = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    if raw.len() != expected_len {
+        return None;
+    }
+    let mut out = Vec::with_capacity(SIDECAR_HEADER_LEN + raw.len());
+    out.extend_from_slice(SIDECAR_MAGIC);
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(raw);
+    Some(out)
+}
+
+fn decode_sidecar_render_image(
+    bytes: &[u8],
+    max_w: u32,
+    max_h: u32,
+) -> Option<Arc<RenderImage>> {
+    if bytes.len() < SIDECAR_HEADER_LEN || &bytes[0..4] != SIDECAR_MAGIC {
+        return None;
+    }
+    let width = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let height = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    if width == 0
+        || height == 0
+        || width > max_w
+        || height > max_h
+        || width > SIDECAR_MAX_DIMENSION
+        || height > SIDECAR_MAX_DIMENSION
+    {
+        return None;
+    }
+    let expected_len = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    if bytes.len() != SIDECAR_HEADER_LEN + expected_len {
+        return None;
+    }
+    let bgra = RgbaImage::from_raw(width, height, bytes[SIDECAR_HEADER_LEN..].to_vec())?;
+    Some(Arc::new(RenderImage::new(smallvec![Frame::new(bgra)])))
+}
+
+struct DiskCacheFile {
+    mtime: SystemTime,
+    len: u64,
+    path: PathBuf,
+}
+
+pub fn prune_disk_cache_to_budget(cache_root: &Path, max_bytes: u64) -> u64 {
+    if !cache_root.is_dir() {
+        return 0;
+    }
+    let mut stack = vec![cache_root.to_path_buf()];
+    let mut files: Vec<DiskCacheFile> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let now = SystemTime::now();
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                let is_recent_part = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".part."))
+                    && meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| now.duration_since(m).ok())
+                        .is_none_or(|age| age < Duration::from_secs(60));
+                if is_recent_part {
+                    continue;
+                }
+                let len = meta.len();
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                total_bytes = total_bytes.saturating_add(len);
+                files.push(DiskCacheFile { mtime, len, path });
+            }
+        }
+    }
+
+    if total_bytes <= max_bytes {
+        return 0;
+    }
+
+    files.sort_unstable_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.path.cmp(&b.path)));
+    let mut freed: u64 = 0;
+    for file in files {
+        if total_bytes <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&file.path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(file.len);
+            freed = freed.saturating_add(file.len);
+        }
+    }
+    freed
 }
 
 fn box_blur_horizontal(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) {
@@ -381,28 +800,98 @@ fn box_blur_vertical(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usi
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum LruTarget {
     Decoded,
     Thumb,
+    Still,
     Hero,
+    Ambient,
+}
+
+#[derive(Clone, Copy)]
+struct DecodeTargetSpec {
+    variant: ImageVariant,
+    cdn_max_w: u32,
+    max_w: u32,
+    max_h: u32,
+    target: LruTarget,
+}
+
+impl DecodeTargetSpec {
+    const POSTER: Self = Self {
+        variant: ImageVariant::Poster,
+        cdn_max_w: POSTER_CDN_MAX_W,
+        max_w: POSTER_MAX_W,
+        max_h: POSTER_MAX_H,
+        target: LruTarget::Decoded,
+    };
+    const THUMB: Self = Self {
+        variant: ImageVariant::Thumb,
+        cdn_max_w: THUMB_MAX_W,
+        max_w: THUMB_MAX_W,
+        max_h: THUMB_MAX_H,
+        target: LruTarget::Thumb,
+    };
+    const WIDE: Self = Self {
+        variant: ImageVariant::Wide,
+        cdn_max_w: WIDESCREEN_MAX_W,
+        max_w: WIDESCREEN_MAX_W,
+        max_h: WIDESCREEN_MAX_H,
+        target: LruTarget::Decoded,
+    };
+    const STILL: Self = Self {
+        variant: ImageVariant::Still,
+        cdn_max_w: STILL_MAX_W,
+        max_w: STILL_MAX_W,
+        max_h: STILL_MAX_H,
+        target: LruTarget::Still,
+    };
+    const HERO: Self = Self {
+        variant: ImageVariant::Hero,
+        cdn_max_w: HERO_MAX_W,
+        max_w: HERO_MAX_W,
+        max_h: HERO_MAX_H,
+        target: LruTarget::Hero,
+    };
+    const LOGO: Self = Self {
+        variant: ImageVariant::Logo,
+        cdn_max_w: LOGO_DECODE_MAX_WIDTH,
+        max_w: LOGO_DECODE_MAX_WIDTH,
+        max_h: LOGO_DECODE_MAX_HEIGHT,
+        target: LruTarget::Decoded,
+    };
+    const AMBIENT: Self = Self {
+        variant: ImageVariant::Ambient,
+        cdn_max_w: HERO_MAX_W,
+        max_w: AMBIENT_BLEED_WIDTH,
+        max_h: AMBIENT_BLEED_HEIGHT,
+        target: LruTarget::Ambient,
+    };
 }
 
 struct PosterCacheInner {
     cache_root: PathBuf,
     entries: RwLock<HashMap<String, CacheEntry>>,
+    failed_entry_urls: Mutex<VecDeque<String>>,
+    in_flight_urls: Mutex<HashMap<String, Arc<Notify>>>,
+    initialized_dirs: Mutex<HashSet<PathBuf>>,
     decoded_lru: Mutex<BoundedTextureLru>,
     thumb_lru: Mutex<BoundedTextureLru>,
+    still_lru: Mutex<BoundedTextureLru>,
     hero_lru: Mutex<BoundedTextureLru>,
     ambient_lru: Mutex<BoundedTextureLru>,
     evicted_images: Mutex<Vec<Arc<RenderImage>>>,
     client: reqwest::Client,
     semaphore: Semaphore,
     decode_semaphore: Semaphore,
+    disk_io_semaphore: Semaphore,
     runtime: tokio::runtime::Handle,
     wakeup_tx: async_channel::Sender<()>,
     temp_seq: AtomicU64,
     render_epoch: AtomicU64,
+    disk_writes: AtomicU64,
+    disk_prune_in_flight: AtomicBool,
 }
 
 impl PosterCacheInner {
@@ -415,7 +904,9 @@ impl PosterCacheInner {
         match target {
             LruTarget::Decoded => &self.decoded_lru,
             LruTarget::Thumb => &self.thumb_lru,
+            LruTarget::Still => &self.still_lru,
             LruTarget::Hero => &self.hero_lru,
+            LruTarget::Ambient => &self.ambient_lru,
         }
     }
 }
@@ -436,25 +927,35 @@ impl PosterCache {
 
         let (wakeup_tx, wakeup_rx) = async_channel::bounded(1);
 
-        Self {
-            inner: Arc::new(PosterCacheInner {
-                cache_root,
-                entries: RwLock::new(HashMap::with_capacity(256)),
-                decoded_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_DECODED_TEXTURES)),
-                thumb_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_THUMB_TEXTURES)),
-                hero_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_HERO_TEXTURES)),
-                ambient_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_AMBIENT_TEXTURES)),
-                evicted_images: Mutex::new(Vec::with_capacity(16)),
-                client,
-                semaphore: Semaphore::new(MAX_CONCURRENT_POSTER_DOWNLOADS),
-                decode_semaphore: Semaphore::new(MAX_CONCURRENT_IMAGE_DECODES),
-                runtime,
-                wakeup_tx,
-                temp_seq: AtomicU64::new(1),
-                render_epoch: AtomicU64::new(1),
-            }),
-            wakeup_rx,
+        let inner = Arc::new(PosterCacheInner {
+            cache_root,
+            entries: RwLock::new(HashMap::with_capacity(256)),
+            failed_entry_urls: Mutex::new(VecDeque::with_capacity(64)),
+            in_flight_urls: Mutex::new(HashMap::with_capacity(32)),
+            initialized_dirs: Mutex::new(HashSet::with_capacity(64)),
+            decoded_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_DECODED_TEXTURES)),
+            thumb_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_THUMB_TEXTURES)),
+            still_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_STILL_TEXTURES)),
+            hero_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_HERO_TEXTURES)),
+            ambient_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_AMBIENT_TEXTURES)),
+            evicted_images: Mutex::new(Vec::with_capacity(16)),
+            client,
+            semaphore: Semaphore::new(MAX_CONCURRENT_POSTER_DOWNLOADS),
+            decode_semaphore: Semaphore::new(MAX_CONCURRENT_IMAGE_DECODES),
+            disk_io_semaphore: Semaphore::new(MAX_CONCURRENT_DISK_IO),
+            runtime,
+            wakeup_tx,
+            temp_seq: AtomicU64::new(1),
+            render_epoch: AtomicU64::new(1),
+            disk_writes: AtomicU64::new(0),
+            disk_prune_in_flight: AtomicBool::new(false),
+        });
+
+        if inner.cache_root.is_dir() {
+            trigger_background_disk_prune(&inner);
         }
+
+        Self { inner, wakeup_rx }
     }
 
     pub fn with_default_dir(runtime: tokio::runtime::Handle) -> Self {
@@ -477,6 +978,7 @@ impl PosterCache {
         let epoch = self.inner.render_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let mut swept = self.inner.decoded_lru.lock().sweep_to_capacity(epoch);
         swept.extend(self.inner.thumb_lru.lock().sweep_to_capacity(epoch));
+        swept.extend(self.inner.still_lru.lock().sweep_to_capacity(epoch));
         swept.extend(self.inner.hero_lru.lock().sweep_to_capacity(epoch));
         swept.extend(self.inner.ambient_lru.lock().sweep_to_capacity(epoch));
         if !swept.is_empty() {
@@ -486,13 +988,7 @@ impl PosterCache {
     }
 
     pub fn resolve_poster_image(&self, url: &str) -> Option<Arc<RenderImage>> {
-        self.resolve_scaled_into_target(
-            url,
-            "poster",
-            POSTER_MAX_W,
-            POSTER_MAX_H,
-            LruTarget::Decoded,
-        )
+        self.resolve_spec_if_ready(url, DecodeTargetSpec::POSTER)
     }
 
     pub fn resolve_poster_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
@@ -500,13 +996,7 @@ impl PosterCache {
     }
 
     pub fn resolve_thumbnail_image(&self, url: &str) -> Option<Arc<RenderImage>> {
-        self.resolve_scaled_into_target(
-            url,
-            "thumb",
-            THUMB_MAX_W,
-            THUMB_MAX_H,
-            LruTarget::Thumb,
-        )
+        self.resolve_spec_if_ready(url, DecodeTargetSpec::THUMB)
     }
 
     pub fn resolve_thumbnail_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
@@ -514,21 +1004,23 @@ impl PosterCache {
     }
 
     pub fn resolve_widescreen_image(&self, url: &str) -> Option<Arc<RenderImage>> {
-        self.resolve_scaled_into_target(
-            url,
-            "wide",
-            WIDESCREEN_MAX_W,
-            WIDESCREEN_MAX_H,
-            LruTarget::Decoded,
-        )
+        self.resolve_spec_if_ready(url, DecodeTargetSpec::WIDE)
     }
 
     pub fn resolve_widescreen_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
         self.resolve_widescreen_image(url?.as_str())
     }
 
+    pub fn resolve_episode_still_image(&self, url: &str) -> Option<Arc<RenderImage>> {
+        self.resolve_spec_if_ready(url, DecodeTargetSpec::STILL)
+    }
+
+    pub fn resolve_episode_still_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
+        self.resolve_episode_still_image(url?.as_str())
+    }
+
     pub fn resolve_hero_backdrop_image(&self, url: &str) -> Option<Arc<RenderImage>> {
-        self.resolve_scaled_into_target(url, "hero", HERO_MAX_W, HERO_MAX_H, LruTarget::Hero)
+        self.resolve_spec_if_ready(url, DecodeTargetSpec::HERO)
     }
 
     pub fn resolve_hero_backdrop_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
@@ -536,17 +1028,59 @@ impl PosterCache {
     }
 
     pub fn resolve_logo_image(&self, url: &str) -> Option<Arc<RenderImage>> {
-        self.resolve_scaled_into_target(
-            url,
-            "logo",
-            LOGO_DECODE_MAX_WIDTH,
-            LOGO_DECODE_MAX_HEIGHT,
-            LruTarget::Decoded,
-        )
+        self.resolve_spec_if_ready(url, DecodeTargetSpec::LOGO)
     }
 
     pub fn resolve_logo_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
         self.resolve_logo_image(url?.as_str())
+    }
+
+    pub fn resolve_first_available_hero<'a>(
+        &self,
+        urls: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Arc<RenderImage>> {
+        self.resolve_first_available_for_spec(urls, DecodeTargetSpec::HERO)
+    }
+
+    pub fn resolve_first_available_ambient<'a>(
+        &self,
+        urls: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Arc<RenderImage>> {
+        self.resolve_first_available_for_spec(urls, DecodeTargetSpec::AMBIENT)
+    }
+
+    pub fn resolve_first_available_logo<'a>(
+        &self,
+        urls: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Arc<RenderImage>> {
+        self.resolve_first_available_for_spec(urls, DecodeTargetSpec::LOGO)
+    }
+
+    pub fn resolve_widescreen_or_poster(
+        &self,
+        wide_url: Option<&str>,
+        poster_url: Option<&str>,
+    ) -> Option<Arc<RenderImage>> {
+        if let Some(wide) = wide_url {
+            let (img, outcome) = self.resolve_candidate_in_target(wide, DecodeTargetSpec::WIDE);
+            match outcome {
+                LookupOutcome::Ready => return img,
+                LookupOutcome::Loading | LookupOutcome::Spawned => return None,
+                LookupOutcome::Failed => {}
+            }
+        }
+        if let Some(poster) = poster_url {
+            return self.resolve_poster_image(poster);
+        }
+        None
+    }
+
+    pub fn prefetch_poster(&self, url: &str) {
+        let _ = self.resolve_poster_image(url);
+    }
+
+    pub fn prefetch_hero_backdrop(&self, url: &str) {
+        let _ = self.resolve_hero_backdrop_image(url);
     }
 
     pub fn push_evicted_image(&self, image: Arc<RenderImage>) {
@@ -564,6 +1098,12 @@ impl PosterCache {
                 .thumb_lru
                 .lock()
                 .trim_to_limit(PLAYBACK_RETAINED_THUMB_TEXTURES),
+        );
+        newly_evicted.extend(
+            self.inner
+                .still_lru
+                .lock()
+                .trim_to_limit(PLAYBACK_RETAINED_STILL_TEXTURES),
         );
         newly_evicted.extend(
             self.inner
@@ -590,40 +1130,69 @@ impl PosterCache {
         self.inner.thumb_lru.lock().len_ready()
     }
 
+    pub fn still_ready_count(&self) -> usize {
+        self.inner.still_lru.lock().len_ready()
+    }
+
     pub fn drain_evicted_images(&self) -> Vec<Arc<RenderImage>> {
         std::mem::take(&mut *self.inner.evicted_images.lock())
     }
 
-    fn resolve_scaled_into_target(
+    fn resolve_spec_if_ready(
         &self,
         url: &str,
-        variant: &'static str,
-        max_w: u32,
-        max_h: u32,
-        target: LruTarget,
+        spec: DecodeTargetSpec,
     ) -> Option<Arc<RenderImage>> {
+        self.resolve_candidate_in_target(url, spec).0
+    }
+
+    fn resolve_first_available_for_spec<'a>(
+        &self,
+        urls: impl IntoIterator<Item = &'a str>,
+        spec: DecodeTargetSpec,
+    ) -> Option<Arc<RenderImage>> {
+        for url in urls {
+            let (img, outcome) = self.resolve_candidate_in_target(url, spec);
+            match outcome {
+                LookupOutcome::Ready => return img,
+                LookupOutcome::Loading | LookupOutcome::Spawned => return None,
+                LookupOutcome::Failed => continue,
+            }
+        }
+        None
+    }
+
+    fn resolve_candidate_in_target(
+        &self,
+        url: &str,
+        spec: DecodeTargetSpec,
+    ) -> (Option<Arc<RenderImage>>, LookupOutcome) {
         let trimmed = url.trim();
         if trimmed.is_empty() || !(trimmed.starts_with("http://") || trimmed.starts_with("https://"))
         {
-            return None;
-        }
-        let lru_key = format!("{variant}:{trimmed}");
-        let epoch = self.inner.current_epoch();
-        let (hit, should_spawn) = self
-            .inner
-            .lru_mutex(target)
-            .lock()
-            .lookup_or_begin(&lru_key, epoch);
-        if hit.is_some() || !should_spawn {
-            return hit;
+            return (None, LookupOutcome::Failed);
         }
 
-        let inner = Arc::clone(&self.inner);
-        let url_owned = trimmed.to_owned();
-        self.inner.runtime.spawn(async move {
-            fetch_and_decode_into_target(inner, url_owned, lru_key, max_w, max_h, target).await;
-        });
-        None
+        let epoch = self.inner.current_epoch();
+        let (hit, outcome) = self
+            .inner
+            .lru_mutex(spec.target)
+            .lock()
+            .lookup_or_begin_variant(spec.variant, trimmed, epoch);
+
+        if outcome == LookupOutcome::Spawned {
+            let inner = Arc::clone(&self.inner);
+            let url_owned = trimmed.to_owned();
+            self.inner.runtime.spawn(async move {
+                if spec.target == LruTarget::Ambient {
+                    compute_or_fetch_ambient(inner, url_owned, spec.cdn_max_w).await;
+                } else {
+                    fetch_and_decode_into_target(inner, url_owned, spec).await;
+                }
+            });
+        }
+
+        (hit, outcome)
     }
 
     pub fn resolve_or_fetch(&self, url: &str) -> Option<PathBuf> {
@@ -668,29 +1237,7 @@ impl PosterCache {
     }
 
     pub fn resolve_ambient_bleed(&self, url: &str) -> Option<Arc<RenderImage>> {
-        let trimmed = url.trim();
-        if trimmed.is_empty() || !(trimmed.starts_with("http://") || trimmed.starts_with("https://"))
-        {
-            return None;
-        }
-
-        let epoch = self.inner.current_epoch();
-        let (hit, should_spawn) = self
-            .inner
-            .ambient_lru
-            .lock()
-            .lookup_or_begin(trimmed, epoch);
-        if hit.is_some() || !should_spawn {
-            return hit;
-        }
-
-        let inner = Arc::clone(&self.inner);
-        let url_owned = trimmed.to_owned();
-        self.inner.runtime.spawn(async move {
-            compute_or_fetch_ambient(inner, url_owned).await;
-        });
-
-        None
+        self.resolve_spec_if_ready(url, DecodeTargetSpec::AMBIENT)
     }
 
     pub fn resolve_ambient_url(&self, url: Option<&Url>) -> Option<Arc<RenderImage>> {
@@ -702,178 +1249,530 @@ impl PosterCache {
             .entries
             .write()
             .retain(|_, v| !matches!(v, CacheEntry::Failed));
+        self.inner.failed_entry_urls.lock().clear();
+        self.inner.initialized_dirs.lock().clear();
         self.inner.decoded_lru.lock().clear_failures();
         self.inner.thumb_lru.lock().clear_failures();
+        self.inner.still_lru.lock().clear_failures();
         self.inner.hero_lru.lock().clear_failures();
         self.inner.ambient_lru.lock().clear_failures();
     }
 }
 
-async fn load_or_download_bytes(inner: &Arc<PosterCacheInner>, url: &str) -> Option<Vec<u8>> {
-    let target_path = cache_path_for_url(&inner.cache_root, url);
+struct InFlightGuard {
+    inner: Arc<PosterCacheInner>,
+    url: String,
+    notify: Arc<Notify>,
+}
 
-    if let Ok(bytes) = tokio::fs::read(&target_path).await {
-        if bytes.len() > 64 {
-            inner
-                .entries
-                .write()
-                .insert(url.to_owned(), CacheEntry::Ready(target_path));
-            return Some(bytes);
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        {
+            let mut entries = self.inner.entries.write();
+            if matches!(entries.get(&self.url), Some(CacheEntry::Loading)) {
+                entries.remove(&self.url);
+            }
         }
+        {
+            let mut inflight = self.inner.in_flight_urls.lock();
+            if inflight
+                .get(&self.url)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &self.notify))
+            {
+                inflight.remove(&self.url);
+            }
+        }
+        self.notify.notify_waiters();
     }
+}
 
-    let Ok(_permit) = inner.semaphore.acquire().await else {
-        return None;
+struct PruneFlagGuard {
+    inner: Arc<PosterCacheInner>,
+}
+
+impl Drop for PruneFlagGuard {
+    fn drop(&mut self) {
+        self.inner
+            .disk_prune_in_flight
+            .store(false, Ordering::Release);
+    }
+}
+
+fn trigger_background_disk_prune(inner: &Arc<PosterCacheInner>) {
+    if inner.disk_prune_in_flight.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let guard = PruneFlagGuard {
+        inner: Arc::clone(inner),
     };
+    let root = inner.cache_root.clone();
+    inner.runtime.spawn(async move {
+        let _guard = guard;
+        let _ = tokio::task::spawn_blocking(move || {
+            prune_disk_cache_to_budget(&root, MAX_DISK_CACHE_BYTES)
+        })
+        .await;
+    });
+}
 
-    if let Ok(bytes) = tokio::fs::read(&target_path).await {
-        if bytes.len() > 64 {
-            inner
-                .entries
-                .write()
-                .insert(url.to_owned(), CacheEntry::Ready(target_path));
-            return Some(bytes);
-        }
-    }
+fn mark_entry_ready(inner: &PosterCacheInner, url: &str, path: PathBuf) {
+    inner
+        .entries
+        .write()
+        .insert(url.to_owned(), CacheEntry::Ready(path));
+}
 
-    match download_and_persist(inner, url, &target_path).await {
-        Ok(bytes) => {
-            inner
-                .entries
-                .write()
-                .insert(url.to_owned(), CacheEntry::Ready(target_path));
-            Some(bytes)
-        }
-        Err(err) => {
-            let safe_url = crate::updater::redact_url_for_log(url);
-            tracing::debug!(target: "ferrite::poster_cache", url = %safe_url, "artwork fetch failed: {err}");
-            inner
-                .entries
-                .write()
-                .insert(url.to_owned(), CacheEntry::Failed);
-            None
+fn mark_entry_failed(inner: &PosterCacheInner, url: &str) {
+    let mut entries = inner.entries.write();
+    entries.insert(url.to_owned(), CacheEntry::Failed);
+    let mut failed_queue = inner.failed_entry_urls.lock();
+    failed_queue.push_back(url.to_owned());
+    while failed_queue.len() > MAX_FAILED_ENTRIES {
+        if let Some(oldest) = failed_queue.pop_front() {
+            if oldest != url && matches!(entries.get(&oldest), Some(CacheEntry::Failed)) {
+                entries.remove(&oldest);
+            }
         }
     }
 }
 
-async fn fetch_and_decode_into_target(
-    inner: Arc<PosterCacheInner>,
-    url: String,
-    lru_key: String,
+fn remove_stale_ready_entry(inner: &PosterCacheInner, url: &str, stale_path: &Path) {
+    let mut entries = inner.entries.write();
+    if matches!(entries.get(url), Some(CacheEntry::Ready(p)) if p == stale_path) {
+        entries.remove(url);
+    }
+}
+
+enum DiskOrBytes {
+    ReadyPath(PathBuf),
+    Downloaded(Vec<u8>),
+}
+
+async fn acquire_raw_artwork(
+    inner: &Arc<PosterCacheInner>,
+    fetch_url: &str,
+    force_disk_recheck: bool,
+) -> Option<DiskOrBytes> {
+    if !force_disk_recheck {
+        if let Some(entry) = inner.entries.read().get(fetch_url).cloned() {
+            match entry {
+                CacheEntry::Ready(path) => return Some(DiskOrBytes::ReadyPath(path)),
+                CacheEntry::Failed => return None,
+                CacheEntry::Loading => {}
+            }
+        }
+    }
+
+    loop {
+        let target_path = cache_path_for_url(&inner.cache_root, fetch_url);
+
+        let (notify, is_leader) = {
+            let mut inflight = inner.in_flight_urls.lock();
+            if let Some(existing) = inflight.get(fetch_url) {
+                (Arc::clone(existing), false)
+            } else {
+                let created = Arc::new(Notify::new());
+                inflight.insert(fetch_url.to_owned(), Arc::clone(&created));
+                (created, true)
+            }
+        };
+
+        if !is_leader {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let still_in_flight = {
+                let inflight = inner.in_flight_urls.lock();
+                inflight
+                    .get(fetch_url)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &notify))
+            };
+            if still_in_flight {
+                notified.await;
+            }
+            match inner.entries.read().get(fetch_url).cloned() {
+                Some(CacheEntry::Ready(path)) => return Some(DiskOrBytes::ReadyPath(path)),
+                Some(CacheEntry::Failed) => return None,
+                Some(CacheEntry::Loading) | None => continue,
+            }
+        }
+
+        let _in_flight_guard = InFlightGuard {
+            inner: Arc::clone(inner),
+            url: fetch_url.to_owned(),
+            notify,
+        };
+
+        if !force_disk_recheck {
+            if let Some(entry) = inner.entries.read().get(fetch_url).cloned() {
+                match entry {
+                    CacheEntry::Ready(path) => return Some(DiskOrBytes::ReadyPath(path)),
+                    CacheEntry::Failed => return None,
+                    CacheEntry::Loading => {}
+                }
+            }
+        }
+
+        if let Ok(meta) = tokio::fs::metadata(&target_path).await {
+            if meta.is_file() && meta.len() >= 64 {
+                mark_entry_ready(inner, fetch_url, target_path.clone());
+                return Some(DiskOrBytes::ReadyPath(target_path));
+            }
+        }
+
+        let Ok(_download_permit) = inner.semaphore.acquire().await else {
+            mark_entry_failed(inner, fetch_url);
+            return None;
+        };
+
+        if let Ok(meta) = tokio::fs::metadata(&target_path).await {
+            if meta.is_file() && meta.len() >= 64 {
+                mark_entry_ready(inner, fetch_url, target_path.clone());
+                return Some(DiskOrBytes::ReadyPath(target_path));
+            }
+        }
+
+        match download_and_persist(inner, fetch_url, &target_path).await {
+            Ok(bytes) => {
+                mark_entry_ready(inner, fetch_url, target_path);
+                return Some(DiskOrBytes::Downloaded(bytes));
+            }
+            Err(err) => {
+                let safe_url = crate::updater::redact_url_for_log(fetch_url);
+                tracing::debug!(
+                    target: "ferrite::poster_cache",
+                    url = %safe_url,
+                    "artwork fetch failed: {err}"
+                );
+                mark_entry_failed(inner, fetch_url);
+                return None;
+            }
+        }
+    }
+}
+
+async fn read_and_decode_with_retry<F>(
+    inner: &Arc<PosterCacheInner>,
+    fetch_url: &str,
+    first_source: DiskOrBytes,
+    decode_fn: F,
+) -> Option<Arc<RenderImage>>
+where
+    F: Fn(&[u8]) -> Option<Arc<RenderImage>> + Send + Sync + Copy + 'static,
+{
+    let mut source = first_source;
+    for attempt in 0..2 {
+        match source {
+            DiskOrBytes::Downloaded(bytes) => {
+                let decode_permit = inner.decode_semaphore.acquire().await.ok()?;
+                let decoded = tokio::task::spawn_blocking(move || decode_fn(&bytes))
+                    .await
+                    .ok()
+                    .flatten();
+                drop(decode_permit);
+                return decoded;
+            }
+            DiskOrBytes::ReadyPath(path) => {
+                let decode_permit = inner.decode_semaphore.acquire().await.ok()?;
+                let disk_permit = inner.disk_io_semaphore.acquire().await.ok()?;
+                let read_res = tokio::fs::read(&path).await;
+                drop(disk_permit);
+
+                match read_res {
+                    Ok(bytes) if bytes.len() >= 64 => {
+                        let decoded = tokio::task::spawn_blocking(move || decode_fn(&bytes))
+                            .await
+                            .ok()
+                            .flatten();
+                        drop(decode_permit);
+                        return decoded;
+                    }
+                    _ => {
+                        drop(decode_permit);
+                        if attempt == 0 {
+                            remove_stale_ready_entry(inner, fetch_url, &path);
+                            source = acquire_raw_artwork(inner, fetch_url, true).await?;
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn try_read_sidecar_image(
+    inner: &PosterCacheInner,
+    sidecar_path: &Path,
     max_w: u32,
     max_h: u32,
-    target: LruTarget,
+) -> Option<Arc<RenderImage>> {
+    let disk_permit = inner.disk_io_semaphore.acquire().await.ok()?;
+    let bytes = tokio::fs::read(sidecar_path).await.ok()?;
+    drop(disk_permit);
+    if let Some(img) = decode_sidecar_render_image(&bytes, max_w, max_h) {
+        return Some(img);
+    }
+    let _ = tokio::fs::remove_file(sidecar_path).await;
+    None
+}
+
+async fn persist_sidecar_if_enabled(
+    inner: &Arc<PosterCacheInner>,
+    fetch_url: &str,
+    variant: ImageVariant,
+    image: &RenderImage,
 ) {
-    let Some(bytes) = load_or_download_bytes(&inner, &url).await else {
-        let ep = inner.current_epoch();
-        inner.lru_mutex(target).lock().mark_failed(lru_key, ep);
+    if !variant.uses_sidecar() {
+        return;
+    }
+    let Some(bytes) = encode_sidecar_bytes(image) else {
         return;
     };
+    let sidecar_path = sidecar_path_for_url(&inner.cache_root, fetch_url, variant.as_str());
+    let _ = write_atomic_bytes(inner, &sidecar_path, &bytes).await;
+}
 
-    let Ok(_decode_permit) = inner.decode_semaphore.acquire().await else {
-        let ep = inner.current_epoch();
-        inner.lru_mutex(target).lock().mark_failed(lru_key, ep);
-        return;
-    };
-
-    let decoded =
-        tokio::task::spawn_blocking(move || decode_scaled_render_image(&bytes, max_w, max_h))
-            .await
-            .ok()
-            .flatten();
-    drop(_decode_permit);
-
+fn insert_ready_and_wake(
+    inner: &PosterCacheInner,
+    target: LruTarget,
+    variant: ImageVariant,
+    original_url: &str,
+    render_img: Arc<RenderImage>,
+) {
     let ep = inner.current_epoch();
+    let evicted = inner
+        .lru_mutex(target)
+        .lock()
+        .insert_ready_variant(variant, original_url, render_img, ep);
+    if !evicted.is_empty() {
+        inner.evicted_images.lock().extend(evicted);
+    }
+    let _ = inner.wakeup_tx.try_send(());
+}
+
+fn mark_failed_and_wake(
+    inner: &PosterCacheInner,
+    target: LruTarget,
+    variant: ImageVariant,
+    original_url: &str,
+) {
+    let ep = inner.current_epoch();
+    inner
+        .lru_mutex(target)
+        .lock()
+        .mark_failed_variant(variant, original_url, ep);
+    let _ = inner.wakeup_tx.try_send(());
+}
+
+async fn fetch_and_decode_into_target(
+    inner: Arc<PosterCacheInner>,
+    original_url: String,
+    spec: DecodeTargetSpec,
+) {
+    let fetch_url = rewrite_cdn_image_url(&original_url, spec.cdn_max_w);
+    let fetch_url_str: &str = fetch_url.as_ref();
+
+    if spec.variant.uses_sidecar() {
+        let sidecar_path =
+            sidecar_path_for_url(&inner.cache_root, fetch_url_str, spec.variant.as_str());
+        if let Some(render_img) =
+            try_read_sidecar_image(&inner, &sidecar_path, spec.max_w, spec.max_h).await
+        {
+            insert_ready_and_wake(&inner, spec.target, spec.variant, &original_url, render_img);
+            return;
+        }
+    }
+
+    let Some(source) = acquire_raw_artwork(&inner, fetch_url_str, false).await else {
+        mark_failed_and_wake(&inner, spec.target, spec.variant, &original_url);
+        return;
+    };
+
+    let max_w = spec.max_w;
+    let max_h = spec.max_h;
+    let decoded = read_and_decode_with_retry(&inner, fetch_url_str, source, move |bytes| {
+        decode_scaled_render_image(bytes, max_w, max_h)
+    })
+    .await;
+
     match decoded {
         Some(render_img) => {
-            let evicted = inner
-                .lru_mutex(target)
-                .lock()
-                .insert_ready(lru_key, render_img, ep);
-            if !evicted.is_empty() {
-                inner.evicted_images.lock().extend(evicted);
-            }
-            let _ = inner.wakeup_tx.try_send(());
+            persist_sidecar_if_enabled(&inner, fetch_url_str, spec.variant, &render_img).await;
+            insert_ready_and_wake(&inner, spec.target, spec.variant, &original_url, render_img);
         }
         None => {
-            inner.lru_mutex(target).lock().mark_failed(lru_key, ep);
+            mark_failed_and_wake(&inner, spec.target, spec.variant, &original_url);
         }
     }
 }
 
 async fn fetch_or_load_disk(inner: Arc<PosterCacheInner>, url: String) -> Option<PathBuf> {
-    let target_path = cache_path_for_url(&inner.cache_root, &url);
-
-    if let Ok(meta) = tokio::fs::metadata(&target_path).await {
-        if meta.is_file() && meta.len() > 64 {
-            inner
-                .entries
-                .write()
-                .insert(url, CacheEntry::Ready(target_path.clone()));
+    match acquire_raw_artwork(&inner, &url, false).await {
+        Some(DiskOrBytes::ReadyPath(path)) => {
             let _ = inner.wakeup_tx.try_send(());
-            return Some(target_path);
+            Some(path)
         }
+        Some(DiskOrBytes::Downloaded(_)) => {
+            let path = cache_path_for_url(&inner.cache_root, &url);
+            let _ = inner.wakeup_tx.try_send(());
+            Some(path)
+        }
+        None => None,
+    }
+}
+
+async fn compute_or_fetch_ambient(
+    inner: Arc<PosterCacheInner>,
+    original_url: String,
+    cdn_max_w: u32,
+) {
+    let fetch_url = rewrite_cdn_image_url(&original_url, cdn_max_w);
+    let fetch_url_str: &str = fetch_url.as_ref();
+
+    let sidecar_path = sidecar_path_for_url(
+        &inner.cache_root,
+        fetch_url_str,
+        ImageVariant::Ambient.as_str(),
+    );
+    if let Some(render_img) = try_read_sidecar_image(
+        &inner,
+        &sidecar_path,
+        AMBIENT_BLEED_WIDTH,
+        AMBIENT_BLEED_HEIGHT,
+    )
+    .await
+    {
+        insert_ready_and_wake(
+            &inner,
+            LruTarget::Ambient,
+            ImageVariant::Ambient,
+            &original_url,
+            render_img,
+        );
+        return;
     }
 
-    let Ok(_permit) = inner.semaphore.acquire().await else {
-        inner.entries.write().insert(url, CacheEntry::Failed);
-        return None;
+    let Some(source) = acquire_raw_artwork(&inner, fetch_url_str, false).await else {
+        mark_failed_and_wake(
+            &inner,
+            LruTarget::Ambient,
+            ImageVariant::Ambient,
+            &original_url,
+        );
+        return;
     };
 
-    match download_and_persist(&inner, &url, &target_path).await {
-        Ok(_) => {
-            inner
-                .entries
-                .write()
-                .insert(url, CacheEntry::Ready(target_path.clone()));
-            let _ = inner.wakeup_tx.try_send(());
-            Some(target_path)
+    let built =
+        read_and_decode_with_retry(&inner, fetch_url_str, source, build_ambient_bleed_image).await;
+
+    match built {
+        Some(render_img) => {
+            persist_sidecar_if_enabled(&inner, fetch_url_str, ImageVariant::Ambient, &render_img)
+                .await;
+            insert_ready_and_wake(
+                &inner,
+                LruTarget::Ambient,
+                ImageVariant::Ambient,
+                &original_url,
+                render_img,
+            );
         }
-        Err(err) => {
-            let safe_url = crate::updater::redact_url_for_log(&url);
-            tracing::debug!(target: "ferrite::poster_cache", url = %safe_url, "artwork fetch failed: {err}");
-            inner.entries.write().insert(url, CacheEntry::Failed);
-            None
+        None => {
+            mark_failed_and_wake(
+                &inner,
+                LruTarget::Ambient,
+                ImageVariant::Ambient,
+                &original_url,
+            );
         }
     }
 }
 
-async fn compute_or_fetch_ambient(inner: Arc<PosterCacheInner>, url: String) {
-    let Some(bytes) = load_or_download_bytes(&inner, &url).await else {
-        let ep = inner.current_epoch();
-        inner.ambient_lru.lock().mark_failed(url, ep);
-        return;
-    };
-
-    let Ok(_decode_permit) = inner.decode_semaphore.acquire().await else {
-        let ep = inner.current_epoch();
-        inner.ambient_lru.lock().mark_failed(url, ep);
-        return;
-    };
-
-    let built = tokio::task::spawn_blocking(move || build_ambient_bleed_image(&bytes))
-        .await
-        .ok()
-        .flatten();
-    drop(_decode_permit);
-
-    let ep = inner.current_epoch();
-    match built {
-        Some(render_img) => {
-            let evicted = inner.ambient_lru.lock().insert_ready(url, render_img, ep);
-            if !evicted.is_empty() {
-                inner.evicted_images.lock().extend(evicted);
-            }
-            let _ = inner.wakeup_tx.try_send(());
-        }
-        None => {
-            inner.ambient_lru.lock().mark_failed(url, ep);
-        }
+async fn ensure_dir_initialized(inner: &PosterCacheInner, dir: &Path) -> std::io::Result<()> {
+    if inner.initialized_dirs.lock().contains(dir) {
+        return Ok(());
     }
+    tokio::fs::create_dir_all(dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let should_chmod_root = inner
+            .initialized_dirs
+            .lock()
+            .insert(inner.cache_root.clone());
+        if should_chmod_root {
+            let _ = tokio::fs::set_permissions(
+                &inner.cache_root,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .await;
+        }
+        let _ = tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await;
+    }
+    inner.initialized_dirs.lock().insert(dir.to_path_buf());
+    Ok(())
+}
+
+async fn write_atomic_bytes(
+    inner: &Arc<PosterCacheInner>,
+    target_path: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let Some(parent) = target_path.parent() else {
+        anyhow::bail!("missing parent directory for {}", target_path.display());
+    };
+    ensure_dir_initialized(inner, parent).await?;
+
+    let seq = inner.temp_seq.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = target_path.with_extension(format!("part.{seq}"));
+    {
+        let disk_permit = inner
+            .disk_io_semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("disk semaphore closed"))?;
+
+        if let Err(err) = tokio::fs::write(&tmp_path, bytes).await {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                {
+                    inner.initialized_dirs.lock().remove(parent);
+                }
+                ensure_dir_initialized(inner, parent).await?;
+                tokio::fs::write(&tmp_path, bytes).await?;
+            } else {
+                return Err(err.into());
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(
+                &tmp_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .await;
+        }
+
+        if let Err(err) = tokio::fs::rename(&tmp_path, target_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(err.into());
+        }
+        drop(disk_permit);
+    }
+
+    let writes = inner.disk_writes.fetch_add(1, Ordering::Relaxed) + 1;
+    if writes.is_multiple_of(DISK_PRUNE_INTERVAL_WRITES) {
+        trigger_background_disk_prune(inner);
+    }
+    Ok(())
 }
 
 async fn download_and_persist(
-    inner: &PosterCacheInner,
+    inner: &Arc<PosterCacheInner>,
     url: &str,
     target_path: &Path,
 ) -> anyhow::Result<Vec<u8>> {
@@ -893,29 +1792,7 @@ async fn download_and_persist(
         anyhow::bail!("invalid image byte length {}", bytes.len());
     }
 
-    if let Some(parent) = target_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                tokio::fs::set_permissions(&inner.cache_root, std::fs::Permissions::from_mode(0o700))
-                    .await;
-            let _ =
-                tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await;
-        }
-    }
-
-    let seq = inner.temp_seq.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = target_path.with_extension(format!("part.{seq}"));
-    tokio::fs::write(&tmp_path, &bytes).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ =
-            tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await;
-    }
-    tokio::fs::rename(&tmp_path, target_path).await?;
+    write_atomic_bytes(inner, target_path, &bytes).await?;
     Ok(bytes.to_vec())
 }
 
@@ -1150,10 +2027,12 @@ mod tests {
     }
 
     #[test]
-    fn logo_decoder_preserves_transparent_png_alpha() {
-        let mut rgba = RgbaImage::new(2, 1);
+    fn logo_decoder_preserves_transparent_png_alpha_and_fast_paths_opaque_pixels() {
+        let mut rgba = RgbaImage::new(4, 1);
         rgba.put_pixel(0, 0, image::Rgba([0, 0, 0, 0]));
         rgba.put_pixel(1, 0, image::Rgba([255, 255, 255, 255]));
+        rgba.put_pixel(2, 0, image::Rgba([40, 120, 220, 255]));
+        rgba.put_pixel(3, 0, image::Rgba([200, 100, 50, 128]));
         let mut png_bytes = Vec::new();
         image::DynamicImage::ImageRgba8(rgba)
             .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
@@ -1168,5 +2047,528 @@ mod tests {
         let bytes = rendered.as_bytes(0).expect("frame bytes");
         assert_eq!(&bytes[0..4], &[0, 0, 0, 0]);
         assert_eq!(&bytes[4..8], &[255, 255, 255, 255]);
+        assert_eq!(&bytes[8..12], &[220, 120, 40, 255]);
+        // Premultiplied BGRA for [200, 100, 50, 128]
+        assert_eq!(bytes[12], ((50_u16 * 128 + 127) / 255) as u8);
+        assert_eq!(bytes[13], ((100_u16 * 128 + 127) / 255) as u8);
+        assert_eq!(bytes[14], ((200_u16 * 128 + 127) / 255) as u8);
+        assert_eq!(bytes[15], 128);
+    }
+
+    #[test]
+    fn cdn_url_rewriting_steps_down_tmdb_and_metahub_preserving_query_and_fragment() {
+        // TMDB /original/ steps down according to max_w
+        assert_eq!(
+            rewrite_cdn_image_url("https://image.tmdb.org/t/p/original/abc.jpg?v=2#frag", 80),
+            "https://image.tmdb.org/t/p/w185/abc.jpg?v=2#frag"
+        );
+        assert_eq!(
+            rewrite_cdn_image_url("https://image.tmdb.org/t/p/original/still.jpg", STILL_MAX_W),
+            "https://image.tmdb.org/t/p/w300/still.jpg"
+        );
+        assert_eq!(
+            rewrite_cdn_image_url("https://image.tmdb.org/t/p/original/poster.jpg", 342),
+            "https://image.tmdb.org/t/p/w342/poster.jpg"
+        );
+        assert_eq!(
+            rewrite_cdn_image_url("https://image.tmdb.org/t/p/w500/poster.jpg", 500),
+            "https://image.tmdb.org/t/p/w342/poster.jpg"
+        );
+        assert_eq!(
+            rewrite_cdn_image_url("https://image.tmdb.org/t/p/original/wide.jpg", WIDESCREEN_MAX_W),
+            "https://image.tmdb.org/t/p/w780/wide.jpg"
+        );
+        assert_eq!(
+            rewrite_cdn_image_url("https://image.tmdb.org/t/p/original/hero.jpg", HERO_MAX_W),
+            "https://image.tmdb.org/t/p/w1280/hero.jpg"
+        );
+
+        // Already <= target size: borrowed without allocation
+        let borrowed_small = rewrite_cdn_image_url("https://image.tmdb.org/t/p/w92/p.jpg", 185);
+        assert!(matches!(borrowed_small, Cow::Borrowed(_)));
+        assert_eq!(borrowed_small, "https://image.tmdb.org/t/p/w92/p.jpg");
+
+        let borrowed_w342 = rewrite_cdn_image_url("https://image.tmdb.org/t/p/w342/p.jpg", 500);
+        assert!(matches!(borrowed_w342, Cow::Borrowed(_)));
+
+        let borrowed_w780 = rewrite_cdn_image_url("https://image.tmdb.org/t/p/w780/b.jpg", 1280);
+        assert!(matches!(borrowed_w780, Cow::Borrowed(_)));
+
+        // Metahub /large/ steps down to /medium/ or /small/ (<= 120)
+        assert_eq!(
+            rewrite_cdn_image_url(
+                "https://images.metahub.space/poster/large/tt0133093/img?t=1#top",
+                80
+            ),
+            "https://images.metahub.space/poster/small/tt0133093/img?t=1#top"
+        );
+        assert_eq!(
+            rewrite_cdn_image_url(
+                "https://images.metahub.space/background/large/tt0133093/img",
+                342
+            ),
+            "https://images.metahub.space/background/medium/tt0133093/img"
+        );
+        let metahub_med =
+            rewrite_cdn_image_url("https://images.metahub.space/poster/medium/tt0133093/img", 80);
+        assert!(matches!(metahub_med, Cow::Borrowed(_)));
+
+        // Non-CDN URLs untouched
+        let custom = rewrite_cdn_image_url("http://127.0.0.1:8080/poster/large/a.jpg", 80);
+        assert!(matches!(custom, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn bounded_texture_lru_variant_separation_and_failed_cap() {
+        let png_bytes = sample_png_bytes(8, 8);
+        let poster_img = decode_scaled_render_image(&png_bytes, 32, 48).unwrap();
+        let wide_img = decode_scaled_render_image(&png_bytes, 64, 36).unwrap();
+
+        let mut lru = BoundedTextureLru::with_capacity(8);
+        let shared_url = "https://example.com/art.jpg";
+        assert!(lru
+            .insert_ready_variant(ImageVariant::Poster, shared_url, Arc::clone(&poster_img), 1)
+            .is_empty());
+        assert!(lru
+            .insert_ready_variant(ImageVariant::Wide, shared_url, Arc::clone(&wide_img), 1)
+            .is_empty());
+        assert_eq!(lru.len_ready(), 2);
+
+        let (got_poster, out_p) = lru.lookup_or_begin_variant(ImageVariant::Poster, shared_url, 2);
+        let (got_wide, out_w) = lru.lookup_or_begin_variant(ImageVariant::Wide, shared_url, 2);
+        assert_eq!(out_p, LookupOutcome::Ready);
+        assert_eq!(out_w, LookupOutcome::Ready);
+        assert!(Arc::ptr_eq(&got_poster.unwrap(), &poster_img));
+        assert!(Arc::ptr_eq(&got_wide.unwrap(), &wide_img));
+
+        // Failure map cap evicts oldest failures above MAX_FAILED_ENTRIES (256)
+        for i in 0..300 {
+            let bad_url = format!("https://example.com/missing-{i}.jpg");
+            lru.mark_failed_variant(ImageVariant::Poster, &bad_url, 3);
+        }
+        assert_eq!(lru.failed_count, MAX_FAILED_ENTRIES);
+        // Oldest entries (0..44) were evicted and now return Spawned again
+        let (_, oldest_outcome) =
+            lru.lookup_or_begin_variant(ImageVariant::Poster, "https://example.com/missing-0.jpg", 3);
+        assert_eq!(oldest_outcome, LookupOutcome::Spawned);
+        // Newest entry (299) is still marked Failed
+        let (_, newest_outcome) = lru.lookup_or_begin_variant(
+            ImageVariant::Poster,
+            "https://example.com/missing-299.jpg",
+            3,
+        );
+        assert_eq!(newest_outcome, LookupOutcome::Failed);
+
+        lru.clear_failures();
+        assert_eq!(lru.failed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn episode_still_target_resolves_and_trims_for_playback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let still_png = sample_png_bytes(640, 360);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0_u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    still_png.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&still_png).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        let rx = cache.wakeup_receiver();
+        let url = Url::parse(&format!("http://{addr}/ep1.png")).unwrap();
+
+        assert!(cache.resolve_episode_still_url(Some(&url)).is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let still_tex = cache
+            .resolve_episode_still_url(Some(&url))
+            .expect("episode still should resolve");
+        let sz = still_tex.size(0);
+        assert_eq!(sz.width.0, STILL_MAX_W as i32);
+        assert_eq!(sz.height.0, STILL_MAX_H as i32);
+        assert_eq!(cache.still_ready_count(), 1);
+        assert_eq!(cache.decoded_ready_count(), 0);
+
+        // Verify playback trim retains PLAYBACK_RETAINED_STILL_TEXTURES
+        let ep = cache.begin_render_frame();
+        let tiny = sample_png_bytes(16, 9);
+        for i in 0..16 {
+            let img = decode_scaled_render_image(&tiny, STILL_MAX_W, STILL_MAX_H).unwrap();
+            cache.inner.still_lru.lock().insert_ready_variant(
+                ImageVariant::Still,
+                &format!("http://example/still-{i}.png"),
+                img,
+                ep,
+            );
+        }
+        assert_eq!(cache.still_ready_count(), 17);
+        cache.trim_for_playback();
+        assert_eq!(cache.still_ready_count(), PLAYBACK_RETAINED_STILL_TEXTURES);
+    }
+
+    #[tokio::test]
+    async fn fallback_resolvers_advance_only_on_failure_without_eager_cascade() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requested_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let req_log = Arc::clone(&requested_paths);
+        let good_png = sample_png_bytes(64, 36);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0_u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let path = req_str
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_owned();
+                req_log.lock().push(path.clone());
+
+                if path.contains("fail") {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        good_png.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(&good_png).await;
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        let rx = cache.wakeup_receiver();
+
+        let u1 = format!("http://{addr}/hero-fail.png");
+        let u2 = format!("http://{addr}/hero-ok.png");
+        let u3 = format!("http://{addr}/hero-never.png");
+
+        // First call spawns ONLY u1 (not u2 or u3)
+        assert!(cache
+            .resolve_first_available_hero(["", u1.as_str(), u2.as_str(), u3.as_str()])
+            .is_none());
+        // Calling again while Loading must still NOT spawn u2 or u3
+        assert!(cache
+            .resolve_first_available_hero([u1.as_str(), u2.as_str(), u3.as_str()])
+            .is_none());
+
+        // Wakes up when u1 fails
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("failure wakeup timed out")
+            .unwrap();
+        assert_eq!(requested_paths.lock().as_slice(), &["/hero-fail.png"]);
+
+        // Second call advances past Failed u1 and spawns ONLY u2 (still NOT u3)
+        assert!(cache
+            .resolve_first_available_hero([u1.as_str(), u2.as_str(), u3.as_str()])
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("success wakeup timed out")
+            .unwrap();
+
+        let resolved = cache
+            .resolve_first_available_hero([u1.as_str(), u2.as_str(), u3.as_str()])
+            .expect("hero fallback u2 should now be ready");
+        assert!(resolved.size(0).width.0 > 0);
+        assert_eq!(
+            requested_paths.lock().as_slice(),
+            &["/hero-fail.png", "/hero-ok.png"]
+        );
+
+        // Also test resolve_widescreen_or_poster advancing only on failure
+        let w_fail = format!("http://{addr}/wide-fail.png");
+        let p_ok = format!("http://{addr}/poster-ok.png");
+        assert!(cache
+            .resolve_widescreen_or_poster(Some(&w_fail), Some(&p_ok))
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cache
+            .resolve_widescreen_or_poster(Some(&w_fail), Some(&p_ok))
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cache
+            .resolve_widescreen_or_poster(Some(&w_fail), Some(&p_ok))
+            .is_some());
+
+        // Also test resolve_first_available_ambient & resolve_first_available_logo
+        let amb_fail = format!("http://{addr}/amb-fail.png");
+        let amb_ok = format!("http://{addr}/amb-ok.png");
+        assert!(cache
+            .resolve_first_available_ambient([amb_fail.as_str(), amb_ok.as_str()])
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cache
+            .resolve_first_available_ambient([amb_fail.as_str(), amb_ok.as_str()])
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cache
+            .resolve_first_available_ambient([amb_fail.as_str(), amb_ok.as_str()])
+            .is_some());
+
+        let logo_fail = format!("http://{addr}/logo-fail.png");
+        let logo_ok = format!("http://{addr}/logo-ok.png");
+        assert!(cache
+            .resolve_first_available_logo([logo_fail.as_str(), logo_ok.as_str()])
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cache
+            .resolve_first_available_logo([logo_fail.as_str(), logo_ok.as_str()])
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cache
+            .resolve_first_available_logo([logo_fail.as_str(), logo_ok.as_str()])
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn hero_and_ambient_coalesce_concurrent_same_url_into_single_http_get() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_srv = Arc::clone(&hits);
+        let png = sample_png_bytes(160, 90);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&png).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        let rx = cache.wakeup_receiver();
+        let url = format!("http://{addr}/shared-backdrop.png");
+
+        assert!(cache.resolve_hero_backdrop_image(&url).is_none());
+        assert!(cache.resolve_ambient_bleed(&url).is_none());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if cache.resolve_hero_backdrop_image(&url).is_some()
+                && cache.resolve_ambient_bleed(&url).is_some()
+            {
+                break;
+            }
+            tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("timed out waiting for hero + ambient")
+                .unwrap();
+        }
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn prescaled_sidecar_roundtrip_serves_warm_launch_without_raw_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_srv = Arc::clone(&hits);
+        let poster_png = sample_png_bytes(400, 600);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    poster_png.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&poster_png).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache1 = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        let rx1 = cache1.wakeup_receiver();
+        let url = format!("http://{addr}/poster-sidecar.png");
+
+        assert!(cache1.resolve_poster_image(&url).is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let img1 = cache1
+            .resolve_poster_image(&url)
+            .expect("poster decoded on cold run");
+        assert_eq!(img1.size(0).width.0, POSTER_MAX_W as i32);
+        assert_eq!(img1.size(0).height.0, POSTER_MAX_H as i32);
+
+        let raw_path = cache_path_for_url(dir.path(), &url);
+        let sidecar_path = sidecar_path_for_url(dir.path(), &url, "poster");
+        assert!(raw_path.is_file());
+        assert!(sidecar_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sidecar_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Remove raw compressed file to prove warm launch reads purely from pre-scaled sidecar!
+        std::fs::remove_file(&raw_path).unwrap();
+
+        let cache2 = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        let rx2 = cache2.wakeup_receiver();
+        assert!(cache2.resolve_poster_image(&url).is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let img2 = cache2
+            .resolve_poster_image(&url)
+            .expect("poster loaded from pre-scaled sidecar");
+        assert_eq!(img2.size(0), img1.size(0));
+        assert_eq!(img2.as_bytes(0), img1.as_bytes(0));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn disk_budget_pruning_deletes_oldest_mtime_files_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_a = dir.path().join("aa");
+        let shard_b = dir.path().join("bb");
+        std::fs::create_dir_all(&shard_a).unwrap();
+        std::fs::create_dir_all(&shard_b).unwrap();
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let paths = [
+            shard_a.join("oldest.jpg"),
+            shard_b.join("second.jpg"),
+            shard_a.join("third.poster.bin"),
+            shard_b.join("newest.jpg"),
+        ];
+
+        for (i, path) in paths.iter().enumerate() {
+            use std::io::Write;
+            let mut file = std::fs::File::create(path).unwrap();
+            file.write_all(&vec![0xAB_u8; 1024]).unwrap();
+            file.set_modified(base + Duration::from_secs((i as u64 + 1) * 100))
+                .unwrap();
+        }
+
+        let freed = prune_disk_cache_to_budget(dir.path(), 2048);
+        assert_eq!(freed, 2048);
+        assert!(!paths[0].exists());
+        assert!(!paths[1].exists());
+        assert!(paths[2].exists());
+        assert!(paths[3].exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_sidecar_regenerates_from_raw_and_prefetch_populates_targets() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_srv = Arc::clone(&hits);
+        let png = sample_png_bytes(160, 240);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&png).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let poster_url = format!("http://{addr}/prefetch-poster.png");
+        let hero_url = format!("http://{addr}/prefetch-hero.png");
+
+        let cache1 = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        let rx1 = cache1.wakeup_receiver();
+        cache1.prefetch_poster(&poster_url);
+        cache1.prefetch_hero_backdrop(&hero_url);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if cache1.resolve_poster_image(&poster_url).is_some()
+                && cache1.resolve_hero_backdrop_image(&hero_url).is_some()
+            {
+                break;
+            }
+            tokio::time::timeout_at(deadline, rx1.recv())
+                .await
+                .expect("prefetch timed out")
+                .unwrap();
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // Corrupt the poster sidecar; warm cache2 should discard corrupt sidecar and regenerate from raw
+        let sidecar_path = sidecar_path_for_url(dir.path(), &poster_url, "poster");
+        std::fs::write(&sidecar_path, b"BAD_MAGIC_DATA").unwrap();
+
+        let cache2 = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        let rx2 = cache2.wakeup_receiver();
+        assert!(cache2.resolve_poster_image(&poster_url).is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cache2.resolve_poster_image(&poster_url).is_some());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(decode_sidecar_render_image(
+            &std::fs::read(&sidecar_path).unwrap(),
+            POSTER_MAX_W,
+            POSTER_MAX_H
+        )
+        .is_some());
     }
 }

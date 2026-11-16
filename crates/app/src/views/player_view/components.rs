@@ -9,14 +9,12 @@ use crate::theme::{
 };
 
 pub(super) const SHEET_WIDTH: f32 = 388.0;
-pub(super) const SHEET_BG: u32 = 0x141416F2;
-pub(super) const SHEET_BORDER: u32 = 0xFFFFFF14;
-pub(super) const SHEET_DIVIDER: u32 = 0xFFFFFF10;
-pub(super) const TROUGH_BG: u32 = 0xFFFFFF0B;
-pub(super) const SEGMENT_ACTIVE_BG: u32 = 0xF5F5F7;
-pub(super) const SEGMENT_ACTIVE_TEXT: u32 = 0x0B0B0D;
-pub(super) const ROW_SELECTED_BG: u32 = 0xFFFFFF0F;
-pub(super) const ROW_HOVER_BG: u32 = 0xFFFFFF08;
+pub(super) use crate::theme::{
+    GLASS_BORDER as SHEET_BORDER, GLASS_DIVIDER as SHEET_DIVIDER,
+    GLASS_ROW_HOVER_BG as ROW_HOVER_BG, GLASS_ROW_SELECTED_BG as ROW_SELECTED_BG,
+    GLASS_SHEET_BG as SHEET_BG, GLASS_TROUGH_BG as TROUGH_BG, SEGMENT_ACTIVE_BG,
+    SEGMENT_ACTIVE_TEXT,
+};
 
 pub(super) const SUBTITLE_SWATCHES: &[(&str, &str)] = &[
     ("#F5F1E8", "Warm cream"),

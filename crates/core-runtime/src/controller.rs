@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, RwLockReadGuard},
@@ -24,8 +25,8 @@ use stremio_core::{
     },
     runtime::{
         msg::{
-            Action, ActionCatalogsWithExtra, ActionCtx, ActionLink, ActionLoad, ActionPlayer,
-            ActionSearch, ActionStreamingServer, Event, Internal, Msg,
+            Action, ActionCatalogsWithExtra, ActionCtx, ActionLink, ActionLoad, ActionMetaDetails,
+            ActionPlayer, ActionSearch, ActionStreamingServer, Event, Internal, Msg,
         },
         Effect, Env, Runtime, RuntimeAction, RuntimeEvent,
     },
@@ -33,7 +34,7 @@ use stremio_core::{
         addon::{Descriptor, DescriptorFlags, ExtraValue, Manifest, ResourcePath, ResourceResponse},
         api::AuthRequest,
         profile::Settings as ProfileSettings,
-        resource::{MetaItem, MetaItemPreview, Stream},
+        resource::{MetaItem, MetaItemPreview, Stream, Video},
     },
 };
 use stremio_core::models::common::Loadable;
@@ -71,8 +72,8 @@ use crate::{
     tmdb::{
         build_unified_editorial_search, format_addon_resource_url, meta_resource_matches_url,
         normalize_title_for_dedup, preview_to_editorial_hit, EditorialMediaHit, EditorialPersonHit,
-        EnrichedTitleMeta, MetadataEngine, PersonFilmography, TmdbAccountStatus,
-        UnifiedEditorialSearch,
+        EnrichedCollection, EnrichedTitleMeta, MetadataEngine, PersonFilmography,
+        TmdbAccountStatus, UnifiedEditorialSearch,
     },
     track_prefs::{
         delete_series_track_pref, load_all_series_track_prefs, load_series_track_pref,
@@ -106,6 +107,7 @@ pub struct CoreController {
     prowlarr_client: Arc<ProwlarrClient>,
     native_subtitles: NativeSubtitleClient,
     metadata_engine: Arc<MetadataEngine>,
+    ingested_hashes: Arc<Mutex<HashMap<String, (u8, u64)>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -199,11 +201,22 @@ impl CoreController {
             prowlarr_client: Arc::new(ProwlarrClient::new()),
             native_subtitles,
             metadata_engine: Arc::clone(&metadata_engine),
+            ingested_hashes: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Seed library titles into local FTS5 index asynchronously
         let seed_lib = controller.with_model(|m| {
-            m.ctx.library.items.values().cloned().collect::<Vec<_>>()
+            let mut tracker = controller
+                .ingested_hashes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            m.ctx
+                .library
+                .items
+                .values()
+                .filter(|li| should_ingest_library_item(&mut tracker, li))
+                .cloned()
+                .collect::<Vec<_>>()
         });
         if !seed_lib.is_empty() {
             let meta_seed = Arc::clone(&metadata_engine);
@@ -266,11 +279,29 @@ impl CoreController {
                                 if let Ok(ResourceResponse::Metas { metas }) =
                                     serde_json::from_slice::<ResourceResponse>(&payload.bytes)
                                 {
-                                    let eng = Arc::clone(&swr_ctrl.metadata_engine);
-                                    let metas_ingest = metas.clone();
-                                    swr_handle.spawn_blocking(move || {
-                                        eng.ingest_stremio_previews(&metas_ingest);
-                                    });
+                                    let metas_ingest: Vec<MetaItemPreview> = {
+                                        let mut tracker = swr_ctrl
+                                            .ingested_hashes
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        metas
+                                            .iter()
+                                            .filter(|p| {
+                                                should_ingest_preview(
+                                                    &mut tracker,
+                                                    p,
+                                                    INGEST_TIER_PREVIEW,
+                                                )
+                                            })
+                                            .cloned()
+                                            .collect()
+                                    };
+                                    if !metas_ingest.is_empty() {
+                                        let eng = Arc::clone(&swr_ctrl.metadata_engine);
+                                        swr_handle.spawn_blocking(move || {
+                                            eng.ingest_stremio_previews(&metas_ingest);
+                                        });
+                                    }
                                     swr_ctrl.mutate_model_sync(move |model| {
                                         let mut changed = Vec::new();
                                         let mut board_hit = false;
@@ -309,11 +340,24 @@ impl CoreController {
                                 if let Ok(ResourceResponse::Meta { meta }) =
                                     serde_json::from_slice::<ResourceResponse>(&payload.bytes)
                                 {
-                                    let eng = Arc::clone(&swr_ctrl.metadata_engine);
-                                    let meta_ingest = meta.clone();
-                                    swr_handle.spawn_blocking(move || {
-                                        eng.ingest_stremio_meta_item(&meta_ingest);
-                                    });
+                                    let should_ingest_meta = {
+                                        let mut tracker = swr_ctrl
+                                            .ingested_hashes
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        should_ingest_preview(
+                                            &mut tracker,
+                                            &meta.preview,
+                                            INGEST_TIER_FULL_META,
+                                        )
+                                    };
+                                    if should_ingest_meta {
+                                        let eng = Arc::clone(&swr_ctrl.metadata_engine);
+                                        let meta_ingest = meta.clone();
+                                        swr_handle.spawn_blocking(move || {
+                                            eng.ingest_stremio_meta_item(&meta_ingest);
+                                        });
+                                    }
                                     swr_ctrl.mutate_model_sync(move |model| {
                                         let mut hit = false;
                                         for loadable in model.meta_details.meta_items.iter_mut() {
@@ -576,6 +620,54 @@ impl CoreController {
         } else {
             self.dispatch_action(Action::Ctx(ActionCtx::AddToLibrary(meta_preview)));
         }
+    }
+
+    pub fn pull_notifications(&self) {
+        self.dispatch_action(Action::Ctx(ActionCtx::PullNotifications));
+    }
+
+    pub fn dismiss_notification_item(&self, id: impl Into<String>) {
+        self.dispatch_action(Action::Ctx(ActionCtx::DismissNotificationItem(id.into())));
+    }
+
+    pub fn rewind_library_item(&self, id: impl Into<String>) {
+        self.dispatch_action(Action::Ctx(ActionCtx::RewindLibraryItem(id.into())));
+    }
+
+    pub fn remove_from_library(&self, id: impl Into<String>) {
+        self.dispatch_action(Action::Ctx(ActionCtx::RemoveFromLibrary(id.into())));
+    }
+
+    pub fn mark_library_item_watched(&self, id: impl Into<String>, is_watched: bool) {
+        self.dispatch_action(Action::Ctx(ActionCtx::LibraryItemMarkAsWatched {
+            id: id.into(),
+            is_watched,
+        }));
+    }
+
+    pub fn mark_meta_watched(&self, is_watched: bool) {
+        self.dispatch(
+            Action::MetaDetails(ActionMetaDetails::MarkAsWatched(is_watched)),
+            Some(DesktopModelField::MetaDetails),
+        );
+    }
+
+    pub fn mark_video_watched(&self, video: Video, is_watched: bool) {
+        self.dispatch(
+            Action::MetaDetails(ActionMetaDetails::MarkVideoAsWatched(video, is_watched)),
+            Some(DesktopModelField::MetaDetails),
+        );
+    }
+
+    pub fn mark_season_watched(&self, season: u32, is_watched: bool) {
+        self.dispatch(
+            Action::MetaDetails(ActionMetaDetails::MarkSeasonAsWatched(season, is_watched)),
+            Some(DesktopModelField::MetaDetails),
+        );
+    }
+
+    pub fn clear_search_history(&self) {
+        self.dispatch_action(Action::Ctx(ActionCtx::ClearSearchHistory));
     }
 
     pub fn load_meta_details(
@@ -1322,6 +1414,7 @@ impl CoreController {
                         logo_url: None,
                         genres: Vec::new(),
                         score: crate::tmdb::score_title_relevance(&item.name, &norm_q) + 10,
+                        role_hint: None,
                     });
                 }
             }
@@ -1435,6 +1528,23 @@ impl CoreController {
             .and_then(Result::ok)
             .flatten()
             .or_else(|| self.metadata_engine.cached_enriched_meta(&fallback_id))
+    }
+
+    pub async fn fetch_tmdb_collection(
+        &self,
+        collection_id: u64,
+    ) -> Result<EnrichedCollection, CoreRuntimeError> {
+        let cfg = self.private_integrations();
+        let key = if cfg.tmdb_enabled && cfg.has_tmdb_configured() {
+            cfg.tmdb_api_key.expose().to_owned()
+        } else {
+            String::new()
+        };
+        let eng = Arc::clone(&self.metadata_engine);
+        self.runtime_handle
+            .spawn(async move { eng.fetch_collection(&key, collection_id).await })
+            .await
+            .map_err(|err| CoreRuntimeError::Env(format!("TMDB collection task failed: {err}")))?
     }
 
     pub async fn resolve_canonical_imdb_id(
@@ -1966,6 +2076,86 @@ impl CoreController {
     }
 }
 
+const MAX_INGEST_TRACKER_ENTRIES: usize = 20_000;
+const INGEST_TIER_LIBRARY: u8 = 0;
+const INGEST_TIER_PREVIEW: u8 = 1;
+const INGEST_TIER_FULL_META: u8 = 2;
+
+fn preview_content_hash(preview: &MetaItemPreview) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    preview.id.hash(&mut hasher);
+    preview.r#type.hash(&mut hasher);
+    preview.name.hash(&mut hasher);
+    preview.release_info.hash(&mut hasher);
+    preview.runtime.hash(&mut hasher);
+    preview.description.hash(&mut hasher);
+    preview.poster.as_ref().map(Url::as_str).hash(&mut hasher);
+    preview
+        .background
+        .as_ref()
+        .map(Url::as_str)
+        .hash(&mut hasher);
+    preview.logo.as_ref().map(Url::as_str).hash(&mut hasher);
+    preview.links.len().hash(&mut hasher);
+    for link in &preview.links {
+        link.category.hash(&mut hasher);
+        link.name.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn library_item_content_hash(li: &stremio_core::types::library::LibraryItem) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    li.id.hash(&mut hasher);
+    li.r#type.hash(&mut hasher);
+    li.name.hash(&mut hasher);
+    li.poster.as_ref().map(Url::as_str).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn should_ingest_preview(
+    tracker: &mut HashMap<String, (u8, u64)>,
+    preview: &MetaItemPreview,
+    tier: u8,
+) -> bool {
+    if preview.id.trim().is_empty() || preview.name.trim().is_empty() {
+        return false;
+    }
+    if tracker.len() >= MAX_INGEST_TRACKER_ENTRIES {
+        tracker.clear();
+    }
+    let hash = preview_content_hash(preview);
+    if let Some(&(prev_tier, prev_hash)) = tracker.get(&preview.id) {
+        if prev_tier > tier || (prev_tier == tier && prev_hash == hash) {
+            return false;
+        }
+    }
+    tracker.insert(preview.id.clone(), (tier, hash));
+    true
+}
+
+fn should_ingest_library_item(
+    tracker: &mut HashMap<String, (u8, u64)>,
+    li: &stremio_core::types::library::LibraryItem,
+) -> bool {
+    if li.id.trim().is_empty() || li.name.trim().is_empty() {
+        return false;
+    }
+    if tracker.len() >= MAX_INGEST_TRACKER_ENTRIES {
+        tracker.clear();
+    }
+    let hash = library_item_content_hash(li);
+    if let Some(&(prev_tier, prev_hash)) = tracker.get(&li.id) {
+        if prev_tier >= INGEST_TIER_PREVIEW
+            || (prev_tier == INGEST_TIER_LIBRARY && prev_hash == hash)
+        {
+            return false;
+        }
+    }
+    tracker.insert(li.id.clone(), (INGEST_TIER_LIBRARY, hash));
+    true
+}
+
 fn collect_ingest_batch(
     ctrl: &CoreController,
     fields: &[DesktopModelField],
@@ -1975,6 +2165,10 @@ fn collect_ingest_batch(
     Vec<stremio_core::types::library::LibraryItem>,
 ) {
     ctrl.with_model(|model| {
+        let mut tracker = ctrl
+            .ingested_hashes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut previews = Vec::new();
         let mut full_items = Vec::new();
         let mut lib_items = Vec::new();
@@ -1983,7 +2177,11 @@ fn collect_ingest_batch(
             for cat in &model.board.catalogs {
                 for page in cat {
                     if let Some(Loadable::Ready(items)) = &page.content {
-                        previews.extend(items.iter().take(24).cloned());
+                        for item in items.iter().take(24) {
+                            if should_ingest_preview(&mut tracker, item, INGEST_TIER_PREVIEW) {
+                                previews.push(item.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -1991,7 +2189,11 @@ fn collect_ingest_batch(
         if fields.contains(&DesktopModelField::Discover) {
             for page in &model.discover.catalog {
                 if let Some(Loadable::Ready(items)) = &page.content {
-                    previews.extend(items.iter().take(48).cloned());
+                    for item in items.iter().take(48) {
+                        if should_ingest_preview(&mut tracker, item, INGEST_TIER_PREVIEW) {
+                            previews.push(item.clone());
+                        }
+                    }
                 }
             }
         }
@@ -1999,7 +2201,11 @@ fn collect_ingest_batch(
             for cat in &model.search.catalogs {
                 for page in cat {
                     if let Some(Loadable::Ready(items)) = &page.content {
-                        previews.extend(items.iter().take(24).cloned());
+                        for item in items.iter().take(24) {
+                            if should_ingest_preview(&mut tracker, item, INGEST_TIER_PREVIEW) {
+                                previews.push(item.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -2007,12 +2213,18 @@ fn collect_ingest_batch(
         if fields.contains(&DesktopModelField::MetaDetails) {
             for loadable in &model.meta_details.meta_items {
                 if let Some(Loadable::Ready(item)) = &loadable.content {
-                    full_items.push(item.clone());
+                    if should_ingest_preview(&mut tracker, &item.preview, INGEST_TIER_FULL_META) {
+                        full_items.push(item.clone());
+                    }
                 }
             }
         }
         if fields.contains(&DesktopModelField::Ctx) {
-            lib_items.extend(model.ctx.library.items.values().cloned());
+            for li in model.ctx.library.items.values() {
+                if should_ingest_library_item(&mut tracker, li) {
+                    lib_items.push(li.clone());
+                }
+            }
         }
 
         (previews, full_items, lib_items)
@@ -2077,6 +2289,7 @@ fn compute_addon_side_effects(model: &DesktopModel) -> AddonMutationSideEffects 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::tempdir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -2187,6 +2400,430 @@ mod tests {
                 .search_and_fetch_native_subtitles(query, 3)
                 .await;
             assert!(disabled.is_empty());
+        })
+        .await
+        .unwrap();
+
+        server.abort();
+    }
+
+    fn make_test_preview(id: &str, name: &str, desc: Option<&str>) -> MetaItemPreview {
+        MetaItemPreview {
+            id: id.to_owned(),
+            r#type: "movie".to_owned(),
+            name: name.to_owned(),
+            poster: None,
+            background: None,
+            logo: None,
+            description: desc.map(str::to_owned),
+            release_info: Some("2024".to_owned()),
+            runtime: None,
+            released: None,
+            poster_shape: stremio_core::types::resource::PosterShape::Poster,
+            links: vec![],
+            trailer_streams: vec![],
+            behavior_hints: stremio_core::types::resource::MetaItemBehaviorHints::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_board_ingest_deduplicates_across_shelves_and_tiers() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("incremental_ingest.db");
+
+        DesktopEnv::run_isolated(EnvConfig::with_storage_path(&db_path), async {
+            let ctrl = CoreController::from_initialized_env().await.unwrap();
+            let base_url: Url = "https://mock.addon/manifest.json".parse().unwrap();
+
+            let shelf0_items: Vec<MetaItemPreview> = (0..24)
+                .map(|i| make_test_preview(&format!("tt100{i:04}"), &format!("Movie {i}"), None))
+                .collect();
+            let shelf1_items: Vec<MetaItemPreview> = (12..36)
+                .map(|i| make_test_preview(&format!("tt100{i:04}"), &format!("Movie {i}"), None))
+                .collect();
+
+            ctrl.mutate_model_sync(move |model| {
+                use stremio_core::models::common::ResourceLoadable;
+                model.board.catalogs.push(vec![ResourceLoadable {
+                    request: stremio_core::types::addon::ResourceRequest {
+                        base: base_url.clone(),
+                        path: ResourcePath::without_extra("catalog", "movie", "s0"),
+                    },
+                    content: Some(Loadable::Ready(shelf0_items)),
+                }]);
+                ((), vec![], vec![])
+            });
+
+            let (p1, full1, lib1) = collect_ingest_batch(&ctrl, &[DesktopModelField::Board]);
+            assert_eq!(p1.len(), 24);
+            assert!(full1.is_empty());
+            assert!(lib1.is_empty());
+
+            // Repeating Board without changes produces 0 items.
+            let (p1_repeat, _, _) = collect_ingest_batch(&ctrl, &[DesktopModelField::Board]);
+            assert!(p1_repeat.is_empty());
+
+            // Adding shelf 1 (items 12..36, 12 overlapping with shelf 0) emits ONLY the 12 unseen items.
+            let base_url2: Url = "https://mock.addon/manifest.json".parse().unwrap();
+            ctrl.mutate_model_sync(move |model| {
+                use stremio_core::models::common::ResourceLoadable;
+                model.board.catalogs.push(vec![ResourceLoadable {
+                    request: stremio_core::types::addon::ResourceRequest {
+                        base: base_url2,
+                        path: ResourcePath::without_extra("catalog", "movie", "s1"),
+                    },
+                    content: Some(Loadable::Ready(shelf1_items)),
+                }]);
+                ((), vec![], vec![])
+            });
+
+            let (p2, _, _) = collect_ingest_batch(&ctrl, &[DesktopModelField::Board]);
+            assert_eq!(p2.len(), 12);
+            assert!(p2.iter().all(|item| {
+                let n: usize = item.id.trim_start_matches("tt100").parse().unwrap();
+                n >= 24
+            }));
+
+            // Ctx library update for already-previewed item tt1000000 must not downgrade/re-ingest.
+            let now = DesktopEnv::now();
+            ctrl.mutate_model_sync(move |model| {
+                model.ctx.library.items.insert(
+                    "tt1000000".to_owned(),
+                    stremio_core::types::library::LibraryItem {
+                        id: "tt1000000".to_owned(),
+                        name: "Movie 0".to_owned(),
+                        r#type: "movie".to_owned(),
+                        poster: None,
+                        poster_shape: Default::default(),
+                        removed: false,
+                        temp: false,
+                        ctime: Some(now),
+                        mtime: now,
+                        state: Default::default(),
+                        behavior_hints: Default::default(),
+                    },
+                );
+                ((), vec![], vec![])
+            });
+            let (_, _, lib2) = collect_ingest_batch(&ctrl, &[DesktopModelField::Ctx]);
+            assert!(lib2.is_empty());
+
+            // Full MetaItem upgrades Preview -> FullMeta tier once, then skips on repeat.
+            let base_url3: Url = "https://mock.addon/manifest.json".parse().unwrap();
+            let full_meta = MetaItem {
+                preview: make_test_preview("tt1000000", "Movie 0", Some("Detailed overview")),
+                videos: vec![],
+            };
+            ctrl.mutate_model_sync(move |model| {
+                use stremio_core::models::common::ResourceLoadable;
+                model.meta_details.meta_items.push(ResourceLoadable {
+                    request: stremio_core::types::addon::ResourceRequest {
+                        base: base_url3,
+                        path: ResourcePath::without_extra("meta", "movie", "tt1000000"),
+                    },
+                    content: Some(Loadable::Ready(full_meta)),
+                });
+                ((), vec![], vec![])
+            });
+            let (_, full2, _) = collect_ingest_batch(&ctrl, &[DesktopModelField::MetaDetails]);
+            assert_eq!(full2.len(), 1);
+            let (_, full3, _) = collect_ingest_batch(&ctrl, &[DesktopModelField::MetaDetails]);
+            assert!(full3.is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_exposes_library_watched_notifications_search_history_and_collection_actions(
+    ) {
+        std::env::set_var("EMPTY_OFFICIAL_ADDONS", "1");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url: Url = format!("http://{addr}/").parse().unwrap();
+
+        let notif_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notif_clone = Arc::clone(&notif_requests);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let nc = Arc::clone(&notif_clone);
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let decoded = path.replace("%3A", ":");
+                    let body = if decoded == "/addon/meta/series/tt7777777.json" {
+                        serde_json::json!({
+                            "meta": {
+                                "id": "tt7777777",
+                                "type": "series",
+                                "name": "Test Series",
+                                "posterShape": "poster",
+                                "videos": [
+                                    {
+                                        "id": "tt7777777:1:1",
+                                        "title": "Pilot",
+                                        "season": 1,
+                                        "episode": 1,
+                                        "released": "2020-01-01T00:00:00.000Z"
+                                    },
+                                    {
+                                        "id": "tt7777777:1:2",
+                                        "title": "Second",
+                                        "season": 1,
+                                        "episode": 2,
+                                        "released": "2020-01-08T00:00:00.000Z"
+                                    }
+                                ]
+                            }
+                        })
+                        .to_string()
+                    } else if decoded.starts_with("/addon/catalog/series/lastVideosIds/") {
+                        nc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        serde_json::json!({
+                            "metasDetailed": [{
+                                "id": "tt7777777",
+                                "type": "series",
+                                "name": "Test Series",
+                                "posterShape": "poster",
+                                "videos": []
+                            }]
+                        })
+                        .to_string()
+                    } else if decoded.starts_with("/tmdb/collection/42") {
+                        serde_json::json!({
+                            "id": 42,
+                            "name": "Galaxy Saga",
+                            "overview": "Space trilogy.",
+                            "poster_path": "/gp.jpg",
+                            "backdrop_path": "/gb.jpg",
+                            "parts": [
+                                {"id": 100, "title": "Galaxy I", "release_date": "2018-01-01", "poster_path": "/p1.jpg"}
+                            ]
+                        })
+                        .to_string()
+                    } else {
+                        serde_json::json!({}).to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("actions.db");
+
+        DesktopEnv::run_isolated(EnvConfig::with_storage_path(&db_path), async {
+            let controller = CoreController::from_initialized_env().await.unwrap();
+            controller.set_tmdb_base_urls(
+                format!("http://{addr}/tmdb"),
+                "https://image.tmdb.org/t/p",
+            );
+
+            let mut pcfg = controller.private_integrations();
+            pcfg.tmdb_enabled = true;
+            pcfg.tmdb_api_key = crate::SecretApiKey::new("test_tmdb_key");
+            controller.update_private_integrations(pcfg).unwrap();
+
+            let col = controller.fetch_tmdb_collection(42).await.unwrap();
+            assert_eq!(col.id, 42);
+            assert_eq!(col.name, "Galaxy Saga");
+            assert_eq!(col.parts.len(), 1);
+
+            let addon = Descriptor {
+                manifest: Manifest {
+                    id: "io.ferrite.actions".to_owned(),
+                    version: stremio_core::types::addon::Version::new(1, 0, 0),
+                    name: "Actions Mock".to_owned(),
+                    contact_email: None,
+                    description: None,
+                    logo: None,
+                    background: None,
+                    types: vec!["series".to_owned()],
+                    resources: vec![
+                        stremio_core::types::addon::ManifestResource::Short(
+                            META_RESOURCE_NAME.to_owned(),
+                        ),
+                        stremio_core::types::addon::ManifestResource::Short(
+                            stremio_core::constants::CATALOG_RESOURCE_NAME.to_owned(),
+                        ),
+                    ],
+                    id_prefixes: Some(vec!["tt".to_owned()]),
+                    catalogs: vec![stremio_core::types::addon::ManifestCatalog {
+                        id: "lastVideosIds".to_owned(),
+                        r#type: "series".to_owned(),
+                        name: None,
+                        extra: stremio_core::types::addon::ManifestExtra::Full {
+                            props: vec![stremio_core::constants::LAST_VIDEOS_IDS_EXTRA_PROP.to_owned()],
+                        },
+                    }],
+                    addon_catalogs: vec![],
+                    behavior_hints: Default::default(),
+                },
+                transport_url: base_url.join("addon/manifest.json").unwrap(),
+                flags: Default::default(),
+            };
+            controller.install_addon(addon);
+
+            // Search + clear_search_history
+            controller.search("Galaxy");
+            assert!(controller.with_model(|m| m.ctx.search_history.items.contains_key("Galaxy")));
+            controller.clear_search_history();
+            assert!(controller.with_model(|m| m.ctx.search_history.items.is_empty()));
+
+            // Add series to library, load meta details, test watched/rewind/remove actions
+            let preview = MetaItemPreview {
+                id: "tt7777777".to_owned(),
+                r#type: "series".to_owned(),
+                name: "Test Series".to_owned(),
+                poster: None,
+                background: None,
+                logo: None,
+                description: None,
+                release_info: Some("2020".to_owned()),
+                runtime: None,
+                released: None,
+                poster_shape: stremio_core::types::resource::PosterShape::Poster,
+                links: vec![],
+                trailer_streams: vec![],
+                behavior_hints: Default::default(),
+            };
+            controller.toggle_library_item(preview);
+            controller.load_meta_details("series", "tt7777777", None);
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let ready = controller.with_model(|m| {
+                    m.meta_details
+                        .meta_items
+                        .iter()
+                        .any(|item| matches!(&item.content, Some(Loadable::Ready(_))))
+                        && m.meta_details.watched.is_some()
+                });
+                if ready {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+
+            let video1 = controller.with_model(|m| {
+                m.meta_details
+                    .meta_items
+                    .iter()
+                    .find_map(|item| match &item.content {
+                        Some(Loadable::Ready(meta)) => meta.videos.first().cloned(),
+                        _ => None,
+                    })
+                    .unwrap()
+            });
+
+            controller.mark_video_watched(video1.clone(), true);
+            assert!(controller.with_model(|m| {
+                m.meta_details
+                    .watched
+                    .as_ref()
+                    .is_some_and(|w| w.get_video(&video1.id))
+            }));
+
+            controller.mark_season_watched(1, true);
+            assert!(controller.with_model(|m| {
+                m.meta_details
+                    .watched
+                    .as_ref()
+                    .is_some_and(|w| w.get_video("tt7777777:1:1") && w.get_video("tt7777777:1:2"))
+            }));
+
+            controller.mark_meta_watched(false);
+            assert!(controller.with_model(|m| {
+                m.ctx
+                    .library
+                    .items
+                    .get("tt7777777")
+                    .is_some_and(|li| li.state.times_watched == 0)
+            }));
+
+            controller.mark_library_item_watched("tt7777777", true);
+            assert!(controller.with_model(|m| {
+                m.ctx
+                    .library
+                    .items
+                    .get("tt7777777")
+                    .is_some_and(|li| li.state.times_watched > 0)
+            }));
+
+            // Seed time_offset & notification, then test rewind_library_item & dismiss_notification_item
+            controller.mutate_model_sync(|model| {
+                if let Some(li) = model.ctx.library.items.get_mut("tt7777777") {
+                    li.state.time_offset = 60_000;
+                    li.state.last_watched = Some(DesktopEnv::now());
+                }
+                model.ctx.notifications.last_updated = None;
+                model.ctx.notifications.items.insert(
+                    "tt7777777".to_owned(),
+                    [(
+                        "tt7777777:1:2".to_owned(),
+                        stremio_core::types::notifications::NotificationItem {
+                            meta_id: "tt7777777".to_owned(),
+                            video_id: "tt7777777:1:2".to_owned(),
+                            video_released: DesktopEnv::now(),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                );
+                ((), vec![], vec![DesktopModelField::Ctx])
+            });
+            controller.rewind_library_item("tt7777777");
+            assert_eq!(
+                controller.with_model(|m| {
+                    m.ctx
+                        .library
+                        .items
+                        .get("tt7777777")
+                        .map(|li| li.state.time_offset)
+                }),
+                Some(0)
+            );
+            controller.dismiss_notification_item("tt7777777");
+            assert!(!controller.with_model(|m| m.ctx.notifications.items.contains_key("tt7777777")));
+
+            let before_pull = notif_requests.load(std::sync::atomic::Ordering::SeqCst);
+            controller.pull_notifications();
+            let pull_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if notif_requests.load(std::sync::atomic::Ordering::SeqCst) > before_pull {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < pull_deadline);
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+
+            controller.remove_from_library("tt7777777");
+            assert!(controller.with_model(|m| {
+                m.ctx
+                    .library
+                    .items
+                    .get("tt7777777")
+                    .is_some_and(|li| li.removed)
+            }));
         })
         .await
         .unwrap();

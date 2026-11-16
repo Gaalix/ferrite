@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -6,10 +7,11 @@ use std::{
 };
 
 use gpui::{
-    div, point, prelude::*, px, rgb, rgba, AnimationExt, AsyncApp, Context, CursorStyle,
-    Decorations, FocusHandle, Focusable, FontWeight, KeyDownEvent, KeyUpEvent, MouseButton,
-    PathPromptOptions, Render, RenderImage, ResizeEdge, ScrollDelta, ScrollHandle, SharedString,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowControlArea,
+    div, point, prelude::*, px, rgb, rgba, AnimationExt, AsyncApp, ClipboardItem, Context,
+    CursorStyle, Decorations, FocusHandle, Focusable, FontWeight, KeyDownEvent, KeyUpEvent,
+    MouseButton, NavigationDirection, PathPromptOptions, Render, RenderImage, ResizeEdge,
+    ScrollDelta, ScrollHandle, SharedString, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowControlArea,
 };
 use gpui_mpv::{
     extract_audio_pcm_s16le_8khz, MpvThumbnailer, PlayerEvent, PlayerSnapshot, TrackType,
@@ -18,22 +20,26 @@ use stremio_core_runtime::{
     detect_clipboard_addon_url, has_full_embedded_subtitle_for_lang, human_language_name,
     is_native_playable_stream, normalize_addon_url, select_preferred_tracks,
     stremio_core::{
-        models::common::Loadable,
+        constants::CINEMETA_URL,
+        models::{
+            catalog_with_filters::Selected as CatalogWithFiltersSelected, common::Loadable,
+        },
         runtime::{
-            msg::{Action, Event as CoreEvent},
+            msg::{Action, ActionCtx, Event as CoreEvent},
             RuntimeEvent,
         },
         types::{
-            addon::{ResourcePath, ResourceRequest},
+            addon::{ExtraValue, ResourcePath, ResourceRequest},
             resource::{MetaItem, StreamSource, Video},
         },
     },
     build_unified_editorial_search, subtitle_lang_matches, AudioSpeechFingerprint,
     AudioSpeechWindow, CoreController, DebridCacheStatus, DesktopModelField, EditorialMediaHit,
-    EditorialPersonHit, FetchedNativeSubtitle, LocalDebridProvider, NativeSubtitleQuery,
-    PersonFilmography, PrivateIntegrationsConfig, ProwlarrFallbackMode, ResolvedNextEpisode,
-    SecretApiKey, SeriesTrackPreference, SubtitleAlignmentResult, SubtitleMatchTier,
-    SubtitleSyncAligner, TrackCandidate, UnifiedEditorialSearch, INITIAL_BOARD_SHELVES,
+    EditorialPersonHit, EnrichedCollection, FetchedNativeSubtitle, LocalDebridProvider,
+    NativeSubtitleQuery, PersonFilmography, PrivateIntegrationsConfig, ProwlarrFallbackMode,
+    ResolvedNextEpisode, SecretApiKey, SeriesTrackPreference, SubtitleAlignmentResult,
+    SubtitleMatchTier, SubtitleSyncAligner, TrackCandidate, UnifiedEditorialSearch,
+    INITIAL_BOARD_SHELVES,
 };
 use stremio_stream_engine::{opensubhash::compute_opensubhash_http, StreamEngineHandle};
 use url::Url;
@@ -46,25 +52,35 @@ use crate::{
     },
     poster_cache::PosterCache,
     state::{
-        apply_key_to_text_buffer, build_subtitles_resource_path, default_library_selected,
-        detect_addon_url_candidate, is_loopback_p2p_torrent_url, is_scrub_thumbnail_stale,
-        merge_and_enrich_stream_candidates, parse_season_episode_from_video_id,
-        pick_default_series_episode_id, quantize_scrub_bucket_ms, resolve_ready_meta_item,
-        rewrite_loopback_engine_url, switch_engine_storage_mode_on_tokio,
+        apply_key_to_text_buffer_with_cursor, build_subtitles_resource_path,
+        classify_library_item_status, default_library_selected, detect_addon_url_candidate,
+        format_core_error_message, format_text_with_caret, is_loopback_p2p_torrent_url,
+        is_scrub_thumbnail_stale, merge_and_enrich_stream_candidates,
+        parse_season_episode_from_video_id, pick_default_series_episode_id,
+        quantize_scrub_bucket_ms, resolve_ready_meta_item, rewrite_loopback_engine_url,
+        route_affected_by_fields, step_kb_focus_2d, switch_engine_storage_mode_on_tokio,
         sync_memoized_meta_streams, trim_process_heap, AddonCategoryFilter, AddonSubTab,
-        AppPreferences, AppRoute, BootServices, DebridAccessMode, DiscoverDropdown, FocusedInput,
-        LibrarySortOrder, LibraryStatusTab, LibraryTypeFilter, MemoizedMetaStreams,
-        NativeSubtitleMatchState, NativeSubtitleMatchStatus, PlaybackCandidate, PlaybackSession,
-        PlayerPopover, SettingsCategory, SettingsDropdown, SidebarTab, StorageModeChoice,
-        StreamFilterState, SubtitleBackgroundChoice, ToastKind, ToastMessage, ToneMappingChoice,
-        UpscaleChoice, LIBRARY_PAGE_SIZE, MAX_AUTO_FAILOVER_ATTEMPTS, STREAM_PAGE_SIZE,
+        AppPreferences, AppRoute, BootServices, BrowsingContextMenu, DebridAccessMode,
+        DeferredStreamEngine, DiscoverDropdown, DiscoverViewSnapshot, FocusedInput,
+        KbFocusableCard, LibrarySortCriterion, LibrarySortOrder, LibraryStatusTab,
+        LibraryTypeFilter, MemoizedEnrichedStreams, MemoizedLibraryView, MemoizedMetaStreams,
+        NativeSubtitleMatchState, NativeSubtitleMatchStatus, NavHistoryEntry, PersonDeptFilter,
+        PlaybackCandidate, PlaybackSession, PlayerPopover, SettingsCategory, SettingsDropdown,
+        SidebarTab, StorageModeChoice, StreamFilterState, SubtitleBackgroundChoice, ToastKind,
+        ToastMessage, ToneMappingChoice, UpscaleChoice, LIBRARY_PAGE_SIZE,
+        MAX_AUTO_FAILOVER_ATTEMPTS, STREAM_PAGE_SIZE,
     },
     theme::{
         editorial_serif, glass_capsule_shadow, keycap, movietracker_mark, obsidian_fade_in,
         transparent_cutout, ui_sans, ACCENT, ACCENT_AMBER, ACCENT_ROSE, ACCENT_SOFT, BG_ELEVATED,
-        BG_INPUT, BG_OBSIDIAN, BG_POPOVER_GLASS, BG_SURFACE, BG_TOPNAV, BORDER_POSTER_HOVER,
-        BORDER_SOFT, BORDER_STRONG, BORDER_SUBTLE, STATUS_WATCHED, TEXT_MUTED, TEXT_PRIMARY,
-        TEXT_SECONDARY,
+        BG_OBSIDIAN, BG_TOPNAV, BORDER_ACCENT, BORDER_SUBTLE, CTA_ON_ACCENT, GLASS_BORDER,
+        GLASS_BORDER_STRONG, GLASS_DIVIDER, GLASS_POPOVER_BG, GLASS_ROW_HOVER_BG,
+        GLASS_ROW_SELECTED_BG, GLASS_TROUGH_BG, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        STATUS_WATCHED, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    },
+    ui_components::{
+        click_handler, glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar,
+        glass_segmented_item, ClickHandler,
     },
     updater::{self, AppliedUpdateOutcome, UpdateStatus},
 };
@@ -83,12 +99,14 @@ fn shared_opensubhash_http_client() -> Option<&'static reqwest13::Client> {
 
 const TOAST_LIFETIME: Duration = Duration::from_millis(3600);
 const PREWARM_HEAD_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_NAV_HISTORY: usize = 64;
+const HEAP_TRIM_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct AppShell {
     pub focus_handle: FocusHandle,
     pub tokio_handle: tokio::runtime::Handle,
     pub core: CoreController,
-    pub engine: StreamEngineHandle,
+    pub engine: DeferredStreamEngine,
     pub poster_cache: PosterCache,
     pub preferences: AppPreferences,
     pub mpv: Option<gpui_mpv::MpvController>,
@@ -96,14 +114,39 @@ pub struct AppShell {
     pub player_snapshot: PlayerSnapshot,
 
     pub route: AppRoute,
-    pub nav_history: Vec<AppRoute>,
+    pub nav_history: Vec<NavHistoryEntry>,
+    pub nav_forward: Vec<NavHistoryEntry>,
+    pub viewport_size_px: (f32, f32),
     pub exit_fullscreen_on_next_render: bool,
     pub window_blur_active: bool,
     pub command_palette_open: bool,
     pub avatar_menu_open: bool,
+    pub context_menu: Option<BrowsingContextMenu>,
     pub palette_query: String,
     pub palette_selected_idx: usize,
+    pub palette_scroll_handle: ScrollHandle,
     pub focused_input: Option<FocusedInput>,
+    pub input_cursors: HashMap<FocusedInput, usize>,
+    pub input_selected_all: HashSet<FocusedInput>,
+    pub kb_focus_index: Option<usize>,
+    pub kb_focus_items: Vec<KbFocusableCard>,
+
+    pub board_state_rev: u64,
+    pub discover_state_rev: u64,
+    pub library_state_rev: u64,
+    pub calendar_state_rev: u64,
+    pub meta_state_rev: u64,
+    pub search_state_rev: u64,
+    pub search_debounce_seq: u64,
+    pub hover_prefetch_seq: u64,
+    pub hover_prefetch_target: Option<String>,
+    pub last_heap_trim_at: Option<Instant>,
+
+    pub memoized_library_statuses: parking_lot::Mutex<(u64, Arc<HashMap<String, LibraryStatusTab>>)>,
+    pub memoized_enriched_streams: Option<MemoizedEnrichedStreams>,
+    pub memoized_discover_catalog: parking_lot::Mutex<Option<(u64, DiscoverViewSnapshot)>>,
+    pub discover_last_next_page_len: Cell<Option<usize>>,
+    pub memoized_library_items: parking_lot::Mutex<Option<MemoizedLibraryView>>,
 
     pub auth_email_input: String,
     pub auth_password_input: String,
@@ -129,9 +172,17 @@ pub struct AppShell {
     pub meta_scroll_handle: ScrollHandle,
     pub board_scroll_handle: ScrollHandle,
     pub library_scroll_handle: ScrollHandle,
+    pub calendar_scroll_handle: ScrollHandle,
+    pub board_list_scroll_handle: gpui::UniformListScrollHandle,
+    pub board_shelf_scrolls: HashMap<usize, ScrollHandle>,
+    pub board_hidden_drawer_open: bool,
     pub discover_grid_scroll_handle: gpui::UniformListScrollHandle,
     pub library_grid_scroll_handle: gpui::UniformListScrollHandle,
     pub episode_list_scroll_handle: gpui::UniformListScrollHandle,
+    pub meta_streams_scroll_handle: gpui::UniformListScrollHandle,
+    pub search_movies_scroll: gpui::UniformListScrollHandle,
+    pub search_series_scroll: gpui::UniformListScrollHandle,
+    pub person_credits_scroll: gpui::UniformListScrollHandle,
     pub episode_list_scrolled_key: Option<(String, String)>,
     pub meta_addon_dropdown_open: bool,
     pub discover_open_dropdown: Option<DiscoverDropdown>,
@@ -140,6 +191,9 @@ pub struct AppShell {
     pub library_status_tab: LibraryStatusTab,
     pub library_type_filter: LibraryTypeFilter,
     pub library_sort_order: LibrarySortOrder,
+    pub library_search_query: String,
+    pub library_sort_dropdown_open: bool,
+    pub library_sort_criterion: LibrarySortCriterion,
 
     pub mpv_subscriptions_attached: bool,
     pub playback_session: Option<PlaybackSession>,
@@ -225,6 +279,11 @@ pub struct AppShell {
     pub person_loading: bool,
     pub person_request_seq: u64,
     pub person_scroll_handle: ScrollHandle,
+    pub person_bio_expanded: bool,
+    pub person_department_filter: PersonDeptFilter,
+    pub person_sort_recent: bool,
+    pub active_collection: Option<(u64, EnrichedCollection)>,
+    pub loading_collection_id: Option<u64>,
     pub board_spotlight_idx: usize,
     pub enriched_attempted: HashSet<String>,
     pub synthetic_tmdb_meta: Option<(String, MetaItem)>,
@@ -271,12 +330,27 @@ impl AppShell {
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             while poster_rx.recv().await.is_ok() {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                while poster_rx.try_recv().is_ok() {}
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
             }
         })
         .detach();
+
+        if let Some(engine_rx) = services.engine_ready_rx {
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                if let Ok(outcome) = engine_rx.recv().await {
+                    let _ = this.update(cx, |shell, cx| {
+                        shell.on_stream_engine_ready(outcome, cx);
+                    });
+                }
+            })
+            .detach();
+        }
 
         let mpv_subscriptions_attached = if let Some(mpv) = &services.mpv {
             Self::configure_and_subscribe_mpv(mpv, &services.preferences, cx);
@@ -315,6 +389,9 @@ impl AppShell {
         let private_cfg = services.core.private_integrations();
         let last_debrid_latency_ms = services.core.last_debrid_resolve_latency_ms();
 
+        let initial_vp = window.viewport_size();
+        let viewport_size_px = (f32::from(initial_vp.width), f32::from(initial_vp.height));
+
         let cli_addon_url = services.initial_addon_url;
         let initial_route = if cli_addon_url.is_some() {
             services.core.load_remote_addons(None);
@@ -335,13 +412,36 @@ impl AppShell {
             player_snapshot: services.initial_snapshot,
             route: initial_route,
             nav_history: Vec::new(),
+            nav_forward: Vec::new(),
+            viewport_size_px,
             exit_fullscreen_on_next_render: false,
             window_blur_active: true,
             command_palette_open: false,
             avatar_menu_open: false,
+            context_menu: None,
             palette_query: String::new(),
             palette_selected_idx: 0,
+            palette_scroll_handle: ScrollHandle::new(),
             focused_input: None,
+            input_cursors: HashMap::new(),
+            input_selected_all: HashSet::new(),
+            kb_focus_index: None,
+            kb_focus_items: Vec::new(),
+            board_state_rev: 1,
+            discover_state_rev: 1,
+            library_state_rev: 1,
+            calendar_state_rev: 1,
+            meta_state_rev: 1,
+            search_state_rev: 1,
+            search_debounce_seq: 0,
+            hover_prefetch_seq: 0,
+            hover_prefetch_target: None,
+            last_heap_trim_at: None,
+            memoized_library_statuses: parking_lot::Mutex::new((0, Arc::new(HashMap::new()))),
+            memoized_enriched_streams: None,
+            memoized_discover_catalog: parking_lot::Mutex::new(None),
+            discover_last_next_page_len: Cell::new(None),
+            memoized_library_items: parking_lot::Mutex::new(None),
             auth_email_input: String::new(),
             auth_password_input: String::new(),
             addon_url_input: cli_addon_url.clone().unwrap_or_default(),
@@ -365,9 +465,17 @@ impl AppShell {
             meta_scroll_handle: ScrollHandle::new(),
             board_scroll_handle: ScrollHandle::new(),
             library_scroll_handle: ScrollHandle::new(),
+            calendar_scroll_handle: ScrollHandle::new(),
+            board_list_scroll_handle: gpui::UniformListScrollHandle::new(),
+            board_shelf_scrolls: HashMap::new(),
+            board_hidden_drawer_open: false,
             discover_grid_scroll_handle: gpui::UniformListScrollHandle::new(),
             library_grid_scroll_handle: gpui::UniformListScrollHandle::new(),
             episode_list_scroll_handle: gpui::UniformListScrollHandle::new(),
+            meta_streams_scroll_handle: gpui::UniformListScrollHandle::new(),
+            search_movies_scroll: gpui::UniformListScrollHandle::new(),
+            search_series_scroll: gpui::UniformListScrollHandle::new(),
+            person_credits_scroll: gpui::UniformListScrollHandle::new(),
             episode_list_scrolled_key: None,
             meta_addon_dropdown_open: false,
             discover_open_dropdown: None,
@@ -376,6 +484,9 @@ impl AppShell {
             library_status_tab: LibraryStatusTab::Watching,
             library_type_filter: LibraryTypeFilter::All,
             library_sort_order: LibrarySortOrder::Recent,
+            library_search_query: String::new(),
+            library_sort_dropdown_open: false,
+            library_sort_criterion: LibrarySortCriterion::default(),
             mpv_subscriptions_attached,
             playback_session: None,
             playback_generation_seq: 1,
@@ -456,6 +567,11 @@ impl AppShell {
             person_loading: false,
             person_request_seq: 0,
             person_scroll_handle: ScrollHandle::new(),
+            person_bio_expanded: false,
+            person_department_filter: PersonDeptFilter::default(),
+            person_sort_recent: true,
+            active_collection: None,
+            loading_collection_id: None,
             board_spotlight_idx: 0,
             enriched_attempted: HashSet::new(),
             synthetic_tmdb_meta: None,
@@ -465,6 +581,283 @@ impl AppShell {
             shell.submit_addon_manifest_lookup(cx);
         }
         shell
+    }
+
+    fn on_stream_engine_ready(
+        &mut self,
+        outcome: Result<StreamEngineHandle, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            Ok(handle) => {
+                let url = handle.base_url();
+                handle.set_enable_upnp(self.preferences.enable_upnp);
+                handle.set_first_byte_timeout(Duration::from_secs(
+                    self.preferences.dead_swarm_timeout_secs.max(12),
+                ));
+                let desired_mode = self.preferences.storage_mode.to_engine_mode();
+                let needs_mode_sync = handle.storage_mode() != desired_mode;
+                self.engine.attach(handle);
+                if !self.core.sync_loopback_streaming_server_url(url) {
+                    self.core.reload_streaming_server();
+                }
+                if needs_mode_sync {
+                    let engine_clone = self.engine.clone();
+                    let tokio_handle = self.tokio_handle.clone();
+                    cx.spawn(async move |_, _| {
+                        let _ = switch_engine_storage_mode_on_tokio(
+                            &tokio_handle,
+                            engine_clone,
+                            desired_mode,
+                        )
+                        .await;
+                    })
+                    .detach();
+                }
+                cx.notify();
+            }
+            Err(err) => {
+                self.push_toast(
+                    ToastKind::Error,
+                    "Stream engine failed to start",
+                    Some(err),
+                    cx,
+                );
+            }
+        }
+    }
+
+    pub fn schedule_debounced_heap_trim(&mut self) {
+        if self
+            .last_heap_trim_at
+            .is_some_and(|t| t.elapsed() < HEAP_TRIM_MIN_INTERVAL)
+        {
+            return;
+        }
+        self.last_heap_trim_at = Some(Instant::now());
+        drop(self.tokio_handle.spawn_blocking(trim_process_heap));
+    }
+
+    pub fn cached_library_statuses(&self) -> Arc<HashMap<String, LibraryStatusTab>> {
+        let rev = self.library_state_rev;
+        {
+            let guard = self.memoized_library_statuses.lock();
+            if guard.0 == rev {
+                return Arc::clone(&guard.1);
+            }
+        }
+        let computed: HashMap<String, LibraryStatusTab> = self.core.with_model(|model| {
+            model
+                .ctx
+                .library
+                .items
+                .iter()
+                .filter_map(|(id, li)| {
+                    classify_library_item_status(li).map(|st| (id.clone(), st))
+                })
+                .collect()
+        });
+        let arc = Arc::new(computed);
+        let mut guard = self.memoized_library_statuses.lock();
+        guard.0 = rev;
+        guard.1 = Arc::clone(&arc);
+        arc
+    }
+
+    pub fn cached_discover_snapshot(&self) -> DiscoverViewSnapshot {
+        let rev = self.discover_state_rev;
+        {
+            let guard = self.memoized_discover_catalog.lock();
+            if let Some((cached_rev, snap)) = guard.as_ref() {
+                if *cached_rev == rev {
+                    return snap.clone();
+                }
+            }
+        }
+        let snap = self.core.with_model(DiscoverViewSnapshot::from_model);
+        let mut guard = self.memoized_discover_catalog.lock();
+        *guard = Some((rev, snap.clone()));
+        snap
+    }
+
+    pub fn toggle_pin_board_shelf(&mut self, shelf_key: String, cx: &mut Context<Self>) {
+        if let Some(pos) = self
+            .preferences
+            .pinned_board_shelves
+            .iter()
+            .position(|k| k == &shelf_key)
+        {
+            self.preferences.pinned_board_shelves.remove(pos);
+        } else {
+            self.preferences
+                .hidden_board_shelves
+                .retain(|k| k != &shelf_key);
+            self.preferences.pinned_board_shelves.push(shelf_key);
+        }
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn toggle_hide_board_shelf(&mut self, shelf_key: String, cx: &mut Context<Self>) {
+        if let Some(pos) = self
+            .preferences
+            .hidden_board_shelves
+            .iter()
+            .position(|k| k == &shelf_key)
+        {
+            self.preferences.hidden_board_shelves.remove(pos);
+        } else {
+            self.preferences
+                .pinned_board_shelves
+                .retain(|k| k != &shelf_key);
+            self.preferences.hidden_board_shelves.push(shelf_key);
+        }
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn restore_all_hidden_shelves(&mut self, cx: &mut Context<Self>) {
+        self.preferences.hidden_board_shelves.clear();
+        self.board_hidden_drawer_open = false;
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn on_card_hover_prefetch(
+        &mut self,
+        media_type: &str,
+        id: &str,
+        backdrop_url: Option<&str>,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !hovered {
+            if self.hover_prefetch_target.as_deref() == Some(id) {
+                self.hover_prefetch_target = None;
+                self.hover_prefetch_seq = self.hover_prefetch_seq.wrapping_add(1);
+            }
+            return;
+        }
+
+        self.hover_prefetch_seq = self.hover_prefetch_seq.wrapping_add(1);
+        let seq = self.hover_prefetch_seq;
+        self.hover_prefetch_target = Some(id.to_owned());
+        let media_type = media_type.to_owned();
+        let id = id.to_owned();
+        let backdrop_url = backdrop_url.map(str::to_owned);
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |shell, cx| {
+                if shell.hover_prefetch_seq != seq
+                    || shell.hover_prefetch_target.as_deref() != Some(id.as_str())
+                {
+                    return;
+                }
+                let bg = backdrop_url.or_else(|| {
+                    shell
+                        .core
+                        .cached_enriched_meta(&id)
+                        .and_then(|e| e.backdrop_url)
+                });
+                if let Some(bg_url) = bg.as_deref() {
+                    shell.poster_cache.prefetch_hero_backdrop(bg_url);
+                }
+                shell.request_background_enrichment_if_needed(&media_type, &id, cx);
+            });
+        })
+        .detach();
+    }
+
+    pub fn request_collection_if_needed(&mut self, collection_id: u64, cx: &mut Context<Self>) {
+        if self
+            .active_collection
+            .as_ref()
+            .is_some_and(|(id, _)| *id == collection_id)
+            || self.loading_collection_id == Some(collection_id)
+        {
+            return;
+        }
+        self.loading_collection_id = Some(collection_id);
+        let core = self.core.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = core.fetch_tmdb_collection(collection_id).await;
+            let _ = this.update(cx, |shell, cx| {
+                if shell.loading_collection_id == Some(collection_id) {
+                    shell.loading_collection_id = None;
+                    if let Ok(collection) = res {
+                        shell.active_collection = Some((collection_id, collection));
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn open_browsing_context_menu(
+        &mut self,
+        menu: BrowsingContextMenu,
+        cx: &mut Context<Self>,
+    ) {
+        self.avatar_menu_open = false;
+        self.command_palette_open = false;
+        self.discover_open_dropdown = None;
+        self.meta_addon_dropdown_open = false;
+        self.library_sort_dropdown_open = false;
+        self.settings_open_dropdown = None;
+        self.context_menu = Some(menu);
+        cx.notify();
+    }
+
+    pub fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        let before = self.toasts.len();
+        self.toasts.retain(|t| t.id != id);
+        if self.toasts.len() != before {
+            cx.notify();
+        }
+    }
+
+    pub fn format_input_with_caret(&self, which: FocusedInput, text: &str) -> String {
+        let focused = self.focused_input == Some(which);
+        let cursor = self
+            .input_cursors
+            .get(&which)
+            .copied()
+            .unwrap_or(text.len());
+        let selected_all = self.input_selected_all.contains(&which);
+        format_text_with_caret(text, cursor, selected_all, focused)
+    }
+
+    pub fn set_kb_focus_items(&mut self, items: Vec<KbFocusableCard>) {
+        self.kb_focus_items = items;
+        if let Some(idx) = self.kb_focus_index {
+            if self.kb_focus_items.is_empty() {
+                self.kb_focus_index = None;
+            } else if idx >= self.kb_focus_items.len() {
+                self.kb_focus_index = Some(self.kb_focus_items.len() - 1);
+            }
+        }
+    }
+
+    pub fn clear_palette_query(&mut self, cx: &mut Context<Self>) {
+        self.palette_query.clear();
+        self.input_cursors.remove(&FocusedInput::CommandPalette);
+        self.input_selected_all
+            .remove(&FocusedInput::CommandPalette);
+        self.palette_selected_idx = 0;
+        self.palette_scroll_handle.scroll_to_item(0);
+        self.search_debounce_seq = self.search_debounce_seq.wrapping_add(1);
+        self.core.unload_search();
+        cx.notify();
     }
 
     fn configure_and_subscribe_mpv(
@@ -571,13 +964,17 @@ impl AppShell {
         }
         if matches!(self.route, AppRoute::MetaDetails { .. })
             || self.memoized_meta_streams.is_some()
+            || self.memoized_enriched_streams.is_some()
         {
             self.memoized_meta_streams = None;
+            self.memoized_enriched_streams = None;
             self.auto_selected_episode_for_meta = None;
             self.visible_stream_limit = STREAM_PAGE_SIZE;
             self.expanded_stream_rows.clear();
+            self.active_collection = None;
+            self.loading_collection_id = None;
             self.core.unload_meta_details();
-            trim_process_heap();
+            self.schedule_debounced_heap_trim();
         }
     }
 
@@ -726,6 +1123,49 @@ impl AppShell {
         .detach();
     }
 
+    fn bump_state_revisions(&mut self, fields: &[DesktopModelField]) {
+        for field in fields {
+            match field {
+                DesktopModelField::Board | DesktopModelField::ContinueWatchingPreview => {
+                    self.board_state_rev = self.board_state_rev.wrapping_add(1);
+                }
+                DesktopModelField::Discover => {
+                    self.discover_state_rev = self.discover_state_rev.wrapping_add(1);
+                    self.discover_last_next_page_len.set(None);
+                }
+                DesktopModelField::Library | DesktopModelField::ContinueWatching => {
+                    self.library_state_rev = self.library_state_rev.wrapping_add(1);
+                    self.board_state_rev = self.board_state_rev.wrapping_add(1);
+                }
+                DesktopModelField::Calendar => {
+                    self.calendar_state_rev = self.calendar_state_rev.wrapping_add(1);
+                }
+                DesktopModelField::MetaDetails => {
+                    self.meta_state_rev = self.meta_state_rev.wrapping_add(1);
+                }
+                DesktopModelField::Search | DesktopModelField::LocalSearch => {
+                    self.search_state_rev = self.search_state_rev.wrapping_add(1);
+                }
+                DesktopModelField::Ctx => {
+                    self.board_state_rev = self.board_state_rev.wrapping_add(1);
+                    self.discover_state_rev = self.discover_state_rev.wrapping_add(1);
+                    self.discover_last_next_page_len.set(None);
+                    self.library_state_rev = self.library_state_rev.wrapping_add(1);
+                    self.calendar_state_rev = self.calendar_state_rev.wrapping_add(1);
+                    self.meta_state_rev = self.meta_state_rev.wrapping_add(1);
+                    self.search_state_rev = self.search_state_rev.wrapping_add(1);
+                }
+                DesktopModelField::InstalledAddons => {
+                    self.board_state_rev = self.board_state_rev.wrapping_add(1);
+                    self.discover_state_rev = self.discover_state_rev.wrapping_add(1);
+                    self.discover_last_next_page_len.set(None);
+                    self.meta_state_rev = self.meta_state_rev.wrapping_add(1);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn handle_core_runtime_event(
         &mut self,
         ev: &crate::CoreRuntimeEventAlias,
@@ -733,6 +1173,8 @@ impl AppShell {
     ) {
         match ev {
             RuntimeEvent::NewState(fields) => {
+                self.bump_state_revisions(fields);
+
                 if fields.contains(&DesktopModelField::AuthLink) && self.link_poll_active {
                     let resolved_token = self.core.with_model(|m| match &m.auth_link.data {
                         Some(Loadable::Ready(key)) => Some(key.auth_key.clone()),
@@ -769,12 +1211,14 @@ impl AppShell {
                     self.sync_player_from_core_model(cx);
                 }
 
-                if self.route.is_player()
-                    && fields.len() == 1
-                    && fields[0] == DesktopModelField::Player
-                    && !self.is_player_osd_visible()
-                    && !self.player_stats_for_nerds
-                {
+                let player_osd_or_stats =
+                    self.is_player_osd_visible() || self.player_stats_for_nerds;
+                if !route_affected_by_fields(
+                    &self.route,
+                    self.command_palette_open,
+                    player_osd_or_stats,
+                    fields,
+                ) {
                     return;
                 }
 
@@ -783,6 +1227,8 @@ impl AppShell {
             RuntimeEvent::CoreEvent(core_ev) => match core_ev {
                 CoreEvent::UserAuthenticated { auth_request: _ } => {
                     self.auth_password_input.clear();
+                    self.input_cursors.remove(&FocusedInput::AuthPassword);
+                    self.input_selected_all.remove(&FocusedInput::AuthPassword);
                     self.link_poll_active = false;
                     self.core
                         .sync_loopback_streaming_server_url(self.engine.base_url());
@@ -799,13 +1245,9 @@ impl AppShell {
                         cx,
                     );
                 }
-                CoreEvent::Error { error, .. } => {
-                    self.push_toast(
-                        ToastKind::Error,
-                        "Stremio notice",
-                        Some(format!("{error:?}")),
-                        cx,
-                    );
+                CoreEvent::Error { error, source } => {
+                    let (title, detail) = format_core_error_message(error, source);
+                    self.push_toast(ToastKind::Error, title, detail, cx);
                 }
                 _ => {
                     cx.notify();
@@ -1314,22 +1756,222 @@ impl AppShell {
         self.core.save_series_track_pref(pref);
     }
 
+    fn current_route_scroll_y(&self) -> f32 {
+        match &self.route {
+            AppRoute::Tab(SidebarTab::Home) => {
+                (-self.board_scroll_handle.offset().y / px(1.0)).max(0.0)
+            }
+            AppRoute::Tab(SidebarTab::Discover) => (-self
+                .discover_grid_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+                / px(1.0))
+            .max(0.0),
+            AppRoute::Tab(SidebarTab::Calendar) => {
+                (-self.calendar_scroll_handle.offset().y / px(1.0)).max(0.0)
+            }
+            AppRoute::Tab(SidebarTab::Library) => (-self
+                .library_grid_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+                / px(1.0))
+            .max(0.0),
+            AppRoute::Tab(SidebarTab::Settings) => {
+                (-self.settings_scroll_handle.offset().y / px(1.0)).max(0.0)
+            }
+            AppRoute::MetaDetails { .. } => {
+                (-self.meta_scroll_handle.offset().y / px(1.0)).max(0.0)
+            }
+            AppRoute::Search { .. } => (-self.search_scroll_handle.offset().y / px(1.0)).max(0.0),
+            AppRoute::Person { .. } => (-self.person_scroll_handle.offset().y / px(1.0)).max(0.0),
+            AppRoute::Tab(SidebarTab::Addons | SidebarTab::Account) | AppRoute::Player => 0.0,
+        }
+    }
+
+    fn restore_route_scroll_y(&self, route: &AppRoute, scroll_y: f32) {
+        let off = point(px(0.0), px(-scroll_y.max(0.0)));
+        match route {
+            AppRoute::Tab(SidebarTab::Home) => self.board_scroll_handle.set_offset(off),
+            AppRoute::Tab(SidebarTab::Discover) => self
+                .discover_grid_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(off),
+            AppRoute::Tab(SidebarTab::Calendar) => self.calendar_scroll_handle.set_offset(off),
+            AppRoute::Tab(SidebarTab::Library) => self
+                .library_grid_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(off),
+            AppRoute::Tab(SidebarTab::Settings) => self.settings_scroll_handle.set_offset(off),
+            AppRoute::MetaDetails { .. } => self.meta_scroll_handle.set_offset(off),
+            AppRoute::Search { .. } => self.search_scroll_handle.set_offset(off),
+            AppRoute::Person { .. } => self.person_scroll_handle.set_offset(off),
+            AppRoute::Tab(SidebarTab::Addons | SidebarTab::Account) | AppRoute::Player => {}
+        }
+    }
+
+    fn capture_nav_entry(&self) -> NavHistoryEntry {
+        NavHistoryEntry {
+            route: self.route.clone(),
+            selected_season: self.selected_season,
+            scroll_y: self.current_route_scroll_y(),
+        }
+    }
+
+    fn push_nav_history_entry(&mut self, entry: NavHistoryEntry) {
+        if self.nav_history.len() >= MAX_NAV_HISTORY {
+            let excess = self.nav_history.len() - MAX_NAV_HISTORY + 1;
+            self.nav_history.drain(..excess);
+        }
+        self.nav_history.push(entry);
+    }
+
+    fn push_forward_history_entry(&mut self, entry: NavHistoryEntry) {
+        if self.nav_forward.len() >= MAX_NAV_HISTORY {
+            let excess = self.nav_forward.len() - MAX_NAV_HISTORY + 1;
+            self.nav_forward.drain(..excess);
+        }
+        self.nav_forward.push(entry);
+    }
+
+    fn clear_transient_browsing_state(&mut self) {
+        self.focused_input = None;
+        self.command_palette_open = false;
+        self.avatar_menu_open = false;
+        self.context_menu = None;
+        self.discover_open_dropdown = None;
+        self.meta_addon_dropdown_open = false;
+        self.library_sort_dropdown_open = false;
+        self.board_hidden_drawer_open = false;
+        self.settings_open_dropdown = None;
+        self.pending_quick_resume = None;
+        self.kb_focus_index = None;
+        self.kb_focus_items.clear();
+    }
+
+    fn apply_nav_entry(&mut self, entry: NavHistoryEntry, cx: &mut Context<Self>) {
+        let keep_meta = matches!(
+            entry.route,
+            AppRoute::MetaDetails { .. } | AppRoute::Player
+        );
+        self.unload_meta_details_if_leaving(keep_meta);
+        self.clear_transient_browsing_state();
+
+        self.route = entry.route.clone();
+        self.selected_season = entry.selected_season;
+
+        match entry.route.clone() {
+            AppRoute::Tab(SidebarTab::Home) => {}
+            AppRoute::Tab(SidebarTab::Discover) => {
+                if !self.discover_loaded_once {
+                    self.discover_loaded_once = true;
+                    self.core.load_discover(None);
+                }
+            }
+            AppRoute::Tab(SidebarTab::Calendar) => {
+                self.core.load_calendar(None);
+            }
+            AppRoute::Tab(SidebarTab::Addons) => {
+                self.core.load_installed_addons(None);
+                self.core.load_remote_addons(None);
+            }
+            AppRoute::Tab(SidebarTab::Settings) => {
+                self.core.reload_streaming_server();
+            }
+            AppRoute::Tab(SidebarTab::Library | SidebarTab::Account) => {}
+            AppRoute::MetaDetails {
+                type_name,
+                id,
+                video_id,
+            } => {
+                let already_loaded = self.core.with_model(|m| {
+                    resolve_ready_meta_item(&m.meta_details.meta_items)
+                        .is_some_and(|(item, _)| item.preview.id == id)
+                });
+                if !already_loaded {
+                    self.memoized_meta_streams = None;
+                    self.memoized_enriched_streams = None;
+                    self.synthetic_tmdb_meta = None;
+                    self.core
+                        .load_meta_details(&type_name, &id, video_id.as_deref());
+                }
+                self.request_background_enrichment_if_needed(&type_name, &id, cx);
+                self.maybe_trigger_stream_enrichments(cx);
+            }
+            AppRoute::Search { query } => {
+                if self.full_search_query != query {
+                    self.full_search_query = query;
+                    self.refresh_full_search(cx);
+                }
+            }
+            AppRoute::Person { person_key, name } => {
+                if self
+                    .active_person_filmography
+                    .as_ref()
+                    .is_none_or(|f| f.person_key != person_key)
+                {
+                    self.person_request_seq = self.person_request_seq.wrapping_add(1);
+                    let seq = self.person_request_seq;
+                    self.person_loading = true;
+                    self.active_person_filmography = None;
+                    let core = self.core.clone();
+                    cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                        let filmo = core.fetch_person_filmography(person_key, name).await;
+                        let _ = this.update(cx, |shell, cx| {
+                            if shell.person_request_seq == seq {
+                                shell.person_loading = false;
+                                shell.active_person_filmography = Some(filmo);
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                }
+            }
+            AppRoute::Player => {}
+        }
+
+        self.restore_route_scroll_y(&entry.route, entry.scroll_y);
+        cx.notify();
+    }
+
+    pub fn open_route(&mut self, route: AppRoute, cx: &mut Context<Self>) {
+        match route {
+            AppRoute::Tab(tab) => self.navigate_tab(tab, cx),
+            AppRoute::MetaDetails {
+                type_name,
+                id,
+                video_id,
+            } => self.open_editorial_media_hit(type_name, id, video_id, cx),
+            AppRoute::Search { query } => self.open_full_search(query, cx),
+            AppRoute::Person { person_key, name } => self.open_person_details(person_key, name, cx),
+            AppRoute::Player => {}
+        }
+    }
+
     pub fn navigate_tab(&mut self, tab: SidebarTab, cx: &mut Context<Self>) {
         if self.route.is_player() {
             self.teardown_active_playback();
+        } else if self.route != AppRoute::Tab(tab) {
+            let entry = self.capture_nav_entry();
+            self.push_nav_history_entry(entry);
+            self.nav_forward.clear();
         }
+
         if self.command_palette_open {
             self.core.unload_search();
         }
         self.unload_meta_details_if_leaving(false);
-
-        self.focused_input = None;
-        self.command_palette_open = false;
-        self.avatar_menu_open = false;
-        self.discover_open_dropdown = None;
-        self.meta_addon_dropdown_open = false;
-        self.settings_open_dropdown = None;
-        self.pending_quick_resume = None;
+        self.clear_transient_browsing_state();
 
         match tab {
             SidebarTab::Home => {
@@ -1339,11 +1981,22 @@ impl AppShell {
             }
             SidebarTab::Discover => {
                 self.discover_loaded_once = true;
+                self.discover_last_next_page_len.set(None);
                 self.core.load_discover(None);
+            }
+            SidebarTab::Calendar => {
+                self.calendar_scroll_handle
+                    .set_offset(point(px(0.0), px(0.0)));
+                self.core.load_calendar(None);
             }
             SidebarTab::Library => {
                 self.visible_library_limit = LIBRARY_PAGE_SIZE;
                 self.library_scroll_handle
+                    .set_offset(point(px(0.0), px(0.0)));
+                self.library_grid_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
                     .set_offset(point(px(0.0), px(0.0)));
                 self.core.load_library(default_library_selected());
             }
@@ -1356,9 +2009,142 @@ impl AppShell {
             SidebarTab::Account => {}
         }
 
-        self.nav_history.clear();
         self.route = AppRoute::Tab(tab);
         cx.notify();
+    }
+
+    pub fn open_discover_catalog(
+        &mut self,
+        selected: CatalogWithFiltersSelected,
+        cx: &mut Context<Self>,
+    ) {
+        if self.route.is_player() {
+            self.teardown_active_playback();
+        } else {
+            let entry = self.capture_nav_entry();
+            self.push_nav_history_entry(entry);
+            self.nav_forward.clear();
+        }
+        self.unload_meta_details_if_leaving(false);
+        self.clear_transient_browsing_state();
+        self.discover_loaded_once = true;
+        self.discover_last_next_page_len.set(None);
+        self.discover_grid_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.0), px(0.0)));
+        self.route = AppRoute::Tab(SidebarTab::Discover);
+        self.core.load_discover(Some(selected));
+        cx.notify();
+    }
+
+    pub fn open_discover_genre(
+        &mut self,
+        type_name: &str,
+        genre: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let req_type = type_name.trim();
+        let req_genre = genre.trim();
+        let request = self.core.with_model(|model| {
+            let mut matched_exact: Option<ResourceRequest> = None;
+            let mut matched_type_with_genre: Option<ResourceRequest> = None;
+            let mut matched_type_any: Option<ResourceRequest> = None;
+
+            for addon in &model.ctx.profile.addons {
+                for mc in &addon.manifest.catalogs {
+                    if !mc.r#type.eq_ignore_ascii_case(req_type) {
+                        continue;
+                    }
+                    let Some(base_extra) = mc.default_required_extra() else {
+                        continue;
+                    };
+                    if let Some(genre_prop) =
+                        mc.extra.iter().find(|e| e.name.eq_ignore_ascii_case("genre"))
+                    {
+                        if let Some(opt_val) = genre_prop
+                            .options
+                            .iter()
+                            .find(|o| o.eq_ignore_ascii_case(req_genre))
+                        {
+                            let mut extra = base_extra;
+                            extra.retain(|ev| !ev.name.eq_ignore_ascii_case("genre"));
+                            extra.push(ExtraValue {
+                                name: genre_prop.name.clone(),
+                                value: opt_val.clone(),
+                            });
+                            matched_exact = Some(ResourceRequest {
+                                base: addon.transport_url.clone(),
+                                path: ResourcePath {
+                                    resource: "catalog".to_owned(),
+                                    r#type: mc.r#type.clone(),
+                                    id: mc.id.clone(),
+                                    extra,
+                                },
+                            });
+                            break;
+                        } else if matched_type_with_genre.is_none() {
+                            let mut extra = base_extra;
+                            extra.retain(|ev| !ev.name.eq_ignore_ascii_case("genre"));
+                            extra.push(ExtraValue {
+                                name: genre_prop.name.clone(),
+                                value: req_genre.to_owned(),
+                            });
+                            matched_type_with_genre = Some(ResourceRequest {
+                                base: addon.transport_url.clone(),
+                                path: ResourcePath {
+                                    resource: "catalog".to_owned(),
+                                    r#type: mc.r#type.clone(),
+                                    id: mc.id.clone(),
+                                    extra,
+                                },
+                            });
+                        }
+                    } else if matched_type_any.is_none() {
+                        let mut extra = base_extra;
+                        extra.push(ExtraValue {
+                            name: "genre".to_owned(),
+                            value: req_genre.to_owned(),
+                        });
+                        matched_type_any = Some(ResourceRequest {
+                            base: addon.transport_url.clone(),
+                            path: ResourcePath {
+                                resource: "catalog".to_owned(),
+                                r#type: mc.r#type.clone(),
+                                id: mc.id.clone(),
+                                extra,
+                            },
+                        });
+                    }
+                }
+                if matched_exact.is_some() {
+                    break;
+                }
+            }
+
+            matched_exact
+                .or(matched_type_with_genre)
+                .or(matched_type_any)
+                .unwrap_or_else(|| ResourceRequest {
+                    base: CINEMETA_URL.clone(),
+                    path: ResourcePath {
+                        resource: "catalog".to_owned(),
+                        r#type: if req_type.is_empty() {
+                            "movie".to_owned()
+                        } else {
+                            req_type.to_owned()
+                        },
+                        id: "top".to_owned(),
+                        extra: vec![ExtraValue {
+                            name: "genre".to_owned(),
+                            value: req_genre.to_owned(),
+                        }],
+                    },
+                })
+        });
+
+        self.open_discover_catalog(CatalogWithFiltersSelected { request }, cx);
     }
 
     pub fn open_meta_details(
@@ -1370,9 +2156,10 @@ impl AppShell {
     ) {
         if self.route.is_player() {
             self.teardown_active_playback();
-        }
-        if !matches!(self.route, AppRoute::Player) {
-            self.nav_history.push(self.route.clone());
+        } else {
+            let entry = self.capture_nav_entry();
+            self.push_nav_history_entry(entry);
+            self.nav_forward.clear();
         }
         let resolved_video_id = video_id
             .filter(|v| !v.trim().is_empty())
@@ -1387,16 +2174,17 @@ impl AppShell {
                 })
             });
 
-        self.avatar_menu_open = false;
-        self.discover_open_dropdown = None;
-        self.meta_addon_dropdown_open = false;
+        self.clear_transient_browsing_state();
         self.selected_season = None;
         self.auto_selected_episode_for_meta = resolved_video_id
             .as_ref()
             .map(|vid| (id.clone(), vid.clone()));
         self.stream_filter.reset();
         self.memoized_meta_streams = None;
+        self.memoized_enriched_streams = None;
         self.synthetic_tmdb_meta = None;
+        self.active_collection = None;
+        self.loading_collection_id = None;
         self.visible_stream_limit = STREAM_PAGE_SIZE;
         self.expanded_stream_rows.clear();
         self.meta_scroll_handle.set_offset(point(px(0.0), px(0.0)));
@@ -1416,19 +2204,20 @@ impl AppShell {
     pub fn open_full_search(&mut self, query: String, cx: &mut Context<Self>) {
         if self.route.is_player() {
             self.teardown_active_playback();
+        } else if !matches!(self.route, AppRoute::Search { .. }) {
+            let entry = self.capture_nav_entry();
+            self.push_nav_history_entry(entry);
+            self.nav_forward.clear();
         }
-        if !matches!(self.route, AppRoute::Player | AppRoute::Search { .. }) {
-            self.nav_history.push(self.route.clone());
-        }
-        self.avatar_menu_open = false;
-        self.command_palette_open = false;
-        self.discover_open_dropdown = None;
-        self.meta_addon_dropdown_open = false;
-        self.settings_open_dropdown = None;
+        self.clear_transient_browsing_state();
 
         let trimmed = query.trim().to_owned();
         self.full_search_query = trimmed.clone();
         self.palette_query = trimmed.clone();
+        self.input_cursors
+            .insert(FocusedInput::FullSearchInput, self.full_search_query.len());
+        self.input_selected_all
+            .remove(&FocusedInput::FullSearchInput);
         self.route = AppRoute::Search { query: trimmed };
         self.focused_input = Some(FocusedInput::FullSearchInput);
         self.search_scroll_handle.set_offset(point(px(0.0), px(0.0)));
@@ -1436,8 +2225,20 @@ impl AppShell {
     }
 
     pub fn refresh_full_search(&mut self, cx: &mut Context<Self>) {
+        self.search_debounce_seq = self.search_debounce_seq.wrapping_add(1);
+        self.refresh_full_search_with_debounce(false, cx);
+    }
+
+    pub fn refresh_full_search_debounced(&mut self, cx: &mut Context<Self>) {
+        self.refresh_full_search_with_debounce(true, cx);
+    }
+
+    fn refresh_full_search_with_debounce(&mut self, debounce: bool, cx: &mut Context<Self>) {
         self.full_search_seq = self.full_search_seq.wrapping_add(1);
         let seq = self.full_search_seq;
+        self.search_debounce_seq = self.search_debounce_seq.wrapping_add(1);
+        let debounce_seq = self.search_debounce_seq;
+
         let q = self.full_search_query.trim().to_owned();
         self.route = AppRoute::Search { query: q.clone() };
         self.full_search_tmdb_hits.clear();
@@ -1451,9 +2252,8 @@ impl AppShell {
             return;
         }
 
+        // Synchronous 0ms local FTS5 snapshot
         self.full_search_results = self.core.editorial_search_snapshot(&q);
-        self.core.search(q.clone());
-
         let has_tmdb = {
             let cfg = self.core.private_integrations();
             cfg.tmdb_enabled && cfg.has_tmdb_configured()
@@ -1464,6 +2264,32 @@ impl AppShell {
         }
         cx.notify();
 
+        if debounce {
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(180))
+                    .await;
+                let _ = this.update(cx, |shell, cx| {
+                    if shell.search_debounce_seq != debounce_seq || shell.full_search_seq != seq {
+                        return;
+                    }
+                    shell.dispatch_network_search_and_tmdb(q, seq, has_tmdb, cx);
+                });
+            })
+            .detach();
+        } else {
+            self.dispatch_network_search_and_tmdb(q, seq, has_tmdb, cx);
+        }
+    }
+
+    fn dispatch_network_search_and_tmdb(
+        &mut self,
+        q: String,
+        seq: u64,
+        has_tmdb: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.core.search(q.clone());
         if has_tmdb {
             let core = self.core.clone();
             cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -1527,20 +2353,20 @@ impl AppShell {
     ) {
         if self.route.is_player() {
             self.teardown_active_playback();
+        } else {
+            let entry = self.capture_nav_entry();
+            self.push_nav_history_entry(entry);
+            self.nav_forward.clear();
         }
-        if !matches!(self.route, AppRoute::Player) {
-            self.nav_history.push(self.route.clone());
-        }
-        self.avatar_menu_open = false;
-        self.command_palette_open = false;
-        self.discover_open_dropdown = None;
-        self.meta_addon_dropdown_open = false;
-        self.settings_open_dropdown = None;
+        self.clear_transient_browsing_state();
 
         self.person_request_seq = self.person_request_seq.wrapping_add(1);
         let seq = self.person_request_seq;
         self.person_loading = true;
         self.active_person_filmography = None;
+        self.person_bio_expanded = false;
+        self.person_department_filter = PersonDeptFilter::All;
+        self.person_sort_recent = true;
         self.person_scroll_handle.set_offset(point(px(0.0), px(0.0)));
         self.route = AppRoute::Person {
             person_key: person_key.clone(),
@@ -1604,6 +2430,7 @@ impl AppShell {
                             .as_ref()
                             .map(|vid| (imdb_id.clone(), vid.clone()));
                         shell.memoized_meta_streams = None;
+                        shell.memoized_enriched_streams = None;
                         shell.synthetic_tmdb_meta = None;
                         shell.core.load_meta_details(
                             &type_name,
@@ -1696,6 +2523,7 @@ impl AppShell {
         self.meta_addon_dropdown_open = false;
         self.auto_selected_episode_for_meta = Some((id.clone(), video_id.clone()));
         self.memoized_meta_streams = None;
+        self.memoized_enriched_streams = None;
         self.visible_stream_limit = STREAM_PAGE_SIZE;
         self.expanded_stream_rows.clear();
         self.core
@@ -1768,6 +2596,7 @@ impl AppShell {
                 Some((type_name.clone(), id.clone(), Some(default_vid.clone())));
         }
         self.memoized_meta_streams = None;
+        self.memoized_enriched_streams = None;
         self.route = AppRoute::MetaDetails {
             type_name: type_name.clone(),
             id: id.clone(),
@@ -1861,8 +2690,9 @@ impl AppShell {
         let subs_path = Some(build_subtitles_resource_path(&req_type, &vid));
 
         if matches!(self.route, AppRoute::MetaDetails { .. }) {
-            if let Some(origin_route) = self.nav_history.pop() {
-                self.route = origin_route;
+            if let Some(origin_entry) = self.nav_history.pop() {
+                self.route = origin_entry.route;
+                self.selected_season = origin_entry.selected_season;
             }
         }
 
@@ -1881,9 +2711,10 @@ impl AppShell {
         );
 
         self.memoized_meta_streams = None;
+        self.memoized_enriched_streams = None;
         self.auto_selected_episode_for_meta = None;
         self.core.unload_meta_details();
-        trim_process_heap();
+        self.schedule_debounced_heap_trim();
     }
 
     pub fn navigate_back(&mut self, cx: &mut Context<Self>) {
@@ -1891,44 +2722,112 @@ impl AppShell {
             self.exit_player(cx);
             return;
         }
-        self.discover_open_dropdown = None;
-        self.meta_addon_dropdown_open = false;
-        self.pending_quick_resume = None;
-        let next_route = self
-            .nav_history
-            .pop()
-            .unwrap_or(AppRoute::Tab(SidebarTab::Home));
-        let keep_meta = matches!(
-            next_route,
-            AppRoute::MetaDetails { .. } | AppRoute::Player
-        );
-        self.unload_meta_details_if_leaving(keep_meta);
-        self.route = next_route.clone();
-        if let AppRoute::Person { person_key, name } = next_route {
-            if self
-                .active_person_filmography
-                .as_ref()
-                .is_none_or(|f| f.person_key != person_key)
-            {
-                self.person_request_seq = self.person_request_seq.wrapping_add(1);
-                let seq = self.person_request_seq;
-                self.person_loading = true;
-                self.active_person_filmography = None;
-                let core = self.core.clone();
-                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    let filmo = core.fetch_person_filmography(person_key, name).await;
-                    let _ = this.update(cx, |shell, cx| {
-                        if shell.person_request_seq == seq {
-                            shell.person_loading = false;
-                            shell.active_person_filmography = Some(filmo);
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
+        if let Some(prev_entry) = self.nav_history.pop() {
+            let cur_entry = self.capture_nav_entry();
+            self.push_forward_history_entry(cur_entry);
+            self.apply_nav_entry(prev_entry, cx);
+        } else if self.route != AppRoute::Tab(SidebarTab::Home) {
+            let cur_entry = self.capture_nav_entry();
+            self.push_forward_history_entry(cur_entry);
+            self.apply_nav_entry(
+                NavHistoryEntry {
+                    route: AppRoute::Tab(SidebarTab::Home),
+                    selected_season: None,
+                    scroll_y: 0.0,
+                },
+                cx,
+            );
+        }
+    }
+
+    pub fn navigate_forward(&mut self, cx: &mut Context<Self>) {
+        if self.route.is_player() {
+            return;
+        }
+        let Some(next_entry) = self.nav_forward.pop() else {
+            return;
+        };
+        let cur_entry = self.capture_nav_entry();
+        self.push_nav_history_entry(cur_entry);
+        self.apply_nav_entry(next_entry, cx);
+    }
+
+    pub fn move_kb_focus(&mut self, dr: isize, dc: isize, cx: &mut Context<Self>) -> bool {
+        let Some(next_idx) = step_kb_focus_2d(&self.kb_focus_items, self.kb_focus_index, dr, dc)
+        else {
+            return false;
+        };
+        if self.kb_focus_index == Some(next_idx) {
+            return false;
+        }
+        self.kb_focus_index = Some(next_idx);
+        if let Some(card) = self.kb_focus_items.get(next_idx) {
+            match self.route {
+                AppRoute::Tab(SidebarTab::Discover) => {
+                    self.discover_grid_scroll_handle
+                        .scroll_to_item(card.row, gpui::ScrollStrategy::Nearest);
+                }
+                AppRoute::Tab(SidebarTab::Library) => {
+                    self.library_grid_scroll_handle
+                        .scroll_to_item(card.row, gpui::ScrollStrategy::Nearest);
+                }
+                _ => {}
             }
         }
         cx.notify();
+        true
+    }
+
+    fn scroll_handle_for_page_key(
+        handle: &ScrollHandle,
+        key: &str,
+        viewport_height_px: f32,
+    ) -> bool {
+        let max_scroll = (handle.max_offset().y / px(1.0)).max(0.0);
+        let cur_scrolled = (-handle.offset().y / px(1.0)).max(0.0);
+        let page_step = (viewport_height_px - 120.0).max(280.0) * 0.8;
+        let next = match key {
+            "pageup" => (cur_scrolled - page_step).max(0.0),
+            "pagedown" => (cur_scrolled + page_step).min(max_scroll),
+            "home" => 0.0,
+            "end" => max_scroll,
+            _ => return false,
+        };
+        handle.set_offset(point(px(0.0), px(-next)));
+        true
+    }
+
+    pub fn scroll_active_view_key(&self, key: &str) -> bool {
+        let vh = self.viewport_size_px.1;
+        match &self.route {
+            AppRoute::Tab(SidebarTab::Home) => {
+                Self::scroll_handle_for_page_key(&self.board_scroll_handle, key, vh)
+            }
+            AppRoute::Tab(SidebarTab::Discover) => {
+                let guard = self.discover_grid_scroll_handle.0.borrow();
+                Self::scroll_handle_for_page_key(&guard.base_handle, key, vh)
+            }
+            AppRoute::Tab(SidebarTab::Calendar) => {
+                Self::scroll_handle_for_page_key(&self.calendar_scroll_handle, key, vh)
+            }
+            AppRoute::Tab(SidebarTab::Library) => {
+                let guard = self.library_grid_scroll_handle.0.borrow();
+                Self::scroll_handle_for_page_key(&guard.base_handle, key, vh)
+            }
+            AppRoute::Tab(SidebarTab::Settings) => {
+                Self::scroll_handle_for_page_key(&self.settings_scroll_handle, key, vh)
+            }
+            AppRoute::MetaDetails { .. } => {
+                Self::scroll_handle_for_page_key(&self.meta_scroll_handle, key, vh)
+            }
+            AppRoute::Search { .. } => {
+                Self::scroll_handle_for_page_key(&self.search_scroll_handle, key, vh)
+            }
+            AppRoute::Person { .. } => {
+                Self::scroll_handle_for_page_key(&self.person_scroll_handle, key, vh)
+            }
+            AppRoute::Tab(SidebarTab::Addons | SidebarTab::Account) | AppRoute::Player => false,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1983,7 +2882,9 @@ impl AppShell {
         }
 
         if !self.route.is_player() {
-            self.nav_history.push(self.route.clone());
+            let entry = self.capture_nav_entry();
+            self.push_nav_history_entry(entry);
+            self.nav_forward.clear();
         }
 
         self.poster_cache.trim_for_playback();
@@ -2028,7 +2929,10 @@ impl AppShell {
         self.meta_addon_dropdown_open = false;
         self.discover_open_dropdown = None;
         self.avatar_menu_open = false;
+        self.context_menu = None;
         self.command_palette_open = false;
+        self.kb_focus_index = None;
+        self.kb_focus_items.clear();
         self.expanded_stream_rows.clear();
         self.next_episode_prewarmed = false;
         self.prewarmed_next = None;
@@ -2529,19 +3433,12 @@ impl AppShell {
     pub fn exit_player(&mut self, cx: &mut Context<Self>) {
         self.exit_fullscreen_on_next_render = true;
         self.teardown_active_playback();
-        let next_route = self
-            .nav_history
-            .pop()
-            .unwrap_or(AppRoute::Tab(SidebarTab::Home));
-        if !matches!(next_route, AppRoute::MetaDetails { .. }) {
-            self.memoized_meta_streams = None;
-            self.auto_selected_episode_for_meta = None;
-            self.visible_stream_limit = STREAM_PAGE_SIZE;
-            self.core.unload_meta_details();
-            trim_process_heap();
-        }
-        self.route = next_route;
-        cx.notify();
+        let next_entry = self.nav_history.pop().unwrap_or(NavHistoryEntry {
+            route: AppRoute::Tab(SidebarTab::Home),
+            selected_season: None,
+            scroll_y: 0.0,
+        });
+        self.apply_nav_entry(next_entry, cx);
     }
 
     fn teardown_active_playback(&mut self) {
@@ -2574,7 +3471,7 @@ impl AppShell {
         self.pending_auto_select_sub_title = None;
         self.user_picked_subtitle = false;
         self.sync_os_integrations();
-        trim_process_heap();
+        self.schedule_debounced_heap_trim();
     }
 
     pub fn is_player_osd_visible(&self) -> bool {
@@ -3031,6 +3928,7 @@ impl AppShell {
             self.stream_filter.cached_only = false;
         }
         self.memoized_meta_streams = None;
+        self.memoized_enriched_streams = None;
         self.visible_stream_limit = STREAM_PAGE_SIZE;
         let _ = self.preferences.save();
         cx.notify();
@@ -3047,12 +3945,16 @@ impl AppShell {
             .set_offset(point(px(0.0), px(0.0)));
         if !self.settings_search_query.is_empty() {
             self.settings_search_query.clear();
+            self.input_cursors.remove(&FocusedInput::SettingsSearch);
+            self.input_selected_all.remove(&FocusedInput::SettingsSearch);
         }
         cx.notify();
     }
 
     pub fn clear_settings_search(&mut self, cx: &mut Context<Self>) {
         self.settings_search_query.clear();
+        self.input_cursors.remove(&FocusedInput::SettingsSearch);
+        self.input_selected_all.remove(&FocusedInput::SettingsSearch);
         self.settings_open_dropdown = None;
         if self.focused_input == Some(FocusedInput::SettingsSearch) {
             self.focused_input = None;
@@ -4151,14 +5053,22 @@ impl AppShell {
             1 => {
                 self.real_debrid_key_input.clear();
                 self.real_debrid_key_configured = false;
+                self.input_cursors.remove(&FocusedInput::RealDebridApiKey);
+                self.input_selected_all
+                    .remove(&FocusedInput::RealDebridApiKey);
             }
             2 => {
                 self.torbox_key_input.clear();
                 self.torbox_key_configured = false;
+                self.input_cursors.remove(&FocusedInput::TorBoxApiKey);
+                self.input_selected_all.remove(&FocusedInput::TorBoxApiKey);
             }
             3 => {
                 self.alldebrid_key_input.clear();
                 self.alldebrid_key_configured = false;
+                self.input_cursors.remove(&FocusedInput::AllDebridApiKey);
+                self.input_selected_all
+                    .remove(&FocusedInput::AllDebridApiKey);
             }
             _ => {}
         }
@@ -4232,6 +5142,9 @@ impl AppShell {
     pub fn clear_prowlarr_key(&mut self, cx: &mut Context<Self>) {
         self.prowlarr_key_input.clear();
         self.prowlarr_key_configured = false;
+        self.input_cursors.remove(&FocusedInput::ProwlarrApiKey);
+        self.input_selected_all
+            .remove(&FocusedInput::ProwlarrApiKey);
         self.prowlarr_test_status = None;
         self.persist_private_integrations_draft(cx);
     }
@@ -4239,18 +5152,28 @@ impl AppShell {
     pub fn clear_opensubtitles_key(&mut self, cx: &mut Context<Self>) {
         self.opensubtitles_key_input.clear();
         self.opensubtitles_key_configured = false;
+        self.input_cursors
+            .remove(&FocusedInput::SettingsOpenSubtitlesKey);
+        self.input_selected_all
+            .remove(&FocusedInput::SettingsOpenSubtitlesKey);
         self.persist_private_integrations_draft(cx);
     }
 
     pub fn clear_subdl_key(&mut self, cx: &mut Context<Self>) {
         self.subdl_key_input.clear();
         self.subdl_key_configured = false;
+        self.input_cursors.remove(&FocusedInput::SettingsSubdlKey);
+        self.input_selected_all
+            .remove(&FocusedInput::SettingsSubdlKey);
         self.persist_private_integrations_draft(cx);
     }
 
     pub fn clear_tmdb_key(&mut self, cx: &mut Context<Self>) {
         self.tmdb_key_input.clear();
         self.tmdb_key_configured = false;
+        self.input_cursors.remove(&FocusedInput::SettingsTmdbApiKey);
+        self.input_selected_all
+            .remove(&FocusedInput::SettingsTmdbApiKey);
         self.tmdb_verify_status = None;
         self.persist_private_integrations_draft(cx);
     }
@@ -4350,6 +5273,7 @@ impl AppShell {
             );
         } else {
             self.memoized_meta_streams = None;
+            self.memoized_enriched_streams = None;
             self.prowlarr_fallback_key = None;
             self.prowlarr_fallback_attempted = false;
             self.enriched_attempted.clear();
@@ -4361,6 +5285,8 @@ impl AppShell {
         self.core.clear_addon_cache();
         self.enriched_attempted.clear();
         self.synthetic_tmdb_meta = None;
+        self.active_collection = None;
+        self.loading_collection_id = None;
         self.poster_cache.clear_failures();
         self.poster_cache.trim_for_playback();
         let cache_root = self.poster_cache.cache_root().to_path_buf();
@@ -4374,7 +5300,7 @@ impl AppShell {
                 }
             }
         }
-        trim_process_heap();
+        self.schedule_debounced_heap_trim();
         self.push_toast(
             ToastKind::Success,
             "Metadata & image cache cleared",
@@ -4384,12 +5310,24 @@ impl AppShell {
     }
 
     pub fn open_command_palette(&mut self, cx: &mut Context<Self>) {
+        if self.route.is_player() && !self.player_snapshot.paused {
+            if let Some(mpv) = &self.mpv {
+                let _ = mpv.set_paused(true);
+            }
+        }
         self.avatar_menu_open = false;
+        self.context_menu = None;
         self.discover_open_dropdown = None;
         self.meta_addon_dropdown_open = false;
+        self.library_sort_dropdown_open = false;
         self.command_palette_open = true;
         self.palette_selected_idx = 0;
+        self.palette_scroll_handle.scroll_to_item(0);
         self.focused_input = Some(FocusedInput::CommandPalette);
+        self.input_cursors
+            .insert(FocusedInput::CommandPalette, self.palette_query.len());
+        self.input_selected_all
+            .remove(&FocusedInput::CommandPalette);
         if !self.palette_query.trim().is_empty() {
             self.core.search(self.palette_query.clone());
         }
@@ -4402,7 +5340,7 @@ impl AppShell {
             self.focused_input = None;
         }
         self.core.unload_search();
-        trim_process_heap();
+        self.schedule_debounced_heap_trim();
         cx.notify();
     }
 
@@ -4532,6 +5470,10 @@ impl AppShell {
                     Ok(res) => {
                         if clear_url_input {
                             shell.addon_url_input.clear();
+                            shell.input_cursors.remove(&FocusedInput::AddonManifestUrl);
+                            shell
+                                .input_selected_all
+                                .remove(&FocusedInput::AddonManifestUrl);
                         }
                         if shell
                             .clipboard_addon_suggestion
@@ -4786,6 +5728,79 @@ impl AppShell {
         cx.notify();
     }
 
+    fn apply_focused_text_edit(
+        &mut self,
+        target: FocusedInput,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> crate::state::TextEditResult {
+        let clip = cx.read_from_clipboard().and_then(|c| c.text());
+        let is_secret = target.is_secret();
+        let selected_all_entry = &mut self.input_selected_all;
+        let cursors = &mut self.input_cursors;
+
+        let buf = match target {
+            FocusedInput::CommandPalette => &mut self.palette_query,
+            FocusedInput::FullSearchInput => &mut self.full_search_query,
+            FocusedInput::AuthEmail => &mut self.auth_email_input,
+            FocusedInput::AuthPassword => &mut self.auth_password_input,
+            FocusedInput::AddonManifestUrl => &mut self.addon_url_input,
+            FocusedInput::AddonSearch => &mut self.addon_search_query,
+            FocusedInput::DiscoverCatalogSearch => &mut self.discover_catalog_search,
+            FocusedInput::LibrarySearch => &mut self.library_search_query,
+            FocusedInput::SettingsSearch => &mut self.settings_search_query,
+            FocusedInput::RealDebridApiKey => &mut self.real_debrid_key_input,
+            FocusedInput::TorBoxApiKey => &mut self.torbox_key_input,
+            FocusedInput::AllDebridApiKey => &mut self.alldebrid_key_input,
+            FocusedInput::ProwlarrUrl => &mut self.prowlarr_url_input,
+            FocusedInput::ProwlarrApiKey => &mut self.prowlarr_key_input,
+            FocusedInput::SettingsOpenSubtitlesKey => &mut self.opensubtitles_key_input,
+            FocusedInput::SettingsSubdlKey => &mut self.subdl_key_input,
+            FocusedInput::SettingsTmdbApiKey => &mut self.tmdb_key_input,
+        };
+
+        let cursor = cursors.entry(target).or_insert_with(|| buf.len());
+        let mut selected_all = selected_all_entry.contains(&target);
+        let res = apply_key_to_text_buffer_with_cursor(
+            buf,
+            cursor,
+            &mut selected_all,
+            is_secret,
+            event,
+            clip,
+        );
+        if selected_all {
+            selected_all_entry.insert(target);
+        } else {
+            selected_all_entry.remove(&target);
+        }
+        if let Some(copied) = &res.copied_text {
+            cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+        }
+        res
+    }
+
+    fn schedule_palette_search_debounced(&mut self, cx: &mut Context<Self>) {
+        self.search_debounce_seq = self.search_debounce_seq.wrapping_add(1);
+        let debounce_seq = self.search_debounce_seq;
+        let query = self.palette_query.clone();
+        if query.trim().is_empty() {
+            self.core.unload_search();
+            return;
+        }
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            cx.background_executor()
+                .timer(Duration::from_millis(180))
+                .await;
+            let _ = this.update(cx, |shell, _cx| {
+                if shell.search_debounce_seq == debounce_seq && shell.command_palette_open {
+                    shell.core.search(query);
+                }
+            });
+        })
+        .detach();
+    }
+
     fn on_global_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -4818,6 +5833,8 @@ impl AppShell {
                 }
                 "up" => {
                     self.palette_selected_idx = self.palette_selected_idx.saturating_sub(1);
+                    self.palette_scroll_handle
+                        .scroll_to_item(self.palette_selected_idx);
                     cx.notify();
                     return;
                 }
@@ -4825,6 +5842,8 @@ impl AppShell {
                     let count = self.build_palette_entries().len();
                     if count > 0 {
                         self.palette_selected_idx = (self.palette_selected_idx + 1).min(count - 1);
+                        self.palette_scroll_handle
+                            .scroll_to_item(self.palette_selected_idx);
                     }
                     cx.notify();
                     return;
@@ -4839,10 +5858,13 @@ impl AppShell {
                     return;
                 }
                 _ => {
-                    let clip = cx.read_from_clipboard().and_then(|c| c.text());
-                    if apply_key_to_text_buffer(&mut self.palette_query, event, clip) {
+                    let edit = self.apply_focused_text_edit(FocusedInput::CommandPalette, event, cx);
+                    if edit.text_changed {
                         self.palette_selected_idx = 0;
-                        self.core.search(self.palette_query.clone());
+                        self.palette_scroll_handle.scroll_to_item(0);
+                        self.schedule_palette_search_debounced(cx);
+                        cx.notify();
+                    } else if edit.handled {
                         cx.notify();
                     }
                     return;
@@ -4857,10 +5879,22 @@ impl AppShell {
                         && !self.settings_search_query.is_empty()
                     {
                         self.settings_search_query.clear();
+                        self.input_cursors.remove(&FocusedInput::SettingsSearch);
+                        self.input_selected_all
+                            .remove(&FocusedInput::SettingsSearch);
+                        cx.notify();
+                        return;
+                    }
+                    if target == FocusedInput::LibrarySearch && !self.library_search_query.is_empty()
+                    {
+                        self.library_search_query.clear();
+                        self.input_cursors.remove(&FocusedInput::LibrarySearch);
+                        self.input_selected_all.remove(&FocusedInput::LibrarySearch);
                         cx.notify();
                         return;
                     }
                     self.focused_input = None;
+                    self.input_selected_all.remove(&target);
                     if target == FocusedInput::DiscoverCatalogSearch {
                         self.discover_open_dropdown = None;
                     }
@@ -4868,31 +5902,28 @@ impl AppShell {
                     return;
                 }
                 "tab" => {
-                    self.focused_input = match target {
-                        FocusedInput::AuthEmail => Some(FocusedInput::AuthPassword),
-                        FocusedInput::AuthPassword => Some(FocusedInput::AuthEmail),
-                        FocusedInput::AddonManifestUrl => Some(FocusedInput::AddonSearch),
-                        FocusedInput::AddonSearch => Some(FocusedInput::AddonManifestUrl),
-                        FocusedInput::RealDebridApiKey => Some(FocusedInput::TorBoxApiKey),
-                        FocusedInput::TorBoxApiKey => Some(FocusedInput::AllDebridApiKey),
-                        FocusedInput::AllDebridApiKey => Some(FocusedInput::ProwlarrUrl),
-                        FocusedInput::ProwlarrUrl => Some(FocusedInput::ProwlarrApiKey),
-                        FocusedInput::ProwlarrApiKey => Some(FocusedInput::SettingsOpenSubtitlesKey),
-                        FocusedInput::SettingsOpenSubtitlesKey => {
-                            Some(FocusedInput::SettingsSubdlKey)
-                        }
-                        FocusedInput::SettingsSubdlKey => {
-                            Some(FocusedInput::SettingsTmdbApiKey)
-                        }
-                        FocusedInput::SettingsTmdbApiKey => {
-                            Some(FocusedInput::RealDebridApiKey)
-                        }
-                        other => Some(other),
+                    self.input_selected_all.remove(&target);
+                    let next_target = match target {
+                        FocusedInput::AuthEmail => FocusedInput::AuthPassword,
+                        FocusedInput::AuthPassword => FocusedInput::AuthEmail,
+                        FocusedInput::AddonManifestUrl => FocusedInput::AddonSearch,
+                        FocusedInput::AddonSearch => FocusedInput::AddonManifestUrl,
+                        FocusedInput::RealDebridApiKey => FocusedInput::TorBoxApiKey,
+                        FocusedInput::TorBoxApiKey => FocusedInput::AllDebridApiKey,
+                        FocusedInput::AllDebridApiKey => FocusedInput::ProwlarrUrl,
+                        FocusedInput::ProwlarrUrl => FocusedInput::ProwlarrApiKey,
+                        FocusedInput::ProwlarrApiKey => FocusedInput::SettingsOpenSubtitlesKey,
+                        FocusedInput::SettingsOpenSubtitlesKey => FocusedInput::SettingsSubdlKey,
+                        FocusedInput::SettingsSubdlKey => FocusedInput::SettingsTmdbApiKey,
+                        FocusedInput::SettingsTmdbApiKey => FocusedInput::RealDebridApiKey,
+                        other => other,
                     };
+                    self.focused_input = Some(next_target);
                     cx.notify();
                     return;
                 }
                 "enter" => {
+                    self.input_selected_all.remove(&target);
                     match target {
                         FocusedInput::AuthEmail | FocusedInput::AuthPassword => {
                             self.submit_password_login(cx);
@@ -4905,6 +5936,7 @@ impl AppShell {
                         }
                         FocusedInput::AddonSearch
                         | FocusedInput::DiscoverCatalogSearch
+                        | FocusedInput::LibrarySearch
                         | FocusedInput::SettingsSearch => {
                             self.focused_input = None;
                             cx.notify();
@@ -4925,130 +5957,60 @@ impl AppShell {
                     return;
                 }
                 _ => {
-                    let clip = cx.read_from_clipboard().and_then(|c| c.text());
+                    let edit = self.apply_focused_text_edit(target, event, cx);
+                    if !edit.text_changed {
+                        if edit.handled {
+                            cx.notify();
+                        }
+                        return;
+                    }
                     let mut integration_edited = false;
-                    let changed = match target {
-                        FocusedInput::AuthEmail => {
-                            apply_key_to_text_buffer(&mut self.auth_email_input, event, clip)
-                        }
-                        FocusedInput::AuthPassword => {
-                            apply_key_to_text_buffer(&mut self.auth_password_input, event, clip)
-                        }
-                        FocusedInput::AddonManifestUrl => {
-                            apply_key_to_text_buffer(&mut self.addon_url_input, event, clip)
-                        }
-                        FocusedInput::AddonSearch => {
-                            apply_key_to_text_buffer(&mut self.addon_search_query, event, clip)
-                        }
-                        FocusedInput::DiscoverCatalogSearch => {
-                            apply_key_to_text_buffer(&mut self.discover_catalog_search, event, clip)
-                        }
-                        FocusedInput::SettingsSearch => {
-                            apply_key_to_text_buffer(&mut self.settings_search_query, event, clip)
-                        }
+                    match target {
                         FocusedInput::RealDebridApiKey => {
-                            let c = apply_key_to_text_buffer(
-                                &mut self.real_debrid_key_input,
-                                event,
-                                clip,
-                            );
-                            if c {
-                                self.real_debrid_key_configured =
-                                    !self.real_debrid_key_input.trim().is_empty();
-                                integration_edited = true;
-                            }
-                            c
+                            self.real_debrid_key_configured =
+                                !self.real_debrid_key_input.trim().is_empty();
+                            integration_edited = true;
                         }
                         FocusedInput::TorBoxApiKey => {
-                            let c =
-                                apply_key_to_text_buffer(&mut self.torbox_key_input, event, clip);
-                            if c {
-                                self.torbox_key_configured =
-                                    !self.torbox_key_input.trim().is_empty();
-                                integration_edited = true;
-                            }
-                            c
+                            self.torbox_key_configured = !self.torbox_key_input.trim().is_empty();
+                            integration_edited = true;
                         }
                         FocusedInput::AllDebridApiKey => {
-                            let c = apply_key_to_text_buffer(
-                                &mut self.alldebrid_key_input,
-                                event,
-                                clip,
-                            );
-                            if c {
-                                self.alldebrid_key_configured =
-                                    !self.alldebrid_key_input.trim().is_empty();
-                                integration_edited = true;
-                            }
-                            c
+                            self.alldebrid_key_configured =
+                                !self.alldebrid_key_input.trim().is_empty();
+                            integration_edited = true;
                         }
                         FocusedInput::ProwlarrUrl => {
-                            let c =
-                                apply_key_to_text_buffer(&mut self.prowlarr_url_input, event, clip);
-                            if c {
-                                integration_edited = true;
-                            }
-                            c
+                            integration_edited = true;
                         }
                         FocusedInput::ProwlarrApiKey => {
-                            let c =
-                                apply_key_to_text_buffer(&mut self.prowlarr_key_input, event, clip);
-                            if c {
-                                self.prowlarr_key_configured =
-                                    !self.prowlarr_key_input.trim().is_empty();
-                                integration_edited = true;
-                            }
-                            c
+                            self.prowlarr_key_configured =
+                                !self.prowlarr_key_input.trim().is_empty();
+                            integration_edited = true;
                         }
                         FocusedInput::SettingsOpenSubtitlesKey => {
-                            let c = apply_key_to_text_buffer(
-                                &mut self.opensubtitles_key_input,
-                                event,
-                                clip,
-                            );
-                            if c {
-                                self.opensubtitles_key_configured =
-                                    !self.opensubtitles_key_input.trim().is_empty();
-                                integration_edited = true;
-                            }
-                            c
+                            self.opensubtitles_key_configured =
+                                !self.opensubtitles_key_input.trim().is_empty();
+                            integration_edited = true;
                         }
                         FocusedInput::SettingsSubdlKey => {
-                            let c =
-                                apply_key_to_text_buffer(&mut self.subdl_key_input, event, clip);
-                            if c {
-                                self.subdl_key_configured =
-                                    !self.subdl_key_input.trim().is_empty();
-                                integration_edited = true;
-                            }
-                            c
+                            self.subdl_key_configured = !self.subdl_key_input.trim().is_empty();
+                            integration_edited = true;
                         }
                         FocusedInput::SettingsTmdbApiKey => {
-                            let c =
-                                apply_key_to_text_buffer(&mut self.tmdb_key_input, event, clip);
-                            if c {
-                                self.tmdb_key_configured = !self.tmdb_key_input.trim().is_empty();
-                                integration_edited = true;
-                            }
-                            c
+                            self.tmdb_key_configured = !self.tmdb_key_input.trim().is_empty();
+                            integration_edited = true;
                         }
                         FocusedInput::FullSearchInput => {
-                            let c = apply_key_to_text_buffer(
-                                &mut self.full_search_query,
-                                event,
-                                clip,
-                            );
-                            if c {
-                                self.palette_query = self.full_search_query.clone();
-                                self.refresh_full_search(cx);
-                            }
-                            false
+                            self.palette_query = self.full_search_query.clone();
+                            self.refresh_full_search_debounced(cx);
+                            return;
                         }
-                        FocusedInput::CommandPalette => false,
-                    };
+                        _ => {}
+                    }
                     if integration_edited {
                         self.persist_private_integrations_draft(cx);
-                    } else if changed {
+                    } else {
                         cx.notify();
                     }
                     return;
@@ -5124,7 +6086,9 @@ impl AppShell {
             return;
         }
         if ks.key == "escape" {
-            if self.avatar_menu_open {
+            if self.context_menu.is_some() {
+                self.dismiss_context_menu(cx);
+            } else if self.avatar_menu_open {
                 self.avatar_menu_open = false;
                 cx.notify();
             } else if self.discover_open_dropdown.is_some() {
@@ -5133,8 +6097,16 @@ impl AppShell {
             } else if self.meta_addon_dropdown_open {
                 self.meta_addon_dropdown_open = false;
                 cx.notify();
+            } else if self.library_sort_dropdown_open {
+                self.library_sort_dropdown_open = false;
+                cx.notify();
+            } else if self.board_hidden_drawer_open {
+                self.board_hidden_drawer_open = false;
+                cx.notify();
             } else if self.settings_open_dropdown.is_some() {
                 self.settings_open_dropdown = None;
+                cx.notify();
+            } else if self.kb_focus_index.take().is_some() {
                 cx.notify();
             } else if window.is_fullscreen() {
                 window.toggle_fullscreen();
@@ -5145,17 +6117,66 @@ impl AppShell {
             return;
         }
         if ks.modifiers.alt {
+            match ks.key.as_str() {
+                "left" => {
+                    self.navigate_back(cx);
+                    return;
+                }
+                "right" => {
+                    self.navigate_forward(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if ks.modifiers.alt || ctrl_or_cmd {
             let tab = match ks.key.as_str() {
                 "1" => Some(SidebarTab::Home),
                 "2" => Some(SidebarTab::Discover),
-                "3" => Some(SidebarTab::Library),
-                "4" => Some(SidebarTab::Addons),
-                "5" => Some(SidebarTab::Settings),
-                "6" => Some(SidebarTab::Account),
+                "3" => Some(SidebarTab::Calendar),
+                "4" => Some(SidebarTab::Library),
+                "5" => Some(SidebarTab::Addons),
+                "6" => Some(SidebarTab::Settings),
+                "7" => Some(SidebarTab::Account),
                 _ => None,
             };
             if let Some(t) = tab {
                 self.navigate_tab(t, cx);
+                return;
+            }
+        }
+
+        if self.context_menu.is_none()
+            && !self.avatar_menu_open
+            && !ks.modifiers.alt
+            && !ctrl_or_cmd
+        {
+            match ks.key.as_str() {
+                "left" => {
+                    self.move_kb_focus(0, -1, cx);
+                }
+                "right" => {
+                    self.move_kb_focus(0, 1, cx);
+                }
+                "up" => {
+                    self.move_kb_focus(-1, 0, cx);
+                }
+                "down" => {
+                    self.move_kb_focus(1, 0, cx);
+                }
+                "enter" => {
+                    if let Some(idx) = self.kb_focus_index {
+                        if let Some(card) = self.kb_focus_items.get(idx).cloned() {
+                            self.open_route(card.route, cx);
+                        }
+                    }
+                }
+                "pageup" | "pagedown" | "home" | "end"
+                    if self.scroll_active_view_key(ks.key.as_str()) =>
+                {
+                    cx.notify();
+                }
+                _ => {}
             }
         }
     }
@@ -5463,14 +6484,20 @@ impl AppShell {
             (email, init)
         });
 
-        let nav_tabs = SidebarTab::TITLEBAR_TABS.into_iter().map(|t| (t, t.label()));
+        let can_back = !self.nav_history.is_empty();
+        let can_forward = !self.nav_forward.is_empty();
+        let on_user_tab = matches!(
+            active_tab,
+            Some(SidebarTab::Addons | SidebarTab::Settings | SidebarTab::Account)
+        );
 
         let query_empty = self.palette_query.is_empty();
         let search_text: SharedString = if self.command_palette_open {
             if query_empty {
                 "Search movies, shows, commands...|".into()
             } else {
-                format!("{}|", self.palette_query).into()
+                self.format_input_with_caret(FocusedInput::CommandPalette, &self.palette_query)
+                    .into()
             }
         } else if query_empty {
             "Search movies, shows...".into()
@@ -5492,11 +6519,11 @@ impl AppShell {
             })
             .bg(rgba(BG_TOPNAV))
             .border_b_1()
-            .border_color(rgba(BORDER_SOFT))
+            .border_color(rgba(GLASS_DIVIDER))
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(24.0))
+            .gap(px(16.0))
             .on_mouse_down(MouseButton::Left, |event, window, _cx| {
                 if event.click_count >= 2 {
                     window.zoom_window();
@@ -5510,9 +6537,10 @@ impl AppShell {
             })
             .child(
                 div()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(px(28.0))
+                    .gap(px(18.0))
                     .child(
                         div()
                             .id("topnav-brand")
@@ -5538,70 +6566,126 @@ impl AppShell {
                     )
                     .child(
                         div()
+                            .h(px(32.0))
+                            .px(px(3.0))
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(rgba(GLASS_TROUGH_BG))
+                            .border_1()
+                            .border_color(rgba(GLASS_BORDER))
                             .flex()
                             .items_center()
-                            .gap(px(4.0))
-                            .children(nav_tabs.into_iter().enumerate().map(|(idx, (tab, label))| {
-                                let is_active = active_tab == Some(tab);
+                            .gap(px(2.0))
+                            .child(
                                 div()
-                                    .id(("topnav-link", idx))
-                                    .cursor_pointer()
-                                    .h(px(34.0))
-                                    .px(px(12.0))
-                                    .rounded(px(6.0))
-                                    .when(is_active, |el| el.bg(rgb(BG_ELEVATED)))
-                                    .when(!is_active, |el| {
-                                        el.hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                                    })
+                                    .id("topnav-nav-back")
+                                    .w(px(26.0))
+                                    .h(px(26.0))
+                                    .rounded(px(RADIUS_POSTER))
                                     .flex()
                                     .items_center()
-                                    .font(ui_sans(FontWeight::MEDIUM))
-                                    .text_size(px(14.0))
-                                    .text_color(if is_active {
-                                        rgb(TEXT_PRIMARY)
-                                    } else {
-                                        rgb(TEXT_SECONDARY)
+                                    .justify_center()
+                                    .when(can_back, |el| {
+                                        el.cursor_pointer()
+                                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.navigate_back(cx);
+                                                }),
+                                            )
                                     })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.navigate_tab(tab, cx);
-                                        }),
-                                    )
-                                    .child(label)
-                            })),
+                                    .child(svg_icon(
+                                        IconName::ChevronLeft,
+                                        14.0,
+                                        if can_back {
+                                            rgb(TEXT_PRIMARY)
+                                        } else {
+                                            rgb(TEXT_MUTED)
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("topnav-nav-forward")
+                                    .w(px(26.0))
+                                    .h(px(26.0))
+                                    .rounded(px(RADIUS_POSTER))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(can_forward, |el| {
+                                        el.cursor_pointer()
+                                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.navigate_forward(cx);
+                                                }),
+                                            )
+                                    })
+                                    .child(svg_icon(
+                                        IconName::ChevronRight,
+                                        14.0,
+                                        if can_forward {
+                                            rgb(TEXT_PRIMARY)
+                                        } else {
+                                            rgb(TEXT_MUTED)
+                                        },
+                                    )),
+                            ),
+                    )
+                    .child(
+                        glass_segmented_bar("topnav-tabs-bar").children(
+                            SidebarTab::TITLEBAR_TABS.into_iter().enumerate().map(|(idx, tab)| {
+                                let is_active = active_tab == Some(tab);
+                                glass_segmented_item(
+                                    ("topnav-link", idx),
+                                    tab.label(),
+                                    is_active,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.navigate_tab(tab, cx);
+                                    }),
+                                )
+                            }),
+                        ),
                     ),
             )
             .child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .flex()
                     .items_center()
+                    .justify_end()
                     .gap(px(12.0))
                     .child(
                         div()
                             .id("topnav-search-box")
                             .cursor_pointer()
-                            .w(px(340.0))
+                            .min_w(px(180.0))
+                            .max_w(px(340.0))
+                            .flex_1()
                             .h(px(36.0))
                             .px(px(12.0))
-                            .rounded(px(8.0))
+                            .rounded(px(RADIUS_CONTROL))
                             .bg(if self.command_palette_open {
-                                rgb(BG_ELEVATED)
+                                rgba(GLASS_ROW_SELECTED_BG)
                             } else {
-                                rgb(BG_INPUT)
+                                rgba(GLASS_TROUGH_BG)
                             })
                             .border_1()
                             .border_color(if self.command_palette_open {
-                                rgba(BORDER_POSTER_HOVER)
+                                rgba(BORDER_ACCENT)
                             } else {
-                                rgba(BORDER_SUBTLE)
+                                rgba(GLASS_BORDER)
                             })
                             .hover(|s| {
                                 s.border_color(if self.command_palette_open {
-                                    rgba(BORDER_POSTER_HOVER)
+                                    rgba(BORDER_ACCENT)
                                 } else {
-                                    rgba(BORDER_STRONG)
+                                    rgba(GLASS_BORDER_STRONG)
                                 })
                             })
                             .flex()
@@ -5652,14 +6736,12 @@ impl AppShell {
                                     .cursor_pointer()
                                     .p(px(3.0))
                                     .rounded(px(4.0))
-                                    .hover(|s| s.bg(rgba(0xffffff10)))
+                                    .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             cx.stop_propagation();
-                                            this.palette_query.clear();
-                                            this.palette_selected_idx = 0;
-                                            cx.notify();
+                                            this.clear_palette_query(cx);
                                         }),
                                     )
                                     .child(svg_icon(IconName::X, 12.0, rgb(TEXT_MUTED)))
@@ -5676,10 +6758,11 @@ impl AppShell {
                             row.child(
                                 div()
                                     .id("topnav-update-badge")
+                                    .flex_shrink_0()
                                     .cursor_pointer()
                                     .h(px(30.0))
                                     .px(px(11.0))
-                                    .rounded(px(999.0))
+                                    .rounded(px(RADIUS_PILL))
                                     .bg(rgba(ACCENT_SOFT))
                                     .border_1()
                                     .border_color(rgb(ACCENT))
@@ -5712,21 +6795,25 @@ impl AppShell {
                     .child(
                         div()
                             .id("topnav-avatar-btn")
+                            .flex_shrink_0()
                             .cursor_pointer()
-                            .w(px(32.0))
-                            .h(px(32.0))
-                            .rounded(px(999.0))
+                            .w(px(34.0))
+                            .h(px(34.0))
+                            .rounded(px(RADIUS_PILL))
                             .bg(if signed_in_email.is_some() {
                                 rgb(ACCENT)
+                            } else if on_user_tab || self.avatar_menu_open {
+                                rgba(ACCENT_SOFT)
                             } else {
-                                rgb(BG_ELEVATED)
+                                rgba(GLASS_TROUGH_BG)
                             })
                             .border_1()
-                            .border_color(if self.avatar_menu_open {
-                                rgba(BORDER_POSTER_HOVER)
+                            .border_color(if on_user_tab || self.avatar_menu_open {
+                                rgb(ACCENT)
                             } else {
-                                rgba(BORDER_SUBTLE)
+                                rgba(GLASS_BORDER)
                             })
+                            .hover(|s| s.border_color(rgba(GLASS_BORDER_STRONG)))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -5735,6 +6822,7 @@ impl AppShell {
                                 cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.command_palette_open = false;
+                                    this.context_menu = None;
                                     this.avatar_menu_open = !this.avatar_menu_open;
                                     cx.notify();
                                 }),
@@ -5743,26 +6831,35 @@ impl AppShell {
                                 div()
                                     .font(ui_sans(FontWeight::BOLD))
                                     .text_size(px(13.0))
-                                    .text_color(rgb(BG_OBSIDIAN))
+                                    .text_color(rgb(CTA_ON_ACCENT))
                                     .child(ch)
                                     .into_any_element()
                             } else {
-                                svg_icon(IconName::User, 15.0, rgb(TEXT_SECONDARY))
-                                    .into_any_element()
+                                svg_icon(
+                                    IconName::User,
+                                    15.0,
+                                    if on_user_tab || self.avatar_menu_open {
+                                        rgb(ACCENT)
+                                    } else {
+                                        rgb(TEXT_SECONDARY)
+                                    },
+                                )
+                                .into_any_element()
                             }),
                     )
                     .when(is_fullscreen, |row| {
                         row.child(
                             div()
                                 .id("topnav-btn-exit-fullscreen")
+                                .flex_shrink_0()
                                 .cursor_pointer()
                                 .h(px(34.0))
                                 .px(px(12.0))
-                                .rounded(px(999.0))
-                                .bg(rgb(BG_ELEVATED))
+                                .rounded(px(RADIUS_PILL))
+                                .bg(rgba(GLASS_TROUGH_BG))
                                 .border_1()
-                                .border_color(rgba(BORDER_SUBTLE))
-                                .hover(|s| s.border_color(rgba(BORDER_STRONG)))
+                                .border_color(rgba(GLASS_BORDER))
+                                .hover(|s| s.border_color(rgba(GLASS_BORDER_STRONG)))
                                 .flex()
                                 .items_center()
                                 .gap(px(6.0))
@@ -5783,7 +6880,7 @@ impl AppShell {
                                 .w(px(1.0))
                                 .h(px(18.0))
                                 .flex_shrink_0()
-                                .bg(rgba(BORDER_SOFT)),
+                                .bg(rgba(GLASS_DIVIDER)),
                         )
                         .child(controls_el)
                     }),
@@ -5794,6 +6891,7 @@ impl AppShell {
         let email_opt = self.core.with_model(|m| {
             m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone())
         });
+        let active_tab = self.route.active_sidebar_tab();
 
         div()
             .id("avatar-menu-backdrop")
@@ -5809,15 +6907,16 @@ impl AppShell {
             .child(
                 div()
                     .id("avatar-menu-popover")
+                    .occlude()
                     .absolute()
                     .top(px(60.0))
                     .right(if is_csd { px(136.0) } else { px(32.0) })
-                    .w(px(236.0))
+                    .w(px(244.0))
                     .p(px(6.0))
-                    .rounded(px(12.0))
-                    .bg(rgba(BG_POPOVER_GLASS))
+                    .rounded(px(14.0))
+                    .bg(rgba(GLASS_POPOVER_BG))
                     .border_1()
-                    .border_color(rgba(BORDER_SUBTLE))
+                    .border_color(rgba(GLASS_BORDER))
                     .shadow(glass_capsule_shadow())
                     .flex()
                     .flex_col()
@@ -5828,7 +6927,7 @@ impl AppShell {
                             .px(px(10.0))
                             .py(px(8.0))
                             .border_b_1()
-                            .border_color(rgba(BORDER_SOFT))
+                            .border_color(rgba(GLASS_DIVIDER))
                             .mb(px(4.0))
                             .flex()
                             .flex_col()
@@ -5858,74 +6957,41 @@ impl AppShell {
                             ),
                     )
                     .child(
-                        div()
-                            .id("avatar-menu-account")
-                            .cursor_pointer()
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .rounded(px(6.0))
-                            .hover(|s| s.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_PRIMARY)))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .text_size(px(13.5))
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.navigate_tab(SidebarTab::Account, cx);
-                                }),
-                            )
-                            .child(svg_icon(IconName::User, 14.5, rgb(TEXT_SECONDARY)))
-                            .child(if email_opt.is_some() {
+                        glass_dropdown_option(
+                            "avatar-menu-account",
+                            if email_opt.is_some() {
                                 "Account & sync"
                             } else {
                                 "Sign in"
+                            },
+                            None,
+                            active_tab == Some(SidebarTab::Account),
+                            cx.listener(|this, _, _, cx| {
+                                this.navigate_tab(SidebarTab::Account, cx);
                             }),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("avatar-menu-addons")
-                            .cursor_pointer()
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .rounded(px(6.0))
-                            .hover(|s| s.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_PRIMARY)))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .text_size(px(13.5))
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.navigate_tab(SidebarTab::Addons, cx);
-                                }),
-                            )
-                            .child(svg_icon(IconName::Layers, 14.5, rgb(TEXT_SECONDARY)))
-                            .child("Addons"),
+                        glass_dropdown_option(
+                            "avatar-menu-addons",
+                            "Addons",
+                            None,
+                            active_tab == Some(SidebarTab::Addons),
+                            cx.listener(|this, _, _, cx| {
+                                this.navigate_tab(SidebarTab::Addons, cx);
+                            }),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("avatar-menu-settings")
-                            .cursor_pointer()
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .rounded(px(6.0))
-                            .hover(|s| s.bg(rgb(BG_ELEVATED)).text_color(rgb(TEXT_PRIMARY)))
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .text_size(px(13.5))
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.navigate_tab(SidebarTab::Settings, cx);
-                                }),
-                            )
-                            .child(svg_icon(IconName::Settings, 14.5, rgb(TEXT_SECONDARY)))
-                            .child("Settings"),
+                        glass_dropdown_option(
+                            "avatar-menu-settings",
+                            "Settings",
+                            None,
+                            active_tab == Some(SidebarTab::Settings),
+                            cx.listener(|this, _, _, cx| {
+                                this.navigate_tab(SidebarTab::Settings, cx);
+                            }),
+                        ),
                     )
                     .when(email_opt.is_some(), |el| {
                         el.child(
@@ -5933,14 +6999,15 @@ impl AppShell {
                                 .id("avatar-menu-logout")
                                 .cursor_pointer()
                                 .mt(px(4.0))
-                                .px(px(10.0))
+                                .px(px(12.0))
                                 .py(px(8.0))
-                                .rounded(px(6.0))
+                                .rounded(px(RADIUS_CONTROL))
                                 .hover(|s| s.bg(rgba(0xf871711a)))
                                 .flex()
                                 .items_center()
                                 .gap(px(10.0))
-                                .text_size(px(13.5))
+                                .text_size(px(13.0))
+                                .font(ui_sans(FontWeight::MEDIUM))
                                 .text_color(rgb(ACCENT_ROSE))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -5965,7 +7032,233 @@ impl AppShell {
             )
     }
 
-    fn render_toast_stack(&self) -> impl IntoElement {
+    fn render_browsing_context_menu(
+        &self,
+        menu: &BrowsingContextMenu,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let menu_w = 248.0_f32;
+        let est_h = 264.0_f32;
+        let x = f32::from(menu.position.x)
+            .clamp(12.0, (self.viewport_size_px.0 - menu_w - 12.0).max(12.0));
+        let y = f32::from(menu.position.y)
+            .clamp(12.0, (self.viewport_size_px.1 - est_h - 12.0).max(12.0));
+
+        let play_type = menu.type_name.clone();
+        let play_id = menu.id.clone();
+        let play_vid = menu.video_id.clone();
+        let play_label = if menu.can_rewind_cw {
+            "Resume"
+        } else {
+            "Play"
+        };
+
+        let details_type = menu.type_name.clone();
+        let details_id = menu.id.clone();
+        let details_vid = menu.video_id.clone();
+
+        let lib_id = menu.id.clone();
+        let lib_in = menu.is_in_library;
+        let lib_preview = menu.preview.clone();
+
+        let watch_id = menu.id.clone();
+        let watch_in_lib = menu.is_in_library;
+        let watch_is_watched = menu.is_watched;
+        let watch_preview = menu.preview.clone();
+        let watch_video = menu.video.clone();
+
+        let rewind_id = menu.id.clone();
+        let can_rewind = menu.can_rewind_cw;
+
+        let menu_row = |id: &'static str,
+                        icon: IconName,
+                        label: &'static str,
+                        col: u32,
+                        on_click: ClickHandler| {
+            div()
+                .id(id)
+                .w_full()
+                .cursor_pointer()
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(RADIUS_CONTROL))
+                .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .font(ui_sans(FontWeight::MEDIUM))
+                .text_size(px(13.0))
+                .text_color(rgb(col))
+                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                    cx.stop_propagation();
+                    on_click(ev, window, cx);
+                })
+                .child(svg_icon(icon, 14.0, rgb(col)))
+                .child(label)
+        };
+
+        div()
+            .id("browsing-context-menu-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dismiss_context_menu(cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.dismiss_context_menu(cx);
+                }),
+            )
+            .child(
+                glass_dropdown_panel("browsing-context-menu", menu_w)
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .border_b_1()
+                            .border_color(rgba(GLASS_DIVIDER))
+                            .mb(px(2.0))
+                            .font(ui_sans(FontWeight::SEMIBOLD))
+                            .text_size(px(12.5))
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .truncate()
+                            .child(menu.title.clone()),
+                    )
+                    .child(menu_row(
+                        "ctx-menu-play",
+                        IconName::Play,
+                        play_label,
+                        ACCENT,
+                        click_handler(cx.listener(move |this, _, _, cx| {
+                            this.dismiss_context_menu(cx);
+                            this.quick_resume_or_open(
+                                play_type.clone(),
+                                play_id.clone(),
+                                play_vid.clone(),
+                                cx,
+                            );
+                        })),
+                    ))
+                    .child(menu_row(
+                        "ctx-menu-details",
+                        IconName::Info,
+                        "Open details",
+                        TEXT_PRIMARY,
+                        click_handler(cx.listener(move |this, _, _, cx| {
+                            this.dismiss_context_menu(cx);
+                            this.open_meta_details(
+                                details_type.clone(),
+                                details_id.clone(),
+                                details_vid.clone(),
+                                cx,
+                            );
+                        })),
+                    ))
+                    .when(lib_in || lib_preview.is_some(), |panel| {
+                        panel.child(menu_row(
+                            "ctx-menu-library",
+                            IconName::Bookmark,
+                            if lib_in {
+                                "Remove from library"
+                            } else {
+                                "Add to library"
+                            },
+                            TEXT_PRIMARY,
+                            click_handler(cx.listener(move |this, _, _, cx| {
+                                this.dismiss_context_menu(cx);
+                                if lib_in {
+                                    this.core.remove_from_library(lib_id.clone());
+                                    this.push_toast(
+                                        ToastKind::Info,
+                                        "Removed from library",
+                                        None,
+                                        cx,
+                                    );
+                                } else if let Some(preview) = lib_preview.clone() {
+                                    this.core.toggle_library_item(preview);
+                                    this.push_toast(
+                                        ToastKind::Success,
+                                        "Added to library",
+                                        None,
+                                        cx,
+                                    );
+                                }
+                            })),
+                        ))
+                    })
+                    .when(
+                        watch_video.is_some() || watch_in_lib || watch_preview.is_some(),
+                        |panel| {
+                            let label = if let Some((_, vid_watched)) = &watch_video {
+                                if *vid_watched {
+                                    "Mark episode unwatched"
+                                } else {
+                                    "Mark episode watched"
+                                }
+                            } else if watch_is_watched {
+                                "Mark as unwatched"
+                            } else {
+                                "Mark as watched"
+                            };
+                            panel.child(menu_row(
+                                "ctx-menu-watched",
+                                IconName::Check,
+                                label,
+                                TEXT_PRIMARY,
+                                click_handler(cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_context_menu(cx);
+                                    if let Some((video, vid_watched)) = watch_video.clone() {
+                                        this.core.mark_video_watched(video, !vid_watched);
+                                    } else if watch_in_lib {
+                                        this.core.mark_library_item_watched(
+                                            watch_id.clone(),
+                                            !watch_is_watched,
+                                        );
+                                    } else if let Some(preview) = watch_preview.clone() {
+                                        this.core.dispatch_action(Action::Ctx(
+                                            ActionCtx::MetaItemMarkAsWatched {
+                                                meta_item: preview,
+                                                is_watched: !watch_is_watched,
+                                            },
+                                        ));
+                                    }
+                                    cx.notify();
+                                })),
+                            ))
+                        },
+                    )
+                    .when(can_rewind, |panel| {
+                        panel.child(menu_row(
+                            "ctx-menu-rewind",
+                            IconName::X,
+                            "Remove from Continue Watching",
+                            TEXT_SECONDARY,
+                            click_handler(cx.listener(move |this, _, _, cx| {
+                                this.dismiss_context_menu(cx);
+                                this.core.rewind_library_item(rewind_id.clone());
+                                this.push_toast(
+                                    ToastKind::Info,
+                                    "Removed from Continue Watching",
+                                    None,
+                                    cx,
+                                );
+                            })),
+                        ))
+                    })
+                    .with_animation("ctx-menu-fade", obsidian_fade_in(), |el, delta| {
+                        el.opacity(delta)
+                    }),
+            )
+    }
+
+    fn render_toast_stack(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .absolute()
             .bottom(if self.route.is_player() {
@@ -5980,6 +7273,7 @@ impl AppShell {
             .items_center()
             .gap(px(8.0))
             .children(self.toasts.iter().map(|toast| {
+                let toast_id = toast.id;
                 let (icon_col, icon) = match toast.kind {
                     ToastKind::Info => (ACCENT, IconName::Info),
                     ToastKind::Success => (STATUS_WATCHED, IconName::Check),
@@ -5987,12 +7281,12 @@ impl AppShell {
                     ToastKind::Error => (ACCENT_ROSE, IconName::X),
                 };
                 div()
-                    .px(px(16.0))
-                    .py(px(10.0))
-                    .rounded(px(999.0))
-                    .bg(rgb(BG_SURFACE))
+                    .px(px(14.0))
+                    .py(px(9.0))
+                    .rounded(px(RADIUS_PILL))
+                    .bg(rgba(GLASS_POPOVER_BG))
                     .border_1()
-                    .border_color(rgba(BORDER_SUBTLE))
+                    .border_color(rgba(GLASS_BORDER))
                     .shadow(glass_capsule_shadow())
                     .flex()
                     .items_center()
@@ -6013,8 +7307,28 @@ impl AppShell {
                                 .child(d),
                         )
                     })
+                    .child(
+                        div()
+                            .id(("toast-dismiss", toast_id as usize))
+                            .cursor_pointer()
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .rounded(px(RADIUS_PILL))
+                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.dismiss_toast(toast_id, cx);
+                                }),
+                            )
+                            .child(svg_icon(IconName::X, 12.0, rgb(TEXT_MUTED))),
+                    )
                     .with_animation(
-                        ("toast-fade", toast.id as usize),
+                        ("toast-fade", toast_id as usize),
                         obsidian_fade_in(),
                         |el, delta| el.opacity(delta),
                     )
@@ -6024,6 +7338,9 @@ impl AppShell {
 
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let vp = window.viewport_size();
+        self.viewport_size_px = (f32::from(vp.width), f32::from(vp.height));
+
         if self.exit_fullscreen_on_next_render {
             self.exit_fullscreen_on_next_render = false;
             if window.is_fullscreen() {
@@ -6035,11 +7352,14 @@ impl Render for AppShell {
 
         let mut evicted_images = self.poster_cache.drain_evicted_images();
         evicted_images.extend(gpui_mpv::drain_evicted_video_images());
-        if !evicted_images.is_empty() {
+        let evicted_count = evicted_images.len();
+        if evicted_count > 0 {
             for img in evicted_images {
                 let _ = window.drop_image(img);
             }
-            trim_process_heap();
+            if evicted_count >= 16 {
+                self.schedule_debounced_heap_trim();
+            }
         }
 
         let is_player = self.route.is_player();
@@ -6074,6 +7394,9 @@ impl Render for AppShell {
             AppRoute::Tab(SidebarTab::Discover) => {
                 self.render_discover_view(window, cx).into_any_element()
             }
+            AppRoute::Tab(SidebarTab::Calendar) => {
+                self.render_calendar_view(cx).into_any_element()
+            }
             AppRoute::Tab(SidebarTab::Library) => {
                 self.render_library_view(window, cx).into_any_element()
             }
@@ -6098,6 +7421,20 @@ impl Render for AppShell {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_global_key_down))
             .on_key_up(cx.listener(Self::on_global_key_up))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.navigate_back(cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.navigate_forward(cx);
+                }),
+            )
             .size_full()
             .bg(root_bg)
             .font(ui_sans(FontWeight::NORMAL))
@@ -6134,8 +7471,11 @@ impl Render for AppShell {
             .when(self.avatar_menu_open, |el| {
                 el.child(self.render_avatar_menu(is_csd, cx))
             })
+            .when_some(self.context_menu.as_ref(), |el, menu| {
+                el.child(self.render_browsing_context_menu(menu, cx))
+            })
             .when(!self.toasts.is_empty(), |el| {
-                el.child(self.render_toast_stack())
+                el.child(self.render_toast_stack(cx))
             })
             .when_some(resize_handles_el, |el, handles| el.child(handles))
     }

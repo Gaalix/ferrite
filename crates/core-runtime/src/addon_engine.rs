@@ -1487,6 +1487,7 @@ pub struct AddonHttpEngine {
     storage: Option<SqliteStorage>,
     runtime_handle: Option<tokio::runtime::Handle>,
     disk_snapshots: Arc<Mutex<HashMap<String, DiskSnapshotEntry>>>,
+    cache_epoch: Arc<AtomicU64>,
     revalidating_keys: Arc<Mutex<HashSet<String>>>,
     revalidate_tx: broadcast::Sender<RevalidatedPayload>,
     hits: AtomicU64,
@@ -1508,23 +1509,21 @@ impl AddonHttpEngine {
         storage: Option<SqliteStorage>,
         runtime_handle: Option<tokio::runtime::Handle>,
     ) -> Self {
-        let mut preloaded = HashMap::new();
+        let disk_snapshots = Arc::new(Mutex::new(HashMap::new()));
+        let cache_epoch = Arc::new(AtomicU64::new(0));
+        let effective_handle = runtime_handle
+            .clone()
+            .or_else(|| tokio::runtime::Handle::try_current().ok());
         if let Some(ref store) = storage {
-            if let Ok(rows) = store.load_recent_http_cache(DISK_CACHE_PRELOAD_LIMIT) {
-                for row in rows {
-                    if let Some(kind) = parse_resource_kind(&row.resource_kind) {
-                        preloaded.insert(
-                            row.url_sha256,
-                            DiskSnapshotEntry {
-                                resource_kind: kind,
-                                body_zlib: row.body_zlib,
-                                fetched_at: row.fetched_at,
-                                soft_ttl_secs: row.soft_ttl_secs,
-                                hard_ttl_secs: row.hard_ttl_secs,
-                            },
-                        );
-                    }
-                }
+            if let Some(ref handle) = effective_handle {
+                let store_bg = store.clone();
+                let snapshots_bg = Arc::clone(&disk_snapshots);
+                let epoch_bg = Arc::clone(&cache_epoch);
+                handle.spawn_blocking(move || {
+                    preload_http_disk_cache(&store_bg, &snapshots_bg, &epoch_bg);
+                });
+            } else {
+                preload_http_disk_cache(store, &disk_snapshots, &cache_epoch);
             }
         }
         let (revalidate_tx, _) = broadcast::channel(128);
@@ -1535,7 +1534,8 @@ impl AddonHttpEngine {
             telemetry: Arc::new(Mutex::new(HashMap::new())),
             storage,
             runtime_handle,
-            disk_snapshots: Arc::new(Mutex::new(preloaded)),
+            disk_snapshots,
+            cache_epoch,
             revalidating_keys: Arc::new(Mutex::new(HashSet::new())),
             revalidate_tx,
             hits: AtomicU64::new(0),
@@ -1551,6 +1551,7 @@ impl AddonHttpEngine {
     }
 
     pub fn clear_cache(&self) {
+        self.cache_epoch.fetch_add(1, Ordering::Release);
         if let Ok(mut guard) = self.cache.lock() {
             guard.clear();
         }
@@ -1721,7 +1722,7 @@ impl AddonHttpEngine {
         }
     }
 
-    fn lookup_disk_snapshot(
+    async fn lookup_disk_snapshot(
         &self,
         url_sha256: &str,
         now_unix: i64,
@@ -1743,45 +1744,48 @@ impl AddonHttpEngine {
             ))
         });
 
-        let found = if let Some(hit) = in_ram {
-            Some(hit)
-        } else if let Some(ref storage) = self.storage {
-            storage
-                .get_http_cache_row(url_sha256)
-                .ok()
-                .flatten()
-                .and_then(|row| {
-                    let kind = parse_resource_kind(&row.resource_kind)?;
-                    let hard_expiry = row.fetched_at.saturating_add(row.hard_ttl_secs as i64);
-                    if now_unix > hard_expiry {
-                        return None;
-                    }
-                    let is_stale =
-                        now_unix > row.fetched_at.saturating_add(row.soft_ttl_secs as i64);
-                    let entry = DiskSnapshotEntry {
-                        resource_kind: kind,
-                        body_zlib: row.body_zlib.clone(),
-                        fetched_at: row.fetched_at,
-                        soft_ttl_secs: row.soft_ttl_secs,
-                        hard_ttl_secs: row.hard_ttl_secs,
-                    };
-                    if let Ok(mut guard) = self.disk_snapshots.lock() {
-                        guard.insert(url_sha256.to_owned(), entry);
-                    }
-                    Some((
-                        row.body_zlib,
-                        kind,
-                        row.soft_ttl_secs,
-                        row.hard_ttl_secs,
-                        is_stale,
-                    ))
-                })
-        } else {
-            None
-        }?;
+        if let Some((body_zlib, kind, soft_ttl, hard_ttl, is_stale)) = in_ram {
+            let decompressed = run_blocking_task(self.runtime_handle.as_ref(), move || {
+                decompress_zlib(&body_zlib).ok()
+            })
+            .await
+            .flatten()?;
+            return Some((
+                Arc::<[u8]>::from(decompressed.as_slice()),
+                kind,
+                soft_ttl,
+                hard_ttl,
+                is_stale,
+            ));
+        }
 
-        let (body_zlib, kind, soft_ttl, hard_ttl, is_stale) = found;
-        let decompressed = decompress_zlib(&body_zlib).ok()?;
+        let storage = self.storage.as_ref()?.clone();
+        let sha_owned = url_sha256.to_owned();
+        let loaded = run_blocking_task(self.runtime_handle.as_ref(), move || {
+            let row = storage.get_http_cache_row(&sha_owned).ok().flatten()?;
+            let kind = parse_resource_kind(&row.resource_kind)?;
+            let hard_expiry = row.fetched_at.saturating_add(row.hard_ttl_secs as i64);
+            if now_unix > hard_expiry {
+                return None;
+            }
+            let is_stale = now_unix > row.fetched_at.saturating_add(row.soft_ttl_secs as i64);
+            let decompressed = decompress_zlib(&row.body_zlib).ok()?;
+            let entry = DiskSnapshotEntry {
+                resource_kind: kind,
+                body_zlib: row.body_zlib,
+                fetched_at: row.fetched_at,
+                soft_ttl_secs: row.soft_ttl_secs,
+                hard_ttl_secs: row.hard_ttl_secs,
+            };
+            Some((entry, decompressed, kind, row.soft_ttl_secs, row.hard_ttl_secs, is_stale))
+        })
+        .await
+        .flatten()?;
+
+        let (entry, decompressed, kind, soft_ttl, hard_ttl, is_stale) = loaded;
+        if let Ok(mut guard) = self.disk_snapshots.lock() {
+            guard.insert(url_sha256.to_owned(), entry);
+        }
         Some((
             Arc::<[u8]>::from(decompressed.as_slice()),
             kind,
@@ -1826,6 +1830,7 @@ impl AddonHttpEngine {
         let revalidating_keys = Arc::clone(&self.revalidating_keys);
         let revalidate_tx = self.revalidate_tx.clone();
         let stale_revalidations = Arc::clone(&self.stale_revalidations);
+        let bg_handle = handle.clone();
 
         handle.spawn(async move {
             let _guard = RevalidatingKeyGuard {
@@ -1856,14 +1861,16 @@ impl AddonHttpEngine {
                         );
                     }
                     persist_disk_snapshot(
+                        Some(&bg_handle),
                         &disk_snapshots,
                         storage.as_ref(),
                         &url_sha256,
                         kind,
                         soft_ttl,
                         hard_ttl,
-                        &fresh_bytes,
-                    );
+                        Arc::clone(&fresh_bytes),
+                    )
+                    .await;
                     if fresh_bytes.as_ref() != prev_bytes.as_ref() {
                         let _ = revalidate_tx.send(RevalidatedPayload {
                             url_sha256,
@@ -1936,7 +1943,7 @@ impl AddonHttpEngine {
         {
             let now_unix = Utc::now().timestamp();
             if let Some((bytes, kind, soft_ttl, hard_ttl, is_stale)) =
-                self.lookup_disk_snapshot(sha, now_unix)
+                self.lookup_disk_snapshot(sha, now_unix).await
             {
                 self.disk_hits.fetch_add(1, Ordering::Relaxed);
                 self.record_cache_hit(&origin);
@@ -2057,14 +2064,16 @@ impl AddonHttpEngine {
                     (disk_policy, &url_sha256)
                 {
                     persist_disk_snapshot(
+                        self.runtime_handle.as_ref(),
                         &self.disk_snapshots,
                         self.storage.as_ref(),
                         sha,
                         kind,
                         soft_ttl,
                         hard_ttl,
-                        &shared_bytes,
-                    );
+                        Arc::clone(&shared_bytes),
+                    )
+                    .await;
                 }
                 if let Some(leader) = leader_guard {
                     leader.complete(Ok(Arc::clone(&shared_bytes)));
@@ -2107,46 +2116,103 @@ fn record_network_success_map(
     }
 }
 
-fn persist_disk_snapshot(
+fn preload_http_disk_cache(
+    store: &SqliteStorage,
     disk_snapshots: &Mutex<HashMap<String, DiskSnapshotEntry>>,
+    cache_epoch: &AtomicU64,
+) {
+    let epoch_at_start = cache_epoch.load(Ordering::Acquire);
+    let Ok(rows) = store.load_recent_http_cache(DISK_CACHE_PRELOAD_LIMIT) else {
+        return;
+    };
+    let mut preloaded = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(kind) = parse_resource_kind(&row.resource_kind) {
+            preloaded.push((
+                row.url_sha256,
+                DiskSnapshotEntry {
+                    resource_kind: kind,
+                    body_zlib: row.body_zlib,
+                    fetched_at: row.fetched_at,
+                    soft_ttl_secs: row.soft_ttl_secs,
+                    hard_ttl_secs: row.hard_ttl_secs,
+                },
+            ));
+        }
+    }
+    if !preloaded.is_empty() && cache_epoch.load(Ordering::Acquire) == epoch_at_start {
+        if let Ok(mut guard) = disk_snapshots.lock() {
+            if cache_epoch.load(Ordering::Acquire) == epoch_at_start {
+                for (sha, entry) in preloaded {
+                    guard.entry(sha).or_insert(entry);
+                }
+            }
+        }
+    }
+}
+
+async fn run_blocking_task<F, R>(handle: Option<&tokio::runtime::Handle>, f: F) -> Option<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let tokio_handle = handle
+        .cloned()
+        .or_else(|| tokio::runtime::Handle::try_current().ok());
+    match tokio_handle {
+        Some(h) => h.spawn_blocking(f).await.ok(),
+        None => Some(f()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_disk_snapshot(
+    runtime_handle: Option<&tokio::runtime::Handle>,
+    disk_snapshots: &Arc<Mutex<HashMap<String, DiskSnapshotEntry>>>,
     storage: Option<&SqliteStorage>,
     url_sha256: &str,
     kind: AddonResourceKind,
     soft_ttl: u64,
     hard_ttl: u64,
-    bytes: &[u8],
+    bytes: Arc<[u8]>,
 ) {
     if bytes.len() > DISK_CACHE_MAX_ENTRY_BYTES {
         return;
     }
-    let Ok(body_zlib) = compress_zlib(bytes) else {
-        return;
-    };
+    let disk_snapshots = Arc::clone(disk_snapshots);
+    let storage = storage.cloned();
+    let url_sha256 = url_sha256.to_owned();
     let fetched_at = Utc::now().timestamp();
-    if let Ok(mut guard) = disk_snapshots.lock() {
-        guard.insert(
-            url_sha256.to_owned(),
-            DiskSnapshotEntry {
-                resource_kind: kind,
-                body_zlib: body_zlib.clone(),
+    let _ = run_blocking_task(runtime_handle, move || {
+        let Ok(body_zlib) = compress_zlib(&bytes) else {
+            return;
+        };
+        if let Ok(mut guard) = disk_snapshots.lock() {
+            guard.insert(
+                url_sha256.clone(),
+                DiskSnapshotEntry {
+                    resource_kind: kind,
+                    body_zlib: body_zlib.clone(),
+                    fetched_at,
+                    soft_ttl_secs: soft_ttl,
+                    hard_ttl_secs: hard_ttl,
+                },
+            );
+        }
+        if let Some(storage) = storage {
+            let _ = storage.upsert_http_cache_row(&DiskCacheRow {
+                url_sha256,
+                resource_kind: kind.as_str().to_owned(),
+                status_code: 200,
+                body_zlib,
+                body_len: bytes.len(),
                 fetched_at,
                 soft_ttl_secs: soft_ttl,
                 hard_ttl_secs: hard_ttl,
-            },
-        );
-    }
-    if let Some(storage) = storage {
-        let _ = storage.upsert_http_cache_row(&DiskCacheRow {
-            url_sha256: url_sha256.to_owned(),
-            resource_kind: kind.as_str().to_owned(),
-            status_code: 200,
-            body_zlib,
-            body_len: bytes.len(),
-            fetched_at,
-            soft_ttl_secs: soft_ttl,
-            hard_ttl_secs: hard_ttl,
-        });
-    }
+            });
+        }
+    })
+    .await;
 }
 
 async fn fetch_http_bytes(
@@ -2836,5 +2902,52 @@ mod tests {
         let db_bytes = std::fs::read(&db_path).unwrap();
         let db_text = String::from_utf8_lossy(&db_bytes);
         assert!(!db_text.contains("SECRET_RD_TOKEN_999"));
+    }
+
+    #[test]
+    fn with_storage_preloads_synchronously_without_runtime_and_asynchronously_with_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("preload.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let url = "https://example.com/catalog/movie/top.json";
+        let sha = url_sha256_hex(url);
+        let payload = br#"{"metas":[{"id":"tt0133093","type":"movie","name":"Matrix"}]}"#;
+        storage
+            .upsert_http_cache_row(&DiskCacheRow {
+                url_sha256: sha.clone(),
+                resource_kind: "catalog".to_owned(),
+                status_code: 200,
+                body_zlib: compress_zlib(payload).unwrap(),
+                body_len: payload.len(),
+                fetched_at: Utc::now().timestamp(),
+                soft_ttl_secs: 600,
+                hard_ttl_secs: 3600,
+            })
+            .unwrap();
+
+        // Without Tokio runtime: synchronous preload populates disk_snapshots immediately.
+        let sync_engine = AddonHttpEngine::with_storage(
+            AddonEngineConfig::default(),
+            Some(storage.clone()),
+            None,
+        );
+        assert!(sync_engine.disk_snapshots.lock().unwrap().contains_key(&sha));
+
+        // With Tokio runtime: returns immediately without blocking on SQLite, then populates in background.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let async_engine = AddonHttpEngine::with_storage(
+            AddonEngineConfig::default(),
+            Some(storage),
+            Some(rt.handle().clone()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !async_engine.disk_snapshots.lock().unwrap().contains_key(&sha) {
+            assert!(Instant::now() < deadline, "background preload timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

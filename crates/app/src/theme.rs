@@ -26,6 +26,26 @@ pub const BG_SCRIM: u32 = 0x0b0b0db8;
 pub const BG_OSD_GLASS: u32 = 0x141417db;
 pub const BG_POPOVER_GLASS: u32 = 0x141417f7;
 
+// Unified v0.4.5 glass surface & interaction tokens.
+pub const GLASS_SHEET_BG: u32 = 0x141416F2;
+pub const GLASS_POPOVER_BG: u32 = 0x141417F5;
+pub const GLASS_CARD_BG: u32 = 0xFFFFFF06;
+pub const GLASS_BORDER: u32 = 0xFFFFFF14;
+pub const GLASS_BORDER_STRONG: u32 = 0xFFFFFF26;
+pub const GLASS_DIVIDER: u32 = 0xFFFFFF10;
+pub const GLASS_TROUGH_BG: u32 = 0xFFFFFF0B;
+pub const GLASS_ROW_HOVER_BG: u32 = 0xFFFFFF08;
+pub const GLASS_ROW_SELECTED_BG: u32 = 0xFFFFFF0F;
+pub const SEGMENT_ACTIVE_BG: u32 = 0xF5F5F7;
+pub const SEGMENT_ACTIVE_TEXT: u32 = 0x0B0B0D;
+pub const CTA_ON_ACCENT: u32 = 0x0B0B0D;
+
+pub const RADIUS_POSTER: f32 = 8.0;
+pub const RADIUS_CARD: f32 = 12.0;
+pub const RADIUS_CONTROL: f32 = 10.0;
+pub const RADIUS_SHEET: f32 = 16.0;
+pub const RADIUS_PILL: f32 = 999.0;
+
 pub const BORDER_SUBTLE: u32 = 0x2a2a2fff;
 pub const BORDER_SOFT: u32 = 0x1f1f23ff;
 pub const BORDER_STRONG: u32 = 0x3a3a40ff;

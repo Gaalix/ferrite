@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui::{px, ClipboardItem, KeyDownEvent, ScrollHandle};
+use gpui::{px, ClipboardItem, KeyDownEvent, Pixels, Point, ScrollHandle, SharedString};
 use gpui_mpv::{
     DebandConfig, HdrBackendOptions, MpvController, PlayerSnapshot, ShaderPreset,
     SubtitleAssOverride, SubtitleBackgroundMode, SubtitleStyle, ToneMappingPreset, UpscalePreset,
@@ -16,34 +16,38 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use stremio_core_runtime::{
     is_loopback_streaming_url, is_native_playable_stream, parse_stream_with_addon,
-    resolve_addon_for_request_base,
+    redact_sensitive_text, resolve_addon_for_request_base,
     stremio_core::{
         constants::{META_RESOURCE_NAME, STREAM_RESOURCE_NAME, SUBTITLES_RESOURCE_NAME},
         models::{
+            catalog_with_filters::{SelectableCatalog, SelectableExtra, SelectableType},
             common::{Loadable, ResourceLoadable},
+            ctx::CtxError,
             library_with_filters::{
                 LibraryRequest, LibraryRequestPage, Selected as LibraryWithFiltersSelected,
                 Sort as LibrarySort,
             },
             player::Selected as PlayerSelected,
         },
+        runtime::msg::Event as CoreEvent,
         types::{
             addon::{Descriptor, ExtraValue, ResourcePath, ResourceRequest},
             library::LibraryItem,
-            resource::{Link, MetaItem, MetaItemPreview, Stream, StreamSource},
+            resource::{Link, MetaItem, MetaItemPreview, Stream, StreamSource, Video},
+            streaming_server::Statistics,
         },
     },
     normalize_person_slug, AddonCategory, CoreController, DebridCacheStatus, DesktopModel,
-    FetchedNativeSubtitle, LocalDebridProvider, ParsedStream, PersonCreditChip, Resolution,
-    RichStreamItem, StreamFilter, SubtitleMatchTier,
+    DesktopModelField, FetchedNativeSubtitle, LocalDebridProvider, ParsedStream, PersonCreditChip,
+    Resolution, RichStreamItem, StreamFilter, SubtitleMatchTier,
 };
 use stremio_stream_engine::{
-    StorageMode, StreamEngine, StreamEngineConfig, StreamEngineError, StreamEngineHandle,
-    DEFAULT_BIND_PORT,
+    EngineStatsSnapshot, StorageMode, StreamEngine, StreamEngineConfig, StreamEngineError,
+    StreamEngineHandle, DEFAULT_BIND_PORT,
 };
 use url::Url;
 
-use crate::{icons::IconName, poster_cache::PosterCache};
+use crate::{icons::IconName, poster_cache::PosterCache, theme::sentence_case_label};
 
 pub const STREAM_PAGE_SIZE: usize = 30;
 
@@ -87,6 +91,7 @@ pub fn default_library_selected() -> LibraryWithFiltersSelected {
 pub enum SidebarTab {
     Home,
     Discover,
+    Calendar,
     Library,
     Addons,
     Settings,
@@ -94,16 +99,18 @@ pub enum SidebarTab {
 }
 
 impl SidebarTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Home,
         Self::Discover,
+        Self::Calendar,
         Self::Library,
         Self::Addons,
         Self::Settings,
         Self::Account,
     ];
 
-    pub const TITLEBAR_TABS: [Self; 3] = [Self::Home, Self::Discover, Self::Library];
+    pub const TITLEBAR_TABS: [Self; 4] =
+        [Self::Home, Self::Discover, Self::Calendar, Self::Library];
 
     pub const USER_MENU_TABS: [Self; 3] = [Self::Account, Self::Addons, Self::Settings];
 
@@ -111,6 +118,7 @@ impl SidebarTab {
         match self {
             Self::Home => "Home",
             Self::Discover => "Discover",
+            Self::Calendar => "Calendar",
             Self::Library => "Library",
             Self::Addons => "Addons",
             Self::Settings => "Settings",
@@ -122,6 +130,7 @@ impl SidebarTab {
         match self {
             Self::Home => IconName::Home,
             Self::Discover => IconName::Compass,
+            Self::Calendar => IconName::Calendar,
             Self::Library => IconName::Bookmark,
             Self::Addons => IconName::Layers,
             Self::Settings => IconName::Settings,
@@ -133,10 +142,11 @@ impl SidebarTab {
         match self {
             Self::Home => "1",
             Self::Discover => "2",
-            Self::Library => "3",
-            Self::Addons => "4",
-            Self::Settings => "5",
-            Self::Account => "6",
+            Self::Calendar => "3",
+            Self::Library => "4",
+            Self::Addons => "5",
+            Self::Settings => "6",
+            Self::Account => "7",
         }
     }
 }
@@ -179,10 +189,174 @@ impl AppRoute {
             Self::Tab(tab) => format!("route-tab-{}", tab.label()),
             Self::Search { .. } => "route-search".to_owned(),
             Self::Person { person_key, .. } => format!("route-person-{person_key}"),
-            Self::MetaDetails { id, video_id, .. } => {
-                format!("route-meta-{id}-{}", video_id.as_deref().unwrap_or("root"))
+            Self::MetaDetails { type_name, id, .. } => {
+                format!("route-meta-{type_name}-{id}")
             }
             Self::Player => "route-player".to_owned(),
+        }
+    }
+}
+
+/// Snapshot entry in the browser-grade back/forward navigation stack.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavHistoryEntry {
+    pub route: AppRoute,
+    pub selected_season: Option<u32>,
+    pub scroll_y: f32,
+}
+
+/// Floating glass right-click context menu payload for browsing cards and episode rows.
+pub struct BrowsingContextMenu {
+    pub position: Point<Pixels>,
+    pub type_name: String,
+    pub id: String,
+    pub video_id: Option<String>,
+    pub title: SharedString,
+    pub preview: Option<MetaItemPreview>,
+    pub is_in_library: bool,
+    pub is_watched: bool,
+    pub can_rewind_cw: bool,
+    pub video: Option<(Video, bool)>,
+}
+
+impl BrowsingContextMenu {
+    pub fn new(
+        position: Point<Pixels>,
+        type_name: impl Into<String>,
+        id: impl Into<String>,
+        title: impl Into<SharedString>,
+    ) -> Self {
+        Self {
+            position,
+            type_name: type_name.into(),
+            id: id.into(),
+            video_id: None,
+            title: title.into(),
+            preview: None,
+            is_in_library: false,
+            is_watched: false,
+            can_rewind_cw: false,
+            video: None,
+        }
+    }
+
+    pub fn video_id(mut self, video_id: Option<String>) -> Self {
+        self.video_id = video_id;
+        self
+    }
+
+    pub fn preview(mut self, preview: Option<MetaItemPreview>) -> Self {
+        self.preview = preview;
+        self
+    }
+
+    pub fn is_in_library(mut self, in_library: bool) -> Self {
+        self.is_in_library = in_library;
+        self
+    }
+
+    pub fn is_watched(mut self, watched: bool) -> Self {
+        self.is_watched = watched;
+        self
+    }
+
+    pub fn can_rewind_cw(mut self, can_rewind: bool) -> Self {
+        self.can_rewind_cw = can_rewind;
+        self
+    }
+
+    pub fn video(mut self, video: Option<(Video, bool)>) -> Self {
+        self.video = video;
+        self
+    }
+}
+
+/// 2D grid-coordinated focusable card registered by views for arrow/Enter keyboard navigation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KbFocusableCard {
+    pub route: AppRoute,
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Pure 2D grid keyboard navigation step over `(row, col)` card coordinates.
+pub fn step_kb_focus_2d(
+    items: &[KbFocusableCard],
+    current: Option<usize>,
+    dr: isize,
+    dc: isize,
+) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    let Some(cur_idx) = current.filter(|&i| i < items.len()) else {
+        return Some(0);
+    };
+    let cur = &items[cur_idx];
+
+    if dr == 0 && dc != 0 {
+        let candidate = if dc > 0 {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.row == cur.row && c.col > cur.col)
+                .min_by_key(|(_, c)| c.col)
+                .map(|(i, _)| i)
+        } else {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.row == cur.row && c.col < cur.col)
+                .max_by_key(|(_, c)| c.col)
+                .map(|(i, _)| i)
+        };
+        return Some(candidate.unwrap_or(cur_idx));
+    }
+
+    if dr != 0 {
+        let target_row = if dr > 0 {
+            items
+                .iter()
+                .filter(|c| c.row > cur.row)
+                .map(|c| c.row)
+                .min()
+        } else {
+            items
+                .iter()
+                .filter(|c| c.row < cur.row)
+                .map(|c| c.row)
+                .max()
+        };
+        if let Some(row) = target_row {
+            let best = items
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.row == row)
+                .min_by_key(|(_, c)| ((c.col as isize - cur.col as isize).abs(), c.col))
+                .map(|(i, _)| i);
+            return Some(best.unwrap_or(cur_idx));
+        }
+    }
+
+    Some(cur_idx)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PersonDeptFilter {
+    #[default]
+    All,
+    Acting,
+    Directing,
+}
+
+impl PersonDeptFilter {
+    pub const ALL: [Self; 3] = [Self::All, Self::Acting, Self::Directing];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Acting => "Acting",
+            Self::Directing => "Directing",
         }
     }
 }
@@ -621,6 +795,10 @@ pub struct AppPreferences {
     pub auto_play_next_episode: bool,
     #[serde(default = "default_true")]
     pub show_home_spotlight: bool,
+    #[serde(default)]
+    pub pinned_board_shelves: Vec<String>,
+    #[serde(default)]
+    pub hidden_board_shelves: Vec<String>,
 }
 
 impl Default for AppPreferences {
@@ -653,6 +831,8 @@ impl Default for AppPreferences {
             auto_match_native_subtitles: true,
             auto_play_next_episode: true,
             show_home_spotlight: true,
+            pinned_board_shelves: Vec::new(),
+            hidden_board_shelves: Vec::new(),
         }
     }
 }
@@ -801,13 +981,135 @@ pub fn build_engine_config_from_prefs(prefs: &AppPreferences) -> StreamEngineCon
     cfg
 }
 
+/// Lazily-attached stream engine handle allowing immediate GPUI window creation before librqbit binds.
+#[derive(Clone, Default)]
+pub struct DeferredStreamEngine(Arc<parking_lot::RwLock<Option<StreamEngineHandle>>>);
+
+impl From<StreamEngineHandle> for DeferredStreamEngine {
+    fn from(handle: StreamEngineHandle) -> Self {
+        Self(Arc::new(parking_lot::RwLock::new(Some(handle))))
+    }
+}
+
+impl DeferredStreamEngine {
+    pub fn new(handle: StreamEngineHandle) -> Self {
+        Self::from(handle)
+    }
+
+    pub fn attach(&self, handle: StreamEngineHandle) {
+        *self.0.write() = Some(handle);
+    }
+
+    pub fn handle(&self) -> Option<StreamEngineHandle> {
+        self.0.read().clone()
+    }
+
+    pub fn base_url(&self) -> Url {
+        self.0
+            .read()
+            .as_ref()
+            .map(|h| h.base_url())
+            .unwrap_or_else(|| {
+                Url::parse(&format!("http://127.0.0.1:{DEFAULT_BIND_PORT}/"))
+                    .expect("valid loopback fallback URL")
+            })
+    }
+
+    pub fn torrent_stats(&self, info_hash: &str, file_idx: Option<usize>) -> Option<Statistics> {
+        self.0
+            .read()
+            .as_ref()
+            .and_then(|h| h.torrent_stats(info_hash, file_idx))
+    }
+
+    pub fn release_playback_sessions_bg(&self) {
+        if let Some(h) = self.0.read().as_ref() {
+            h.release_playback_sessions_bg();
+        }
+    }
+
+    pub fn set_enable_upnp(&self, enabled: bool) {
+        if let Some(h) = self.0.read().as_ref() {
+            h.set_enable_upnp(enabled);
+        }
+    }
+
+    pub fn set_first_byte_timeout(&self, timeout: Duration) {
+        if let Some(h) = self.0.read().as_ref() {
+            h.set_first_byte_timeout(timeout);
+        }
+    }
+
+    pub fn engine_stats(&self) -> EngineStatsSnapshot {
+        self.0
+            .read()
+            .as_ref()
+            .map(|h| h.engine_stats())
+            .unwrap_or_default()
+    }
+
+    pub fn cache_usage_bytes(&self) -> u64 {
+        self.0
+            .read()
+            .as_ref()
+            .map(|h| h.cache_usage_bytes())
+            .unwrap_or(0)
+    }
+
+    pub async fn set_storage_mode(&self, mode: StorageMode) -> Result<(), StreamEngineError> {
+        let Some(handle) = self.handle() else {
+            return Ok(());
+        };
+        handle.set_storage_mode(mode).await
+    }
+
+    pub async fn prewarm_stream(
+        &self,
+        stream_url: &Url,
+        bytes_to_warm: u64,
+    ) -> Result<u64, StreamEngineError> {
+        let Some(handle) = self.handle() else {
+            return Err(StreamEngineError::Torrent(
+                "Stream engine is still initializing".to_owned(),
+            ));
+        };
+        handle.prewarm_stream(stream_url, bytes_to_warm).await
+    }
+
+    pub async fn prebuffer_episode(
+        &self,
+        info_hash_hex: &str,
+        file_idx: Option<usize>,
+        trackers: Vec<String>,
+    ) -> Result<String, StreamEngineError> {
+        let Some(handle) = self.handle() else {
+            return Err(StreamEngineError::Torrent(
+                "Stream engine is still initializing".to_owned(),
+            ));
+        };
+        handle
+            .prebuffer_episode(info_hash_hex, file_idx, trackers)
+            .await
+    }
+
+    pub async fn shutdown(&self) {
+        let handle = self.0.write().take();
+        if let Some(h) = handle {
+            h.shutdown().await;
+        }
+    }
+}
+
 pub async fn switch_engine_storage_mode_on_tokio(
     tokio_handle: &tokio::runtime::Handle,
-    engine: StreamEngineHandle,
+    engine: impl Into<DeferredStreamEngine>,
     mode: StorageMode,
 ) -> anyhow::Result<()> {
+    let Some(handle) = engine.into().handle() else {
+        return Ok(());
+    };
     let res = tokio_handle
-        .spawn(async move { engine.set_storage_mode(mode).await })
+        .spawn(async move { handle.set_storage_mode(mode).await })
         .await
         .map_err(|join_err| anyhow::anyhow!("storage mode switch task cancelled: {join_err}"))?;
     res.map_err(|err| anyhow::anyhow!("{err}"))
@@ -1043,15 +1345,160 @@ impl LibrarySortOrder {
     }
 }
 
+/// Extended sorting criteria for the v0.5.0 Library view dropdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibrarySortCriterion {
+    #[default]
+    RecentlyUpdated,
+    LastWatched,
+    DateAdded,
+    TitleAsc,
+    TimesWatched,
+}
+
+impl LibrarySortCriterion {
+    pub const ALL: [Self; 5] = [
+        Self::RecentlyUpdated,
+        Self::LastWatched,
+        Self::DateAdded,
+        Self::TitleAsc,
+        Self::TimesWatched,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RecentlyUpdated => "Recently updated",
+            Self::LastWatched => "Last watched",
+            Self::DateAdded => "Date added",
+            Self::TitleAsc => "Title (A–Z)",
+            Self::TimesWatched => "Most watched",
+        }
+    }
+}
+
+/// Memoized snapshot for the Library view grid and statistics.
+#[derive(Clone, Debug)]
+pub struct MemoizedLibraryView {
+    pub library_rev: u64,
+    pub status_tab: LibraryStatusTab,
+    pub type_filter: LibraryTypeFilter,
+    pub sort_criterion: LibrarySortCriterion,
+    pub search_query: String,
+    pub count_watching: usize,
+    pub count_watchlist: usize,
+    pub count_watched: usize,
+    pub films_count: usize,
+    pub shows_count: usize,
+    pub episodes_logged: u64,
+    pub hours_logged: u64,
+    pub filtered_items: Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
+}
+
+/// Discover catalog option paired with human-readable title and source addon label.
+#[derive(Clone, Debug)]
+pub struct DiscoverCatalogOption {
+    pub catalog: SelectableCatalog,
+    pub title: String,
+    pub addon_name: Option<String>,
+}
+
+/// Memoized Discover view catalog state keyed by `discover_state_rev`.
+#[derive(Clone, Debug)]
+pub struct DiscoverViewSnapshot {
+    pub types: Vec<SelectableType>,
+    pub catalogs: Vec<DiscoverCatalogOption>,
+    pub extras: Vec<SelectableExtra>,
+    pub has_next_page: bool,
+    pub items: Arc<Vec<MetaItemPreview>>,
+    pub is_loading: bool,
+    pub active_type_label: String,
+    pub active_catalog_display: String,
+    pub active_genre_label: String,
+}
+
+impl DiscoverViewSnapshot {
+    pub fn from_model(model: &DesktopModel) -> Self {
+        let types = model.discover.selectable.types.clone();
+        let catalogs_raw = model.discover.selectable.catalogs.clone();
+        let extras = model.discover.selectable.extra.clone();
+        let has_next_page = model.discover.selectable.next_page.is_some();
+
+        let mut merged = Vec::new();
+        let mut is_loading = false;
+        for page in &model.discover.catalog {
+            match &page.content {
+                Some(Loadable::Ready(list)) => merged.extend(list.iter().cloned()),
+                Some(Loadable::Loading) => is_loading = true,
+                _ => {}
+            }
+        }
+
+        let installed_addons = &model.ctx.profile.addons;
+        let active_type_label = types
+            .iter()
+            .find(|t| t.selected)
+            .or_else(|| types.first())
+            .map(|t| sentence_case_label(&t.r#type))
+            .unwrap_or_else(|| "All formats".to_owned());
+
+        let catalogs: Vec<DiscoverCatalogOption> = catalogs_raw
+            .into_iter()
+            .map(|catalog| {
+                let title = sentence_case_label(&catalog.catalog);
+                let addon_name = resolve_addon_for_request_base(installed_addons, &catalog.request.base)
+                    .map(|d| d.manifest.name.clone())
+                    .or_else(|| catalog.request.base.host_str().map(ToOwned::to_owned));
+                DiscoverCatalogOption {
+                    catalog,
+                    title,
+                    addon_name,
+                }
+            })
+            .collect();
+
+        let active_catalog_display = catalogs
+            .iter()
+            .find(|c| c.catalog.selected)
+            .or_else(|| catalogs.first())
+            .map(|c| match &c.addon_name {
+                Some(addon) => format!("{} ({addon})", c.title),
+                None => c.title.clone(),
+            })
+            .unwrap_or_else(|| "Select catalog".to_owned());
+
+        let genre_extra = extras.iter().find(|e| e.name.eq_ignore_ascii_case("genre"));
+        let active_genre_label = genre_extra
+            .and_then(|g| {
+                g.options
+                    .iter()
+                    .find(|o| o.selected)
+                    .map(|o| o.value.clone().unwrap_or_else(|| "All genres".to_owned()))
+            })
+            .unwrap_or_else(|| "All genres".to_owned());
+
+        Self {
+            types,
+            catalogs,
+            extras,
+            has_next_page,
+            items: Arc::new(merged),
+            is_loading,
+            active_type_label,
+            active_catalog_display,
+            active_genre_label,
+        }
+    }
+}
+
 pub fn classify_library_item_status(li: &LibraryItem) -> Option<LibraryStatusTab> {
-    if li.removed && li.state.time_offset == 0 && li.state.times_watched == 0 {
+    if li.removed {
         return None;
     }
     if li.watched() || li.progress() >= 95.0 {
         Some(LibraryStatusTab::Watched)
     } else if li.state.time_offset > 0 || li.progress() > 0.0 || li.state.times_watched > 0 {
         Some(LibraryStatusTab::Watching)
-    } else if !li.removed && !li.temp {
+    } else if !li.temp {
         Some(LibraryStatusTab::Watchlist)
     } else {
         None
@@ -1442,6 +1889,79 @@ pub type AddonStreamCounts = Arc<Vec<(String, String, usize)>>;
 /// Ranked stream candidates paired with their per-addon stream counts.
 pub type EnrichedStreamCandidates = (Arc<Vec<PlaybackCandidate>>, AddonStreamCounts);
 
+/// Cached Prowlarr + Debrid-enriched stream list for `MetaDetails` to skip per-frame re-merges.
+#[derive(Clone, Debug)]
+pub struct MemoizedEnrichedStreams {
+    pub route_id: String,
+    pub active_video_id: String,
+    pub addon_arc_ptr: usize,
+    pub prowlarr_request_seq: u64,
+    pub prowlarr_stream_count: usize,
+    pub debrid_cache_len: usize,
+    pub active_debrid: LocalDebridProvider,
+    pub debrid_cached_only: bool,
+    pub candidates: Arc<Vec<PlaybackCandidate>>,
+    pub available_addons: AddonStreamCounts,
+}
+
+/// Returns cached enriched stream candidates when the inputs match, recomputing only on change.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_memoized_enriched_streams(
+    memo_slot: &mut Option<MemoizedEnrichedStreams>,
+    route_id: &str,
+    active_video_id: &str,
+    addon_candidates: &Arc<Vec<PlaybackCandidate>>,
+    prowlarr_candidates: &[PlaybackCandidate],
+    prowlarr_request_seq: u64,
+    local_debrid_provider: LocalDebridProvider,
+    debrid_cache: &HashMap<(LocalDebridProvider, [u8; 20]), DebridCacheStatus>,
+    cached_only_filter: bool,
+) -> EnrichedStreamCandidates {
+    let addon_arc_ptr = Arc::as_ptr(addon_candidates) as usize;
+    let prowlarr_stream_count = prowlarr_candidates.len();
+    let debrid_cache_len = debrid_cache.len();
+
+    if let Some(existing) = memo_slot.as_ref() {
+        if existing.route_id == route_id
+            && existing.active_video_id == active_video_id
+            && existing.addon_arc_ptr == addon_arc_ptr
+            && existing.prowlarr_request_seq == prowlarr_request_seq
+            && existing.prowlarr_stream_count == prowlarr_stream_count
+            && existing.debrid_cache_len == debrid_cache_len
+            && existing.active_debrid == local_debrid_provider
+            && existing.debrid_cached_only == cached_only_filter
+        {
+            return (
+                Arc::clone(&existing.candidates),
+                Arc::clone(&existing.available_addons),
+            );
+        }
+    }
+
+    let (candidates, available_addons) = merge_and_enrich_stream_candidates(
+        addon_candidates,
+        prowlarr_candidates,
+        local_debrid_provider,
+        debrid_cache,
+        cached_only_filter,
+    );
+
+    *memo_slot = Some(MemoizedEnrichedStreams {
+        route_id: route_id.to_owned(),
+        active_video_id: active_video_id.to_owned(),
+        addon_arc_ptr,
+        prowlarr_request_seq,
+        prowlarr_stream_count,
+        debrid_cache_len,
+        active_debrid: local_debrid_provider,
+        debrid_cached_only: cached_only_filter,
+        candidates: Arc::clone(&candidates),
+        available_addons: Arc::clone(&available_addons),
+    });
+
+    (candidates, available_addons)
+}
+
 /// Merges Prowlarr fallback streams (deduplicated by torrent info_hash), applies
 /// local Debrid instant-cache badges (`RD+` / `TB+` / `AD+`), and filters out
 /// uncached P2P torrents when `cached_only_filter` is enabled.
@@ -1759,7 +2279,7 @@ pub struct ToastMessage {
     pub created_at: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FocusedInput {
     CommandPalette,
     FullSearchInput,
@@ -1768,6 +2288,7 @@ pub enum FocusedInput {
     AddonManifestUrl,
     AddonSearch,
     DiscoverCatalogSearch,
+    LibrarySearch,
     SettingsSearch,
     RealDebridApiKey,
     TorBoxApiKey,
@@ -1777,6 +2298,23 @@ pub enum FocusedInput {
     SettingsOpenSubtitlesKey,
     SettingsSubdlKey,
     SettingsTmdbApiKey,
+}
+
+impl FocusedInput {
+    /// Returns `true` for credential/password inputs whose contents must never be copied out.
+    pub const fn is_secret(self) -> bool {
+        matches!(
+            self,
+            Self::AuthPassword
+                | Self::RealDebridApiKey
+                | Self::TorBoxApiKey
+                | Self::AllDebridApiKey
+                | Self::ProwlarrApiKey
+                | Self::SettingsOpenSubtitlesKey
+                | Self::SettingsSubdlKey
+                | Self::SettingsTmdbApiKey
+        )
+    }
 }
 
 pub fn settings_row_matches_query(
@@ -1928,60 +2466,441 @@ pub fn extract_cli_addon_arg(args: impl IntoIterator<Item = String>) -> Option<S
         .find_map(|arg| detect_addon_url_candidate(&arg))
 }
 
-pub fn apply_key_to_text_buffer(
+/// Result of applying a keystroke to a cursor-tracked text buffer.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextEditResult {
+    pub text_changed: bool,
+    pub handled: bool,
+    pub copied_text: Option<String>,
+}
+
+/// Clamps a byte offset to a valid UTF-8 character boundary within `text`.
+#[inline]
+pub fn clamp_cursor_to_char_boundary(text: &str, cursor: usize) -> usize {
+    let mut idx = cursor.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+#[inline]
+fn prev_char_boundary(text: &str, cursor: usize) -> usize {
+    let mut idx = clamp_cursor_to_char_boundary(text, cursor);
+    if idx == 0 {
+        return 0;
+    }
+    idx -= 1;
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+#[inline]
+fn next_char_boundary(text: &str, cursor: usize) -> usize {
+    let mut idx = clamp_cursor_to_char_boundary(text, cursor);
+    if idx >= text.len() {
+        return text.len();
+    }
+    idx += 1;
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn prev_word_boundary(text: &str, cursor: usize) -> usize {
+    let c = clamp_cursor_to_char_boundary(text, cursor);
+    let prefix = &text[..c];
+    let mut chars = prefix.char_indices().rev().peekable();
+    while let Some(&(_, ch)) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let mut boundary = 0usize;
+    for (idx, ch) in chars {
+        if ch.is_whitespace() {
+            boundary = idx + ch.len_utf8();
+            break;
+        }
+    }
+    boundary
+}
+
+fn next_word_boundary(text: &str, cursor: usize) -> usize {
+    let c = clamp_cursor_to_char_boundary(text, cursor);
+    let suffix = &text[c..];
+    let mut chars = suffix.char_indices().peekable();
+    while let Some(&(_, ch)) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    for (idx, ch) in chars {
+        if ch.is_whitespace() {
+            return c + idx;
+        }
+    }
+    text.len()
+}
+
+/// Formats `text` with a visible caret (`|`) or full-selection indicator when focused.
+pub fn format_text_with_caret(
+    text: &str,
+    cursor: usize,
+    selected_all: bool,
+    focused: bool,
+) -> String {
+    if !focused {
+        return text.to_owned();
+    }
+    if selected_all && !text.is_empty() {
+        return format!("[{text}]");
+    }
+    let idx = clamp_cursor_to_char_boundary(text, cursor);
+    let mut out = String::with_capacity(text.len() + 1);
+    out.push_str(&text[..idx]);
+    out.push('|');
+    out.push_str(&text[idx..]);
+    out
+}
+
+/// Applies a GPUI key event to `buffer` with caret, selection, clipboard, and word-delete support.
+pub fn apply_key_to_text_buffer_with_cursor(
     buffer: &mut String,
+    cursor: &mut usize,
+    selected_all: &mut bool,
+    is_secret: bool,
     event: &KeyDownEvent,
     clipboard_text: Option<String>,
-) -> bool {
+) -> TextEditResult {
+    *cursor = clamp_cursor_to_char_boundary(buffer, *cursor);
     let ks = &event.keystroke;
     let ctrl_or_cmd = ks.modifiers.control || ks.modifiers.platform;
 
     if ctrl_or_cmd {
         match ks.key.as_str() {
+            "a" => {
+                *selected_all = !buffer.is_empty();
+                *cursor = buffer.len();
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            "c" => {
+                let copied = if !is_secret && !buffer.is_empty() && *selected_all {
+                    Some(buffer.clone())
+                } else {
+                    None
+                };
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: copied,
+                };
+            }
+            "x" => {
+                if !is_secret && *selected_all && !buffer.is_empty() {
+                    let copied = buffer.clone();
+                    buffer.clear();
+                    *cursor = 0;
+                    *selected_all = false;
+                    return TextEditResult {
+                        text_changed: true,
+                        handled: true,
+                        copied_text: Some(copied),
+                    };
+                }
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
             "v" => {
                 if let Some(paste) = clipboard_text {
                     let clean: String =
                         paste.chars().filter(|c| *c != '\n' && *c != '\r').collect();
                     if !clean.is_empty() {
-                        buffer.push_str(&clean);
-                        return true;
+                        if *selected_all {
+                            buffer.clear();
+                            *cursor = 0;
+                            *selected_all = false;
+                        }
+                        buffer.insert_str(*cursor, &clean);
+                        *cursor += clean.len();
+                        return TextEditResult {
+                            text_changed: true,
+                            handled: true,
+                            copied_text: None,
+                        };
                     }
                 }
-                return false;
+                return TextEditResult::default();
             }
-            "u" | "backspace" => {
+            "backspace" => {
+                if *selected_all {
+                    if !buffer.is_empty() {
+                        buffer.clear();
+                        *cursor = 0;
+                        *selected_all = false;
+                        return TextEditResult {
+                            text_changed: true,
+                            handled: true,
+                            copied_text: None,
+                        };
+                    }
+                    *selected_all = false;
+                    return TextEditResult {
+                        text_changed: false,
+                        handled: true,
+                        copied_text: None,
+                    };
+                }
+                if *cursor > 0 {
+                    let prev = prev_word_boundary(buffer, *cursor);
+                    buffer.drain(prev..*cursor);
+                    *cursor = prev;
+                    return TextEditResult {
+                        text_changed: true,
+                        handled: true,
+                        copied_text: None,
+                    };
+                }
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            "delete" => {
+                if *selected_all {
+                    buffer.clear();
+                    *cursor = 0;
+                    *selected_all = false;
+                    return TextEditResult {
+                        text_changed: true,
+                        handled: true,
+                        copied_text: None,
+                    };
+                }
+                if *cursor < buffer.len() {
+                    let next = next_word_boundary(buffer, *cursor);
+                    buffer.drain(*cursor..next);
+                    return TextEditResult {
+                        text_changed: true,
+                        handled: true,
+                        copied_text: None,
+                    };
+                }
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            "u" => {
+                *selected_all = false;
                 if !buffer.is_empty() {
                     buffer.clear();
-                    return true;
+                    *cursor = 0;
+                    return TextEditResult {
+                        text_changed: true,
+                        handled: true,
+                        copied_text: None,
+                    };
                 }
-                return false;
+                return TextEditResult::default();
             }
-            _ => return false,
+            "left" => {
+                *selected_all = false;
+                *cursor = prev_word_boundary(buffer, *cursor);
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            "right" => {
+                *selected_all = false;
+                *cursor = next_word_boundary(buffer, *cursor);
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            "home" => {
+                *selected_all = false;
+                *cursor = 0;
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            "end" => {
+                *selected_all = false;
+                *cursor = buffer.len();
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            _ => return TextEditResult::default(),
         }
     }
 
     if ks.modifiers.alt {
-        return false;
+        return TextEditResult::default();
     }
 
-    if ks.key == "backspace" {
-        return buffer.pop().is_some();
-    }
-
-    if ks.key == "space" {
-        buffer.push(' ');
-        return true;
+    match ks.key.as_str() {
+        "left" => {
+            *selected_all = false;
+            *cursor = prev_char_boundary(buffer, *cursor);
+            return TextEditResult {
+                text_changed: false,
+                handled: true,
+                copied_text: None,
+            };
+        }
+        "right" => {
+            *selected_all = false;
+            *cursor = next_char_boundary(buffer, *cursor);
+            return TextEditResult {
+                text_changed: false,
+                handled: true,
+                copied_text: None,
+            };
+        }
+        "home" => {
+            *selected_all = false;
+            *cursor = 0;
+            return TextEditResult {
+                text_changed: false,
+                handled: true,
+                copied_text: None,
+            };
+        }
+        "end" => {
+            *selected_all = false;
+            *cursor = buffer.len();
+            return TextEditResult {
+                text_changed: false,
+                handled: true,
+                copied_text: None,
+            };
+        }
+        "backspace" => {
+            if *selected_all {
+                *selected_all = false;
+                if !buffer.is_empty() {
+                    buffer.clear();
+                    *cursor = 0;
+                    return TextEditResult {
+                        text_changed: true,
+                        handled: true,
+                        copied_text: None,
+                    };
+                }
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            if *cursor > 0 {
+                let prev = prev_char_boundary(buffer, *cursor);
+                buffer.drain(prev..*cursor);
+                *cursor = prev;
+                return TextEditResult {
+                    text_changed: true,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            return TextEditResult {
+                text_changed: false,
+                handled: true,
+                copied_text: None,
+            };
+        }
+        "delete" => {
+            if *selected_all {
+                *selected_all = false;
+                if !buffer.is_empty() {
+                    buffer.clear();
+                    *cursor = 0;
+                    return TextEditResult {
+                        text_changed: true,
+                        handled: true,
+                        copied_text: None,
+                    };
+                }
+                return TextEditResult {
+                    text_changed: false,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            if *cursor < buffer.len() {
+                let next = next_char_boundary(buffer, *cursor);
+                buffer.drain(*cursor..next);
+                return TextEditResult {
+                    text_changed: true,
+                    handled: true,
+                    copied_text: None,
+                };
+            }
+            return TextEditResult {
+                text_changed: false,
+                handled: true,
+                copied_text: None,
+            };
+        }
+        "space" => {
+            if *selected_all {
+                buffer.clear();
+                *cursor = 0;
+                *selected_all = false;
+            }
+            buffer.insert(*cursor, ' ');
+            *cursor += 1;
+            return TextEditResult {
+                text_changed: true,
+                handled: true,
+                copied_text: None,
+            };
+        }
+        _ => {}
     }
 
     if let Some(ch_str) = &ks.key_char {
-        let mut mutated = false;
-        for ch in ch_str.chars() {
-            if !ch.is_control() {
-                buffer.push(ch);
-                mutated = true;
+        let inserted: String = ch_str.chars().filter(|ch| !ch.is_control()).collect();
+        if !inserted.is_empty() {
+            if *selected_all {
+                buffer.clear();
+                *cursor = 0;
+                *selected_all = false;
             }
+            buffer.insert_str(*cursor, &inserted);
+            *cursor += inserted.len();
+            return TextEditResult {
+                text_changed: true,
+                handled: true,
+                copied_text: None,
+            };
         }
-        return mutated;
     }
 
     if ks.key.chars().count() == 1 {
@@ -1992,13 +2911,168 @@ pub fn apply_key_to_text_buffer(
                 } else {
                     ch
                 };
-                buffer.push(c);
-                return true;
+                if *selected_all {
+                    buffer.clear();
+                    *cursor = 0;
+                    *selected_all = false;
+                }
+                buffer.insert(*cursor, c);
+                *cursor += c.len_utf8();
+                return TextEditResult {
+                    text_changed: true,
+                    handled: true,
+                    copied_text: None,
+                };
             }
         }
     }
 
-    false
+    TextEditResult::default()
+}
+
+pub fn apply_key_to_text_buffer(
+    buffer: &mut String,
+    event: &KeyDownEvent,
+    clipboard_text: Option<String>,
+) -> bool {
+    let mut cursor = buffer.len();
+    let mut selected_all = false;
+    apply_key_to_text_buffer_with_cursor(
+        buffer,
+        &mut cursor,
+        &mut selected_all,
+        false,
+        event,
+        clipboard_text,
+    )
+    .text_changed
+}
+
+/// Formats `CoreEvent::Error` payloads into concise, user-friendly toast `(title, detail)`.
+pub fn format_core_error_message(error: &CtxError, source: &CoreEvent) -> (String, Option<String>) {
+    let title = match source {
+        CoreEvent::UserAuthenticated { .. } => "Sign-in failed",
+        CoreEvent::AddonInstalled { .. }
+        | CoreEvent::AddonUpgraded { .. }
+        | CoreEvent::AddonUninstalled { .. } => "Addon update failed",
+        CoreEvent::LibraryItemsPushedToAPI { .. }
+        | CoreEvent::LibraryItemsPulledFromAPI { .. }
+        | CoreEvent::LibraryItemAdded { .. }
+        | CoreEvent::LibraryItemRemoved { .. }
+        | CoreEvent::LibraryItemRewinded { .. }
+        | CoreEvent::LibraryItemMarkedAsWatched { .. } => "Library sync notice",
+        CoreEvent::UserPulledFromAPI { .. } | CoreEvent::UserPushedToAPI { .. } => {
+            "Profile sync notice"
+        }
+        _ => "Stremio notice",
+    };
+
+    let raw_detail = match error {
+        CtxError::API(api_err) => {
+            let msg = api_err.message.trim();
+            if msg.is_empty() {
+                format!("Stremio API returned error code {}", api_err.code)
+            } else {
+                redact_sensitive_text(msg)
+            }
+        }
+        CtxError::Env(env_err) => redact_sensitive_text(&env_err.message()),
+        CtxError::Other(other_err) => other_err.message(),
+    };
+
+    let detail = raw_detail.trim();
+    let capped = if detail.is_empty() {
+        None
+    } else if detail.chars().count() > 160 {
+        let short: String = detail.chars().take(157).collect();
+        Some(format!("{short}..."))
+    } else {
+        Some(detail.to_owned())
+    };
+    (title.to_owned(), capped)
+}
+
+/// Returns `true` when any changed `DesktopModelField` can visibly affect `route` or open overlays.
+pub fn route_affected_by_fields(
+    route: &AppRoute,
+    command_palette_open: bool,
+    player_osd_or_stats: bool,
+    fields: &[DesktopModelField],
+) -> bool {
+    if fields.is_empty() {
+        return false;
+    }
+    if command_palette_open
+        && fields.iter().any(|f| {
+            matches!(
+                f,
+                DesktopModelField::Search | DesktopModelField::LocalSearch | DesktopModelField::Ctx
+            )
+        })
+    {
+        return true;
+    }
+
+    fields.iter().any(|field| match route {
+        AppRoute::Tab(SidebarTab::Home) => matches!(
+            field,
+            DesktopModelField::Board
+                | DesktopModelField::ContinueWatchingPreview
+                | DesktopModelField::ContinueWatching
+                | DesktopModelField::Ctx
+                | DesktopModelField::InstalledAddons
+        ),
+        AppRoute::Tab(SidebarTab::Discover) => matches!(
+            field,
+            DesktopModelField::Discover | DesktopModelField::Ctx | DesktopModelField::InstalledAddons
+        ),
+        AppRoute::Tab(SidebarTab::Calendar) => {
+            matches!(field, DesktopModelField::Calendar | DesktopModelField::Ctx)
+        }
+        AppRoute::Tab(SidebarTab::Library) => matches!(
+            field,
+            DesktopModelField::Library
+                | DesktopModelField::ContinueWatching
+                | DesktopModelField::ContinueWatchingPreview
+                | DesktopModelField::Ctx
+        ),
+        AppRoute::Tab(SidebarTab::Addons) => matches!(
+            field,
+            DesktopModelField::InstalledAddons
+                | DesktopModelField::RemoteAddons
+                | DesktopModelField::AddonDetails
+                | DesktopModelField::Ctx
+        ),
+        AppRoute::Tab(SidebarTab::Settings) => matches!(
+            field,
+            DesktopModelField::StreamingServer
+                | DesktopModelField::Ctx
+                | DesktopModelField::InstalledAddons
+        ),
+        AppRoute::Tab(SidebarTab::Account) => matches!(
+            field,
+            DesktopModelField::Ctx
+                | DesktopModelField::AuthLink
+                | DesktopModelField::Library
+                | DesktopModelField::InstalledAddons
+        ),
+        AppRoute::MetaDetails { .. } => matches!(
+            field,
+            DesktopModelField::MetaDetails
+                | DesktopModelField::Ctx
+                | DesktopModelField::InstalledAddons
+        ),
+        AppRoute::Search { .. } => matches!(
+            field,
+            DesktopModelField::Search | DesktopModelField::LocalSearch | DesktopModelField::Ctx
+        ),
+        AppRoute::Person { .. } => matches!(field, DesktopModelField::Ctx),
+        AppRoute::Player => match field {
+            DesktopModelField::Player => player_osd_or_stats,
+            DesktopModelField::MetaDetails => true,
+            _ => false,
+        },
+    })
 }
 
 /// Extracts `(season, episode)` from a Stremio-style `id:season:episode` video identifier.
@@ -2317,7 +3391,8 @@ pub fn resume_offset_for_library_item(item: Option<&LibraryItem>, video_id: &str
 pub struct BootServices {
     pub tokio_handle: tokio::runtime::Handle,
     pub core: CoreController,
-    pub engine: StreamEngineHandle,
+    pub engine: DeferredStreamEngine,
+    pub engine_ready_rx: Option<async_channel::Receiver<Result<StreamEngineHandle, String>>>,
     pub poster_cache: PosterCache,
     pub preferences: AppPreferences,
     pub mpv: Option<MpvController>,
@@ -3192,8 +4267,17 @@ mod tests {
     fn navigation_tabs_home_spotlight_default_and_cast_links_work() {
         assert_eq!(
             SidebarTab::TITLEBAR_TABS,
-            [SidebarTab::Home, SidebarTab::Discover, SidebarTab::Library]
+            [
+                SidebarTab::Home,
+                SidebarTab::Discover,
+                SidebarTab::Calendar,
+                SidebarTab::Library,
+            ]
         );
+        assert_eq!(SidebarTab::ALL.len(), 7);
+        assert_eq!(SidebarTab::Calendar.label(), "Calendar");
+        assert_eq!(SidebarTab::Calendar.icon_name(), IconName::Calendar);
+        assert_eq!(SidebarTab::Calendar.shortcut_label(), "3");
         assert!(!SidebarTab::USER_MENU_TABS.contains(&SidebarTab::Library));
         assert!(SidebarTab::USER_MENU_TABS.contains(&SidebarTab::Addons));
         assert!(SidebarTab::USER_MENU_TABS.contains(&SidebarTab::Settings));
@@ -3298,5 +4382,332 @@ mod tests {
         );
         assert_eq!(PlayerPopover::AudioAndSubtitles.parent_sheet(), None);
         assert_eq!(PlayerPopover::SwitchStream.parent_sheet(), None);
+    }
+
+    #[test]
+    fn removed_library_items_never_stay_in_watching_or_watched() {
+        use stremio_core_runtime::stremio_core::types::library::LibraryItemState;
+
+        let base = LibraryItem {
+            id: "tt0903747".to_owned(),
+            name: "Breaking Bad".to_owned(),
+            r#type: "series".to_owned(),
+            poster: None,
+            poster_shape: Default::default(),
+            removed: false,
+            temp: false,
+            ctime: None,
+            mtime: chrono::Utc::now(),
+            state: LibraryItemState::default(),
+            behavior_hints: Default::default(),
+        };
+
+        assert_eq!(
+            classify_library_item_status(&base),
+            Some(LibraryStatusTab::Watchlist)
+        );
+
+        let mut watching = base.clone();
+        watching.state.time_offset = 120_000;
+        watching.state.duration = 2_400_000;
+        assert_eq!(
+            classify_library_item_status(&watching),
+            Some(LibraryStatusTab::Watching)
+        );
+
+        let mut removed_watching = watching.clone();
+        removed_watching.removed = true;
+        assert_eq!(classify_library_item_status(&removed_watching), None);
+
+        let mut watched = base.clone();
+        watched.state.times_watched = 2;
+        assert_eq!(
+            classify_library_item_status(&watched),
+            Some(LibraryStatusTab::Watched)
+        );
+
+        let mut removed_watched = watched;
+        removed_watched.removed = true;
+        assert_eq!(classify_library_item_status(&removed_watched), None);
+
+        let mut removed_high_progress = base;
+        removed_high_progress.removed = true;
+        removed_high_progress.state.time_offset = 98_000;
+        removed_high_progress.state.duration = 100_000;
+        assert_eq!(classify_library_item_status(&removed_high_progress), None);
+    }
+
+    #[test]
+    fn route_transition_id_preserves_key_across_episode_switches() {
+        let ep1 = AppRoute::MetaDetails {
+            type_name: "series".to_owned(),
+            id: "tt0903747".to_owned(),
+            video_id: Some("tt0903747:1:1".to_owned()),
+        };
+        let ep2 = AppRoute::MetaDetails {
+            type_name: "series".to_owned(),
+            id: "tt0903747".to_owned(),
+            video_id: Some("tt0903747:1:2".to_owned()),
+        };
+        let root = AppRoute::MetaDetails {
+            type_name: "series".to_owned(),
+            id: "tt0903747".to_owned(),
+            video_id: None,
+        };
+        assert_eq!(ep1.transition_id(), "route-meta-series-tt0903747");
+        assert_eq!(ep1.transition_id(), ep2.transition_id());
+        assert_eq!(ep1.transition_id(), root.transition_id());
+        assert_eq!(
+            AppRoute::Tab(SidebarTab::Calendar).transition_id(),
+            "route-tab-Calendar"
+        );
+    }
+
+    #[test]
+    fn deferred_stream_engine_provides_safe_fallback_when_unattached() {
+        let deferred = DeferredStreamEngine::default();
+        assert!(deferred.handle().is_none());
+        assert_eq!(deferred.base_url().as_str(), "http://127.0.0.1:11470/");
+        assert_eq!(deferred.engine_stats(), EngineStatsSnapshot::default());
+        assert_eq!(deferred.cache_usage_bytes(), 0);
+        assert!(deferred
+            .torrent_stats("0123456789abcdef0123456789abcdef01234567", None)
+            .is_none());
+        deferred.set_enable_upnp(false);
+        deferred.set_first_byte_timeout(Duration::from_secs(15));
+        deferred.release_playback_sessions_bg();
+    }
+
+    #[test]
+    fn caret_text_editing_supports_navigation_word_delete_paste_and_secret_guard() {
+        let key_ev = |key: &str, key_char: Option<&str>, ctrl: bool| KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers {
+                    control: ctrl,
+                    ..Modifiers::default()
+                },
+                key: key.to_owned(),
+                key_char: key_char.map(str::to_owned),
+            },
+            is_held: false,
+            prefer_character_input: key_char.is_some(),
+        };
+
+        let mut buf = "hello world".to_owned();
+        let mut cursor = buf.len();
+        let mut selected_all = false;
+
+        // Home -> insert at start -> Right -> Delete -> End
+        let r_home = apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("home", None, false),
+            None,
+        );
+        assert!(r_home.handled && !r_home.text_changed);
+        assert_eq!(cursor, 0);
+
+        apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("v", None, true),
+            Some("hi ".to_owned()),
+        );
+        assert_eq!(buf, "hi hello world");
+        assert_eq!(cursor, 3);
+        assert_eq!(
+            format_text_with_caret(&buf, cursor, selected_all, true),
+            "hi |hello world"
+        );
+
+        // Delete forward removes 'h'
+        apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("delete", None, false),
+            None,
+        );
+        assert_eq!(buf, "hi ello world");
+
+        // Left + Backspace removes ' '
+        apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("left", None, false),
+            None,
+        );
+        assert_eq!(cursor, 2);
+        apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("backspace", None, false),
+            None,
+        );
+        assert_eq!(buf, "h ello world");
+        assert_eq!(cursor, 1);
+
+        // End + Ctrl+Backspace deletes last word
+        apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("end", None, false),
+            None,
+        );
+        assert_eq!(cursor, buf.len());
+        apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("backspace", None, true),
+            None,
+        );
+        assert_eq!(buf, "h ello ");
+
+        // Ctrl+A + Ctrl+C on non-secret copies; on secret does not copy
+        apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("a", None, true),
+            None,
+        );
+        assert!(selected_all);
+        assert_eq!(
+            format_text_with_caret(&buf, cursor, selected_all, true),
+            "[h ello ]"
+        );
+        let copy_public = apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("c", None, true),
+            None,
+        );
+        assert_eq!(copy_public.copied_text.as_deref(), Some("h ello "));
+
+        let copy_secret = apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            true,
+            &key_ev("c", None, true),
+            None,
+        );
+        assert_eq!(copy_secret.copied_text, None);
+        let cut_secret = apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            true,
+            &key_ev("x", None, true),
+            None,
+        );
+        assert_eq!(cut_secret.copied_text, None);
+        assert_eq!(buf, "h ello ");
+
+        let cut_public = apply_key_to_text_buffer_with_cursor(
+            &mut buf,
+            &mut cursor,
+            &mut selected_all,
+            false,
+            &key_ev("x", None, true),
+            None,
+        );
+        assert_eq!(cut_public.copied_text.as_deref(), Some("h ello "));
+        assert!(buf.is_empty());
+        assert!(FocusedInput::AuthPassword.is_secret());
+        assert!(FocusedInput::RealDebridApiKey.is_secret());
+        assert!(!FocusedInput::FullSearchInput.is_secret());
+    }
+
+    #[test]
+    fn route_field_filtering_and_2d_kb_focus_and_error_formatting_work() {
+        use stremio_core_runtime::stremio_core::models::ctx::OtherError;
+
+        let home = AppRoute::Tab(SidebarTab::Home);
+        assert!(!route_affected_by_fields(
+            &home,
+            false,
+            false,
+            &[DesktopModelField::Library]
+        ));
+        assert!(route_affected_by_fields(
+            &home,
+            false,
+            false,
+            &[DesktopModelField::Board]
+        ));
+        assert!(route_affected_by_fields(
+            &AppRoute::Player,
+            true,
+            false,
+            &[DesktopModelField::Search]
+        ));
+        assert!(!route_affected_by_fields(
+            &AppRoute::Player,
+            false,
+            false,
+            &[DesktopModelField::Player]
+        ));
+        assert!(route_affected_by_fields(
+            &AppRoute::Player,
+            false,
+            true,
+            &[DesktopModelField::Player]
+        ));
+
+        let cards = vec![
+            KbFocusableCard {
+                route: home.clone(),
+                row: 0,
+                col: 0,
+            },
+            KbFocusableCard {
+                route: home.clone(),
+                row: 0,
+                col: 1,
+            },
+            KbFocusableCard {
+                route: home.clone(),
+                row: 1,
+                col: 0,
+            },
+            KbFocusableCard {
+                route: home,
+                row: 1,
+                col: 1,
+            },
+        ];
+        assert_eq!(step_kb_focus_2d(&cards, None, 0, 1), Some(0));
+        assert_eq!(step_kb_focus_2d(&cards, Some(0), 0, 1), Some(1));
+        assert_eq!(step_kb_focus_2d(&cards, Some(1), 1, 0), Some(3));
+        assert_eq!(step_kb_focus_2d(&cards, Some(3), 0, -1), Some(2));
+        assert_eq!(step_kb_focus_2d(&cards, Some(2), -1, 0), Some(0));
+
+        let (title, detail) = format_core_error_message(
+            &CtxError::Other(OtherError::UserNotLoggedIn),
+            &CoreEvent::LibraryItemsPushedToAPI { ids: vec![] },
+        );
+        assert_eq!(title, "Library sync notice");
+        assert_eq!(detail.as_deref(), Some("User is not logged in"));
+
+        let legacy_prefs: AppPreferences = serde_json::from_str("{}").unwrap();
+        assert!(legacy_prefs.pinned_board_shelves.is_empty());
+        assert!(legacy_prefs.hidden_board_shelves.is_empty());
     }
 }

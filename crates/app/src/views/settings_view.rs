@@ -2,7 +2,7 @@ use gpui::{
     deferred, div, prelude::*, px, rgb, rgba, AnyElement, ClipboardItem, Context, FontWeight,
     MouseButton, SharedString,
 };
-use stremio_core_runtime::format_bytes;
+use stremio_core_runtime::{format_bytes, DEFAULT_PROWLARR_TIMEOUT_MS};
 
 use crate::{
     icons::{svg_icon, IconName},
@@ -13,11 +13,16 @@ use crate::{
         ToastKind, ToneMappingChoice, UpscaleChoice,
     },
     theme::{
-        editorial_serif, glass_capsule_shadow, keycap, mono_font, neutral_chip,
-        semantic_status_pill, ui_sans, ACCENT, ACCENT_HOVER, ACCENT_ROSE, ACCENT_SOFT, BG_ELEVATED,
-        BG_INPUT, BG_OBSIDIAN, BG_POPOVER_GLASS, BG_SURFACE, BG_SURFACE_3, BORDER_POSTER_HOVER,
-        BORDER_SOFT, BORDER_STRONG, BORDER_SUBTLE, STATUS_WATCHED, STATUS_WATCHING, TEXT_MUTED,
-        TEXT_PRIMARY, TEXT_SECONDARY,
+        editorial_serif, keycap, mono_font, neutral_chip, semantic_status_pill, ui_sans, ACCENT,
+        ACCENT_HOVER, ACCENT_ROSE, ACCENT_SOFT, BG_ELEVATED, BG_INPUT, BG_OBSIDIAN, BG_SURFACE,
+        BG_SURFACE_3, BORDER_ACCENT, BORDER_POSTER_HOVER, BORDER_SOFT, BORDER_STRONG,
+        BORDER_SUBTLE, GLASS_BORDER, GLASS_BORDER_STRONG, GLASS_ROW_HOVER_BG, GLASS_TROUGH_BG,
+        RADIUS_CONTROL, RADIUS_PILL, STATUS_WATCHED, STATUS_WATCHING, TEXT_MUTED, TEXT_PRIMARY,
+        TEXT_SECONDARY,
+    },
+    ui_components::{
+        glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar, glass_segmented_item,
+        glass_stepper, glass_switch,
     },
     updater::{self, UpdateStatus, CURRENT_APP_VERSION},
 };
@@ -1542,10 +1547,14 @@ impl AppShell {
                     render_stepper(
                         "stepper-sub-delay",
                         value_label,
-                        delay <= -5000,
-                        delay >= 5000,
                         cx.listener(|this, _, _, cx| {
                             this.step_default_subtitle_delay(-100, cx);
+                        }),
+                        cx.listener(|this, _, _, cx| {
+                            let cur = this.preferences.default_subtitle_delay_ms;
+                            if cur != 0 {
+                                this.step_default_subtitle_delay(-cur, cx);
+                            }
                         }),
                         cx.listener(|this, _, _, cx| {
                             this.step_default_subtitle_delay(100, cx);
@@ -1908,10 +1917,15 @@ impl AppShell {
                         .child(render_stepper(
                             "stepper-prowlarr-timeout",
                             format!("{} ms", self.prowlarr_timeout_ms),
-                            self.prowlarr_timeout_ms <= 1000,
-                            self.prowlarr_timeout_ms >= 15000,
                             cx.listener(|this, _, _, cx| {
                                 this.step_prowlarr_timeout(-500, cx);
+                            }),
+                            cx.listener(|this, _, _, cx| {
+                                let delta = DEFAULT_PROWLARR_TIMEOUT_MS as i64
+                                    - this.prowlarr_timeout_ms as i64;
+                                if delta != 0 {
+                                    this.step_prowlarr_timeout(delta, cx);
+                                }
                             }),
                             cx.listener(|this, _, _, cx| {
                                 this.step_prowlarr_timeout(500, cx);
@@ -2605,137 +2619,22 @@ where
     L: Into<SharedString>,
     F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 {
-    div()
-        .p(px(3.0))
-        .rounded(px(8.0))
-        .bg(rgb(BG_SURFACE))
-        .border_1()
-        .border_color(rgba(BORDER_SUBTLE))
-        .flex()
-        .items_center()
-        .gap(px(2.0))
-        .children(options.into_iter().enumerate().map(|(idx, (label, active, on_click))| {
-            div()
-                .id((id_prefix, idx))
-                .cursor_pointer()
-                .h(px(28.0))
-                .px(px(10.0))
-                .rounded(px(6.0))
-                .bg(if active {
-                    rgba(ACCENT_SOFT)
-                } else {
-                    rgba(0x00000000)
-                })
-                .border_1()
-                .border_color(if active {
-                    rgba(0xff5e3a55)
-                } else {
-                    rgba(0x00000000)
-                })
-                .hover(|s| {
-                    if active {
-                        s
-                    } else {
-                        s.bg(rgb(BG_ELEVATED))
-                    }
-                })
-                .flex()
-                .items_center()
-                .font(ui_sans(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                }))
-                .text_size(px(12.0))
-                .text_color(if active {
-                    rgb(ACCENT)
-                } else {
-                    rgb(TEXT_SECONDARY)
-                })
-                .on_mouse_down(MouseButton::Left, on_click)
-                .child(label.into())
-        }))
+    let bar_id = SharedString::from(format!("{id_prefix}-bar"));
+    glass_segmented_bar(bar_id).children(options.into_iter().enumerate().map(
+        |(idx, (label, active, on_click))| {
+            glass_segmented_item((id_prefix, idx), label, active, on_click)
+        },
+    ))
 }
 
 fn render_stepper(
     id_prefix: &'static str,
     value_label: impl Into<SharedString>,
-    at_min: bool,
-    at_max: bool,
     on_dec: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    on_reset: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     on_inc: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
-    let dec_id = SharedString::from(format!("{id_prefix}-dec"));
-    let inc_id = SharedString::from(format!("{id_prefix}-inc"));
-
-    div()
-        .h(px(34.0))
-        .px(px(4.0))
-        .rounded(px(8.0))
-        .bg(rgb(BG_SURFACE))
-        .border_1()
-        .border_color(rgba(BORDER_SUBTLE))
-        .flex()
-        .items_center()
-        .gap(px(4.0))
-        .child(
-            div()
-                .id(dec_id)
-                .cursor_pointer()
-                .w(px(26.0))
-                .h(px(26.0))
-                .rounded(px(6.0))
-                .bg(rgb(BG_ELEVATED))
-                .hover(|s| s.bg(rgb(BG_SURFACE_3)))
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, on_dec)
-                .child(svg_icon(
-                    IconName::Minus,
-                    12.0,
-                    if at_min {
-                        rgb(TEXT_MUTED)
-                    } else {
-                        rgb(TEXT_PRIMARY)
-                    },
-                )),
-        )
-        .child(
-            div()
-                .min_w(px(74.0))
-                .px(px(6.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .font(mono_font())
-                .text_xs()
-                .text_color(rgb(TEXT_PRIMARY))
-                .child(value_label.into()),
-        )
-        .child(
-            div()
-                .id(inc_id)
-                .cursor_pointer()
-                .w(px(26.0))
-                .h(px(26.0))
-                .rounded(px(6.0))
-                .bg(rgb(BG_ELEVATED))
-                .hover(|s| s.bg(rgb(BG_SURFACE_3)))
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(MouseButton::Left, on_inc)
-                .child(svg_icon(
-                    IconName::Plus,
-                    12.0,
-                    if at_max {
-                        rgb(TEXT_MUTED)
-                    } else {
-                        rgb(TEXT_PRIMARY)
-                    },
-                )),
-        )
+    glass_stepper(id_prefix, value_label, on_dec, on_reset, on_inc)
 }
 
 fn render_settings_dropdown<L, F>(
@@ -2761,15 +2660,21 @@ where
                 .h(px(34.0))
                 .min_w(px(190.0))
                 .px(px(12.0))
-                .rounded(px(8.0))
-                .bg(rgb(BG_SURFACE))
+                .rounded(px(RADIUS_CONTROL))
+                .bg(rgba(GLASS_TROUGH_BG))
                 .border_1()
                 .border_color(if open {
                     rgb(ACCENT)
                 } else {
-                    rgba(BORDER_SUBTLE)
+                    rgba(GLASS_BORDER)
                 })
-                .hover(|s| s.border_color(rgba(BORDER_STRONG)))
+                .hover(|s| {
+                    s.bg(rgba(GLASS_ROW_HOVER_BG)).border_color(if open {
+                        rgb(ACCENT)
+                    } else {
+                        rgba(GLASS_BORDER_STRONG)
+                    })
+                })
                 .flex()
                 .items_center()
                 .justify_between()
@@ -2787,80 +2692,23 @@ where
         .when(open, |wrap| {
             wrap.child(
                 deferred(
-                    div()
-                        .id(menu_id)
-                        .occlude()
+                    glass_dropdown_panel(menu_id, 230.0)
                         .absolute()
                         .top(px(38.0))
                         .right_0()
-                        .w(px(230.0))
                         .max_h(px(280.0))
                         .overflow_y_scroll()
-                        .p(px(5.0))
-                        .rounded(px(8.0))
-                        .bg(rgba(BG_POPOVER_GLASS))
-                        .border_1()
-                        .border_color(rgba(BORDER_SUBTLE))
-                        .shadow(glass_capsule_shadow())
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .children(items.into_iter().enumerate().map(
-                                    |(idx, (label, selected, on_select))| {
-                                        div()
-                                            .id((id_prefix, idx))
-                                            .cursor_pointer()
-                                            .px(px(10.0))
-                                            .py(px(7.0))
-                                            .rounded(px(6.0))
-                                            .bg(if selected {
-                                                rgba(ACCENT_SOFT)
-                                            } else {
-                                                rgba(0x00000000)
-                                            })
-                                            .hover(|s| {
-                                                if selected {
-                                                    s
-                                                } else {
-                                                    s.bg(rgb(BG_ELEVATED))
-                                                }
-                                            })
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(8.0))
-                                            .on_mouse_down(MouseButton::Left, on_select)
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font(ui_sans(if selected {
-                                                        FontWeight::SEMIBOLD
-                                                    } else {
-                                                        FontWeight::NORMAL
-                                                    }))
-                                                    .text_color(if selected {
-                                                        rgb(ACCENT)
-                                                    } else {
-                                                        rgb(TEXT_PRIMARY)
-                                                    })
-                                                    .child(label.into()),
-                                            )
-                                            .when(selected, |el| {
-                                                el.child(svg_icon(
-                                                    IconName::Check,
-                                                    12.0,
-                                                    rgb(ACCENT),
-                                                ))
-                                            })
-                                    },
-                                )),
-                        ),
+                        .children(items.into_iter().enumerate().map(
+                            |(idx, (label, selected, on_select))| {
+                                glass_dropdown_option(
+                                    (id_prefix, idx),
+                                    label,
+                                    None,
+                                    selected,
+                                    on_select,
+                                )
+                            },
+                        )),
                 )
                 .with_priority(2),
             )
@@ -2925,23 +2773,28 @@ pub(crate) fn render_choice_pill(
         .cursor_pointer()
         .h(px(32.0))
         .px(px(13.0))
-        .rounded(px(999.0))
+        .rounded(px(RADIUS_PILL))
         .bg(if active {
             rgba(ACCENT_SOFT)
         } else {
-            rgb(BG_ELEVATED)
+            rgba(GLASS_TROUGH_BG)
         })
         .border_1()
         .border_color(if active {
-            rgb(ACCENT)
+            rgba(BORDER_ACCENT)
         } else {
-            rgba(BORDER_SUBTLE)
+            rgba(GLASS_BORDER)
         })
         .hover(|s| {
-            s.border_color(if active {
+            s.bg(if active {
+                rgba(ACCENT_SOFT)
+            } else {
+                rgba(GLASS_ROW_HOVER_BG)
+            })
+            .border_color(if active {
                 rgb(ACCENT)
             } else {
-                rgba(BORDER_STRONG)
+                rgba(GLASS_BORDER_STRONG)
             })
         })
         .flex()
@@ -2962,33 +2815,7 @@ pub(crate) fn render_movietracker_switch(
     enabled: bool,
     on_click: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .id(id)
-        .cursor_pointer()
-        .w(px(40.0))
-        .h(px(22.0))
-        .p(px(3.0))
-        .rounded(px(999.0))
-        .bg(if enabled {
-            rgb(ACCENT)
-        } else {
-            rgb(BG_SURFACE_3)
-        })
-        .flex()
-        .items_center()
-        .when(enabled, |el| el.justify_end())
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(
-            div()
-                .w(px(16.0))
-                .h(px(16.0))
-                .rounded(px(999.0))
-                .bg(if enabled {
-                    rgb(BG_OBSIDIAN)
-                } else {
-                    rgb(TEXT_PRIMARY)
-                }),
-        )
+    glass_switch(id, enabled, on_click)
 }
 
 #[cfg(test)]

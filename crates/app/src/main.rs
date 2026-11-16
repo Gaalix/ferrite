@@ -9,7 +9,7 @@ use ferrite::{
     shell::AppShell,
     state::{
         default_library_selected, extract_cli_addon_arg, start_stream_engine_with_fallback,
-        AppPreferences, BootServices,
+        AppPreferences, BootServices, DeferredStreamEngine,
     },
 };
 use gpui::{
@@ -30,30 +30,39 @@ fn main() -> anyhow::Result<()> {
 
     let preferences = AppPreferences::load_or_default();
 
-    let engine = runtime.block_on(start_stream_engine_with_fallback(&preferences))?;
+    let engine = DeferredStreamEngine::default();
     let streaming_url = engine.base_url();
 
     let env_config = EnvConfig::default()
-        .with_streaming_server_url(streaming_url.clone())
+        .with_streaming_server_url(streaming_url)
         .with_runtime_handle(rt_handle.clone());
     let core = runtime.block_on(CoreController::boot(env_config))?;
 
-    if !core.sync_loopback_streaming_server_url(streaming_url) {
-        core.reload_streaming_server();
-    }
     core.load_board();
     core.load_library(default_library_selected());
     core.load_installed_addons(None);
+    core.pull_notifications();
+
+    let (engine_tx, engine_rx) = async_channel::bounded(1);
+    let prefs_for_engine = preferences.clone();
+    rt_handle.spawn(async move {
+        let res = start_stream_engine_with_fallback(&prefs_for_engine)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = engine_tx.send(res).await;
+    });
 
     let poster_cache = PosterCache::with_default_dir(rt_handle.clone());
     let mpv = None;
     let initial_snapshot = PlayerSnapshot::default();
 
     let engine_for_shutdown = engine.clone();
+    let engine_rx_for_shutdown = engine_rx.clone();
     let boot_services = BootServices {
         tokio_handle: rt_handle,
         core,
         engine,
+        engine_ready_rx: Some(engine_rx),
         poster_cache,
         preferences,
         mpv,
@@ -105,6 +114,11 @@ fn main() -> anyhow::Result<()> {
             cx.activate(true);
         });
 
-    runtime.block_on(engine_for_shutdown.shutdown());
+    runtime.block_on(async {
+        if let Ok(Ok(handle)) = engine_rx_for_shutdown.try_recv() {
+            engine_for_shutdown.attach(handle);
+        }
+        engine_for_shutdown.shutdown().await;
+    });
     Ok(())
 }

@@ -1,5 +1,6 @@
 use std::{
     any::TypeId,
+    collections::HashMap,
     ffi::OsString,
     future::Future,
     panic::AssertUnwindSafe,
@@ -10,7 +11,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use futures::{future, try_join, FutureExt};
+use futures::{future, FutureExt};
 use http::{Method, Request};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -399,6 +400,34 @@ impl SqliteStorage {
         .map_err(|err| EnvError::StorageReadError(err.to_string()))
     }
 
+    pub fn get_raw_many(&self, keys: &[&str]) -> Result<HashMap<String, String>, EnvError> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| EnvError::StorageReadError("SQLite mutex poisoned".to_owned()))?;
+        let placeholders = vec!["?"; keys.len()].join(", ");
+        let sql = format!("SELECT key, value FROM kv_storage WHERE key IN ({placeholders})");
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|err| EnvError::StorageReadError(err.to_string()))?;
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params_vec.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| EnvError::StorageReadError(err.to_string()))?;
+        let mut out = HashMap::with_capacity(keys.len());
+        for row_res in rows {
+            let (k, v) = row_res.map_err(|err| EnvError::StorageReadError(err.to_string()))?;
+            out.insert(k, v);
+        }
+        Ok(out)
+    }
+
     pub fn set_raw(&self, key: &str, value: Option<&str>) -> Result<(), EnvError> {
         let conn = self
             .conn
@@ -422,7 +451,6 @@ impl SqliteStorage {
                     .map_err(|err| EnvError::StorageWriteError(err.to_string()))?;
             }
         }
-        tighten_sqlite_file_permissions(&self.path);
         Ok(())
     }
 
@@ -479,7 +507,6 @@ impl SqliteStorage {
         )
         .map_err(|err| EnvError::StorageWriteError(err.to_string()))?;
 
-        tighten_sqlite_file_permissions(&self.path);
         Ok(output)
     }
 
@@ -553,7 +580,6 @@ impl SqliteStorage {
         )
         .map_err(|err| EnvError::StorageWriteError(err.to_string()))?;
 
-        tighten_sqlite_file_permissions(&self.path);
         Ok(())
     }
 
@@ -768,9 +794,6 @@ impl SqliteStorage {
              )",
             [],
         );
-        if self.path != Path::new(":memory:") {
-            tighten_sqlite_file_permissions(&self.path);
-        }
         Ok(())
     }
 
@@ -1008,6 +1031,7 @@ impl DesktopEnv {
         let env = current_env_arc()?;
         Self::migrate_storage_schema().await?;
 
+        let storage = env.storage.clone();
         let (
             stored_profile,
             recent_library,
@@ -1017,16 +1041,38 @@ impl DesktopEnv {
             notifications_bucket,
             search_history_bucket,
             dismissed_events_bucket,
-        ) = try_join!(
-            Self::get_storage::<Profile>(PROFILE_STORAGE_KEY),
-            Self::get_storage::<LibraryBucket>(LIBRARY_RECENT_STORAGE_KEY),
-            Self::get_storage::<LibraryBucket>(LIBRARY_STORAGE_KEY),
-            Self::get_storage::<StreamsBucket>(STREAMS_STORAGE_KEY),
-            Self::get_storage::<ServerUrlsBucket>(STREAMING_SERVER_URLS_STORAGE_KEY),
-            Self::get_storage::<NotificationsBucket>(NOTIFICATIONS_STORAGE_KEY),
-            Self::get_storage::<SearchHistoryBucket>(SEARCH_HISTORY_STORAGE_KEY),
-            Self::get_storage::<DismissedEventsBucket>(DISMISSED_EVENTS_STORAGE_KEY),
-        )?;
+        ) = env
+            .handle
+            .spawn_blocking(move || -> Result<_, EnvError> {
+                let raw_map = storage.get_raw_many(&[
+                    PROFILE_STORAGE_KEY,
+                    LIBRARY_RECENT_STORAGE_KEY,
+                    LIBRARY_STORAGE_KEY,
+                    STREAMS_STORAGE_KEY,
+                    STREAMING_SERVER_URLS_STORAGE_KEY,
+                    NOTIFICATIONS_STORAGE_KEY,
+                    SEARCH_HISTORY_STORAGE_KEY,
+                    DISMISSED_EVENTS_STORAGE_KEY,
+                ])?;
+                Ok((
+                    parse_bucket_json::<Profile>(&raw_map, PROFILE_STORAGE_KEY)?,
+                    parse_bucket_json::<LibraryBucket>(&raw_map, LIBRARY_RECENT_STORAGE_KEY)?,
+                    parse_bucket_json::<LibraryBucket>(&raw_map, LIBRARY_STORAGE_KEY)?,
+                    parse_bucket_json::<StreamsBucket>(&raw_map, STREAMS_STORAGE_KEY)?,
+                    parse_bucket_json::<ServerUrlsBucket>(
+                        &raw_map,
+                        STREAMING_SERVER_URLS_STORAGE_KEY,
+                    )?,
+                    parse_bucket_json::<NotificationsBucket>(&raw_map, NOTIFICATIONS_STORAGE_KEY)?,
+                    parse_bucket_json::<SearchHistoryBucket>(&raw_map, SEARCH_HISTORY_STORAGE_KEY)?,
+                    parse_bucket_json::<DismissedEventsBucket>(
+                        &raw_map,
+                        DISMISSED_EVENTS_STORAGE_KEY,
+                    )?,
+                ))
+            })
+            .await
+            .map_err(|err| EnvError::StorageReadError(format!("Blocking task failed: {err}")))??;
 
         let profile_was_empty = stored_profile.is_none();
         let mut profile = stored_profile.unwrap_or_default();
@@ -1075,6 +1121,18 @@ impl DesktopEnv {
             search_history,
             dismissed_events,
         })
+    }
+}
+
+fn parse_bucket_json<T: for<'de> Deserialize<'de>>(
+    raw_map: &HashMap<String, String>,
+    key: &str,
+) -> Result<Option<T>, EnvError> {
+    match raw_map.get(key) {
+        Some(json_str) => serde_json::from_str::<T>(json_str)
+            .map(Some)
+            .map_err(EnvError::from),
+        None => Ok(None),
     }
 }
 
