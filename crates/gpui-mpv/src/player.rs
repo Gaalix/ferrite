@@ -1827,8 +1827,9 @@ impl MpvController {
                 .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            guard.last_handles = Some(handles);
-            let underlay = guard
+            let state = &mut *guard;
+            state.last_handles = Some(handles);
+            let underlay = state
                 .underlay
                 .get_or_insert_with(|| WindowsDCompUnderlay::new(mode));
             if underlay.mode() != mode {
@@ -1852,9 +1853,9 @@ impl MpvController {
                     mode = DCompBackendMode::FlipChildHwndUnderlay;
                     self.inner.dcomp.set_mode(mode);
                     self.inner.dcomp.swapchain_ptr.store(0, Ordering::Release);
-                    guard.last_composition_size = None;
-                    guard.wid_applied = None;
-                    guard.needs_vo_rebind = true;
+                    state.last_composition_size = None;
+                    state.wid_applied = None;
+                    state.needs_vo_rebind = true;
                     underlay.set_mode(mode);
                     underlay.sync(
                         handles,
@@ -1875,13 +1876,13 @@ impl MpvController {
             } else {
                 None
             };
-            let wid_update = child_hwnd.filter(|&h| guard.wid_applied != Some(h));
+            let wid_update = child_hwnd.filter(|&h| state.wid_applied != Some(h));
             if let Some(hwnd_val) = wid_update {
-                guard.wid_applied = Some(hwnd_val);
+                state.wid_applied = Some(hwnd_val);
             }
-            let first_attach = !guard.attached;
-            let vo_rebind = core::mem::replace(&mut guard.needs_vo_rebind, false);
-            guard.attached = true;
+            let first_attach = !state.attached;
+            let vo_rebind = core::mem::replace(&mut state.needs_vo_rebind, false);
+            state.attached = true;
             (wid_update, first_attach, vo_rebind)
         };
 
