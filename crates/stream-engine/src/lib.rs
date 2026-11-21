@@ -6,7 +6,7 @@ pub mod scheduler;
 pub mod storage_mode;
 
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,9 +16,11 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures::StreamExt;
 use librqbit::{
-    api::TorrentIdOrHash, dht::Id20, torrent_from_bytes, AddTorrent, AddTorrentOptions,
-    DhtSessionConfig, ListenerMode, ListenerOptions, ManagedTorrent, PeerConnectionOptions,
-    Session, SessionOptions, SessionPersistenceConfig,
+    api::TorrentIdOrHash,
+    dht::{DhtPersistenceConfig, Id20},
+    torrent_from_bytes, AddTorrent, AddTorrentOptions, ConnectionOptions, DhtSessionConfig,
+    ListenerMode, ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
+    SessionPersistenceConfig,
 };
 use parking_lot::{Mutex, RwLock};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -35,7 +37,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 pub use failover::{
@@ -65,15 +67,60 @@ pub use storage_mode::{
 pub const DEFAULT_BIND_PORT: u16 = 11470;
 pub const SERVER_VERSION: &str = "4.21.1";
 
+pub const DEFAULT_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+pub const DEFAULT_PEER_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_PEER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+pub const DEFAULT_PEER_MAX_REQUEST_WINDOW: usize = 64;
+pub const DEFAULT_TRACKER_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(90);
+pub const DEFAULT_PEER_LIMIT: usize = 128;
+pub const MAX_ADDON_TRACKERS_PER_TORRENT: usize = 20;
+
+pub const DEFAULT_DHT_BOOTSTRAP_ROUTERS: &[&str] = &[
+    "router.bittorrent.com:6881",
+    "router.utorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+    "dht.libtorrent.org:25401",
+    "dht.aelitis.com:6881",
+    "router.silotis.us:6881",
+];
+
 pub const DEFAULT_OPENTRACKERS: &[&str] = &[
+    // Core high-uptime UDP trackers (preserved first for compatibility)
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.stealth.si:80/announce",
     "udp://tracker.torrent.eu.org:451/announce",
     "udp://exodus.desync.com:6969/announce",
     "udp://open.demonii.com:1337/announce",
+    // Additional reliable public UDP trackers for low-peer swarm discovery
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://opentracker.io:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.tiny-vps.com:6969/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://tracker.filemail.com:6969/announce",
+    "udp://p4p.arenabg.com:1337/announce",
+    "udp://bt1.archive.org:6969/announce",
+    "udp://bt2.archive.org:6969/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    // HTTP / HTTPS public trackers (essential fallback when UDP is blocked or throttled)
+    "http://tracker.opentrackr.org:1337/announce",
+    "https://tracker.tamersunion.org:443/announce",
+    "https://tracker.gbitt.info:443/announce",
+    "http://tracker.bt4g.com:2095/announce",
+    "https://tr.burnabyhighstar.com:443/announce",
 ];
 
 pub const CURATED_OPENTRACKERS: &[&str] = DEFAULT_OPENTRACKERS;
+
+pub fn default_peer_connection_opts() -> PeerConnectionOptions {
+    PeerConnectionOptions {
+        connect_timeout: Some(DEFAULT_PEER_CONNECT_TIMEOUT),
+        read_write_timeout: Some(DEFAULT_PEER_READ_WRITE_TIMEOUT),
+        keep_alive_interval: Some(DEFAULT_PEER_KEEP_ALIVE_INTERVAL),
+        max_request_window: Some(DEFAULT_PEER_MAX_REQUEST_WINDOW),
+    }
+}
 
 pub fn redact_url(url: &Url) -> String {
     if let Some(host) = url.host_str() {
@@ -150,10 +197,60 @@ pub(crate) fn is_allowed_tracker_url(raw: &str) -> bool {
     let Ok(parsed) = Url::parse(raw) else {
         return false;
     };
-    matches!(parsed.scheme(), "udp" | "http" | "https" | "ws" | "wss")
+    let scheme_ok = match parsed.scheme() {
+        "udp" => parsed.port().is_some(),
+        "http" | "https" => true,
+        _ => false,
+    };
+    scheme_ok
         && parsed.host_str().is_some_and(|h| !h.is_empty())
         && parsed.username().is_empty()
         && parsed.password().is_none()
+}
+
+pub(crate) fn canonical_tracker_key(raw: &str) -> Option<String> {
+    let parsed = Url::parse(raw).ok()?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default();
+    let path = parsed.path().trim_end_matches('/');
+    Some(match (port, parsed.query()) {
+        (Some(p), Some(q)) => format!("{scheme}://{host}:{p}{path}?{q}"),
+        (Some(p), None) => format!("{scheme}://{host}:{p}{path}"),
+        (None, Some(q)) => format!("{scheme}://{host}{path}?{q}"),
+        (None, None) => format!("{scheme}://{host}{path}"),
+    })
+}
+
+pub(crate) fn merge_tracker_lists(incoming: Vec<String>, curated: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    let mut addon_added = 0usize;
+    for tr in incoming {
+        if addon_added >= MAX_ADDON_TRACKERS_PER_TORRENT {
+            break;
+        }
+        let clean = tr.trim().to_owned();
+        if is_allowed_tracker_url(&clean) {
+            if let Some(key) = canonical_tracker_key(&clean) {
+                if seen.insert(key) {
+                    merged.push(clean);
+                    addon_added += 1;
+                }
+            }
+        }
+    }
+    for extra in curated {
+        let clean = extra.trim().to_owned();
+        if is_allowed_tracker_url(&clean) {
+            if let Some(key) = canonical_tracker_key(&clean) {
+                if seen.insert(key) {
+                    merged.push(clean);
+                }
+            }
+        }
+    }
+    merged
 }
 
 #[cfg(unix)]
@@ -245,7 +342,7 @@ impl Default for StreamEngineConfig {
             enable_upnp: true,
             listen_port: None,
             storage_mode: StorageMode::default(),
-            metadata_timeout: Duration::from_secs(30),
+            metadata_timeout: Duration::from_secs(45),
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             extra_trackers: DEFAULT_OPENTRACKERS
                 .iter()
@@ -393,23 +490,7 @@ impl EngineInner {
     }
 
     pub fn merge_with_curated_trackers(&self, incoming: Vec<String>) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut merged = Vec::new();
-        for tr in incoming {
-            let clean = tr.trim().to_owned();
-            if is_allowed_tracker_url(&clean) && seen.insert(clean.clone()) {
-                merged.push(clean);
-            }
-        }
-        if merged.len() < 5 {
-            for extra in &self.config.extra_trackers {
-                let clean = extra.trim().to_owned();
-                if is_allowed_tracker_url(&clean) && seen.insert(clean.clone()) {
-                    merged.push(clean);
-                }
-            }
-        }
-        merged
+        merge_tracker_lists(incoming, &self.config.extra_trackers)
     }
 
     fn get_or_insert_magnet_entry(
@@ -626,11 +707,9 @@ impl EngineInner {
                             overwrite: true,
                             output_folder: Some(out_folder.to_string_lossy().into_owned()),
                             trackers: Some(trackers.clone()),
-                            peer_opts: Some(PeerConnectionOptions {
-                                connect_timeout: Some(Duration::from_secs(8)),
-                                read_write_timeout: Some(Duration::from_secs(15)),
-                                ..Default::default()
-                            }),
+                            peer_opts: Some(default_peer_connection_opts()),
+                            force_tracker_interval: Some(DEFAULT_TRACKER_REANNOUNCE_INTERVAL),
+                            peer_limit: Some(DEFAULT_PEER_LIMIT),
                             ..Default::default()
                         };
                         if let Ok(resp) = self
@@ -666,11 +745,9 @@ impl EngineInner {
                 overwrite: true,
                 output_folder: Some(out_folder.to_string_lossy().into_owned()),
                 trackers: Some(trackers),
-                peer_opts: Some(PeerConnectionOptions {
-                    connect_timeout: Some(Duration::from_secs(8)),
-                    read_write_timeout: Some(Duration::from_secs(15)),
-                    ..Default::default()
-                }),
+                peer_opts: Some(default_peer_connection_opts()),
+                force_tracker_interval: Some(DEFAULT_TRACKER_REANNOUNCE_INTERVAL),
+                peer_limit: Some(DEFAULT_PEER_LIMIT),
                 ..Default::default()
             };
 
@@ -767,6 +844,9 @@ impl EngineInner {
             overwrite: true,
             output_folder: Some(out_folder.to_string_lossy().into_owned()),
             trackers: Some(merged_trackers.clone()),
+            peer_opts: Some(default_peer_connection_opts()),
+            force_tracker_interval: Some(DEFAULT_TRACKER_REANNOUNCE_INTERVAL),
+            peer_limit: Some(DEFAULT_PEER_LIMIT),
             initial_peers,
             ..Default::default()
         };
@@ -1537,6 +1617,78 @@ fn build_magnet_with_trackers(info_hash: &[u8; 20], trackers: &[String]) -> Stri
     uri
 }
 
+fn build_session_opts(
+    config: &StreamEngineConfig,
+    session_trackers: &HashSet<Url>,
+    session_cancel: CancellationToken,
+    prefer_dualstack: bool,
+) -> SessionOptions {
+    let persistence_cfg = match config.storage_mode {
+        StorageMode::DiskLru { .. } => {
+            let persist_dir = config.cache_dir.join(".rqbit_session");
+            Some(SessionPersistenceConfig::Json {
+                folder: Some(persist_dir),
+            })
+        }
+        StorageMode::RamOnly { .. } => None,
+    };
+
+    let listen_opts = config.enable_peer_listener.then(|| ListenerOptions {
+        mode: ListenerMode::TcpAndUtp,
+        listen_addr: if prefer_dualstack {
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                config.listen_port.unwrap_or(0),
+            )
+        } else {
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                config.listen_port.unwrap_or(0),
+            )
+        },
+        enable_upnp_port_forwarding: config.enable_upnp,
+        ipv4_only: !prefer_dualstack,
+        ..Default::default()
+    });
+
+    let dht_opts = config.enable_dht.then(|| DhtSessionConfig {
+        bootstrap_addrs: Some(
+            DEFAULT_DHT_BOOTSTRAP_ROUTERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        ),
+        port: None,
+        persistence: config.storage_mode.is_disk_lru().then(|| {
+            DhtPersistenceConfig {
+                dump_interval: Some(Duration::from_secs(30)),
+                config_filename: Some(config.cache_dir.join(".rqbit_session").join("dht.json")),
+            }
+        }),
+    });
+
+    SessionOptions {
+        dht: dht_opts,
+        disable_trackers: !config.enable_trackers,
+        disable_local_service_discovery: !config.enable_lsd,
+        fastresume: config.storage_mode.is_disk_lru(),
+        persistence: persistence_cfg,
+        listen: listen_opts,
+        connect: Some(ConnectionOptions {
+            enable_tcp: true,
+            proxy_url: None,
+            peer_opts: Some(default_peer_connection_opts()),
+        }),
+        trackers: session_trackers.clone(),
+        peer_limit: Some(DEFAULT_PEER_LIMIT),
+        runtime_worker_threads: Some(8),
+        concurrent_init_limit: Some(4),
+        ipv4_only: !prefer_dualstack,
+        cancellation_token: Some(session_cancel),
+        ..Default::default()
+    }
+}
+
 pub struct StreamEngine;
 
 impl StreamEngine {
@@ -1545,23 +1697,14 @@ impl StreamEngine {
         let session_root = match config.storage_mode {
             StorageMode::DiskLru { .. } => {
                 ensure_dir_0700(&config.cache_dir).await?;
+                let persist_dir = config.cache_dir.join(".rqbit_session");
+                ensure_dir_0700(&persist_dir).await?;
                 config.cache_dir.clone()
             }
             StorageMode::RamOnly { .. } => {
                 ensure_dir_0700(&ram_cache_dir).await?;
                 ram_cache_dir.clone()
             }
-        };
-
-        let persistence_cfg = match config.storage_mode {
-            StorageMode::DiskLru { .. } => {
-                let persist_dir = config.cache_dir.join(".rqbit_session");
-                ensure_dir_0700(&persist_dir).await?;
-                Some(SessionPersistenceConfig::Json {
-                    folder: Some(persist_dir),
-                })
-            }
-            StorageMode::RamOnly { .. } => None,
         };
 
         let shutdown_token = CancellationToken::new();
@@ -1575,41 +1718,30 @@ impl StreamEngine {
             }
         }
 
-        let listen_opts = config.enable_peer_listener.then(|| ListenerOptions {
-            mode: ListenerMode::TcpAndUtp,
-            listen_addr: SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                config.listen_port.unwrap_or(0),
-            ),
-            enable_upnp_port_forwarding: config.enable_upnp,
-            ipv4_only: true,
-            ..Default::default()
-        });
-
-        let dht_opts = config.enable_dht.then_some(DhtSessionConfig {
-            bootstrap_addrs: None,
-            port: None,
-            persistence: None,
-        });
-
-        let session_opts = SessionOptions {
-            dht: dht_opts,
-            disable_trackers: !config.enable_trackers,
-            disable_local_service_discovery: !config.enable_lsd,
-            fastresume: config.storage_mode.is_disk_lru(),
-            persistence: persistence_cfg,
-            listen: listen_opts,
-            trackers: session_trackers,
-            peer_limit: Some(55),
-            runtime_worker_threads: Some(8),
-            concurrent_init_limit: Some(4),
-            cancellation_token: Some(shutdown_token.child_token()),
-            ..Default::default()
+        let dualstack_token = shutdown_token.child_token();
+        let dualstack_opts =
+            build_session_opts(&config, &session_trackers, dualstack_token.clone(), true);
+        let session = match Session::new_with_opts(session_root.clone(), dualstack_opts).await {
+            Ok(session) => session,
+            Err(dualstack_err) => {
+                dualstack_token.cancel();
+                warn!(
+                    error = %format!("{dualstack_err:#}"),
+                    "dual-stack IPv6+IPv4 librqbit session startup failed; retrying IPv4-only"
+                );
+                let v4_opts = build_session_opts(
+                    &config,
+                    &session_trackers,
+                    shutdown_token.child_token(),
+                    false,
+                );
+                Session::new_with_opts(session_root.clone(), v4_opts)
+                    .await
+                    .map_err(|e| {
+                        StreamEngineError::Torrent(format!("Failed starting librqbit: {e:#}"))
+                    })?
+            }
         };
-
-        let session = Session::new_with_opts(session_root.clone(), session_opts)
-            .await
-            .map_err(|e| StreamEngineError::Torrent(format!("Failed starting librqbit: {e:#}")))?;
 
         let cache_tracker = Arc::new(CacheStateTracker::new(
             config.storage_mode,
@@ -1683,7 +1815,7 @@ impl StreamEngine {
             transcode_profile: None,
             cache_size: reported_cache_size,
             proxy_streams_enabled: false,
-            bt_max_connections: 55,
+            bt_max_connections: DEFAULT_PEER_LIMIT as u64,
             bt_handshake_timeout: 20_000,
             bt_request_timeout: 4_000,
             bt_download_speed_soft_limit: 2_621_440.0,
@@ -2138,5 +2270,132 @@ impl StreamEngineHandle {
 
     pub async fn shutdown(self) {
         self.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_peer_tracker_validation_and_merging_always_includes_curated_udp_and_http() {
+        assert!(DEFAULT_OPENTRACKERS.len() >= 15);
+        assert!(DEFAULT_OPENTRACKERS.iter().any(|t| t.starts_with("udp://")));
+        assert!(DEFAULT_OPENTRACKERS
+            .iter()
+            .any(|t| t.starts_with("http://") || t.starts_with("https://")));
+
+        let mut canonical_defaults = HashSet::new();
+        for tr in DEFAULT_OPENTRACKERS {
+            assert!(
+                is_allowed_tracker_url(tr),
+                "curated tracker must be valid: {tr}"
+            );
+            let key = canonical_tracker_key(tr).expect("canonical key");
+            assert!(
+                canonical_defaults.insert(key),
+                "duplicate curated tracker: {tr}"
+            );
+        }
+
+        // Reject unsupported WebTorrent WS/WSS and portless UDP trackers.
+        assert!(!is_allowed_tracker_url("wss://tracker.openwebtorrent.com"));
+        assert!(!is_allowed_tracker_url("ws://tracker.example.org:8080"));
+        assert!(!is_allowed_tracker_url("udp://tracker.example.org/announce"));
+        assert!(!is_allowed_tracker_url(
+            "https://user:pass@tracker.example.org/announce"
+        ));
+        assert!(is_allowed_tracker_url("https://tracker.example.org/announce"));
+
+        // Even when an addon provides 25 trackers (plus wss:// noise), curated trackers
+        // MUST still be merged in and addon count must be capped so curated trackers survive.
+        let curated: Vec<String> = DEFAULT_OPENTRACKERS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let mut incoming: Vec<String> = (0..25)
+            .map(|i| format!("udp://addon-{i}.tracker.example:6969/announce"))
+            .collect();
+        incoming.insert(0, "wss://tracker.openwebtorrent.com".to_owned());
+        incoming.push("udp://TRACKER.OPENTRACKR.ORG:1337/announce/".to_owned());
+
+        let merged = merge_tracker_lists(incoming, &curated);
+        assert!(
+            !merged.iter().any(|t| t.starts_with("wss://")),
+            "wss trackers must be filtered out"
+        );
+        for tr in DEFAULT_OPENTRACKERS {
+            let key = canonical_tracker_key(tr).unwrap();
+            assert!(
+                merged
+                    .iter()
+                    .any(|m| canonical_tracker_key(m).as_deref() == Some(key.as_str())),
+                "curated tracker {tr} must always be merged regardless of addon tracker count"
+            );
+        }
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|t| t.contains("addon-"))
+                .count(),
+            MAX_ADDON_TRACKERS_PER_TORRENT
+        );
+    }
+
+    #[test]
+    fn low_peer_connection_dht_and_session_defaults_are_properly_tuned() {
+        // Must survive BitTorrent's standard 30s optimistic unchoke rotation on low-peer swarms.
+        let peer_opts = default_peer_connection_opts();
+        assert!(peer_opts.connect_timeout.unwrap() >= Duration::from_secs(10));
+        assert!(peer_opts.read_write_timeout.unwrap() >= Duration::from_secs(45));
+        assert!(
+            peer_opts.keep_alive_interval.unwrap() < peer_opts.read_write_timeout.unwrap()
+        );
+        assert!(matches!(peer_opts.max_request_window, Some(32..=64)));
+
+        // Mainline DHT bootstrap set must include core public routers.
+        assert!(DEFAULT_DHT_BOOTSTRAP_ROUTERS.contains(&"router.bittorrent.com:6881"));
+        assert!(DEFAULT_DHT_BOOTSTRAP_ROUTERS.contains(&"router.utorrent.com:6881"));
+        assert!(DEFAULT_DHT_BOOTSTRAP_ROUTERS.contains(&"dht.transmissionbt.com:6881"));
+        assert!(DEFAULT_DHT_BOOTSTRAP_ROUTERS.contains(&"dht.aelitis.com:6881"));
+
+        let disk_cfg = StreamEngineConfig::default();
+        assert!(disk_cfg.enable_dht);
+        assert!(disk_cfg.enable_trackers);
+        assert!(disk_cfg.enable_lsd);
+        assert!(disk_cfg.metadata_timeout >= Duration::from_secs(45));
+        assert!(disk_cfg.first_byte_timeout >= Duration::from_secs(15));
+
+        let trackers = HashSet::new();
+        let disk_opts =
+            build_session_opts(&disk_cfg, &trackers, CancellationToken::new(), true);
+        assert!(!disk_opts.ipv4_only);
+        assert_eq!(disk_opts.peer_limit, Some(DEFAULT_PEER_LIMIT));
+        assert!(disk_opts
+            .connect
+            .as_ref()
+            .and_then(|c| c.peer_opts)
+            .is_some());
+        let dht_cfg = disk_opts.dht.expect("DHT enabled by default");
+        assert_eq!(
+            dht_cfg.bootstrap_addrs.as_ref().map(Vec::len),
+            Some(DEFAULT_DHT_BOOTSTRAP_ROUTERS.len())
+        );
+        assert!(
+            dht_cfg.persistence.is_some(),
+            "DiskLru mode must persist DHT routing table for warm startup"
+        );
+
+        let ram_cfg = StreamEngineConfig {
+            storage_mode: StorageMode::default_ram_only(),
+            ..StreamEngineConfig::default()
+        };
+        let ram_opts =
+            build_session_opts(&ram_cfg, &trackers, CancellationToken::new(), false);
+        assert!(ram_opts.ipv4_only);
+        assert!(
+            ram_opts.dht.expect("DHT enabled").persistence.is_none(),
+            "RamOnly mode must not persist DHT state to disk"
+        );
     }
 }

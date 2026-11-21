@@ -148,6 +148,22 @@ pub struct UnifiedEditorialSearch {
     pub elapsed_us: u64,
 }
 
+impl UnifiedEditorialSearch {
+    /// Returns the top deduplicated media hits across both movies and series
+    /// in unified descending relevance and quality order.
+    pub fn ranked_media_hits(&self, limit: usize) -> Vec<EditorialMediaHit> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut combined = Vec::with_capacity(self.movies.len() + self.series.len());
+        combined.extend(self.movies.iter().cloned());
+        combined.extend(self.series.iter().cloned());
+        combined.sort_by(cmp_editorial_hits);
+        combined.truncate(limit);
+        combined
+    }
+}
+
 #[derive(Default)]
 struct HotMetadataCaches {
     search_queries: HashMap<String, (Vec<EditorialMediaHit>, Vec<EditorialPersonHit>)>,
@@ -540,16 +556,34 @@ impl MetadataEngine {
              FROM fts_titles f
              JOIN meta_titles m ON m.canonical_id = f.canonical_id
              WHERE fts_titles MATCH ?1
-             ORDER BY bm25(fts_titles)
-             LIMIT ?2",
+             ORDER BY
+                 CASE
+                     WHEN m.norm_title = ?2 THEN 0
+                     WHEN m.norm_title = ('the ' || ?2) THEN 1
+                     WHEN substr(m.norm_title, 1, length(?2)) = ?2 THEN 2
+                     ELSE 3
+                 END,
+                 bm25(fts_titles, 0.0, 0.0, 10.0, 1.0, 0.5)
+             LIMIT ?3",
         ) {
-            if let Ok(rows) = stmt.query_map(params![match_expr, (limit * 2).max(12) as i64], |r| {
+            let fetch_limit = (limit * 4).max(48) as i64;
+            if let Ok(rows) = stmt.query_map(params![match_expr, &norm_q, fetch_limit], |r| {
                 let genres_raw: String = r.get(11)?;
                 let genres: Vec<String> = serde_json::from_str(&genres_raw).unwrap_or_default();
                 let tmdb_id_raw: Option<i64> = r.get(2)?;
                 let title: String = r.get(4)?;
+                let year: Option<String> = r.get(5)?;
+                let imdb_rating: Option<String> = r.get(6)?;
+                let overview: Option<String> = r.get(7)?;
+                let poster_url: Option<String> = r.get(8)?;
                 let enriched_flag: i64 = r.get(12)?;
                 let base_score = score_title_relevance(&title, &norm_q)
+                    + score_hit_quality(
+                        imdb_rating.as_deref(),
+                        poster_url.is_some(),
+                        year.is_some(),
+                        overview.as_deref().is_some_and(|s| !s.trim().is_empty()),
+                    )
                     + if enriched_flag > 0 { 18 } else { 0 };
                 Ok(EditorialMediaHit {
                     canonical_id: r.get(0)?,
@@ -557,10 +591,10 @@ impl MetadataEngine {
                     tmdb_id: tmdb_id_raw.and_then(|v| u64::try_from(v).ok()),
                     media_type: r.get(3)?,
                     title,
-                    year: r.get(5)?,
-                    imdb_rating: r.get(6)?,
-                    overview: r.get(7)?,
-                    poster_url: r.get(8)?,
+                    year,
+                    imdb_rating,
+                    overview,
+                    poster_url,
                     backdrop_url: r.get(9)?,
                     logo_url: r.get(10)?,
                     genres,
@@ -573,7 +607,7 @@ impl MetadataEngine {
                 }
             }
         }
-        titles.sort_by_key(|a| std::cmp::Reverse(a.score));
+        titles.sort_by(cmp_editorial_hits);
         titles.truncate(limit);
 
         let mut people = Vec::new();
@@ -735,7 +769,28 @@ impl MetadataEngine {
                         .vote_average
                         .filter(|v| *v > 0.1)
                         .map(|v| format!("{v:.1}"));
-                    let score = score_title_relevance(&title, &norm_q) + 22;
+                    let overview = item.overview.filter(|s| !s.trim().is_empty());
+                    let poster_url = tmdb_img_url(&endpoints.image_base, "w342", item.poster_path);
+                    let pop_bonus = item
+                        .popularity
+                        .filter(|p| p.is_finite() && *p > 0.0)
+                        .map(|p| ((p.ln_1p() * 5.0) as i64).min(30))
+                        .unwrap_or(0);
+                    let votes_bonus = match item.vote_count.unwrap_or(0) {
+                        v if v >= 100 => 10,
+                        v if v >= 10 => 5,
+                        _ => 0,
+                    };
+                    let score = score_title_relevance(&title, &norm_q)
+                        + score_hit_quality(
+                            vote.as_deref(),
+                            poster_url.is_some(),
+                            year.is_some(),
+                            overview.is_some(),
+                        )
+                        + pop_bonus
+                        + votes_bonus
+                        + 22;
                     media_hits.push(EditorialMediaHit {
                         canonical_id: format!("tmdb:{}", item.id),
                         imdb_id: None,
@@ -744,8 +799,8 @@ impl MetadataEngine {
                         title,
                         year,
                         imdb_rating: vote,
-                        overview: item.overview.filter(|s| !s.trim().is_empty()),
-                        poster_url: tmdb_img_url(&endpoints.image_base, "w342", item.poster_path),
+                        overview,
+                        poster_url,
                         backdrop_url: tmdb_img_url(
                             &endpoints.image_base,
                             "w780",
@@ -2816,6 +2871,65 @@ pub fn is_v4_bearer_token(key: &str) -> bool {
     k.starts_with("eyJ") || k.contains('.') || k.len() > 64
 }
 
+fn norm_title_matches_all_tokens(norm_t: &str, norm_query: &str) -> bool {
+    let title_words: Vec<&str> = norm_t.split_whitespace().collect();
+    if title_words.is_empty() {
+        return false;
+    }
+    let mut has_token = false;
+    for token in norm_query.split_whitespace() {
+        has_token = true;
+        if !title_words.iter().any(|w| w.starts_with(token)) {
+            return false;
+        }
+    }
+    has_token
+}
+
+pub fn title_matches_query(title: &str, norm_query: &str) -> bool {
+    if norm_query.is_empty() {
+        return false;
+    }
+    let norm_t = normalize_title_for_dedup(title);
+    if norm_t.is_empty() {
+        return false;
+    }
+    norm_t.contains(norm_query) || norm_title_matches_all_tokens(&norm_t, norm_query)
+}
+
+fn parse_rating_tenths(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| (v.clamp(0.0, 10.0) * 10.0).round() as u32)
+        .unwrap_or(0)
+}
+
+pub fn score_hit_quality(
+    imdb_rating: Option<&str>,
+    has_poster: bool,
+    has_year: bool,
+    has_overview: bool,
+) -> i64 {
+    let rating_bonus = (i64::from(parse_rating_tenths(imdb_rating)) * 4) / 10;
+    let poster_bonus = if has_poster { 12 } else { 0 };
+    let year_bonus = if has_year { 4 } else { 0 };
+    let overview_bonus = if has_overview { 4 } else { 0 };
+    rating_bonus + poster_bonus + year_bonus + overview_bonus
+}
+
+pub fn cmp_editorial_hits(a: &EditorialMediaHit, b: &EditorialMediaHit) -> std::cmp::Ordering {
+    b.score
+        .cmp(&a.score)
+        .then_with(|| {
+            parse_rating_tenths(b.imdb_rating.as_deref())
+                .cmp(&parse_rating_tenths(a.imdb_rating.as_deref()))
+        })
+        .then_with(|| b.poster_url.is_some().cmp(&a.poster_url.is_some()))
+        .then_with(|| b.overview.is_some().cmp(&a.overview.is_some()))
+        .then_with(|| a.title.len().cmp(&b.title.len()))
+        .then_with(|| a.canonical_id.cmp(&b.canonical_id))
+}
+
 pub fn score_title_relevance(title: &str, norm_query: &str) -> i64 {
     if norm_query.is_empty() {
         return 10;
@@ -2823,10 +2937,27 @@ pub fn score_title_relevance(title: &str, norm_query: &str) -> i64 {
     let norm_t = normalize_title_for_dedup(title);
     if norm_t == norm_query {
         1_000
+    } else if !norm_query.starts_with("the ")
+        && norm_t
+            .strip_prefix("the ")
+            .is_some_and(|rest| rest == norm_query)
+    {
+        900
     } else if norm_t.starts_with(norm_query) {
         700 - (norm_t.len().saturating_sub(norm_query.len()) as i64).min(150)
+    } else if !norm_query.starts_with("the ")
+        && norm_t
+            .strip_prefix("the ")
+            .is_some_and(|rest| rest.starts_with(norm_query))
+    {
+        660 - (norm_t
+            .len()
+            .saturating_sub(norm_query.len() + 4) as i64)
+            .min(150)
     } else if norm_t.split_whitespace().any(|w| w.starts_with(norm_query)) {
         480
+    } else if norm_query.contains(' ') && norm_title_matches_all_tokens(&norm_t, norm_query) {
+        420
     } else if norm_t.contains(norm_query) {
         320
     } else {
@@ -2855,23 +2986,37 @@ pub fn preview_to_editorial_hit(preview: &MetaItemPreview, norm_query: &str, boo
         .map(|l| l.name.clone())
         .take(4)
         .collect();
+    let year = preview
+        .release_info
+        .as_deref()
+        .and_then(extract_4_digit_year);
+    let overview = preview
+        .description
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+    let poster_url = preview.poster.as_ref().map(Url::to_string);
+    let score = score_title_relevance(&preview.name, norm_query)
+        + score_hit_quality(
+            imdb_rating.as_deref(),
+            poster_url.is_some(),
+            year.is_some(),
+            overview.is_some(),
+        )
+        + boost;
     EditorialMediaHit {
         canonical_id: preview.id.clone(),
         imdb_id,
         tmdb_id,
         media_type: canonical_stremio_type(&preview.r#type).to_owned(),
         title: preview.name.clone(),
-        year: preview
-            .release_info
-            .as_deref()
-            .and_then(extract_4_digit_year),
+        year,
         imdb_rating,
-        overview: preview.description.clone(),
-        poster_url: preview.poster.as_ref().map(Url::to_string),
+        overview,
+        poster_url,
         backdrop_url: preview.background.as_ref().map(Url::to_string),
         logo_url: preview.logo.as_ref().map(Url::to_string),
         genres,
-        score: score_title_relevance(&preview.name, norm_query) + boost,
+        score,
         role_hint: None,
     }
 }
@@ -2884,10 +3029,16 @@ pub fn build_unified_editorial_search(
     people_hits: Vec<EditorialPersonHit>,
     elapsed_us: u64,
 ) -> UnifiedEditorialSearch {
+    const CORROBORATION_STEP: i64 = 20;
+    const MAX_CORROBORATION_BONUS: i64 = 60;
+
     let mut merged: Vec<EditorialMediaHit> = Vec::new();
+    let mut base_scores: Vec<i64> = Vec::new();
+    let mut corroboration_used: Vec<i64> = Vec::new();
     let mut by_imdb: HashMap<String, usize> = HashMap::new();
     let mut by_tmdb: HashMap<(String, u64), usize> = HashMap::new();
     let mut by_norm: HashMap<(String, String, Option<String>), usize> = HashMap::new();
+    let mut by_norm_any_year: HashMap<(String, String), usize> = HashMap::new();
 
     for cand in tmdb_hits
         .into_iter()
@@ -2918,11 +3069,15 @@ pub fn build_unified_editorial_search(
                     .copied()
             })
             .or_else(|| {
-                // Also match an untyped-year entry against one with year for the exact same normalized title
+                // Match an untyped-year entry against one with year (or vice versa)
+                // for the exact same media type + normalized title, without merging two
+                // entries that have genuinely distinct years (e.g. Dune 1984 vs Dune 2021).
                 if year.is_some() {
                     by_norm.get(&(stype.clone(), norm_t.clone(), None)).copied()
                 } else {
-                    None
+                    by_norm_any_year
+                        .get(&(stype.clone(), norm_t.clone()))
+                        .copied()
                 }
             });
 
@@ -2945,6 +3100,7 @@ pub fn build_unified_editorial_search(
             }
             if slot.year.is_none() && year.is_some() {
                 slot.year = year.clone();
+                by_norm.remove(&(stype.clone(), norm_t.clone(), None));
                 by_norm.insert((stype.clone(), norm_t.clone(), year), idx);
             }
             if slot.imdb_rating.is_none() {
@@ -2965,7 +3121,10 @@ pub fn build_unified_editorial_search(
             slot.backdrop_url =
                 pick_preferred_art_url(slot.backdrop_url.take(), cand.backdrop_url);
             slot.poster_url = pick_preferred_art_url(slot.poster_url.take(), cand.poster_url);
-            slot.score = slot.score.max(cand.score) + 25;
+            base_scores[idx] = base_scores[idx].max(cand.score);
+            corroboration_used[idx] =
+                (corroboration_used[idx] + CORROBORATION_STEP).min(MAX_CORROBORATION_BONUS);
+            slot.score = base_scores[idx] + corroboration_used[idx];
         } else {
             let idx = merged.len();
             let mut item = cand;
@@ -2980,12 +3139,17 @@ pub fn build_unified_editorial_search(
             if let Some(tid) = item.tmdb_id {
                 by_tmdb.insert((stype.clone(), tid), idx);
             }
+            by_norm_any_year
+                .entry((stype.clone(), norm_t.clone()))
+                .or_insert(idx);
             by_norm.insert((stype, norm_t, year), idx);
+            base_scores.push(item.score);
+            corroboration_used.push(0);
             merged.push(item);
         }
     }
 
-    merged.sort_by_key(|a| std::cmp::Reverse(a.score));
+    merged.sort_by(cmp_editorial_hits);
 
     let top_match = merged.first().cloned();
     let mut movies = Vec::new();
@@ -3211,6 +3375,10 @@ struct TmdbSearchItem {
     profile_path: Option<String>,
     known_for_department: Option<String>,
     vote_average: Option<f64>,
+    #[serde(default)]
+    vote_count: Option<u64>,
+    #[serde(default)]
+    popularity: Option<f64>,
     known_for: Option<Vec<TmdbKnownForItem>>,
 }
 
@@ -4165,5 +4333,196 @@ mod tests {
         updated.background = Url::parse("https://image.tmdb.org/t/p/w780/new_bg.jpg").ok();
         engine.ingest_stremio_previews(&[updated]);
         assert!(engine.hot.lock().unwrap().search_queries.is_empty());
+    }
+
+    #[test]
+    fn game_of_thrones_series_beats_movie_specials_even_after_fts_flood_and_out_of_order_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = MetadataEngine::open(&dir.path().join("got_ranking.db")).unwrap();
+
+        let make_item = |id: &str,
+                         media_type: &str,
+                         name: &str,
+                         year: Option<&str>,
+                         rating: Option<&str>,
+                         poster: Option<&str>,
+                         desc: Option<&str>| MetaItemPreview {
+            id: id.to_owned(),
+            r#type: media_type.to_owned(),
+            name: name.to_owned(),
+            poster: poster.and_then(|u| Url::parse(u).ok()),
+            background: None,
+            logo: None,
+            description: desc.map(str::to_owned),
+            release_info: year.map(str::to_owned),
+            runtime: None,
+            released: None,
+            poster_shape: PosterShape::Poster,
+            links: rating
+                .map(|r| {
+                    vec![Link {
+                        name: r.to_owned(),
+                        category: IMDB_LINK_CATEGORY.to_owned(),
+                        url: CINEMETA_URL.clone(),
+                    }]
+                })
+                .unwrap_or_default(),
+            trailer_streams: Vec::new(),
+            behavior_hints: MetaItemBehaviorHints::default(),
+        };
+
+        // Flood FTS5 with 20 short-overview Game of Thrones movie specials PLUS the real long-overview Series.
+        let mut previews = vec![
+            make_item("tt10400001", "movie", "Game of Thrones: Aftermath", Some("2019"), None, None, None),
+            make_item("tt10400002", "movie", "Game of Thrones Watchathon", Some("2019"), None, None, None),
+            make_item(
+                "tt10090796",
+                "movie",
+                "Game of Thrones: The Last Watch",
+                Some("2019"),
+                Some("7.2"),
+                Some("https://images.metahub.space/poster/small/tt10090796/img"),
+                Some("Behind the scenes of the final season."),
+            ),
+            make_item(
+                "tt10400003",
+                "movie",
+                "Game of Thrones: The Story So Far",
+                Some("2017"),
+                None,
+                Some("https://images.metahub.space/poster/small/tt10400003/img"),
+                None,
+            ),
+            make_item("tt10400004", "movie", "Game of Thrones: The Story So Far", Some("2019"), None, None, None),
+        ];
+        for i in 5..=22 {
+            previews.push(make_item(
+                &format!("tt104000{i:02}"),
+                "movie",
+                &format!("Game of Thrones Special {i}"),
+                Some("2019"),
+                None,
+                None,
+                None,
+            ));
+        }
+        let main_series = make_item(
+            "tt0944947",
+            "series",
+            "Game of Thrones",
+            Some("2011-2019"),
+            Some("9.2"),
+            Some("https://images.metahub.space/poster/small/tt0944947/img"),
+            Some(
+                "Nine noble families fight for control over the lands of Westeros, while an ancient enemy returns after being dormant for millennia.",
+            ),
+        );
+        previews.push(main_series.clone());
+        engine.ingest_stremio_previews(&previews);
+
+        // Even with a small limit=6 and 22 short-overview movie specials in FTS5, the exact Series match MUST be #1.
+        let (fts_hits, _) = engine.search_local_fts("game of thrones", 6);
+        assert!(!fts_hits.is_empty());
+        assert_eq!(fts_hits[0].canonical_id, "tt0944947");
+        assert_eq!(fts_hits[0].media_type, "series");
+
+        // Mid-typing prefix ("game of thro") must also put Game of Thrones Series at #1.
+        let (prefix_hits, _) = engine.search_local_fts("game of thro", 6);
+        assert_eq!(prefix_hits[0].canonical_id, "tt0944947");
+
+        // Compare incremental arrival orders in build_unified_editorial_search:
+        // Stage 1: Series arrives first.
+        let norm_q = normalize_title_for_dedup("game of thrones");
+        let series_hit = preview_to_editorial_hit(&main_series, &norm_q, 15);
+        let movie_hits: Vec<EditorialMediaHit> = previews
+            .iter()
+            .filter(|p| p.r#type == "movie")
+            .map(|p| preview_to_editorial_hit(p, &norm_q, 15))
+            .collect();
+
+        let stage1 = build_unified_editorial_search(
+            "game of thrones",
+            Vec::new(),
+            Vec::new(),
+            vec![series_hit.clone()],
+            Vec::new(),
+            10,
+        );
+        assert_eq!(stage1.ranked_media_hits(12)[0].canonical_id, "tt0944947");
+
+        // Stage 2: 22 Movie specials arrive ahead of Series in catalog order.
+        let mut movies_before_series = movie_hits.clone();
+        movies_before_series.push(series_hit.clone());
+        let stage2 = build_unified_editorial_search(
+            "game of thrones",
+            Vec::new(),
+            Vec::new(),
+            movies_before_series,
+            Vec::new(),
+            10,
+        );
+        let ranked2 = stage2.ranked_media_hits(12);
+        assert_eq!(ranked2[0].canonical_id, "tt0944947");
+        assert_eq!(stage2.top_match.as_ref().unwrap().canonical_id, "tt0944947");
+        assert_eq!(ranked2[1].canonical_id, "tt10090796"); // rated + postered special beats blank specials
+
+        // Symmetric untyped-year deduplication: year'd hit followed by untyped-year library hit merges cleanly,
+        // while distinct years (1984 vs 2021) remain distinct.
+        let dune_1984 = preview_to_editorial_hit(
+            &make_item("tt0087182", "movie", "Dune", Some("1984"), Some("6.3"), None, None),
+            "dune",
+            15,
+        );
+        let dune_2021 = preview_to_editorial_hit(
+            &make_item("tt1160419", "movie", "Dune", Some("2021"), Some("8.0"), Some("https://img.example/d.jpg"), None),
+            "dune",
+            15,
+        );
+        let dune_untyped_dup = EditorialMediaHit {
+            canonical_id: "local:dune".to_owned(),
+            imdb_id: None,
+            tmdb_id: None,
+            media_type: "movie".to_owned(),
+            title: "Dune".to_owned(),
+            year: None,
+            imdb_rating: None,
+            overview: None,
+            poster_url: None,
+            backdrop_url: None,
+            logo_url: None,
+            genres: Vec::new(),
+            score: 1_040,
+            role_hint: None,
+        };
+        let dune_search = build_unified_editorial_search(
+            "dune",
+            Vec::new(),
+            Vec::new(),
+            vec![dune_2021.clone(), dune_1984.clone(), dune_untyped_dup.clone()],
+            Vec::new(),
+            5,
+        );
+        assert_eq!(dune_search.movies.len(), 2);
+        assert_eq!(dune_search.movies[0].canonical_id, "tt1160419");
+
+        // Untyped-year entry arriving FIRST must merge with the first year'd entry (2021)
+        // and still keep a subsequent distinct year (1984) separate.
+        let dune_untyped_first = build_unified_editorial_search(
+            "dune",
+            Vec::new(),
+            Vec::new(),
+            vec![dune_untyped_dup, dune_2021, dune_1984],
+            Vec::new(),
+            5,
+        );
+        assert_eq!(dune_untyped_first.movies.len(), 2);
+        assert_eq!(dune_untyped_first.movies[0].canonical_id, "tt1160419");
+        assert_eq!(dune_untyped_first.movies[1].canonical_id, "tt0087182");
+
+        // Leading-article match: "matrix" puts "The Matrix" above "Matrix: Behind the Scenes".
+        assert!(
+            score_title_relevance("The Matrix", "matrix")
+                > score_title_relevance("Matrix: Behind the Scenes", "matrix")
+        );
     }
 }

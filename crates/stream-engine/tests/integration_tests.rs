@@ -1859,3 +1859,81 @@ async fn magnet_stream_endpoint_waits_for_metadata_or_times_out_never_returning_
     engine.shutdown().await;
     seeder_session.cancellation_token().cancel();
 }
+
+#[tokio::test]
+async fn create_magnet_with_many_addon_and_wss_trackers_still_merges_all_curated_udp_and_http_trackers(
+) {
+    let tmp = TempDir::new().unwrap();
+    let engine = start_test_engine(&tmp, Duration::from_millis(350)).await;
+    let base = engine.base_url();
+    let client = reqwest::Client::new();
+
+    let info_hash: InfoHash = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
+    let create_req: http::Request<CreateMagnetBody> = CreateMagnetRequest {
+        server_url: base.clone(),
+        info_hash,
+        announce: vec![
+            "dht:0123456789abcdef0123456789abcdef01234567".to_owned(),
+            "tracker:wss://tracker.openwebtorrent.com".to_owned(),
+            "tracker:ws://tracker.files.fm:7072/announce".to_owned(),
+            "tracker:udp://addon1.example:6969/announce".to_owned(),
+            "tracker:udp://addon2.example:6969/announce".to_owned(),
+            "tracker:udp://addon3.example:6969/announce".to_owned(),
+            "tracker:udp://addon4.example:6969/announce".to_owned(),
+            "tracker:udp://addon5.example:6969/announce".to_owned(),
+            "tracker:https://addon6.example/announce".to_owned(),
+            "TRACKER:udp://ADDON1.EXAMPLE:6969/announce/".to_owned(),
+        ],
+    }
+    .into();
+
+    let (parts, body) = create_req.into_parts();
+    let stats: Statistics = client
+        .post(parts.uri.to_string())
+        .json(&serde_json::to_value(body).unwrap())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let sources = &stats.opts.peer_search.sources;
+    assert!(
+        !sources.iter().any(|s| s.contains("wss://") || s.contains("ws://")),
+        "unsupported WebTorrent ws/wss trackers must not be passed to librqbit: {sources:?}"
+    );
+    assert!(sources
+        .iter()
+        .any(|s| s == "tracker:udp://addon1.example:6969/announce"));
+    assert!(sources
+        .iter()
+        .any(|s| s == "tracker:https://addon6.example/announce"));
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|s| s.to_ascii_lowercase().contains("addon1.example"))
+            .count(),
+        1,
+        "case/trailing-slash duplicate trackers must be deduplicated"
+    );
+
+    // Every curated UDP + HTTP/HTTPS opentracker must be merged even when addon sent >= 5 trackers.
+    for opentracker in DEFAULT_OPENTRACKERS {
+        let expected = format!("tracker:{opentracker}");
+        assert!(
+            sources.iter().any(|s| s == &expected),
+            "missing curated tracker {expected} when addon supplied 6+ trackers"
+        );
+    }
+    assert!(
+        sources
+            .iter()
+            .any(|s| s.starts_with("tracker:http://") || s.starts_with("tracker:https://")),
+        "merged tracker set must include HTTP/HTTPS trackers as UDP fallback"
+    );
+
+    engine.shutdown().await;
+}

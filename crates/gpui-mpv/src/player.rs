@@ -17,9 +17,12 @@ use tokio::sync::watch;
 
 use crate::dcomp::DCompBackendMode;
 #[cfg(target_os = "windows")]
-use crate::dcomp::{parse_swapchain_ptr_str, WindowsDCompUnderlay};
+use crate::dcomp::{
+    compute_composition_size, format_composition_size, parse_swapchain_ptr_i64,
+    parse_swapchain_ptr_str, WindowsDCompUnderlay,
+};
 #[cfg(target_os = "windows")]
-use crate::mpv_ffi::{mpv_free, MPV_EVENT_VIDEO_RECONFIG};
+use crate::mpv_ffi::{mpv_free, MPV_EVENT_SET_PROPERTY_REPLY, MPV_EVENT_VIDEO_RECONFIG};
 use crate::mpv_ffi::{
     self, error_to_string, mpv_command_async, mpv_create, mpv_error_string, mpv_event_end_file,
     mpv_event_log_message, mpv_event_property, mpv_free_node_contents, mpv_get_property,
@@ -76,6 +79,10 @@ const PROP_VIDEO_FORMAT: u64 = 19;
 const PROP_IDLE_ACTIVE: u64 = 20;
 #[cfg(target_os = "windows")]
 const PROP_DISPLAY_SWAPCHAIN: u64 = 21;
+#[cfg(target_os = "windows")]
+const REQ_D3D11_COMPOSITION_SIZE: u64 = 1;
+#[cfg(target_os = "windows")]
+const REQ_REOPEN_VIDEO_CHAIN: u64 = 2;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +155,57 @@ fn should_probe_d3d11_composition(
         return false;
     }
     !extra_options.iter().any(|&(k, _)| k == "d3d11-output-mode")
+}
+
+#[allow(dead_code)]
+fn resolve_windows_composition_probe(
+    selection: WindowsBackendSelection,
+    extra_options: &[(&str, &str)],
+    output_mode_ok: bool,
+    composition_size_ok: bool,
+) -> DCompBackendMode {
+    if !should_probe_d3d11_composition(selection, extra_options) {
+        return selection.backend_mode;
+    }
+    if output_mode_ok && composition_size_ok {
+        DCompBackendMode::DirectSwapChainVisual
+    } else {
+        DCompBackendMode::FlipChildHwndUnderlay
+    }
+}
+
+#[allow(dead_code)]
+fn next_windows_fallback_mode(current: DCompBackendMode) -> DCompBackendMode {
+    match current {
+        DCompBackendMode::DirectSwapChainVisual => DCompBackendMode::FlipChildHwndUnderlay,
+        DCompBackendMode::FlipChildHwndUnderlay | DCompBackendMode::SoftwareFallback => {
+            DCompBackendMode::SoftwareFallback
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn should_trigger_dcomp_vo_fallback(
+    mode: DCompBackendMode,
+    swapchain_ptr: usize,
+    current_vo: &str,
+    video_width: i64,
+    video_height: i64,
+    has_video_track: bool,
+    file_loaded: bool,
+) -> bool {
+    if !file_loaded || mode == DCompBackendMode::SoftwareFallback {
+        return false;
+    }
+    let expects_video = has_video_track || (video_width > 0 && video_height > 0);
+    if !expects_video {
+        return false;
+    }
+    match mode {
+        DCompBackendMode::DirectSwapChainVisual => swapchain_ptr == 0 || current_vo.is_empty(),
+        DCompBackendMode::FlipChildHwndUnderlay => current_vo.is_empty(),
+        DCompBackendMode::SoftwareFallback => false,
+    }
 }
 
 #[repr(C, align(64))]
@@ -977,6 +1035,8 @@ struct WindowsDCompState {
     underlay: Option<WindowsDCompUnderlay>,
     last_handles: Option<gpui::WindowsVideoHandles>,
     wid_applied: Option<isize>,
+    last_composition_size: Option<(u32, u32)>,
+    needs_vo_rebind: bool,
     attached: bool,
 }
 
@@ -989,11 +1049,14 @@ struct WindowsDCompCoordinator {
 
 #[cfg(target_os = "windows")]
 impl WindowsDCompCoordinator {
-    fn new(mode: DCompBackendMode) -> Self {
+    fn new(mode: DCompBackendMode, initial_composition_size: Option<(u32, u32)>) -> Self {
         Self {
             mode: AtomicU8::new(dcomp_mode_to_u8(mode)),
             swapchain_ptr: AtomicUsize::new(0),
-            state: Mutex::new(WindowsDCompState::default()),
+            state: Mutex::new(WindowsDCompState {
+                last_composition_size: initial_composition_size,
+                ..WindowsDCompState::default()
+            }),
         }
     }
 
@@ -1005,16 +1068,12 @@ impl WindowsDCompCoordinator {
         self.mode.store(dcomp_mode_to_u8(mode), Ordering::Release);
     }
 
-    fn sync_from_cached(&self, viewport_cache: &Mutex<ViewportState>, observer: &ObserverShared) {
+    fn sync_from_cached(&self, viewport_cache: &Mutex<ViewportState>) -> Result<(), MpvError> {
         let mode = self.mode();
         if mode == DCompBackendMode::SoftwareFallback {
-            return;
+            return Ok(());
         }
         let vp = *viewport_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let (video_w, video_h) = {
-            let snap = observer.snapshot.read().unwrap_or_else(|e| e.into_inner());
-            (snap.video_width, snap.video_height)
-        };
         let swapchain_ptr = if mode == DCompBackendMode::DirectSwapChainVisual {
             self.swapchain_ptr.load(Ordering::Acquire)
         } else {
@@ -1022,12 +1081,15 @@ impl WindowsDCompCoordinator {
         };
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !guard.attached {
-            return;
+            return Ok(());
         }
         let Some(handles) = guard.last_handles else {
-            return;
+            return Ok(());
         };
         if let Some(underlay) = guard.underlay.as_mut() {
+            if underlay.mode() != mode {
+                underlay.set_mode(mode);
+            }
             if let Err(err) = underlay.sync(
                 handles,
                 vp.x,
@@ -1037,14 +1099,47 @@ impl WindowsDCompCoordinator {
                 vp.scale_factor,
                 vp.visible,
                 swapchain_ptr,
-                video_w,
-                video_h,
             ) {
                 tracing::warn!(
                     target: "gpui_mpv::dcomp",
                     "cached DirectComposition underlay sync failed: {err}"
                 );
+                return Err(err);
             }
+        }
+        Ok(())
+    }
+
+    fn request_fallback(&self, sw_frame_tx: &watch::Sender<u64>) -> DCompBackendMode {
+        let current = self.mode();
+        let next = next_windows_fallback_mode(current);
+        if next == current {
+            return current;
+        }
+        self.set_mode(next);
+        self.swapchain_ptr.store(0, Ordering::Release);
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.wid_applied = None;
+            guard.last_composition_size = None;
+            guard.needs_vo_rebind = next == DCompBackendMode::FlipChildHwndUnderlay;
+            if let Some(underlay) = guard.underlay.as_mut() {
+                if next == DCompBackendMode::SoftwareFallback {
+                    underlay.clear_visual_content();
+                } else {
+                    underlay.set_mode(next);
+                }
+            }
+        }
+        sw_frame_tx.send_modify(|seq| *seq = seq.wrapping_add(1));
+        next
+    }
+
+    fn clear_visual_content(&self) {
+        self.swapchain_ptr.store(0, Ordering::Release);
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(underlay) = guard.underlay.as_mut() {
+            underlay.clear_visual_content();
         }
     }
 
@@ -1053,6 +1148,7 @@ impl WindowsDCompCoordinator {
         guard.attached = false;
         guard.last_handles = None;
         guard.wid_applied = None;
+        guard.needs_vo_rebind = false;
         if let Some(underlay) = guard.underlay.as_mut() {
             underlay.detach();
         }
@@ -1062,6 +1158,8 @@ impl WindowsDCompCoordinator {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.attached = false;
         guard.last_handles = None;
+        guard.last_composition_size = None;
+        guard.needs_vo_rebind = false;
         let old_wid = guard.wid_applied.take();
         if let Some(mut underlay) = guard.underlay.take() {
             underlay.detach();
@@ -1133,6 +1231,9 @@ impl MpvControllerInner {
         if let Some(handle) = ev_handle {
             let _ = handle.join();
         }
+
+        #[cfg(target_os = "windows")]
+        self.dcomp.clear_visual_content();
 
         let mpv_opt = self
             .mpv_slot
@@ -1222,7 +1323,7 @@ impl MpvController {
 
             #[cfg(target_os = "windows")]
             let dcomp_win_defaults: &[(&str, &str)] = &[
-                ("vo", "gpu"),
+                ("vo", "gpu,gpu-next"),
                 ("gpu-api", "d3d11"),
                 ("gpu-context", "d3d11"),
                 ("d3d11-flip", "yes"),
@@ -1280,15 +1381,42 @@ impl MpvController {
             }
 
             #[cfg(target_os = "windows")]
-            let backend_mode = if should_probe_d3d11_composition(win_sel, extra_options) {
-                if set_option_str(mpv, "d3d11-output-mode", "composition").is_ok() {
-                    DCompBackendMode::DirectSwapChainVisual
+            let (backend_mode, initial_composition_size) =
+                if should_probe_d3d11_composition(win_sel, extra_options) {
+                    let output_mode_ok =
+                        set_option_str(mpv, "d3d11-output-mode", "composition").is_ok();
+                    let default_vp = ViewportState::default();
+                    let initial_size = compute_composition_size(
+                        default_vp.width,
+                        default_vp.height,
+                        default_vp.scale_factor,
+                    );
+                    let comp_size_ok = if output_mode_ok {
+                        let size_str = format_composition_size(initial_size.0, initial_size.1);
+                        set_option_str(mpv, "d3d11-composition-size", &size_str).is_ok()
+                    } else {
+                        false
+                    };
+                    let resolved = resolve_windows_composition_probe(
+                        win_sel,
+                        extra_options,
+                        output_mode_ok,
+                        comp_size_ok,
+                    );
+                    if output_mode_ok && resolved != DCompBackendMode::DirectSwapChainVisual {
+                        let _ = set_option_str(mpv, "d3d11-output-mode", "window");
+                    }
+                    (
+                        resolved,
+                        if resolved == DCompBackendMode::DirectSwapChainVisual {
+                            Some(initial_size)
+                        } else {
+                            None
+                        },
+                    )
                 } else {
-                    DCompBackendMode::FlipChildHwndUnderlay
-                }
-            } else {
-                win_sel.backend_mode
-            };
+                    (win_sel.backend_mode, None)
+                };
 
             let _ = mpv_request_log_messages(mpv, c"warn".as_ptr());
 
@@ -1307,7 +1435,7 @@ impl MpvController {
                     mpv,
                     PROP_DISPLAY_SWAPCHAIN,
                     c"display-swapchain".as_ptr(),
-                    MPV_FORMAT_STRING,
+                    MPV_FORMAT_INT64,
                 );
                 if rc < 0 {
                     tracing::warn!(
@@ -1332,7 +1460,10 @@ impl MpvController {
             });
             let viewport_cache = Arc::new(Mutex::new(ViewportState::default()));
             #[cfg(target_os = "windows")]
-            let dcomp = Arc::new(WindowsDCompCoordinator::new(backend_mode));
+            let dcomp = Arc::new(WindowsDCompCoordinator::new(
+                backend_mode,
+                initial_composition_size,
+            ));
 
             let mpv_ptr = RawMpvPtr(mpv);
             let observer_clone = Arc::clone(&observer);
@@ -1340,6 +1471,8 @@ impl MpvController {
             let dcomp_clone = Arc::clone(&dcomp);
             #[cfg(target_os = "windows")]
             let viewport_cache_clone = Arc::clone(&viewport_cache);
+            #[cfg(target_os = "windows")]
+            let sw_frame_tx_for_events = sw_frame_tx.clone();
 
             let uses_libmpv_vo = active_vo == "libmpv";
             #[cfg(target_os = "windows")]
@@ -1365,6 +1498,7 @@ impl MpvController {
                         pending_media_clone,
                         dcomp_clone,
                         viewport_cache_clone,
+                        sw_frame_tx_for_events,
                     );
                     #[cfg(not(target_os = "windows"))]
                     run_event_loop(mpv_ptr, observer_clone, pending_media_clone);
@@ -1565,6 +1699,81 @@ impl MpvController {
     }
 
     #[cfg(target_os = "windows")]
+    fn sync_windows_composition_size(&self, width: i32, height: i32, scale_factor: f32) {
+        if self.inner.dcomp.mode() != DCompBackendMode::DirectSwapChainVisual {
+            return;
+        }
+        let target = compute_composition_size(width, height, scale_factor);
+        let changed = {
+            let mut guard = self
+                .inner
+                .dcomp
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.last_composition_size == Some(target) {
+                false
+            } else {
+                guard.last_composition_size = Some(target);
+                true
+            }
+        };
+        if changed {
+            let size_str = format_composition_size(target.0, target.1);
+            if let Err(err) = self.set_property_string_with_userdata(
+                "d3d11-composition-size",
+                &size_str,
+                REQ_D3D11_COMPOSITION_SIZE,
+            ) {
+                tracing::warn!(
+                    target: "gpui_mpv::dcomp",
+                    "failed to update d3d11-composition-size to {size_str}: {err}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn rebind_windows_vo_and_reopen(&self, vo_value: &str, track_reopen_reply: bool) {
+        let file_loaded = self
+            .inner
+            .pending_media
+            .lock()
+            .map(|q| q.file_loaded)
+            .unwrap_or(false);
+        let current_vo = if file_loaded {
+            let mpv_guard = self
+                .inner
+                .mpv_slot
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            mpv_guard
+                .map(|raw| unsafe { read_current_vo_now(raw.0) })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        if file_loaded && current_vo.is_empty() {
+            let _ = self.set_property_string("vo", vo_value);
+            let _ = self.set_property_string("vid", "no");
+            if track_reopen_reply {
+                let _ = self.set_property_string_with_userdata(
+                    "vid",
+                    "auto",
+                    REQ_REOPEN_VIDEO_CHAIN,
+                );
+            } else {
+                let _ = self.set_property_string("vid", "auto");
+            }
+        } else if file_loaded && track_reopen_reply {
+            let _ = self.set_property_string_with_userdata("vo", vo_value, REQ_REOPEN_VIDEO_CHAIN);
+        } else {
+            let _ = self.set_property_string("vo", vo_value);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     pub fn attach_or_sync_windows_dcomp(
         &self,
         handles: gpui::WindowsVideoHandles,
@@ -1572,7 +1781,7 @@ impl MpvController {
         if self.inner.terminated.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mode = self.inner.dcomp.mode();
+        let mut mode = self.inner.dcomp.mode();
         if mode == DCompBackendMode::SoftwareFallback {
             return Err(MpvError::Render(
                 "DirectComposition underlay is disabled".into(),
@@ -1589,15 +1798,10 @@ impl MpvController {
             .viewport_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let (video_w, video_h) = {
-            let snap = self
-                .inner
-                .observer
-                .snapshot
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            (snap.video_width, snap.video_height)
-        };
+
+        if mode == DCompBackendMode::DirectSwapChainVisual {
+            self.sync_windows_composition_size(vp.width, vp.height, vp.scale_factor);
+        }
 
         let swapchain_ptr = if mode == DCompBackendMode::DirectSwapChainVisual {
             let mut cached = self.inner.dcomp.swapchain_ptr.load(Ordering::Acquire);
@@ -1616,7 +1820,7 @@ impl MpvController {
             0
         };
 
-        let (need_wid, need_flush) = {
+        let (need_wid, need_flush, need_vo_rebind) = {
             let mut guard = self
                 .inner
                 .dcomp
@@ -1627,7 +1831,10 @@ impl MpvController {
             let underlay = guard
                 .underlay
                 .get_or_insert_with(|| WindowsDCompUnderlay::new(mode));
-            let _diff = underlay.sync(
+            if underlay.mode() != mode {
+                underlay.set_mode(mode);
+            }
+            if let Err(err) = underlay.sync(
                 handles,
                 vp.x,
                 vp.y,
@@ -1636,9 +1843,33 @@ impl MpvController {
                 vp.scale_factor,
                 vp.visible,
                 swapchain_ptr,
-                video_w,
-                video_h,
-            )?;
+            ) {
+                if mode == DCompBackendMode::DirectSwapChainVisual {
+                    tracing::warn!(
+                        target: "gpui_mpv::dcomp",
+                        "DirectSwapChainVisual sync failed ({err}), falling back to FlipChildHwndUnderlay"
+                    );
+                    mode = DCompBackendMode::FlipChildHwndUnderlay;
+                    self.inner.dcomp.set_mode(mode);
+                    self.inner.dcomp.swapchain_ptr.store(0, Ordering::Release);
+                    guard.last_composition_size = None;
+                    guard.wid_applied = None;
+                    guard.needs_vo_rebind = true;
+                    underlay.set_mode(mode);
+                    underlay.sync(
+                        handles,
+                        vp.x,
+                        vp.y,
+                        vp.width,
+                        vp.height,
+                        vp.scale_factor,
+                        vp.visible,
+                        0,
+                    )?;
+                } else {
+                    return Err(err);
+                }
+            }
             let child_hwnd = if mode == DCompBackendMode::FlipChildHwndUnderlay {
                 underlay.child_hwnd_isize()
             } else {
@@ -1649,11 +1880,18 @@ impl MpvController {
                 guard.wid_applied = Some(hwnd_val);
             }
             let first_attach = !guard.attached;
+            let vo_rebind = core::mem::replace(&mut guard.needs_vo_rebind, false);
             guard.attached = true;
-            (wid_update, first_attach)
+            (wid_update, first_attach, vo_rebind)
         };
 
-        if let Some(hwnd_val) = need_wid {
+        if need_vo_rebind {
+            let _ = self.set_property_string("d3d11-output-mode", "window");
+            if let Some(hwnd_val) = need_wid {
+                self.set_property_i64("wid", hwnd_val as i64)?;
+            }
+            self.rebind_windows_vo_and_reopen("gpu,gpu-next", true);
+        } else if let Some(hwnd_val) = need_wid {
             self.set_property_i64("wid", hwnd_val as i64)?;
         }
         if need_flush {
@@ -1703,20 +1941,10 @@ impl MpvController {
 
         #[cfg(target_os = "windows")]
         {
-            let prev_wid = self.inner.dcomp.teardown();
+            self.inner.dcomp.clear_visual_content();
             self.inner
                 .dcomp
                 .set_mode(DCompBackendMode::SoftwareFallback);
-            if prev_wid.is_some() {
-                let _ = self.set_property_i64("wid", 0);
-            }
-            if !self.inner.uses_libmpv_vo {
-                let _ = self.set_property_string(
-                    "hwdec",
-                    "d3d11va-copy,dxva2-copy,nvdec-copy,auto-copy",
-                );
-                let _ = self.set_property_string("vo", "libmpv");
-            }
         }
 
         if let Some(old_worker) = worker_guard.take() {
@@ -1774,6 +2002,21 @@ impl MpvController {
                     join_handle,
                 });
                 drop(worker_guard);
+                #[cfg(target_os = "windows")]
+                {
+                    let prev_wid = self.inner.dcomp.teardown();
+                    if prev_wid.is_some() || !self.inner.uses_libmpv_vo {
+                        let _ = self.set_property_i64("wid", -1);
+                    }
+                    if !self.inner.uses_libmpv_vo {
+                        let _ = self.set_property_string("d3d11-output-mode", "auto");
+                        let _ = self.set_property_string(
+                            "hwdec",
+                            "d3d11va-copy,dxva2-copy,nvdec-copy,auto-copy",
+                        );
+                        self.rebind_windows_vo_and_reopen("libmpv", false);
+                    }
+                }
                 self.flush_pending_media()?;
                 Ok(())
             }
@@ -2592,9 +2835,15 @@ impl MpvController {
         #[cfg(target_os = "windows")]
         {
             drop(worker_guard);
-            self.inner
+            self.sync_windows_composition_size(w, h, scale);
+            if self
+                .inner
                 .dcomp
-                .sync_from_cached(&self.inner.viewport_cache, &self.inner.observer);
+                .sync_from_cached(&self.inner.viewport_cache)
+                .is_err()
+            {
+                let _ = self.inner.dcomp.request_fallback(&self.inner.sw_frame_tx);
+            }
         }
     }
 
@@ -2630,9 +2879,14 @@ impl MpvController {
         #[cfg(target_os = "windows")]
         {
             drop(worker_guard);
-            self.inner
+            if self
+                .inner
                 .dcomp
-                .sync_from_cached(&self.inner.viewport_cache, &self.inner.observer);
+                .sync_from_cached(&self.inner.viewport_cache)
+                .is_err()
+            {
+                let _ = self.inner.dcomp.request_fallback(&self.inner.sw_frame_tx);
+            }
         }
     }
 
@@ -2758,6 +3012,15 @@ impl MpvController {
     }
 
     fn set_property_string(&self, name: &str, value: &str) -> Result<(), MpvError> {
+        self.set_property_string_with_userdata(name, value, self.next_userdata())
+    }
+
+    fn set_property_string_with_userdata(
+        &self,
+        name: &str,
+        value: &str,
+        userdata: u64,
+    ) -> Result<(), MpvError> {
         if self.inner.terminated.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -2777,7 +3040,7 @@ impl MpvController {
         let rc = unsafe {
             mpv_set_property_async(
                 mpv_raw.0,
-                self.next_userdata(),
+                userdata,
                 c_name.as_ptr(),
                 MPV_FORMAT_STRING,
                 &mut val_ptr as *mut *const c_char as *mut c_void,
@@ -2875,6 +3138,17 @@ unsafe fn read_track_list_now(mpv: *mut mpv_handle) -> Vec<MediaTrack> {
 
 #[cfg(target_os = "windows")]
 unsafe fn read_display_swapchain_ptr(mpv: *mut mpv_handle) -> usize {
+    let mut raw_i64: i64 = 0;
+    let rc_i64 = mpv_get_property(
+        mpv,
+        c"display-swapchain".as_ptr(),
+        MPV_FORMAT_INT64,
+        &mut raw_i64 as *mut i64 as *mut c_void,
+    );
+    if rc_i64 >= 0 {
+        return parse_swapchain_ptr_i64(raw_i64).unwrap_or(0);
+    }
+
     let mut out_ptr: *mut c_char = ptr::null_mut();
     let rc = mpv_get_property(
         mpv,
@@ -2889,6 +3163,27 @@ unsafe fn read_display_swapchain_ptr(mpv: *mut mpv_handle) -> usize {
         parsed
     } else {
         0
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn read_current_vo_now(mpv: *mut mpv_handle) -> String {
+    if mpv.is_null() {
+        return String::new();
+    }
+    let mut out_ptr: *mut c_char = ptr::null_mut();
+    let rc = mpv_get_property(
+        mpv,
+        c"current-vo".as_ptr(),
+        MPV_FORMAT_STRING,
+        &mut out_ptr as *mut *mut c_char as *mut c_void,
+    );
+    if rc >= 0 && !out_ptr.is_null() {
+        let text = CStr::from_ptr(out_ptr).to_string_lossy().into_owned();
+        mpv_free(out_ptr as *mut c_void);
+        text
+    } else {
+        String::new()
     }
 }
 
@@ -2950,6 +3245,7 @@ fn run_event_loop(
     pending_media: Arc<Mutex<PendingMediaQueue>>,
     #[cfg(target_os = "windows")] dcomp: Arc<WindowsDCompCoordinator>,
     #[cfg(target_os = "windows")] viewport_cache: Arc<Mutex<ViewportState>>,
+    #[cfg(target_os = "windows")] sw_frame_tx: watch::Sender<u64>,
 ) {
     let mut paused_for_cache = false;
     let mut seeking = false;
@@ -2984,7 +3280,11 @@ fn run_event_loop(
                         };
                         if !text.is_empty() {
                             let sanitized = redact_log_urls(text);
-                            tracing::debug!(target: "gpui_mpv::libmpv", "[{prefix}] {sanitized}");
+                            if msg.log_level <= 20 {
+                                tracing::warn!(target: "gpui_mpv::libmpv", "[{prefix}] {sanitized}");
+                            } else {
+                                tracing::debug!(target: "gpui_mpv::libmpv", "[{prefix}] {sanitized}");
+                            }
                         }
                     }
                 }
@@ -2997,6 +3297,57 @@ fn run_event_loop(
                         "mpv async command returned error: {}",
                         error_to_string(ev.error)
                     );
+                }
+            }
+            #[cfg(target_os = "windows")]
+            MPV_EVENT_SET_PROPERTY_REPLY => {
+                if ev.reply_userdata == REQ_D3D11_COMPOSITION_SIZE
+                    && dcomp.mode() == DCompBackendMode::DirectSwapChainVisual
+                    && dcomp.sync_from_cached(&viewport_cache).is_err()
+                {
+                    let next = dcomp.request_fallback(&sw_frame_tx);
+                    tracing::warn!(
+                        target: "gpui_mpv::dcomp",
+                        "DirectSwapChainVisual resize sync failed; falling back to {next:?}"
+                    );
+                } else if ev.reply_userdata == REQ_REOPEN_VIDEO_CHAIN
+                    && dcomp.mode() != DCompBackendMode::SoftwareFallback
+                {
+                    let file_loaded = pending_media
+                        .lock()
+                        .map(|q| q.file_loaded)
+                        .unwrap_or(false);
+                    let (vw, vh, has_vid) = {
+                        let snap = observer
+                            .snapshot
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner());
+                        (
+                            snap.video_width,
+                            snap.video_height,
+                            snap.tracks
+                                .iter()
+                                .any(|t| t.track_type == TrackType::Video),
+                        )
+                    };
+                    let mode = dcomp.mode();
+                    let swapchain_ptr = dcomp.swapchain_ptr.load(Ordering::Acquire);
+                    let current_vo = unsafe { read_current_vo_now(mpv.0) };
+                    if should_trigger_dcomp_vo_fallback(
+                        mode,
+                        swapchain_ptr,
+                        &current_vo,
+                        vw,
+                        vh,
+                        has_vid,
+                        file_loaded,
+                    ) {
+                        let next = dcomp.request_fallback(&sw_frame_tx);
+                        tracing::warn!(
+                            target: "gpui_mpv::dcomp",
+                            "Windows VO still unavailable after reopen in {mode:?} (current-vo={current_vo:?}, swapchain=0x{swapchain_ptr:x}); falling back to {next:?}"
+                        );
+                    }
                 }
             }
             MPV_EVENT_START_FILE => {
@@ -3040,6 +3391,38 @@ fn run_event_loop(
                 } else {
                     None
                 };
+                #[cfg(target_os = "windows")]
+                let (win_video_w, win_video_h, win_has_video_track) = {
+                    let mut snap = observer
+                        .snapshot
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let new_buf = paused_for_cache || seeking;
+                    let mut changed = snap.buffering != new_buf;
+                    snap.buffering = new_buf;
+                    if let Some(tracks) = loaded_tracks {
+                        if snap.tracks != tracks {
+                            snap.tracks = tracks;
+                            changed = true;
+                        }
+                    }
+                    let vw = snap.video_width;
+                    let vh = snap.video_height;
+                    let has_vid = snap
+                        .tracks
+                        .iter()
+                        .any(|t| t.track_type == TrackType::Video);
+                    if changed {
+                        let cloned = snap.clone();
+                        drop(snap);
+                        let _ = observer.watch_tx.send(cloned.clone());
+                        let _ = observer
+                            .event_tx
+                            .try_send(PlayerEvent::SnapshotChanged(cloned));
+                    }
+                    (vw, vh, has_vid)
+                };
+                #[cfg(not(target_os = "windows"))]
                 {
                     let mut snap = observer
                         .snapshot
@@ -3063,6 +3446,42 @@ fn run_event_loop(
                             .try_send(PlayerEvent::SnapshotChanged(cloned));
                     }
                 }
+                #[cfg(target_os = "windows")]
+                {
+                    if dcomp.mode() == DCompBackendMode::DirectSwapChainVisual {
+                        let queried = unsafe { read_display_swapchain_ptr(mpv.0) };
+                        if queried != 0 {
+                            dcomp.swapchain_ptr.store(queried, Ordering::Release);
+                        }
+                        if dcomp.sync_from_cached(&viewport_cache).is_err() {
+                            let next = dcomp.request_fallback(&sw_frame_tx);
+                            tracing::warn!(
+                                target: "gpui_mpv::dcomp",
+                                "DirectSwapChainVisual bind failed on file load; falling back to {next:?}"
+                            );
+                        }
+                    }
+                    if is_file_loaded && dcomp.mode() != DCompBackendMode::SoftwareFallback {
+                        let mode = dcomp.mode();
+                        let swapchain_ptr = dcomp.swapchain_ptr.load(Ordering::Acquire);
+                        let current_vo = unsafe { read_current_vo_now(mpv.0) };
+                        if should_trigger_dcomp_vo_fallback(
+                            mode,
+                            swapchain_ptr,
+                            &current_vo,
+                            win_video_w,
+                            win_video_h,
+                            win_has_video_track,
+                            true,
+                        ) {
+                            let next = dcomp.request_fallback(&sw_frame_tx);
+                            tracing::warn!(
+                                target: "gpui_mpv::dcomp",
+                                "Windows VO unavailable in {mode:?} (current-vo={current_vo:?}, swapchain=0x{swapchain_ptr:x}); falling back to {next:?}"
+                            );
+                        }
+                    }
+                }
                 if is_file_loaded {
                     let _ = observer.event_tx.try_send(PlayerEvent::FileLoaded);
                 }
@@ -3074,12 +3493,26 @@ fn run_event_loop(
                     if queried != 0 {
                         dcomp.swapchain_ptr.store(queried, Ordering::Release);
                     }
-                    dcomp.sync_from_cached(&viewport_cache, &observer);
+                    if dcomp.sync_from_cached(&viewport_cache).is_err() {
+                        let next = dcomp.request_fallback(&sw_frame_tx);
+                        tracing::warn!(
+                            target: "gpui_mpv::dcomp",
+                            "DirectSwapChainVisual reconfig sync failed; falling back to {next:?}"
+                        );
+                    }
                 }
             }
             MPV_EVENT_END_FILE => {
                 if let Ok(mut q) = pending_media.lock() {
                     q.file_loaded = false;
+                }
+                #[cfg(target_os = "windows")]
+                if dcomp.mode() == DCompBackendMode::DirectSwapChainVisual {
+                    let queried = unsafe { read_display_swapchain_ptr(mpv.0) };
+                    if queried == 0 {
+                        dcomp.swapchain_ptr.store(0, Ordering::Release);
+                        let _ = dcomp.sync_from_cached(&viewport_cache);
+                    }
                 }
                 if !ev.data.is_null() {
                     let end = unsafe { *(ev.data as *const mpv_event_end_file) };
@@ -3298,10 +3731,14 @@ fn run_event_loop(
                             }
                             #[cfg(target_os = "windows")]
                             PROP_DISPLAY_SWAPCHAIN => {
-                                let ptr_val = read_prop_string(&prop)
-                                    .as_deref()
-                                    .and_then(parse_swapchain_ptr_str)
-                                    .unwrap_or(0);
+                                let ptr_val =
+                                    match read_prop_i64(&prop).and_then(parse_swapchain_ptr_i64) {
+                                        Some(ptr) => ptr,
+                                        None => read_prop_string(&prop)
+                                            .as_deref()
+                                            .and_then(parse_swapchain_ptr_str)
+                                            .unwrap_or(0),
+                                    };
                                 if dcomp.swapchain_ptr.swap(ptr_val, Ordering::AcqRel) != ptr_val {
                                     dcomp_resync = true;
                                 }
@@ -3322,8 +3759,15 @@ fn run_event_loop(
                     }
 
                     #[cfg(target_os = "windows")]
-                    if dcomp_resync && dcomp.mode() == DCompBackendMode::DirectSwapChainVisual {
-                        dcomp.sync_from_cached(&viewport_cache, &observer);
+                    if dcomp_resync
+                        && dcomp.mode() == DCompBackendMode::DirectSwapChainVisual
+                        && dcomp.sync_from_cached(&viewport_cache).is_err()
+                    {
+                        let next = dcomp.request_fallback(&sw_frame_tx);
+                        tracing::warn!(
+                            target: "gpui_mpv::dcomp",
+                            "DirectSwapChainVisual property sync failed; falling back to {next:?}"
+                        );
                     }
                 }
             }
@@ -4673,6 +5117,132 @@ mod tests {
         assert!(!forced_null.uses_libmpv_vo);
         assert!(!forced_null.defer_media_until_attach);
         assert!(!should_probe_d3d11_composition(forced_null, &[]));
+
+        // Composition probe requires BOTH d3d11-output-mode=composition AND d3d11-composition-size.
+        assert_eq!(
+            resolve_windows_composition_probe(default_win, &[], true, true),
+            DCompBackendMode::DirectSwapChainVisual
+        );
+        assert_eq!(
+            resolve_windows_composition_probe(default_win, &[], true, false),
+            DCompBackendMode::FlipChildHwndUnderlay
+        );
+        assert_eq!(
+            resolve_windows_composition_probe(default_win, &[], false, true),
+            DCompBackendMode::FlipChildHwndUnderlay
+        );
+        assert_eq!(
+            resolve_windows_composition_probe(default_win, &[], false, false),
+            DCompBackendMode::FlipChildHwndUnderlay
+        );
+        assert_eq!(
+            resolve_windows_composition_probe(
+                default_win,
+                &[("d3d11-output-mode", "window")],
+                true,
+                true,
+            ),
+            DCompBackendMode::FlipChildHwndUnderlay
+        );
+        assert_eq!(
+            resolve_windows_composition_probe(disabled_win, &[], true, true),
+            DCompBackendMode::SoftwareFallback
+        );
+    }
+
+    #[test]
+    fn windows_dcomp_fallback_ladder_and_vo_failure_detection() {
+        assert_eq!(
+            next_windows_fallback_mode(DCompBackendMode::DirectSwapChainVisual),
+            DCompBackendMode::FlipChildHwndUnderlay
+        );
+        assert_eq!(
+            next_windows_fallback_mode(DCompBackendMode::FlipChildHwndUnderlay),
+            DCompBackendMode::SoftwareFallback
+        );
+        assert_eq!(
+            next_windows_fallback_mode(DCompBackendMode::SoftwareFallback),
+            DCompBackendMode::SoftwareFallback
+        );
+
+        // DirectSwapChainVisual with valid swapchain and VO must NOT trigger fallback.
+        assert!(!should_trigger_dcomp_vo_fallback(
+            DCompBackendMode::DirectSwapChainVisual,
+            0xDEAD_BEEF,
+            "gpu",
+            1920,
+            1080,
+            true,
+            true,
+        ));
+        // DirectSwapChainVisual with missing swapchain (e.g. failed d3d11_init) MUST fall back.
+        assert!(should_trigger_dcomp_vo_fallback(
+            DCompBackendMode::DirectSwapChainVisual,
+            0,
+            "",
+            0,
+            0,
+            true,
+            true,
+        ));
+        // DirectSwapChainVisual with VO open but no composition swapchain MUST fall back.
+        assert!(should_trigger_dcomp_vo_fallback(
+            DCompBackendMode::DirectSwapChainVisual,
+            0,
+            "gpu",
+            1920,
+            1080,
+            true,
+            true,
+        ));
+        // FlipChildHwndUnderlay with active VO succeeds; empty VO triggers SoftwareFallback.
+        assert!(!should_trigger_dcomp_vo_fallback(
+            DCompBackendMode::FlipChildHwndUnderlay,
+            0,
+            "gpu",
+            1920,
+            1080,
+            true,
+            true,
+        ));
+        assert!(should_trigger_dcomp_vo_fallback(
+            DCompBackendMode::FlipChildHwndUnderlay,
+            0,
+            "",
+            0,
+            0,
+            true,
+            true,
+        ));
+        // Audio-only streams or pre-FILE_LOADED state must NOT trigger false fallback.
+        assert!(!should_trigger_dcomp_vo_fallback(
+            DCompBackendMode::DirectSwapChainVisual,
+            0,
+            "",
+            0,
+            0,
+            false,
+            true,
+        ));
+        assert!(!should_trigger_dcomp_vo_fallback(
+            DCompBackendMode::DirectSwapChainVisual,
+            0,
+            "",
+            1920,
+            1080,
+            true,
+            false,
+        ));
+        // SoftwareFallback is terminal.
+        assert!(!should_trigger_dcomp_vo_fallback(
+            DCompBackendMode::SoftwareFallback,
+            0,
+            "",
+            1920,
+            1080,
+            true,
+            true,
+        ));
     }
 
     #[test]

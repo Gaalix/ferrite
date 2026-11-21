@@ -10,8 +10,9 @@ pub mod thumbnails;
 #[cfg(target_os = "windows")]
 pub use dcomp::WindowsDCompUnderlay;
 pub use dcomp::{
-    compute_underlay_placement, DCompBackendMode, DCompDesiredState, DCompHandleSnapshot,
-    DCompStateTracker, DCompSyncDiff, DCompUnderlayRect, UnderlayPlacement,
+    compute_composition_size, compute_underlay_placement, format_composition_size,
+    DCompBackendMode, DCompDesiredState, DCompHandleSnapshot, DCompStateTracker, DCompSyncDiff,
+    DCompUnderlayRect, UnderlayPlacement,
 };
 pub use element::{mpv_viewport, MpvViewport};
 pub use player::{

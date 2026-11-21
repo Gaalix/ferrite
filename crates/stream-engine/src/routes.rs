@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -234,20 +236,39 @@ struct CreateIncomingTorrentField {
     blob: Option<String>,
 }
 
+fn strip_ascii_prefix_ignore_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    if input.len() >= prefix.len()
+        && input.is_char_boundary(prefix.len())
+        && input[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        Some(&input[prefix.len()..])
+    } else {
+        None
+    }
+}
+
 pub(crate) fn extract_trackers_from_sources(sources: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for raw in sources {
         let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.starts_with("dht:") {
+        if trimmed.is_empty() || strip_ascii_prefix_ignore_case(trimmed, "dht:").is_some() {
             continue;
         }
-        let without_prefix = trimmed.strip_prefix("tracker:").unwrap_or(trimmed);
+        let without_prefix =
+            strip_ascii_prefix_ignore_case(trimmed, "tracker:").unwrap_or(trimmed);
         let decoded = percent_decode_str(without_prefix)
             .decode_utf8_lossy()
             .into_owned();
-        let clean = decoded.strip_prefix("tracker:").unwrap_or(&decoded).trim();
+        let clean = strip_ascii_prefix_ignore_case(decoded.trim(), "tracker:")
+            .unwrap_or(decoded.trim())
+            .trim();
         if crate::is_allowed_tracker_url(clean) {
-            out.push(clean.to_owned());
+            if let Some(key) = crate::canonical_tracker_key(clean) {
+                if seen.insert(key) {
+                    out.push(clean.to_owned());
+                }
+            }
         }
     }
     out
@@ -477,6 +498,109 @@ impl<R> Drop for TrackedFileStream<R> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProgressGraceState {
+    pub baseline_fetched_bytes: u64,
+    pub last_fetched_bytes: u64,
+    pub ever_saw_byte_progress: bool,
+    pub started_at: Instant,
+    pub last_progress_at: Instant,
+}
+
+impl ProgressGraceState {
+    pub fn new(baseline_fetched_bytes: u64, started_at: Instant) -> Self {
+        Self {
+            baseline_fetched_bytes,
+            last_fetched_bytes: baseline_fetched_bytes,
+            ever_saw_byte_progress: false,
+            started_at,
+            last_progress_at: started_at,
+        }
+    }
+
+    /// Evaluates whether waiting for initial playhead/seek bytes has timed out.
+    ///
+    /// - 0-peer / dead swarms fail fast at `base_timeout` (preserving fast failover).
+    /// - Live connected peers (e.g. waiting for optimistic unchoke on a low-peer swarm)
+    ///   receive up to `2 * base_timeout`.
+    /// - Actively downloading torrents (receiving chunks for a large 2-8 MiB piece)
+    ///   keep waiting as long as `fetched_bytes` advances within each `base_timeout`
+    ///   stall window, capped at `5 * base_timeout`.
+    pub fn should_timeout(
+        &mut self,
+        now: Instant,
+        base_timeout: Duration,
+        fetched_now: u64,
+        live_peers: u32,
+    ) -> bool {
+        if fetched_now > self.last_fetched_bytes {
+            self.last_fetched_bytes = fetched_now;
+            self.last_progress_at = now;
+            self.ever_saw_byte_progress = true;
+        }
+
+        let total_elapsed = now.saturating_duration_since(self.started_at);
+        let stall_elapsed = now.saturating_duration_since(self.last_progress_at);
+        let live_peer_unchoke_cap = base_timeout.saturating_mul(2);
+        let active_download_hard_cap = base_timeout.saturating_mul(5);
+
+        if self.ever_saw_byte_progress {
+            stall_elapsed >= base_timeout || total_elapsed >= active_download_hard_cap
+        } else if live_peers > 0 {
+            total_elapsed >= live_peer_unchoke_cap
+        } else {
+            total_elapsed >= base_timeout
+        }
+    }
+}
+
+fn sample_torrent_progress(handle: &librqbit::ManagedTorrent) -> (u64, u32) {
+    let stats = handle.stats();
+    if let Some(ref live) = stats.live {
+        (live.snapshot.fetched_bytes, live.snapshot.peer_stats.live)
+    } else {
+        (stats.progress_bytes, 0)
+    }
+}
+
+async fn read_initial_bytes_with_progress_grace<R: AsyncRead + Unpin>(
+    tracked: &mut TrackedFileStream<R>,
+    buf: &mut [u8],
+    handle: &librqbit::ManagedTorrent,
+    info_hash: &[u8; 20],
+    base_timeout: Duration,
+) -> Result<usize, ApiHttpError> {
+    let (baseline_fetched, _) = sample_torrent_progress(handle);
+    let mut grace = ProgressGraceState::new(baseline_fetched, Instant::now());
+    let poll_step = (base_timeout / 4).clamp(Duration::from_millis(10), Duration::from_millis(500));
+
+    let mut read_fut = std::pin::pin!(tracked.read(buf));
+    let mut ticker = tokio::time::interval(poll_step);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick so the first timeout check runs after `poll_step`.
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut read_fut => {
+                return res
+                    .map_err(|e| ApiHttpError::bad_gateway(format!("Torrent stream read error: {e}")));
+            }
+            _ = ticker.tick() => {
+                let (fetched_now, live_peers) = sample_torrent_progress(handle);
+                if grace.should_timeout(Instant::now(), base_timeout, fetched_now, live_peers) {
+                    return Err(ApiHttpError::timeout(format!(
+                        "Timed out after {:?} waiting for initial playhead bytes ({})",
+                        grace.started_at.elapsed(),
+                        hex::encode(info_hash)
+                    )));
+                }
+            }
+        }
+    }
+}
+
 async fn stream_torrent_file(
     State(state): State<std::sync::Arc<EngineInner>>,
     method: Method,
@@ -595,16 +719,14 @@ async fn stream_torrent_file(
     let first_byte_timeout = state.first_byte_timeout();
     let initial_cap = (64 * 1024).min(content_len) as usize;
     let mut initial_buf = vec![0u8; initial_cap];
-    let first_read = tokio::time::timeout(first_byte_timeout, tracked.read(&mut initial_buf))
-        .await
-        .map_err(|_| {
-            ApiHttpError::timeout(format!(
-                "Timed out after {:?} waiting for initial playhead bytes ({})",
-                first_byte_timeout,
-                hex::encode(info_hash)
-            ))
-        })?
-        .map_err(|e| ApiHttpError::bad_gateway(format!("Torrent stream read error: {e}")))?;
+    let first_read = read_initial_bytes_with_progress_grace(
+        &mut tracked,
+        &mut initial_buf,
+        &handle,
+        &info_hash,
+        first_byte_timeout,
+    )
+    .await?;
 
     if first_read == 0 {
         return Err(ApiHttpError::bad_gateway(
@@ -918,4 +1040,70 @@ async fn proxy_stream(
     resp_builder.body(Body::from_stream(stream)).map_err(|e| {
         ApiHttpError::internal(format!("Failed building proxied stream response: {e}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_trackers_handles_stremio_prefixes_case_dedup_and_drops_unsupported_schemes() {
+        let sources = vec![
+            "dht:0123456789abcdef0123456789abcdef01234567".to_owned(),
+            "DHT:abcdef0123456789abcdef0123456789abcdef01".to_owned(),
+            "tracker:udp://tracker.opentrackr.org:1337/announce".to_owned(),
+            "TRACKER:udp://TRACKER.OPENTRACKR.ORG:1337/announce/".to_owned(),
+            "tracker:https://tracker.gbitt.info:443/announce".to_owned(),
+            "tracker%3Ahttp%3A%2F%2Ftracker.bt4g.com%3A2095%2Fannounce".to_owned(),
+            "tracker:wss://tracker.openwebtorrent.com".to_owned(),
+            "ws://tracker.files.fm:7072/announce".to_owned(),
+            "tracker:udp://missing-port.example/announce".to_owned(),
+            "tracker:https://user:pass@secret.example/announce".to_owned(),
+        ];
+
+        let extracted = extract_trackers_from_sources(&sources);
+        assert_eq!(
+            extracted,
+            vec![
+                "udp://tracker.opentrackr.org:1337/announce".to_owned(),
+                "https://tracker.gbitt.info:443/announce".to_owned(),
+                "http://tracker.bt4g.com:2095/announce".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_grace_fails_fast_on_dead_swarm_and_extends_for_live_or_downloading_peers() {
+        let t0 = Instant::now();
+        let base = Duration::from_secs(12);
+
+        // 1. Dead 0-peer swarm: times out immediately at base_timeout.
+        let mut dead = ProgressGraceState::new(0, t0);
+        assert!(!dead.should_timeout(t0 + Duration::from_secs(11), base, 0, 0));
+        assert!(dead.should_timeout(t0 + Duration::from_secs(12), base, 0, 0));
+
+        // 2. Low-peer swarm with 1 live peer (choked / waiting for optimistic unchoke):
+        // survives past base_timeout up to 2 * base_timeout.
+        let mut choked = ProgressGraceState::new(0, t0);
+        assert!(!choked.should_timeout(t0 + Duration::from_secs(12), base, 0, 1));
+        assert!(!choked.should_timeout(t0 + Duration::from_secs(23), base, 0, 1));
+        assert!(choked.should_timeout(t0 + Duration::from_secs(24), base, 0, 1));
+
+        // 3. Actively downloading slow 1-peer swarm (large piece taking 35s):
+        // fetched_bytes ticks up -> never killed until hard cap (5 * base_timeout = 60s).
+        let mut slow_active = ProgressGraceState::new(1024, t0);
+        assert!(!slow_active.should_timeout(t0 + Duration::from_secs(5), base, 65_536, 1));
+        assert!(!slow_active.should_timeout(t0 + Duration::from_secs(15), base, 262_144, 1));
+        assert!(!slow_active.should_timeout(t0 + Duration::from_secs(25), base, 1_048_576, 1));
+        assert!(!slow_active.should_timeout(t0 + Duration::from_secs(35), base, 2_097_152, 1));
+        assert!(!slow_active.should_timeout(t0 + Duration::from_secs(45), base, 3_145_728, 1));
+        // Even with constant progress, hard cap at 5 * base_timeout prevents infinite hangs.
+        assert!(slow_active.should_timeout(t0 + Duration::from_secs(60), base, 4_194_304, 1));
+
+        // 4. Mid-piece stall: receives one chunk then freezes for base_timeout -> times out.
+        let mut mid_stall = ProgressGraceState::new(0, t0);
+        assert!(!mid_stall.should_timeout(t0 + Duration::from_secs(2), base, 16_384, 1));
+        assert!(!mid_stall.should_timeout(t0 + Duration::from_secs(13), base, 16_384, 1));
+        assert!(mid_stall.should_timeout(t0 + Duration::from_secs(14), base, 16_384, 1));
+    }
 }

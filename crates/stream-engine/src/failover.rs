@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::{routes, EngineInner, StreamEngineError};
 
-pub const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(8);
+pub const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub enum StreamCandidateKind {

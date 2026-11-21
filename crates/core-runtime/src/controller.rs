@@ -3,7 +3,10 @@ use std::{
     hash::{Hash, Hasher},
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock, RwLockReadGuard,
+    },
 };
 
 use futures::StreamExt;
@@ -38,7 +41,7 @@ use stremio_core::{
     },
 };
 use stremio_core::models::common::Loadable;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::error;
 use url::Url;
 
@@ -71,7 +74,8 @@ use crate::{
     },
     tmdb::{
         build_unified_editorial_search, format_addon_resource_url, meta_resource_matches_url,
-        normalize_title_for_dedup, preview_to_editorial_hit, EditorialMediaHit, EditorialPersonHit,
+        normalize_title_for_dedup, preview_to_editorial_hit, score_hit_quality,
+        score_title_relevance, title_matches_query, EditorialMediaHit, EditorialPersonHit,
         EnrichedCollection, EnrichedTitleMeta, MetadataEngine, PersonFilmography,
         TmdbAccountStatus, UnifiedEditorialSearch,
     },
@@ -91,6 +95,16 @@ pub type DesktopRuntimeEvent = RuntimeEvent<DesktopEnv, DesktopModel>;
 
 pub type DesktopRuntimeAction = RuntimeAction<DesktopEnv, DesktopModel>;
 
+type TmdbSearchResult = Result<(Vec<EditorialMediaHit>, Vec<EditorialPersonHit>), String>;
+type InFlightTmdbSearch = (String, watch::Receiver<Option<TmdbSearchResult>>);
+
+#[derive(Clone, Debug)]
+struct CachedTmdbSearch {
+    norm_query: String,
+    media_hits: Vec<EditorialMediaHit>,
+    person_hits: Vec<EditorialPersonHit>,
+}
+
 #[derive(Clone)]
 pub struct CoreController {
     runtime: Runtime<DesktopEnv, DesktopModel>,
@@ -108,6 +122,9 @@ pub struct CoreController {
     native_subtitles: NativeSubtitleClient,
     metadata_engine: Arc<MetadataEngine>,
     ingested_hashes: Arc<Mutex<HashMap<String, (u8, u64)>>>,
+    tmdb_search_seq: Arc<AtomicU64>,
+    last_tmdb_search: Arc<Mutex<Option<CachedTmdbSearch>>>,
+    in_flight_tmdb_search: Arc<Mutex<Option<InFlightTmdbSearch>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -202,6 +219,9 @@ impl CoreController {
             native_subtitles,
             metadata_engine: Arc::clone(&metadata_engine),
             ingested_hashes: Arc::new(Mutex::new(HashMap::new())),
+            tmdb_search_seq: Arc::new(AtomicU64::new(0)),
+            last_tmdb_search: Arc::new(Mutex::new(None)),
+            in_flight_tmdb_search: Arc::new(Mutex::new(None)),
         };
 
         // Seed library titles into local FTS5 index asynchronously
@@ -568,6 +588,13 @@ impl CoreController {
     }
 
     pub fn unload_search(&self) {
+        self.tmdb_search_seq.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut guard) = self.last_tmdb_search.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.in_flight_tmdb_search.lock() {
+            *guard = None;
+        }
         self.dispatch(Action::Unload, Some(DesktopModelField::Search));
     }
 
@@ -580,6 +607,7 @@ impl CoreController {
         }
 
         let search_query = trimmed.to_owned();
+        let norm_q = normalize_title_for_dedup(trimmed);
         self.dispatch(
             Action::Load(ActionLoad::CatalogsWithExtra(CatalogsWithExtraSelected {
                 r#type: None,
@@ -597,11 +625,64 @@ impl CoreController {
         if self.with_model(|m| !m.local_search.current_records.is_empty()) {
             self.dispatch(
                 Action::Search(ActionSearch::Search {
-                    search_query,
+                    search_query: search_query.clone(),
                     max_results: DEFAULT_LOCAL_SEARCH_LIMIT,
                 }),
                 Some(DesktopModelField::LocalSearch),
             );
+        }
+
+        let seq = self.tmdb_search_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let cfg = self.private_integrations();
+        if cfg.tmdb_enabled && cfg.has_tmdb_configured() && !norm_q.is_empty() {
+            let already_cached = self
+                .last_tmdb_search
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|c| c.norm_query == norm_q))
+                .unwrap_or(false);
+            let already_in_flight = self
+                .in_flight_tmdb_search
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|(q, _)| q == &norm_q))
+                .unwrap_or(false);
+
+            if !already_cached && !already_in_flight {
+                let (tx, rx) = watch::channel(None);
+                if let Ok(mut guard) = self.in_flight_tmdb_search.lock() {
+                    *guard = Some((norm_q.clone(), rx));
+                }
+                let key = cfg.tmdb_api_key.expose().to_owned();
+                let eng = Arc::clone(&self.metadata_engine);
+                let seq_ref = Arc::clone(&self.tmdb_search_seq);
+                let cache_ref = Arc::clone(&self.last_tmdb_search);
+                let inflight_ref = Arc::clone(&self.in_flight_tmdb_search);
+                let event_tx = self.event_tx.clone();
+                self.runtime_handle.spawn(async move {
+                    let res = eng.search_multi(&key, &search_query).await;
+                    if let Ok((ref media_hits, ref person_hits)) = res {
+                        if seq_ref.load(Ordering::SeqCst) == seq {
+                            if let Ok(mut guard) = cache_ref.lock() {
+                                *guard = Some(CachedTmdbSearch {
+                                    norm_query: norm_q.clone(),
+                                    media_hits: media_hits.clone(),
+                                    person_hits: person_hits.clone(),
+                                });
+                            }
+                            let _ = event_tx.send(Arc::new(RuntimeEvent::NewState(vec![
+                                DesktopModelField::Search,
+                            ])));
+                        }
+                    }
+                    let _ = tx.send(Some(res));
+                    if let Ok(mut guard) = inflight_ref.lock() {
+                        if guard.as_ref().is_some_and(|(q, _)| q == &norm_q) {
+                            *guard = None;
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -1358,6 +1439,9 @@ impl CoreController {
     pub fn clear_addon_cache(&self) {
         self.addon_engine.clear_cache();
         self.metadata_engine.clear_caches();
+        if let Ok(mut guard) = self.last_tmdb_search.lock() {
+            *guard = None;
+        }
     }
 
     pub fn metadata_engine(&self) -> &Arc<MetadataEngine> {
@@ -1393,34 +1477,103 @@ impl CoreController {
         let norm_q = normalize_title_for_dedup(trimmed);
         let (local_fts, local_people) = self.metadata_engine.search_local_fts(trimmed, 40);
 
+        let (cached_tmdb_hits, cached_tmdb_people) = self
+            .last_tmdb_search
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|cached| {
+                    if cached.norm_query == norm_q {
+                        (cached.media_hits.clone(), cached.person_hits.clone())
+                    } else {
+                        let filtered_media = cached
+                            .media_hits
+                            .iter()
+                            .filter(|hit| title_matches_query(&hit.title, &norm_q))
+                            .cloned()
+                            .map(|mut hit| {
+                                hit.score = score_title_relevance(&hit.title, &norm_q)
+                                    + score_hit_quality(
+                                        hit.imdb_rating.as_deref(),
+                                        hit.poster_url.is_some(),
+                                        hit.year.is_some(),
+                                        hit.overview
+                                            .as_deref()
+                                            .is_some_and(|s| !s.trim().is_empty()),
+                                    )
+                                    + 22;
+                                hit
+                            })
+                            .collect();
+                        let filtered_people = cached
+                            .person_hits
+                            .iter()
+                            .filter(|p| title_matches_query(&p.name, &norm_q))
+                            .cloned()
+                            .collect();
+                        (filtered_media, filtered_people)
+                    }
+                })
+            })
+            .unwrap_or_default();
+
         let addon_and_library_hits = self.with_model(|model| {
             let mut hits = Vec::new();
+            let catalogs_match_query = model
+                .search
+                .selected
+                .as_ref()
+                .and_then(|sel| {
+                    sel.extra
+                        .iter()
+                        .find(|ev| ev.name == SEARCH_EXTRA_NAME)
+                        .map(|ev| normalize_title_for_dedup(&ev.value) == norm_q)
+                })
+                .unwrap_or(false);
+
             for item in model.local_search.search_results.iter().take(25) {
-                if !item.name.trim().is_empty() {
-                    hits.push(EditorialMediaHit {
-                        canonical_id: item.id.clone(),
-                        imdb_id: item.id.starts_with("tt").then(|| item.id.clone()),
-                        tmdb_id: item.id.strip_prefix("tmdb:").and_then(|s| s.parse().ok()),
-                        media_type: crate::tmdb::canonical_stremio_type(&item.r#type).to_owned(),
-                        title: item.name.clone(),
-                        year: item
-                            .release_info
-                            .as_deref()
-                            .and_then(crate::tmdb::extract_4_digit_year),
-                        imdb_rating: item.imdb_rating.map(|r| format!("{:.1}", r.to_f64())),
-                        overview: None,
-                        poster_url: item.poster.as_ref().map(Url::to_string),
-                        backdrop_url: None,
-                        logo_url: None,
-                        genres: Vec::new(),
-                        score: crate::tmdb::score_title_relevance(&item.name, &norm_q) + 10,
-                        role_hint: None,
-                    });
+                if item.name.trim().is_empty() {
+                    continue;
                 }
+                if !catalogs_match_query && !title_matches_query(&item.name, &norm_q) {
+                    continue;
+                }
+                let year = item
+                    .release_info
+                    .as_deref()
+                    .and_then(crate::tmdb::extract_4_digit_year);
+                let imdb_rating = item.imdb_rating.map(|r| format!("{:.1}", r.to_f64()));
+                let poster_url = item.poster.as_ref().map(Url::to_string);
+                let score = score_title_relevance(&item.name, &norm_q)
+                    + score_hit_quality(
+                        imdb_rating.as_deref(),
+                        poster_url.is_some(),
+                        year.is_some(),
+                        false,
+                    )
+                    + 10;
+                hits.push(EditorialMediaHit {
+                    canonical_id: item.id.clone(),
+                    imdb_id: item.id.starts_with("tt").then(|| item.id.clone()),
+                    tmdb_id: item.id.strip_prefix("tmdb:").and_then(|s| s.parse().ok()),
+                    media_type: crate::tmdb::canonical_stremio_type(&item.r#type).to_owned(),
+                    title: item.name.clone(),
+                    year,
+                    imdb_rating,
+                    overview: None,
+                    poster_url,
+                    backdrop_url: None,
+                    logo_url: None,
+                    genres: Vec::new(),
+                    score,
+                    role_hint: None,
+                });
             }
             for li in model.ctx.library.items.values() {
-                let norm_name = normalize_title_for_dedup(&li.name);
-                if !norm_name.is_empty() && norm_name.contains(&norm_q) {
+                if li.removed {
+                    continue;
+                }
+                if title_matches_query(&li.name, &norm_q) {
                     let fake_preview = MetaItemPreview {
                         id: li.id.clone(),
                         r#type: li.r#type.clone(),
@@ -1443,10 +1596,14 @@ impl CoreController {
             for cat in &model.search.catalogs {
                 for page in cat {
                     if let Some(Loadable::Ready(items)) = &page.content {
-                        for item in items.iter().take(25) {
-                            if !item.name.trim().is_empty() {
-                                hits.push(preview_to_editorial_hit(item, &norm_q, 15));
+                        for item in items.iter().take(40) {
+                            if item.name.trim().is_empty() {
+                                continue;
                             }
+                            if !catalogs_match_query && !title_matches_query(&item.name, &norm_q) {
+                                continue;
+                            }
+                            hits.push(preview_to_editorial_hit(item, &norm_q, 15));
                         }
                     }
                 }
@@ -1454,13 +1611,17 @@ impl CoreController {
             hits
         });
 
+        let merged_people: Vec<EditorialPersonHit> = cached_tmdb_people
+            .into_iter()
+            .chain(local_people)
+            .collect();
         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         build_unified_editorial_search(
             trimmed,
             local_fts,
-            Vec::new(),
+            cached_tmdb_hits,
             addon_and_library_hits,
-            local_people,
+            merged_people,
             elapsed_us,
         )
     }
@@ -1473,12 +1634,52 @@ impl CoreController {
         if !cfg.tmdb_enabled || !cfg.has_tmdb_configured() || query.trim().is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        let norm_q = normalize_title_for_dedup(&query);
+        if let Ok(guard) = self.last_tmdb_search.lock() {
+            if let Some(cached) = guard.as_ref() {
+                if cached.norm_query == norm_q {
+                    return Ok((cached.media_hits.clone(), cached.person_hits.clone()));
+                }
+            }
+        }
+        let in_flight_rx = self
+            .in_flight_tmdb_search
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .filter(|(q, _)| q == &norm_q)
+                    .map(|(_, rx)| rx.clone())
+            });
+        if let Some(mut rx) = in_flight_rx {
+            if rx.wait_for(|v| v.is_some()).await.is_ok() {
+                if let Some(res) = rx.borrow().clone() {
+                    return res;
+                }
+            }
+        }
+
+        let seq_at_start = self.tmdb_search_seq.load(Ordering::SeqCst);
         let key = cfg.tmdb_api_key.expose().to_owned();
         let eng = Arc::clone(&self.metadata_engine);
-        self.runtime_handle
+        let res = self
+            .runtime_handle
             .spawn(async move { eng.search_multi(&key, &query).await })
             .await
-            .map_err(|err| format!("TMDB search task failed: {err}"))?
+            .map_err(|err| format!("TMDB search task failed: {err}"))?;
+        if let Ok((ref media_hits, ref person_hits)) = res {
+            if self.tmdb_search_seq.load(Ordering::SeqCst) == seq_at_start {
+                if let Ok(mut guard) = self.last_tmdb_search.lock() {
+                    *guard = Some(CachedTmdbSearch {
+                        norm_query: norm_q,
+                        media_hits: media_hits.clone(),
+                        person_hits: person_hits.clone(),
+                    });
+                }
+            }
+        }
+        res
     }
 
     pub async fn editorial_search_live(&self, query: String) -> UnifiedEditorialSearch {
@@ -1777,6 +1978,13 @@ impl CoreController {
             }
             if tmdb_changed {
                 self.metadata_engine.clear_caches();
+                self.tmdb_search_seq.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut cached) = self.last_tmdb_search.lock() {
+                    *cached = None;
+                }
+                if let Ok(mut inflight) = self.in_flight_tmdb_search.lock() {
+                    *inflight = None;
+                }
             }
         }
         Ok(())

@@ -64,6 +64,23 @@ impl MpvViewport {
         f(&mut self.style);
         self
     }
+
+    fn ensure_repaint_notifier(&self, window: &mut Window, cx: &mut App) {
+        if !self.controller.mark_software_notifier_attached() {
+            let entity = window.current_view();
+            let mut rx = self.controller.subscribe_software_frames();
+            window
+                .spawn(cx, async move |wcx| {
+                    while rx.changed().await.is_ok() {
+                        let _ = rx.borrow_and_update();
+                        if wcx.update(|_window, cx| cx.notify(entity)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+        }
+    }
 }
 
 impl ParentElement for MpvViewport {
@@ -145,6 +162,7 @@ impl Element for MpvViewport {
             {
                 match self.controller.attach_or_sync_windows_dcomp(handles) {
                     Ok(()) => {
+                        self.ensure_repaint_notifier(window, cx);
                         window.paint_quad(fill(
                             bounds,
                             Rgba {
@@ -209,19 +227,8 @@ impl Element for MpvViewport {
                 target: "gpui_mpv::element",
                 "software video renderer attach failed: {err}"
             );
-        } else if !self.controller.mark_software_notifier_attached() {
-            let entity = window.current_view();
-            let mut rx = self.controller.subscribe_software_frames();
-            window
-                .spawn(cx, async move |wcx| {
-                    while rx.changed().await.is_ok() {
-                        let _ = rx.borrow_and_update();
-                        if wcx.update(|_window, cx| cx.notify(entity)).is_err() {
-                            break;
-                        }
-                    }
-                })
-                .detach();
+        } else {
+            self.ensure_repaint_notifier(window, cx);
         }
 
         let frame_opt = self.controller.latch_video_frame_for_paint();

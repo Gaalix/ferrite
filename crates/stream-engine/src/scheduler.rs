@@ -738,6 +738,10 @@ fn spawn_critical_head_tail_warmers(
     head_warmed: Arc<AtomicBool>,
     tail_warmed: Arc<AtomicBool>,
 ) {
+    // Sequence head before tail so that on 1-2 peer swarms, librqbit's random stream
+    // interleaving cannot hand the sole peer a multi-MiB tail piece before piece 0 is fetched.
+    let (head_done_tx, mut head_done_rx) = tokio::sync::watch::channel(false);
+
     {
         let handle = handle.clone();
         let cancel = cancel.clone();
@@ -765,6 +769,7 @@ fn spawn_critical_head_tail_warmers(
                     if let Err(err) = res {
                         trace!(file_idx, "head warmer exited early: {err}");
                     }
+                    let _ = head_done_tx.send(true);
                 }
             }
         });
@@ -772,6 +777,15 @@ fn spawn_critical_head_tail_warmers(
 
     if file_len > HEAD_CRITICAL_BYTES {
         tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                res = head_done_rx.wait_for(|&done| done) => {
+                    if res.is_err() || cancel.is_cancelled() {
+                        return;
+                    }
+                }
+            }
+
             let tail_start = file_len.saturating_sub(TAIL_CRITICAL_BYTES);
             let fut = async {
                 let mut stream = handle.stream(file_idx).await.map_err(|e| e.to_string())?;
@@ -1010,6 +1024,99 @@ mod tests {
         );
 
         scheduler.shutdown();
+        session.cancellation_token().cancel();
+        seeder.cancellation_token().cancel();
+    }
+
+    #[tokio::test]
+    async fn head_warmer_gates_tail_warmer_and_respects_cancellation() {
+        use librqbit::{AddTorrent, AddTorrentOptions, CreateTorrentOptions, SessionOptions};
+        use tempfile::TempDir;
+
+        let seed_dir = TempDir::new().unwrap();
+        let folder = seed_dir.path().join("SingleFile");
+        tokio::fs::create_dir_all(&folder).await.unwrap();
+        // > HEAD_CRITICAL_BYTES (2 MiB) so tail warmer is spawned.
+        let payload = vec![0x5Au8; (HEAD_CRITICAL_BYTES as usize) + 512 * 1024];
+        tokio::fs::write(folder.join("movie.mkv"), &payload)
+            .await
+            .unwrap();
+
+        let seeder = Session::new_with_opts(
+            seed_dir.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (created_meta, _seed_handle) = seeder
+            .create_and_serve_torrent(
+                &folder,
+                CreateTorrentOptions {
+                    name: Some("SingleFile"),
+                    piece_length: Some(64 * 1024),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let torrent_bytes = created_meta.as_bytes().unwrap().to_vec();
+
+        // Unseeded leecher: head cannot finish, so tail warmer must NOT open a competing stream.
+        let leech_dir = TempDir::new().unwrap();
+        let session = Arc::new(
+            Session::new_with_opts(
+                leech_dir.path().to_path_buf(),
+                SessionOptions {
+                    dht: None,
+                    disable_trackers: true,
+                    disable_local_service_discovery: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent_bytes),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+
+        let cancel = CancellationToken::new();
+        let head_warmed = Arc::new(AtomicBool::new(false));
+        let tail_warmed = Arc::new(AtomicBool::new(false));
+        spawn_critical_head_tail_warmers(
+            handle.clone(),
+            0,
+            payload.len() as u64,
+            cancel.clone(),
+            Arc::clone(&head_warmed),
+            Arc::clone(&tail_warmed),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!head_warmed.load(Ordering::Acquire));
+        assert!(!tail_warmed.load(Ordering::Acquire));
+
+        cancel.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!tail_warmed.load(Ordering::Acquire));
+
         session.cancellation_token().cancel();
         seeder.cancellation_token().cancel();
     }

@@ -77,9 +77,10 @@ pub use subtitles::{
     NATIVE_SUBTITLE_HTTP_TIMEOUT_MS, NATIVE_SUBTITLE_POOL_IDLE_SECS,
 };
 pub use tmdb::{
-    build_unified_editorial_search, enriched_to_stremio_meta_item, extract_4_digit_year,
-    format_addon_resource_url, meta_resource_matches_url, normalize_person_slug,
-    normalize_title_for_dedup, preview_to_editorial_hit, EditorialMediaHit, EditorialPersonHit,
+    build_unified_editorial_search, cmp_editorial_hits, enriched_to_stremio_meta_item,
+    extract_4_digit_year, format_addon_resource_url, meta_resource_matches_url,
+    normalize_person_slug, normalize_title_for_dedup, preview_to_editorial_hit, score_hit_quality,
+    score_title_relevance, title_matches_query, EditorialMediaHit, EditorialPersonHit,
     EnrichedCollection, EnrichedTitleMeta, MetadataEngine, PersonCreditChip, PersonFilmography,
     TmdbAccountStatus, UnifiedEditorialSearch, DEFAULT_TMDB_API_BASE_URL,
     DEFAULT_TMDB_IMAGE_BASE_URL,

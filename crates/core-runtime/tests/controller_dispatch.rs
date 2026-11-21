@@ -589,3 +589,337 @@ async fn boot_updates_stale_loopback_streaming_server_url_while_preserving_remot
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn live_search_keeps_game_of_thrones_series_top_across_incremental_catalogs_and_rejects_stale_queries() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    std::env::set_var("EMPTY_OFFICIAL_ADDONS", "1");
+
+    // Mock addon + mock TMDB server with controllable timing:
+    // - Series catalog returns immediately with Game of Thrones (tt0944947, 9.2).
+    // - Movies catalog returns AFTER a brief delay with 15 Game of Thrones movie specials
+    //   (reproducing the exact "good series flashes then gets buried by movies" race).
+    // - TMDB returns Game of Thrones (tv/1399) for "game of thrones" and a delayed response
+    //   for "batman" to test out-of-order stale TMDB suppression.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_url = Url::parse(&format!("http://{addr}/")).unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let first_line = req.lines().next().unwrap_or("");
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+                let body = if path.contains("/catalog/series/top/search=") {
+                    if path.to_ascii_lowercase().contains("batman") {
+                        serde_json::json!({
+                            "metas": [
+                                {
+                                    "id": "tt0103359",
+                                    "type": "series",
+                                    "name": "Batman: The Animated Series",
+                                    "releaseInfo": "1992-1995",
+                                    "poster": "https://images.metahub.space/poster/small/tt0103359/img",
+                                    "links": [{ "name": "9.0", "category": "imdb", "url": "https://imdb.com/title/tt0103359" }]
+                                }
+                            ]
+                        })
+                        .to_string()
+                    } else {
+                        serde_json::json!({
+                            "metas": [
+                                {
+                                    "id": "tt0944947",
+                                    "type": "series",
+                                    "name": "Game of Thrones",
+                                    "releaseInfo": "2011-2019",
+                                    "poster": "https://images.metahub.space/poster/small/tt0944947/img",
+                                    "description": "Nine noble families fight for control over the lands of Westeros.",
+                                    "links": [{ "name": "9.2", "category": "imdb", "url": "https://imdb.com/title/tt0944947" }]
+                                },
+                                {
+                                    "id": "tt11198330",
+                                    "type": "series",
+                                    "name": "House of the Dragon",
+                                    "releaseInfo": "2022-",
+                                    "poster": "https://images.metahub.space/poster/small/tt11198330/img",
+                                    "links": [{ "name": "8.4", "category": "imdb", "url": "https://imdb.com/title/tt11198330" }]
+                                }
+                            ]
+                        })
+                        .to_string()
+                    }
+                } else if path.contains("/catalog/movie/top/search=") {
+                    if path.to_ascii_lowercase().contains("batman") {
+                        serde_json::json!({
+                            "metas": [
+                                {
+                                    "id": "tt1877830",
+                                    "type": "movie",
+                                    "name": "The Batman",
+                                    "releaseInfo": "2022",
+                                    "poster": "https://images.metahub.space/poster/small/tt1877830/img",
+                                    "links": [{ "name": "7.8", "category": "imdb", "url": "https://imdb.com/title/tt1877830" }]
+                                }
+                            ]
+                        })
+                        .to_string()
+                    } else {
+                        // Delay Movies catalog slightly so Series arrives first, then Movies floods in.
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        let mut metas = vec![
+                            serde_json::json!({
+                                "id": "tt10400001",
+                                "type": "movie",
+                                "name": "Game of Thrones: Aftermath",
+                                "releaseInfo": "2019"
+                            }),
+                            serde_json::json!({
+                                "id": "tt10400002",
+                                "type": "movie",
+                                "name": "Game of Thrones Watchathon",
+                                "releaseInfo": "2019"
+                            }),
+                            serde_json::json!({
+                                "id": "tt10090796",
+                                "type": "movie",
+                                "name": "Game of Thrones: The Last Watch",
+                                "releaseInfo": "2019",
+                                "poster": "https://images.metahub.space/poster/small/tt10090796/img",
+                                "links": [{ "name": "7.2", "category": "imdb", "url": "https://imdb.com/title/tt10090796" }]
+                            }),
+                            serde_json::json!({
+                                "id": "tt10400003",
+                                "type": "movie",
+                                "name": "Game of Thrones: The Story So Far",
+                                "releaseInfo": "2017",
+                                "poster": "https://images.metahub.space/poster/small/tt10400003/img"
+                            }),
+                            serde_json::json!({
+                                "id": "tt10400004",
+                                "type": "movie",
+                                "name": "Game of Thrones: The Story So Far",
+                                "releaseInfo": "2019"
+                            }),
+                        ];
+                        for i in 5..=14 {
+                            metas.push(serde_json::json!({
+                                "id": format!("tt104000{i:02}"),
+                                "type": "movie",
+                                "name": format!("Game of Thrones Documentary {i}"),
+                                "releaseInfo": "2019"
+                            }));
+                        }
+                        serde_json::json!({ "metas": metas }).to_string()
+                    }
+                } else if path.contains("/search/multi") {
+                    if path.to_ascii_lowercase().contains("batman") {
+                        // Slow stale TMDB response for batman
+                        tokio::time::sleep(Duration::from_millis(180)).await;
+                        serde_json::json!({
+                            "results": [
+                                {
+                                    "id": 414906,
+                                    "media_type": "movie",
+                                    "title": "The Batman",
+                                    "release_date": "2022-03-01",
+                                    "vote_average": 7.7,
+                                    "vote_count": 10000,
+                                    "popularity": 120.0,
+                                    "poster_path": "/batman.jpg"
+                                }
+                            ]
+                        })
+                        .to_string()
+                    } else {
+                        serde_json::json!({
+                            "results": [
+                                {
+                                    "id": 1399,
+                                    "media_type": "tv",
+                                    "name": "Game of Thrones",
+                                    "first_air_date": "2011-04-17",
+                                    "vote_average": 8.4,
+                                    "vote_count": 23000,
+                                    "popularity": 450.0,
+                                    "overview": "Seven noble families fight for control of Westeros.",
+                                    "poster_path": "/got.jpg"
+                                }
+                            ]
+                        })
+                        .to_string()
+                    }
+                } else {
+                    r#"{"metas":[]}"#.to_owned()
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("live_search_regression.db");
+    let config =
+        EnvConfig::with_storage_path(&db_path).with_streaming_server_url(server_url.clone());
+
+    DesktopEnv::run_isolated(config, async move {
+        let controller = CoreController::from_initialized_env().await.unwrap();
+
+        // Configure TMDB pointing at our local mock server.
+        let mut cfg = controller.private_integrations();
+        cfg.tmdb_enabled = true;
+        cfg.tmdb_api_key = stremio_core_runtime::SecretApiKey::new("test_tmdb_key_12345");
+        controller.update_private_integrations(cfg).unwrap();
+        controller.set_tmdb_base_urls(
+            format!("http://{addr}"),
+            format!("http://{addr}/images"),
+        );
+
+        // Install mock addon with Movies catalog at index 0 and Series catalog at index 1
+        // (matching Cinemeta's real catalog ordering).
+        let search_addon = Descriptor {
+            manifest: Manifest {
+                id: "io.ferrite.mockcinemeta".to_owned(),
+                version: Version::new(1, 0, 0),
+                name: "Mock Cinemeta".to_owned(),
+                contact_email: None,
+                description: None,
+                logo: None,
+                background: None,
+                types: vec!["movie".to_owned(), "series".to_owned()],
+                resources: vec![ManifestResource::Short("catalog".to_owned())],
+                id_prefixes: None,
+                catalogs: vec![
+                    ManifestCatalog {
+                        r#type: "movie".to_owned(),
+                        id: "top".to_owned(),
+                        name: Some("Popular Movies".to_owned()),
+                        extra: ManifestExtra::Full {
+                            props: vec![stremio_core::types::addon::ExtraProp {
+                                name: "search".to_owned(),
+                                is_required: false,
+                                options: vec![],
+                                options_limit: Default::default(),
+                            }],
+                        },
+                    },
+                    ManifestCatalog {
+                        r#type: "series".to_owned(),
+                        id: "top".to_owned(),
+                        name: Some("Popular Series".to_owned()),
+                        extra: ManifestExtra::Full {
+                            props: vec![stremio_core::types::addon::ExtraProp {
+                                name: "search".to_owned(),
+                                is_required: false,
+                                options: vec![],
+                                options_limit: Default::default(),
+                            }],
+                        },
+                    },
+                ],
+                addon_catalogs: vec![],
+                behavior_hints: Default::default(),
+            },
+            transport_url: server_url.join("addon/manifest.json").unwrap(),
+            flags: Default::default(),
+        };
+        controller
+            .install_or_replace_addon_descriptor(search_addon)
+            .unwrap();
+
+        // 1. Fire slow "batman" query, then immediately supersede with "game of thrones".
+        controller.search("batman");
+        // Before "game of thrones" is dispatched, querying snapshot for "game of thrones"
+        // must never leak unrelated "batman" results.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let pre_snap = controller.editorial_search_snapshot("game of thrones");
+        assert!(
+            pre_snap
+                .ranked_media_hits(12)
+                .iter()
+                .all(|h| !h.title.to_ascii_lowercase().contains("batman")),
+            "stale batman catalog items leaked into game of thrones snapshot"
+        );
+
+        controller.search("game of thrones");
+
+        // Wait until BOTH Movies (delayed 80ms) and Series catalogs AND TMDB have settled,
+        // AND the superseded slow "batman" TMDB response (180ms) has also completed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let ready_count = controller.with_model(|m| {
+                m.search
+                    .catalogs
+                    .iter()
+                    .filter(|cat| {
+                        matches!(
+                            cat.first().and_then(|p| p.content.as_ref()),
+                            Some(stremio_core::models::common::Loadable::Ready(_))
+                        )
+                    })
+                    .count()
+            });
+            if ready_count >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for mock search catalogs"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Let the superseded 180ms "batman" TMDB response finish and FTS ingestion settle.
+        tokio::time::sleep(Duration::from_millis(220)).await;
+
+        let snap = controller.editorial_search_snapshot("game of thrones");
+        let ranked = snap.ranked_media_hits(12);
+        assert!(!ranked.is_empty(), "expected ranked live search hits");
+        assert_eq!(
+            ranked[0].canonical_id, "tt0944947",
+            "Game of Thrones Series must remain #1 after Movies specials and TMDB arrive"
+        );
+        assert_eq!(ranked[0].media_type, "series");
+        assert_eq!(
+            ranked
+                .iter()
+                .filter(|h| h.title == "Game of Thrones")
+                .count(),
+            1,
+            "Game of Thrones must be deduplicated across Cinemeta + TMDB + FTS"
+        );
+        assert!(
+            ranked
+                .iter()
+                .all(|h| !h.title.to_ascii_lowercase().contains("batman")),
+            "superseded slow batman TMDB response must not pollute game of thrones results"
+        );
+        let last_watch_idx = ranked
+            .iter()
+            .position(|h| h.canonical_id == "tt10090796")
+            .expect("The Last Watch should be present");
+        let aftermath_idx = ranked
+            .iter()
+            .position(|h| h.canonical_id == "tt10400001")
+            .expect("Aftermath should be present");
+        assert!(
+            last_watch_idx < aftermath_idx,
+            "rated/postered special should rank ahead of unrated posterless special"
+        );
+    })
+    .await
+    .unwrap();
+}

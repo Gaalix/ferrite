@@ -266,6 +266,31 @@ impl DCompStateTracker {
     }
 }
 
+#[inline]
+pub fn compute_composition_size(
+    logical_width: i32,
+    logical_height: i32,
+    scale_factor: f32,
+) -> (u32, u32) {
+    let scale = sanitize_scale(scale_factor);
+    let w = (((logical_width.max(1)) as f32) * scale).round().max(1.0) as u32;
+    let h = (((logical_height.max(1)) as f32) * scale).round().max(1.0) as u32;
+    (w, h)
+}
+
+#[inline]
+pub fn format_composition_size(width: u32, height: u32) -> String {
+    format!("{}x{}", width.max(1), height.max(1))
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_swapchain_ptr_i64(raw: i64) -> Option<usize> {
+    if raw == 0 {
+        return None;
+    }
+    usize::try_from(raw as u64).ok().filter(|&ptr| ptr != 0)
+}
+
 #[allow(dead_code)]
 pub(crate) fn parse_swapchain_ptr_str(raw: &str) -> Option<usize> {
     let trimmed = raw.trim();
@@ -303,7 +328,7 @@ mod win_impl {
         SetWindowPos, CS_HREDRAW, CS_VREDRAW, HTTRANSPARENT, SWP_HIDEWINDOW, SWP_NOACTIVATE,
         SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WM_APP,
         WM_ERASEBKGND, WM_NCHITTEST, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-        WS_EX_NOACTIVATE, WS_EX_NOPARENTNOTIFY, WS_EX_TRANSPARENT,
+        WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_NOPARENTNOTIFY, WS_EX_TRANSPARENT,
     };
     use windows_core::{IUnknown, Interface};
 
@@ -419,6 +444,22 @@ mod win_impl {
             self.mode
         }
 
+        pub fn set_mode(&mut self, mode: DCompBackendMode) {
+            if self.mode == mode {
+                return;
+            }
+            if mode != DCompBackendMode::DirectSwapChainVisual {
+                self.release_direct_visual_content();
+            }
+            self.mode = mode;
+            self.tracker.reset();
+        }
+
+        pub fn clear_visual_content(&mut self) {
+            self.release_direct_visual_content();
+            self.tracker.reset();
+        }
+
         pub fn child_hwnd_isize(&self) -> Option<isize> {
             self.child_hwnd.map(|h| h.0 as isize)
         }
@@ -438,8 +479,6 @@ mod win_impl {
             scale_factor: f32,
             visible: bool,
             swapchain_ptr: usize,
-            video_width: i64,
-            video_height: i64,
         ) -> Result<DCompSyncDiff, MpvError> {
             if !handles.direct_composition_active || handles.hwnd == 0 {
                 return Err(MpvError::Render(
@@ -462,30 +501,24 @@ mod win_impl {
             let (source_w, source_h) = match self.mode {
                 DCompBackendMode::DirectSwapChainVisual if swapchain_ptr != 0 => unsafe {
                     let raw = swapchain_ptr as *mut c_void;
-                    if let Some(sc) = IDXGISwapChain1::from_raw_borrowed(&raw) {
-                        match sc.GetDesc1() {
-                            Ok(desc) if desc.Width > 0 && desc.Height > 0 => {
-                                (desc.Width, desc.Height)
+                    if let Some(unk) = IUnknown::from_raw_borrowed(&raw) {
+                        if let Ok(sc) = unk.cast::<IDXGISwapChain1>() {
+                            match sc.GetDesc1() {
+                                Ok(desc) if desc.Width > 0 && desc.Height > 0 => {
+                                    (desc.Width, desc.Height)
+                                }
+                                _ => (0, 0),
                             }
-                            _ => (
-                                u32::try_from(video_width).unwrap_or(0),
-                                u32::try_from(video_height).unwrap_or(0),
-                            ),
+                        } else {
+                            (0, 0)
                         }
                     } else {
-                        (
-                            u32::try_from(video_width).unwrap_or(0),
-                            u32::try_from(video_height).unwrap_or(0),
-                        )
+                        (0, 0)
                     }
                 },
-                DCompBackendMode::DirectSwapChainVisual => (
-                    u32::try_from(video_width).unwrap_or(0),
-                    u32::try_from(video_height).unwrap_or(0),
-                ),
-                DCompBackendMode::FlipChildHwndUnderlay | DCompBackendMode::SoftwareFallback => {
-                    (0, 0)
-                }
+                DCompBackendMode::DirectSwapChainVisual
+                | DCompBackendMode::FlipChildHwndUnderlay
+                | DCompBackendMode::SoftwareFallback => (0, 0),
             };
 
             let placement = compute_underlay_placement(
@@ -514,17 +547,20 @@ mod win_impl {
                 return Ok(diff);
             }
 
-            match self.mode {
+            let committed = match self.mode {
                 DCompBackendMode::DirectSwapChainVisual => {
                     self.sync_direct_swapchain_visual(&desired, diff)?;
+                    true
                 }
                 DCompBackendMode::FlipChildHwndUnderlay => {
-                    self.sync_child_hwnd_underlay(&desired, diff)?;
+                    self.sync_child_hwnd_underlay(&desired, diff)?
                 }
                 DCompBackendMode::SoftwareFallback => unreachable!(),
-            }
+            };
 
-            self.tracker.mark_committed(desired);
+            if committed {
+                self.tracker.mark_committed(desired);
+            }
             Ok(diff)
         }
 
@@ -596,12 +632,15 @@ mod win_impl {
                 || self.attached_swapchain_ptr != desired.swapchain_ptr
             {
                 let sc_raw = desired.swapchain_ptr as *mut c_void;
-                let swap_chain = unsafe { IDXGISwapChain1::from_raw_borrowed(&sc_raw) }.ok_or_else(
-                    || MpvError::Render("null IDXGISwapChain1 pointer from libmpv".into()),
+                let sc_unknown = unsafe { IUnknown::from_raw_borrowed(&sc_raw) }.ok_or_else(
+                    || MpvError::Render("null IDXGISwapChain pointer from libmpv".into()),
                 )?;
+                let swap_chain: IDXGISwapChain1 = sc_unknown.cast().map_err(|e| {
+                    MpvError::Render(format!("QueryInterface(IDXGISwapChain1) failed: {e}"))
+                })?;
                 unsafe {
                     video_visual
-                        .SetContent(swap_chain)
+                        .SetContent(&swap_chain)
                         .map_err(|e| MpvError::Render(format!("SetContent(swapchain) failed: {e}")))?;
                 }
                 self.attached_swapchain_ptr = desired.swapchain_ptr;
@@ -659,8 +698,15 @@ mod win_impl {
             &mut self,
             desired: &DCompDesiredState,
             diff: DCompSyncDiff,
-        ) -> Result<(), MpvError> {
+        ) -> Result<bool, MpvError> {
             self.release_direct_visual_content();
+
+            if self
+                .child_owner_thread
+                .is_some_and(|owner| owner != std::thread::current().id())
+            {
+                return Ok(false);
+            }
 
             if diff.parent_hwnd_changed || self.child_hwnd.is_none() {
                 if let Some(old_hwnd) = self.child_hwnd.take() {
@@ -675,7 +721,7 @@ mod win_impl {
                 let parent = HWND(desired.handles.hwnd as *mut c_void);
                 let rect = desired.placement.viewport_rect;
                 let ex_style = WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_NOPARENTNOTIFY;
-                let style = WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+                let style = WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_DISABLED;
                 let child = unsafe {
                     CreateWindowExW(
                         ex_style,
@@ -718,7 +764,7 @@ mod win_impl {
                 }
             }
 
-            Ok(())
+            Ok(true)
         }
 
         fn release_direct_visual_content(&mut self) {
@@ -947,5 +993,22 @@ mod tests {
         assert_eq!(parse_swapchain_ptr_str("0"), None);
         assert_eq!(parse_swapchain_ptr_str(""), None);
         assert_eq!(parse_swapchain_ptr_str("not-a-ptr"), None);
+
+        assert_eq!(parse_swapchain_ptr_i64(0), None);
+        assert_eq!(parse_swapchain_ptr_i64(0x1a2b_3c4d), Some(0x1a2b_3c4d));
+        assert_eq!(
+            parse_swapchain_ptr_i64(0x0000_7ff8_1234_5678),
+            Some(0x0000_7ff8_1234_5678)
+        );
+    }
+
+    #[test]
+    fn composition_size_scales_hi_dpi_and_clamps_invalid_values() {
+        assert_eq!(compute_composition_size(1440, 900, 1.5), (2160, 1350));
+        assert_eq!(compute_composition_size(1280, 720, 1.0), (1280, 720));
+        assert_eq!(compute_composition_size(0, -10, f32::NAN), (1, 1));
+        assert_eq!(compute_composition_size(1920, 1080, 0.0), (1920, 1080));
+        assert_eq!(format_composition_size(2160, 1350), "2160x1350");
+        assert_eq!(format_composition_size(0, 0), "1x1");
     }
 }

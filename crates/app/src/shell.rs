@@ -6209,12 +6209,16 @@ impl AppShell {
         id_prefix: &'static str,
         in_glass_capsule: bool,
     ) -> Option<gpui::Div> {
-        if !matches!(window.window_decorations(), Decorations::Client { .. })
-            || window.is_fullscreen()
-        {
+        let is_windows = cfg!(target_os = "windows");
+        if !should_render_custom_window_controls(
+            is_windows,
+            window.window_decorations(),
+            window.is_fullscreen(),
+        ) {
             return None;
         }
 
+        let use_native_nc_chrome = uses_native_windows_nc_chrome(is_windows);
         let controls = window.window_controls();
         let is_maximized = window.is_maximized();
         let min_id = SharedString::from(format!("{id_prefix}-csd-min"));
@@ -6224,7 +6228,12 @@ impl AppShell {
         let max_grp = SharedString::from(format!("{id_prefix}-grp-max"));
         let close_grp = SharedString::from(format!("{id_prefix}-grp-close"));
 
+        // Occlude the container and each button so the parent titlebar's
+        // `WindowControlArea::Drag` hitbox (which GPUI registers first and
+        // checks in paint order) cannot shadow `Min`/`Max`/`Close` on Windows
+        // or trigger parent titlebar click handlers.
         let base = div()
+            .occlude()
             .flex()
             .items_center()
             .gap(px(2.0))
@@ -6243,6 +6252,7 @@ impl AppShell {
                     div()
                         .id(min_id)
                         .group(min_grp.clone())
+                        .occlude()
                         .window_control_area(WindowControlArea::Min)
                         .cursor_pointer()
                         .w(px(32.0))
@@ -6252,9 +6262,11 @@ impl AppShell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                            cx.stop_propagation();
-                            window.minimize_window();
+                        .when(!use_native_nc_chrome, |btn| {
+                            btn.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
+                                window.minimize_window();
+                            })
                         })
                         .child(
                             svg_icon(IconName::Minus, 14.0, rgb(TEXT_SECONDARY))
@@ -6267,6 +6279,7 @@ impl AppShell {
                     div()
                         .id(max_id)
                         .group(max_grp.clone())
+                        .occlude()
                         .window_control_area(WindowControlArea::Max)
                         .cursor_pointer()
                         .w(px(32.0))
@@ -6276,9 +6289,11 @@ impl AppShell {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                            cx.stop_propagation();
-                            window.zoom_window();
+                        .when(!use_native_nc_chrome, |btn| {
+                            btn.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
+                                window.zoom_window();
+                            })
                         })
                         .child(
                             svg_icon(
@@ -6298,6 +6313,7 @@ impl AppShell {
                 div()
                     .id(close_id)
                     .group(close_grp.clone())
+                    .occlude()
                     .window_control_area(WindowControlArea::Close)
                     .cursor_pointer()
                     .w(px(32.0))
@@ -6307,9 +6323,11 @@ impl AppShell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                        cx.stop_propagation();
-                        window.remove_window();
+                    .when(!use_native_nc_chrome, |btn| {
+                        btn.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            cx.stop_propagation();
+                            window.remove_window();
+                        })
                     })
                     .child(
                         svg_icon(IconName::X, 14.5, rgb(TEXT_SECONDARY))
@@ -6505,9 +6523,13 @@ impl AppShell {
             self.palette_query.clone().into()
         };
 
+        let use_native_nc_chrome = uses_native_windows_nc_chrome(cfg!(target_os = "windows"));
+
         div()
             .id("topnav-titlebar")
-            .window_control_area(WindowControlArea::Drag)
+            .when(!is_fullscreen, |el| {
+                el.window_control_area(WindowControlArea::Drag)
+            })
             .w_full()
             .h(px(64.0))
             .flex_shrink_0()
@@ -6524,16 +6546,18 @@ impl AppShell {
             .items_center()
             .justify_between()
             .gap(px(16.0))
-            .on_mouse_down(MouseButton::Left, |event, window, _cx| {
-                if event.click_count >= 2 {
-                    window.zoom_window();
-                } else {
-                    window.start_window_move();
-                }
-            })
-            .on_mouse_down(MouseButton::Right, |event, window, cx| {
-                cx.stop_propagation();
-                window.show_window_menu(event.position);
+            .when(!use_native_nc_chrome, |el| {
+                el.on_mouse_down(MouseButton::Left, |event, window, _cx| {
+                    if event.click_count >= 2 {
+                        window.zoom_window();
+                    } else {
+                        window.start_window_move();
+                    }
+                })
+                .on_mouse_down(MouseButton::Right, |event, window, cx| {
+                    cx.stop_propagation();
+                    window.show_window_menu(event.position);
+                })
             })
             .child(
                 div()
@@ -7363,8 +7387,11 @@ impl Render for AppShell {
         }
 
         let is_player = self.route.is_player();
-        let is_csd = matches!(window.window_decorations(), Decorations::Client { .. })
-            && !window.is_fullscreen();
+        let has_custom_window_controls = should_render_custom_window_controls(
+            cfg!(target_os = "windows"),
+            window.window_decorations(),
+            window.is_fullscreen(),
+        );
 
         if is_player && self.window_blur_active {
             window.set_background_appearance(WindowBackgroundAppearance::Transparent);
@@ -7469,7 +7496,7 @@ impl Render for AppShell {
                 el.child(self.render_command_palette(cx))
             })
             .when(self.avatar_menu_open, |el| {
-                el.child(self.render_avatar_menu(is_csd, cx))
+                el.child(self.render_avatar_menu(has_custom_window_controls, cx))
             })
             .when_some(self.context_menu.as_ref(), |el, menu| {
                 el.child(self.render_browsing_context_menu(menu, cx))
@@ -7888,4 +7915,101 @@ fn is_uncached_debrid_error(err: &str) -> bool {
     lower.contains("not cached")
         || lower.contains("not instantly cached")
         || lower.contains("uncached")
+}
+
+/// Whether Ferrite should render its own minimize / maximize / close window controls.
+///
+/// On Linux, GPUI reports `Decorations::Client` when client-side decorations are active.
+/// On Windows, `TitlebarOptions { appears_transparent: true, .. }` hides the native Win32
+/// titlebar (`gpui_windows` removes it in `WM_NCCALCSIZE`), while `WindowsWindow` inherits
+/// `PlatformWindow::window_decorations()`'s default of `Decorations::Server`. Because the
+/// native caption buttons are hidden on Windows, Ferrite must render custom controls whenever
+/// the window is not fullscreen.
+/// On macOS, `appears_transparent: true` preserves native traffic lights, so custom controls
+/// remain off when `is_windows` is false and decorations are `Decorations::Server`.
+fn should_render_custom_window_controls(
+    is_windows: bool,
+    decorations: Decorations,
+    is_fullscreen: bool,
+) -> bool {
+    if is_fullscreen {
+        return false;
+    }
+    is_windows || matches!(decorations, Decorations::Client { .. })
+}
+
+/// Whether caption button clicks and titlebar drag / double-click / system-menu interactions
+/// should defer to GPUI's native Windows non-client message path (`WM_NCHITTEST` +
+/// `WM_NCLBUTTONDOWN`/`WM_NCLBUTTONUP` + `DefWindowProcW`) rather than manual `on_mouse_down`
+/// handlers.
+///
+/// On Windows, `Window::zoom_window()` unconditionally calls `ShowWindowAsync(_, SW_MAXIMIZE)`
+/// and cannot restore a maximized window, whereas `gpui_windows`'s `WM_NCLBUTTONUP` handler
+/// for `HTMAXBUTTON` properly toggles `SW_NORMAL`/`SW_MAXIMIZE` and `WM_NCHITTEST` returning
+/// `HTMAXBUTTON` enables Windows 11 Snap Layouts.
+fn uses_native_windows_nc_chrome(is_windows: bool) -> bool {
+    is_windows
+}
+
+#[cfg(test)]
+mod window_chrome_tests {
+    use gpui::{Decorations, Tiling};
+
+    use super::{should_render_custom_window_controls, uses_native_windows_nc_chrome};
+
+    #[test]
+    fn windows_renders_custom_controls_even_with_server_decorations() {
+        assert!(should_render_custom_window_controls(
+            true,
+            Decorations::Server,
+            false
+        ));
+        assert!(should_render_custom_window_controls(
+            true,
+            Decorations::Client {
+                tiling: Tiling::default(),
+            },
+            false
+        ));
+    }
+
+    #[test]
+    fn fullscreen_hides_custom_controls_on_all_platforms() {
+        assert!(!should_render_custom_window_controls(
+            true,
+            Decorations::Server,
+            true
+        ));
+        assert!(!should_render_custom_window_controls(
+            false,
+            Decorations::Client {
+                tiling: Tiling::default(),
+            },
+            true
+        ));
+    }
+
+    #[test]
+    fn non_windows_follows_client_decorations_only() {
+        // Linux CSD renders custom controls
+        assert!(should_render_custom_window_controls(
+            false,
+            Decorations::Client {
+                tiling: Tiling::default(),
+            },
+            false
+        ));
+        // macOS (native traffic lights) and Linux SSD do not render custom controls
+        assert!(!should_render_custom_window_controls(
+            false,
+            Decorations::Server,
+            false
+        ));
+    }
+
+    #[test]
+    fn native_windows_nc_chrome_is_windows_only() {
+        assert!(uses_native_windows_nc_chrome(true));
+        assert!(!uses_native_windows_nc_chrome(false));
+    }
 }

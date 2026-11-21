@@ -1,10 +1,12 @@
+use std::collections::HashMap;
+
 use gpui::{div, img, prelude::*, px, rgb, rgba, AnimationExt, Context, FontWeight, MouseButton};
-use stremio_core_runtime::stremio_core::models::common::Loadable;
+use stremio_core_runtime::UnifiedEditorialSearch;
 
 use crate::{
     icons::{svg_icon, IconName},
     shell::AppShell,
-    state::{classify_library_item_status, FocusedInput, LibraryStatusTab, SidebarTab},
+    state::{FocusedInput, LibraryStatusTab, SidebarTab},
     theme::{
         glass_capsule_shadow, keycap, meta_divider, mono_font, obsidian_fade_in,
         placeholder_tint_for_id, sentence_case_label, tabular_nums, ui_sans, ACCENT, ACCENT_AMBER,
@@ -13,7 +15,7 @@ use crate::{
         RADIUS_POSTER, RADIUS_SHEET, STATUS_WATCHED, STATUS_WATCHING, STATUS_WATCHLIST, TEXT_MUTED,
         TEXT_PRIMARY, TEXT_SECONDARY,
     },
-    views::search_view::person_initials,
+    views::search_view::{hit_library_status, hit_target_id, person_initials},
 };
 
 #[derive(Clone, Debug)]
@@ -47,12 +49,71 @@ pub enum PaletteEntry {
     },
 }
 
+const MAX_PALETTE_MEDIA_HITS: usize = 12;
+const MAX_PALETTE_PERSON_HITS: usize = 4;
+
+/// Builds the live search dropdown rows from a deduplicated, relevance-ranked
+/// `UnifiedEditorialSearch` snapshot so the dropdown always mirrors the same
+/// top match and cross-catalog ranking shown after pressing Enter.
+pub fn build_palette_search_entries(
+    query: &str,
+    snapshot: &UnifiedEditorialSearch,
+    library_statuses: &HashMap<String, LibraryStatusTab>,
+) -> Vec<PaletteEntry> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::with_capacity(20);
+    let q_lower = trimmed.to_ascii_lowercase();
+    entries.push(PaletteEntry::OpenFullSearch {
+        query: trimmed.to_owned(),
+    });
+
+    for tab in SidebarTab::ALL {
+        if tab.label().to_ascii_lowercase().contains(&q_lower) {
+            entries.push(PaletteEntry::QuickNav {
+                tab,
+                title: tab.label(),
+                subtitle: "Jump to section",
+            });
+        }
+    }
+
+    for hit in snapshot.ranked_media_hits(MAX_PALETTE_MEDIA_HITS) {
+        let lib_status = hit_library_status(&hit, library_statuses);
+        let target_id = hit_target_id(&hit);
+        entries.push(PaletteEntry::MediaHit {
+            id: target_id,
+            type_name: hit.media_type,
+            name: hit.title,
+            release_info: hit.year,
+            imdb_rating: hit.imdb_rating,
+            poster_url: hit.poster_url,
+            library_status: lib_status,
+        });
+    }
+
+    for person in snapshot.people.iter().take(MAX_PALETTE_PERSON_HITS) {
+        entries.push(PaletteEntry::PersonHit {
+            person_key: person.person_key.clone(),
+            name: person.name.clone(),
+            department: person.department.clone(),
+            headshot_url: person.headshot_url.clone(),
+            known_for: person.known_for.clone(),
+        });
+    }
+
+    entries
+}
+
 impl AppShell {
     pub fn build_palette_entries(&self) -> Vec<PaletteEntry> {
         let query = self.palette_query.trim();
-        let mut entries = Vec::with_capacity(20);
 
         if query.is_empty() {
+            let mut entries = Vec::with_capacity(20);
             let mut recent: Vec<(String, chrono::DateTime<chrono::Utc>)> =
                 self.core.with_model(|m| {
                     m.ctx
@@ -110,120 +171,9 @@ impl AppShell {
             return entries;
         }
 
-        let q_lower = query.to_ascii_lowercase();
-        entries.push(PaletteEntry::OpenFullSearch {
-            query: query.to_owned(),
-        });
-
-        for tab in SidebarTab::ALL {
-            if tab.label().to_ascii_lowercase().contains(&q_lower) {
-                entries.push(PaletteEntry::QuickNav {
-                    tab,
-                    title: tab.label(),
-                    subtitle: "Jump to section",
-                });
-            }
-        }
-
-        let (local_fts_hits, local_people) =
-            self.core.metadata_engine().search_local_fts(query, 6);
-
-        let media_hits = self.core.with_model(|model| {
-            let mut seen = std::collections::HashSet::new();
-            let mut hits = Vec::new();
-
-            for fts in local_fts_hits {
-                let canonical = fts.imdb_id.as_deref().unwrap_or(&fts.canonical_id);
-                if seen.insert(canonical.to_owned())
-                    && (canonical == fts.canonical_id || seen.insert(fts.canonical_id.clone()))
-                {
-                    let lib_status = model
-                        .ctx
-                        .library
-                        .items
-                        .get(canonical)
-                        .or_else(|| model.ctx.library.items.get(&fts.canonical_id))
-                        .and_then(classify_library_item_status);
-                    hits.push(PaletteEntry::MediaHit {
-                        id: fts.canonical_id,
-                        type_name: fts.media_type,
-                        name: fts.title,
-                        release_info: fts.year,
-                        imdb_rating: fts.imdb_rating,
-                        poster_url: fts.poster_url,
-                        library_status: lib_status,
-                    });
-                }
-            }
-
-            for item in model.local_search.search_results.iter().take(10) {
-                if !item.name.is_empty() && seen.insert(item.id.clone()) {
-                    let lib_status = model
-                        .ctx
-                        .library
-                        .items
-                        .get(&item.id)
-                        .and_then(classify_library_item_status);
-                    hits.push(PaletteEntry::MediaHit {
-                        id: item.id.clone(),
-                        type_name: item.r#type.clone(),
-                        name: item.name.clone(),
-                        release_info: item.release_info.clone(),
-                        imdb_rating: item.imdb_rating.map(|r| format!("{:.1}", r.to_f64())),
-                        poster_url: item.poster.as_ref().map(|u| u.to_string()),
-                        library_status: lib_status,
-                    });
-                }
-            }
-
-            for cat in &model.search.catalogs {
-                if let Some(page) = cat.first() {
-                    if let Some(Loadable::Ready(items)) = &page.content {
-                        for item in items.iter().take(10) {
-                            if seen.insert(item.id.clone()) {
-                                let rating = crate::state::extract_imdb_rating(item);
-                                let lib_status = model
-                                    .ctx
-                                    .library
-                                    .items
-                                    .get(&item.id)
-                                    .and_then(classify_library_item_status);
-                                hits.push(PaletteEntry::MediaHit {
-                                    id: item.id.clone(),
-                                    type_name: item.r#type.clone(),
-                                    name: item.name.clone(),
-                                    release_info: item.release_info.clone(),
-                                    imdb_rating: rating,
-                                    poster_url: item.poster.as_ref().map(|u| u.to_string()),
-                                    library_status: lib_status,
-                                });
-                            }
-                            if hits.len() >= 12 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if hits.len() >= 12 {
-                    break;
-                }
-            }
-            hits
-        });
-
-        entries.extend(media_hits);
-
-        for person in local_people.into_iter().take(4) {
-            entries.push(PaletteEntry::PersonHit {
-                person_key: person.person_key,
-                name: person.name,
-                department: person.department,
-                headshot_url: person.headshot_url,
-                known_for: person.known_for,
-            });
-        }
-
-        entries
+        let snapshot = self.core.editorial_search_snapshot(query);
+        let library_statuses = self.cached_library_statuses();
+        build_palette_search_entries(query, &snapshot, library_statuses.as_ref())
     }
 
     pub fn execute_palette_entry(&mut self, entry: PaletteEntry, cx: &mut Context<Self>) {
@@ -816,5 +766,182 @@ impl AppShell {
                     el.child(svg_icon(icon, 14.0, rgb(col)))
                 }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use stremio_core_runtime::{
+        build_unified_editorial_search, normalize_title_for_dedup, preview_to_editorial_hit,
+        stremio_core::{
+            constants::CINEMETA_URL,
+            types::resource::{Link, MetaItemBehaviorHints, MetaItemPreview, PosterShape},
+        },
+        EditorialMediaHit,
+    };
+    use url::Url;
+
+    use super::{build_palette_search_entries, PaletteEntry};
+    use crate::state::LibraryStatusTab;
+
+    fn make_preview(
+        id: &str,
+        media_type: &str,
+        name: &str,
+        year: Option<&str>,
+        rating: Option<&str>,
+        poster: Option<&str>,
+    ) -> MetaItemPreview {
+        let mut links = Vec::new();
+        if let Some(r) = rating {
+            links.push(Link {
+                name: r.to_owned(),
+                category: "imdb".to_owned(),
+                url: CINEMETA_URL.clone(),
+            });
+        }
+        MetaItemPreview {
+            id: id.to_owned(),
+            r#type: media_type.to_owned(),
+            name: name.to_owned(),
+            poster: poster.and_then(|u| Url::parse(u).ok()),
+            background: None,
+            logo: None,
+            description: None,
+            release_info: year.map(str::to_owned),
+            runtime: None,
+            released: None,
+            poster_shape: PosterShape::Poster,
+            links,
+            trailer_streams: Vec::new(),
+            behavior_hints: MetaItemBehaviorHints::default(),
+        }
+    }
+
+    #[test]
+    fn palette_search_entries_keep_game_of_thrones_series_first_across_movie_specials_and_tmdb() {
+        let query = "game of thrones";
+        let norm_q = normalize_title_for_dedup(query);
+
+        // Simulate Cinemeta Movies catalog arriving first with many Game of Thrones movie specials.
+        let movie_specials = [
+            make_preview("tt10400001", "movie", "Game of Thrones: Aftermath", Some("2019"), None, None),
+            make_preview("tt10400002", "movie", "Game of Thrones Watchathon", Some("2019"), None, None),
+            make_preview(
+                "tt10090796",
+                "movie",
+                "Game of Thrones: The Last Watch",
+                Some("2019"),
+                Some("7.2"),
+                Some("https://images.metahub.space/poster/small/tt10090796/img"),
+            ),
+            make_preview(
+                "tt10400003",
+                "movie",
+                "Game of Thrones: The Story So Far",
+                Some("2017"),
+                None,
+                Some("https://images.metahub.space/poster/small/tt10400003/img"),
+            ),
+            make_preview("tt10400004", "movie", "Game of Thrones: The Story So Far", Some("2019"), None, None),
+        ];
+
+        // Series catalog arrives separately with the main show.
+        let main_series = make_preview(
+            "tt0944947",
+            "series",
+            "Game of Thrones",
+            Some("2011-2019"),
+            Some("9.2"),
+            Some("https://images.metahub.space/poster/small/tt0944947/img"),
+        );
+
+        let addon_hits: Vec<EditorialMediaHit> = movie_specials
+            .iter()
+            .chain(std::iter::once(&main_series))
+            .map(|p| preview_to_editorial_hit(p, &norm_q, 15))
+            .collect();
+
+        // TMDB also returns the same main series under tmdb:1399 (must deduplicate into tt0944947).
+        let tmdb_hits = vec![EditorialMediaHit {
+            canonical_id: "tmdb:1399".to_owned(),
+            imdb_id: None,
+            tmdb_id: Some(1399),
+            media_type: "series".to_owned(),
+            title: "Game of Thrones".to_owned(),
+            year: Some("2011".to_owned()),
+            imdb_rating: Some("8.4".to_owned()),
+            overview: Some("Seven noble families fight for control of the mythical land of Westeros.".to_owned()),
+            poster_url: Some("https://image.tmdb.org/t/p/w342/got.jpg".to_owned()),
+            backdrop_url: None,
+            logo_url: None,
+            genres: Vec::new(),
+            score: 1_080,
+            role_hint: None,
+        }];
+
+        let snapshot = build_unified_editorial_search(
+            query,
+            Vec::new(),
+            tmdb_hits,
+            addon_hits,
+            Vec::new(),
+            50,
+        );
+
+        let mut library = HashMap::new();
+        library.insert("tt0944947".to_owned(), LibraryStatusTab::Watching);
+
+        let entries = build_palette_search_entries(query, &snapshot, &library);
+
+        // Row 0 is OpenFullSearch, row 1 must be the main Game of Thrones Series.
+        assert!(matches!(
+            &entries[0],
+            PaletteEntry::OpenFullSearch { query: q } if q == "game of thrones"
+        ));
+
+        let media_hits: Vec<_> = entries
+            .iter()
+            .filter_map(|e| match e {
+                PaletteEntry::MediaHit {
+                    id,
+                    type_name,
+                    name,
+                    library_status,
+                    ..
+                } => Some((id.as_str(), type_name.as_str(), name.as_str(), *library_status)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            media_hits[0],
+            (
+                "tt0944947",
+                "series",
+                "Game of Thrones",
+                Some(LibraryStatusTab::Watching)
+            )
+        );
+        // No duplicate Game of Thrones entry after merging TMDB + Cinemeta.
+        assert_eq!(
+            media_hits
+                .iter()
+                .filter(|(_, _, name, _)| *name == "Game of Thrones")
+                .count(),
+            1
+        );
+        // Rated + postered special must outrank blank-poster unrated specials.
+        let last_watch_pos = media_hits
+            .iter()
+            .position(|(id, _, _, _)| *id == "tt10090796")
+            .unwrap();
+        let aftermath_pos = media_hits
+            .iter()
+            .position(|(id, _, _, _)| *id == "tt10400001")
+            .unwrap();
+        assert!(last_watch_pos < aftermath_pos);
     }
 }
