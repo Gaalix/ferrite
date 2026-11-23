@@ -18,7 +18,9 @@ use crate::{
 };
 
 pub use crate::ui_components::{
-    clamp_progress_fraction, format_notification_badge_label, render_poster_card, PosterCardProps,
+    card_action_dispatcher, clamp_progress_fraction, format_notification_badge_label,
+    render_poster_card, render_prepared_poster_card, CardActionDispatcher, PosterCardAction,
+    PosterCardCapabilities, PosterCardProps, PreparedPosterCard, PreparedPosterRenderCtx,
 };
 
 /// Canonical poster sizing metrics derived from the active `ThemePalette` (`CardDensityChoice` × `ui_scale`).

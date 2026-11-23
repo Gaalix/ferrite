@@ -3,6 +3,9 @@
     windows_subsystem = "windows"
 )]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use ferrite::{
     icons::EmbeddedIconAssets,
     poster_cache::PosterCache,
