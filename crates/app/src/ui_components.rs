@@ -714,7 +714,7 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
         } else {
             div()
                 .size_full()
-                .p(px(14.0))
+                .p(sp(14.0))
                 .bg(rgb(theme.bg_surface))
                 .flex()
                 .items_end()
@@ -755,10 +755,10 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
             el.child(
                 div()
                     .absolute()
-                    .top(px(8.0))
-                    .left(px(8.0))
-                    .h(px(20.0))
-                    .px(px(7.0))
+                    .top(sp(8.0))
+                    .left(sp(8.0))
+                    .h(sp(20.0))
+                    .px(sp(7.0))
                     .rounded(px(RADIUS_PILL))
                     .bg(rgb(theme.accent))
                     .flex()
@@ -766,7 +766,7 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                     .justify_center()
                     .font(mono_font())
                     .font_weight(FontWeight::BOLD)
-                    .text_size(px(10.0))
+                    .text_size(sp(10.0))
                     .text_color(rgb(theme.cta_on_accent))
                     .child(label),
             )
@@ -780,40 +780,48 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
             el.child(
                 div()
                     .absolute()
-                    .top(px(8.0))
-                    .right(px(8.0))
-                    .w(px(24.0))
-                    .h(px(24.0))
+                    .top(sp(8.0))
+                    .right(sp(8.0))
+                    .w(sp(24.0))
+                    .h(sp(24.0))
                     .rounded(px(RADIUS_PILL))
                     .bg(rgb(bg_col))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(svg_icon(icon, 12.0, rgb(badge_fg_on_status))),
+                    .child(svg_icon(
+                        icon,
+                        12.0 * theme.ui_scale,
+                        rgb(badge_fg_on_status),
+                    )),
             )
         })
         .when_some(props.imdb_rating, |el, rating| {
             el.child(
                 div()
                     .absolute()
-                    .bottom(px(rating_bottom_px))
-                    .left(px(8.0))
-                    .px(px(6.5))
-                    .py(px(2.5))
+                    .bottom(sp(rating_bottom_px))
+                    .left(sp(8.0))
+                    .px(sp(6.5))
+                    .py(sp(2.5))
                     .rounded(px(4.0))
                     .bg(rgba(0x0B0D14D4))
                     .border_1()
                     .border_color(rgba(0xFFFFFF22))
                     .flex()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(sp(4.0))
                     .font(mono_font())
-                    .text_size(px(11.0))
+                    .text_size(sp(11.0))
                     .text_color(rgb(0xF5F1E8))
                     .when(has_bottom_left_hover_btn, |badge| {
                         badge.group_hover(grp.clone(), |s| s.opacity(0.0))
                     })
-                    .child(svg_icon(IconName::Star, 10.5, rgb(0xfbbf24)))
+                    .child(svg_icon(
+                        IconName::Star,
+                        10.5 * theme.ui_scale,
+                        rgb(0xfbbf24),
+                    ))
                     .child(rating),
             )
         });
@@ -832,8 +840,8 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                     div()
                         .id(quick_play_id)
                         .cursor_pointer()
-                        .w(px(44.0))
-                        .h(px(44.0))
+                        .w(sp(44.0))
+                        .h(sp(44.0))
                         .rounded(px(RADIUS_PILL))
                         .bg(rgb(theme.accent))
                         .hover(move |s| s.bg(rgb(theme.accent_hover)))
@@ -845,7 +853,11 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                             cx.stop_propagation();
                             on_quick_play(ev, window, cx);
                         })
-                        .child(svg_icon(IconName::Play, 17.0, rgb(theme.cta_on_accent))),
+                        .child(svg_icon(
+                            IconName::Play,
+                            17.0 * theme.ui_scale,
+                            rgb(theme.cta_on_accent),
+                        )),
                 ),
         );
     }
@@ -857,12 +869,12 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                 .id(toggle_lib_id)
                 .cursor_pointer()
                 .absolute()
-                .bottom(px(rating_bottom_px))
-                .left(px(8.0))
+                .bottom(sp(rating_bottom_px))
+                .left(sp(8.0))
                 .opacity(0.0)
                 .group_hover(grp.clone(), |s| s.opacity(1.0))
-                .w(px(30.0))
-                .h(px(30.0))
+                .w(sp(30.0))
+                .h(sp(30.0))
                 .rounded(px(RADIUS_PILL))
                 .bg(if in_lib {
                     rgb(theme.status_watchlist)
@@ -892,7 +904,7 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                     } else {
                         IconName::Bookmark
                     },
-                    13.0,
+                    13.0 * theme.ui_scale,
                     if in_lib {
                         rgb(badge_fg_on_status)
                     } else {
@@ -905,13 +917,13 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
     if props.quick_action.is_some() || props.on_quick_peek.is_some() {
         let mut right_actions = div()
             .absolute()
-            .bottom(px(rating_bottom_px))
-            .right(px(8.0))
+            .bottom(sp(rating_bottom_px))
+            .right(sp(8.0))
             .opacity(0.0)
             .group_hover(grp.clone(), |s| s.opacity(1.0))
             .flex()
             .items_center()
-            .gap(px(6.0));
+            .gap(sp(6.0));
 
         if let Some(slot) = props.quick_action {
             right_actions = right_actions.child(slot);
@@ -922,8 +934,8 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                 div()
                     .id(quick_peek_id)
                     .cursor_pointer()
-                    .w(px(30.0))
-                    .h(px(30.0))
+                    .w(sp(30.0))
+                    .h(sp(30.0))
                     .rounded(px(RADIUS_PILL))
                     .bg(rgba(0x0B0D14D9))
                     .border_1()
@@ -939,7 +951,11 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                         cx.stop_propagation();
                         on_quick_peek(ev, window, cx);
                     })
-                    .child(svg_icon(IconName::Eye, 13.5, rgb(0xF5F1E8))),
+                    .child(svg_icon(
+                        IconName::Eye,
+                        13.5 * theme.ui_scale,
+                        rgb(0xF5F1E8),
+                    )),
             );
         }
 
@@ -953,7 +969,7 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                 .bottom_0()
                 .left_0()
                 .right_0()
-                .h(px(3.0))
+                .h(sp(3.0))
                 .bg(rgba(0xFFFFFF33))
                 .child(div().h_full().w(relative(frac)).bg(rgb(theme.accent))),
         );

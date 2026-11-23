@@ -179,6 +179,8 @@ pub struct AppShell {
     pub board_scroll_handle: ScrollHandle,
     pub library_scroll_handle: ScrollHandle,
     pub calendar_scroll_handle: ScrollHandle,
+    pub addons_scroll_handle: ScrollHandle,
+    pub auth_scroll_handle: ScrollHandle,
     pub board_list_scroll_handle: gpui::UniformListScrollHandle,
     pub board_shelf_scrolls: HashMap<usize, ScrollHandle>,
     pub board_hidden_drawer_open: bool,
@@ -486,6 +488,8 @@ impl AppShell {
             board_scroll_handle: ScrollHandle::new(),
             library_scroll_handle: ScrollHandle::new(),
             calendar_scroll_handle: ScrollHandle::new(),
+            addons_scroll_handle: ScrollHandle::new(),
+            auth_scroll_handle: ScrollHandle::new(),
             board_list_scroll_handle: gpui::UniformListScrollHandle::new(),
             board_shelf_scrolls: HashMap::new(),
             board_hidden_drawer_open: false,
@@ -2114,7 +2118,13 @@ impl AppShell {
             }
             AppRoute::Search { .. } => (-self.search_scroll_handle.offset().y / px(1.0)).max(0.0),
             AppRoute::Person { .. } => (-self.person_scroll_handle.offset().y / px(1.0)).max(0.0),
-            AppRoute::Tab(SidebarTab::Addons | SidebarTab::Account) | AppRoute::Player => 0.0,
+            AppRoute::Tab(SidebarTab::Addons) => {
+                (-self.addons_scroll_handle.offset().y / px(1.0)).max(0.0)
+            }
+            AppRoute::Tab(SidebarTab::Account) => {
+                (-self.auth_scroll_handle.offset().y / px(1.0)).max(0.0)
+            }
+            AppRoute::Player => 0.0,
         }
     }
 
@@ -2144,7 +2154,9 @@ impl AppShell {
             AppRoute::MetaDetails { .. } => self.meta_scroll_handle.set_offset(off),
             AppRoute::Search { .. } => self.search_scroll_handle.set_offset(off),
             AppRoute::Person { .. } => self.person_scroll_handle.set_offset(off),
-            AppRoute::Tab(SidebarTab::Addons | SidebarTab::Account) | AppRoute::Player => {}
+            AppRoute::Tab(SidebarTab::Addons) => self.addons_scroll_handle.set_offset(off),
+            AppRoute::Tab(SidebarTab::Account) => self.auth_scroll_handle.set_offset(off),
+            AppRoute::Player => {}
         }
     }
 
@@ -3183,7 +3195,13 @@ impl AppShell {
             AppRoute::Person { .. } => {
                 Self::scroll_handle_for_page_key(&self.person_scroll_handle, key, vh)
             }
-            AppRoute::Tab(SidebarTab::Addons | SidebarTab::Account) | AppRoute::Player => false,
+            AppRoute::Tab(SidebarTab::Addons) => {
+                Self::scroll_handle_for_page_key(&self.addons_scroll_handle, key, vh)
+            }
+            AppRoute::Tab(SidebarTab::Account) => {
+                Self::scroll_handle_for_page_key(&self.auth_scroll_handle, key, vh)
+            }
+            AppRoute::Player => false,
         }
     }
 

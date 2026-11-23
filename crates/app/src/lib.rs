@@ -5,6 +5,7 @@ pub mod poster_cache;
 pub mod shell;
 pub mod state;
 pub mod theme;
+pub mod ui;
 pub mod ui_components;
 pub mod updater;
 pub mod views;
