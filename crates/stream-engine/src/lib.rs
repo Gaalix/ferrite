@@ -2546,16 +2546,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait briefly for the local seeder to transfer ep2 pieces before hibernating.
-        for _ in 0..100 {
-            if engine
-                .torrent_progress_snapshot(&ih)
-                .is_some_and(|(fetched, _, _)| fetched >= 64 * 1024)
-            {
+        // Wait for the local seeder to transfer and verify ep2 (file_idx=1) pieces on disk before hibernating.
+        // Do not break on live `fetched_bytes` alone, because `add_torrent_bytes` can fetch ep1 blocks before
+        // `activate_and_touch_episode` narrows `only_files` to `[1]`, leaving ep2 with 0 verified bytes on restore.
+        for _ in 0..250 {
+            let st = handle.stats();
+            let ep2_verified = st.file_progress.get(1).copied().unwrap_or(0);
+            if st.progress_bytes >= 64 * 1024 && ep2_verified >= 64 * 1024 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let st_before_hibernate = handle.stats();
+        assert!(
+            st_before_hibernate.file_progress.get(1).copied().unwrap_or(0) > 0,
+            "ep2 (file_idx=1) should have verified bytes on disk before hibernation"
+        );
         let (fetched_live, _, speed_live) = engine
             .torrent_progress_snapshot(&ih)
             .expect("live torrent snapshot");
