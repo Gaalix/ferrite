@@ -665,9 +665,7 @@ impl AppShell {
             .clone()
             .or_else(|| metahub_bg.clone())
             .or_else(|| active.poster_url.clone());
-        if resolved_ambient_bg.is_some() {
-            self.ambient_hero_backdrop_url = resolved_ambient_bg;
-        }
+        self.set_ambient_hero_backdrop_url(resolved_ambient_bg);
 
         let hero_urls: Vec<&str> = active
             .backdrop_url

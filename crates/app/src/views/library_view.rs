@@ -8,7 +8,8 @@ use std::{
 
 use gpui::{
     deferred, div, img, point, prelude::*, px, relative, rgb, rgba, AnyElement, App, Context,
-    FontWeight, MouseButton, MouseDownEvent, ObjectFit, SharedString, Window,
+    FontWeight, MouseButton, MouseDownEvent, ObjectFit, Render, SharedString, StyleRefinement,
+    WeakEntity, Window,
 };
 use stremio_core_runtime::stremio_core::types::library::LibraryItem;
 
@@ -23,9 +24,9 @@ use crate::{
         QuickPeekTarget, SidebarTab, ToastKind,
     },
     theme::{
-        active_theme, mono_font, placeholder_tint_for_id, placeholder_tint_for_id_with_preset,
-        sentence_case_label, sp, tabular_nums, ui_sans, ThemePalette, ThemePreset, RADIUS_CARD,
-        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        active_theme, active_theme_version, mono_font, placeholder_tint_for_id,
+        placeholder_tint_for_id_with_preset, sentence_case_label, sp, tabular_nums, ui_sans,
+        ThemePalette, ThemePreset, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
     ui::{
         card_action_dispatcher, clamp_progress_fraction, click_handler, compute_app_grid_metrics,
@@ -37,7 +38,7 @@ use crate::{
         toolbar_bar, CardActionDispatcher, ClickHandler, DropdownTriggerProps, EmptyStateProps,
         LandscapeCardProps, PageHeader, PageWidth, PosterCardAction, PosterCardCapabilities,
         PosterMetrics, PreparedPosterCard, PreparedPosterRenderCtx, SearchFieldProps,
-        SectionHeader,
+        SectionHeader, PAGE_SECTION_GAP_PX,
     },
     virtual_grid::{slice_row_items, PosterAspect},
 };
@@ -78,23 +79,163 @@ struct CachedLibraryCardSlab {
 
 type ToggleWatchedDispatcher = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
+/// Cached child view boundary for Library's PageHeader + optional Up Next shelf + Toolbar.
+pub struct LibraryChromeView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl LibraryChromeView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for LibraryChromeView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().w_full().into_any_element();
+        };
+        shell.update(cx, |shell, shell_cx| {
+            shell.render_library_chrome_inner(shell_cx)
+        })
+    }
+}
+
+/// Uncached child view boundary owning Library's virtualized `uniform_list`.
+///
+/// Scrolling the list marks ONLY `LibraryGridView -> ActiveScrollHostView -> AppShell`
+/// dirty, skipping render/layout/prepaint/paint of `LibraryChromeView` (including the
+/// 12-card Up Next shelf), `TopNavView`, `AmbientBackdropView`, and `BackToTopView`.
+pub struct LibraryGridView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl LibraryGridView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for LibraryGridView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().flex_1().w_full().min_h(px(0.0)).into_any_element();
+        };
+        shell.update(cx, |shell, shell_cx| {
+            shell.render_library_grid_inner(window, shell_cx)
+        })
+    }
+}
+
 impl AppShell {
     pub fn render_library_view(
         &mut self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = active_theme();
+        let memo = self.get_or_update_memoized_library();
+        if self.library_filter_tab == LibraryFilterTab::NewEpisodes && memo.count_new_episodes == 0
+        {
+            self.library_filter_tab = LibraryFilterTab::All;
+        }
 
+        let raw_viewport_w = f32::from(window.viewport_size().width);
+        let viewport_w = if raw_viewport_w > 0.0 && raw_viewport_w.is_finite() {
+            raw_viewport_w
+        } else {
+            self.viewport_size_px.0
+        };
+
+        let mut layout_sig_hasher = DefaultHasher::new();
+        (
+            viewport_w.to_bits(),
+            active_theme_version(),
+            self.library_state_rev,
+            self.board_state_rev,
+            std::mem::discriminant(&self.library_filter_tab),
+            self.library_search_query.trim().is_empty(),
+            self.library_sort_dropdown_open,
+        )
+            .hash(&mut layout_sig_hasher);
+        let chrome_layout_sig = layout_sig_hasher.finish();
+
+        // Keep LibraryChromeView uncached while the sort dropdown is open or on the 1st
+        // measure frame of a new layout signature; reuse its cache on all scroll frames.
+        let cached_chrome_h = if !self.library_sort_dropdown_open {
+            self.library_chrome_height
+                .get()
+                .and_then(|(sig, h)| (sig == chrome_layout_sig && h > 1.0).then_some(h))
+        } else {
+            None
+        };
+        let chrome_el: AnyElement = match cached_chrome_h {
+            Some(h) => self
+                .library_chrome_view
+                .clone()
+                .cached(
+                    StyleRefinement::default()
+                        .w_full()
+                        .h(px(h))
+                        .flex_shrink_0(),
+                )
+                .into_any_element(),
+            None => self.library_chrome_view.clone().into_any_element(),
+        };
+        let height_cell = Rc::clone(&self.library_chrome_height);
+        let chrome_slot = div()
+            .on_children_prepainted(move |bounds, _, _| {
+                if let Some(b) = bounds.first() {
+                    let h = f32::from(b.size.height);
+                    if h > 1.0 && height_cell.get() != Some((chrome_layout_sig, h)) {
+                        height_cell.set(Some((chrome_layout_sig, h)));
+                    }
+                }
+            })
+            .id("library-chrome-slot")
+            .w_full()
+            .flex_shrink_0()
+            .child(chrome_el);
+
+        div()
+            .id("library-view-root")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    let mut changed = false;
+                    if this.library_sort_dropdown_open {
+                        this.library_sort_dropdown_open = false;
+                        changed = true;
+                    }
+                    if this.focused_input == Some(FocusedInput::LibrarySearch) {
+                        this.focused_input = None;
+                        changed = true;
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                full_height_page_container(PageWidth::Wide, viewport_w)
+                    .child(chrome_slot)
+                    .child(self.library_grid_view.clone()),
+            )
+    }
+
+    fn render_library_chrome_inner(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = active_theme();
         let mut memo = self.get_or_update_memoized_library();
         if self.library_filter_tab == LibraryFilterTab::NewEpisodes && memo.count_new_episodes == 0
         {
             self.library_filter_tab = LibraryFilterTab::All;
             memo = self.get_or_update_memoized_library();
         }
-
         let aux = self.get_or_update_library_aux();
-        let notif_counts_arc = Arc::clone(&aux.notif_counts);
         let active_tab = self.library_filter_tab;
         let active_type = self.library_type_filter;
         let active_sort = self.library_sort_criterion;
@@ -105,6 +246,329 @@ impl AppShell {
         let search_trimmed_non_empty = !self.library_search_query.trim().is_empty();
         let search_display =
             self.format_input_with_caret(FocusedInput::LibrarySearch, &self.library_search_query);
+
+        let show_up_next_shelf = !search_trimmed_non_empty
+            && matches!(
+                active_tab,
+                LibraryFilterTab::All | LibraryFilterTab::Watching | LibraryFilterTab::NewEpisodes
+            )
+            && !aux.up_next_items.is_empty();
+        let up_next_arc = Arc::clone(&aux.up_next_items);
+        if !show_up_next_shelf {
+            self.library_up_next_pending_images.set(false);
+        }
+
+        let visible_filter_tabs: Vec<LibraryFilterTab> = LibraryFilterTab::ALL
+            .into_iter()
+            .filter(|tab| *tab != LibraryFilterTab::NewEpisodes || memo.count_new_episodes > 0)
+            .collect();
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(theme.sp(PAGE_SECTION_GAP_PX))
+            // 1. Canonical Page Header with frosted glass stat pills.
+            .child(render_page_header(
+                PageHeader::new("Library").right_slot(Some(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(sp(8.0))
+                        .child(render_library_stat_pill(
+                            "lib-stat-watching",
+                            IconName::Play,
+                            IconWeight::Fill,
+                            theme.status_watching,
+                            memo.count_watching.to_string(),
+                            "Watching",
+                            active_tab == LibraryFilterTab::Watching,
+                            Some(click_handler(cx.listener(|this, _, _, cx| {
+                                this.select_library_filter_tab(LibraryFilterTab::Watching, cx);
+                            }))),
+                        ))
+                        .child(render_library_stat_pill(
+                            "lib-stat-saved",
+                            IconName::Bookmark,
+                            if active_tab == LibraryFilterTab::Watchlist {
+                                IconWeight::Fill
+                            } else {
+                                IconWeight::Regular
+                            },
+                            theme.status_watchlist,
+                            memo.count_watchlist.to_string(),
+                            "Saved",
+                            active_tab == LibraryFilterTab::Watchlist,
+                            Some(click_handler(cx.listener(|this, _, _, cx| {
+                                this.select_library_filter_tab(LibraryFilterTab::Watchlist, cx);
+                            }))),
+                        ))
+                        .child(render_library_stat_pill(
+                            "lib-stat-watched",
+                            IconName::Check,
+                            IconWeight::Regular,
+                            theme.status_watched,
+                            memo.count_watched.to_string(),
+                            "Watched",
+                            active_tab == LibraryFilterTab::Watched,
+                            Some(click_handler(cx.listener(|this, _, _, cx| {
+                                this.select_library_filter_tab(LibraryFilterTab::Watched, cx);
+                            }))),
+                        ))
+                        .child(render_library_stat_pill(
+                            "lib-stat-hours",
+                            IconName::Clock,
+                            IconWeight::Regular,
+                            theme.accent_amber,
+                            memo.hours_logged.to_string(),
+                            "Hours",
+                            false,
+                            None,
+                        ))
+                        .into_any_element(),
+                )),
+            ))
+            // 2. "New Episodes & Up Next" Highlight Shelf.
+            .when(show_up_next_shelf, |col| {
+                col.child(self.render_library_up_next_shelf(
+                    &up_next_arc,
+                    memo.count_new_episodes,
+                    active_tab,
+                    cx,
+                ))
+            })
+            // 3. Unified Floating Frosted Glass Toolbar.
+            .child(
+                toolbar_bar()
+                    .child(
+                        glass_segmented_bar("lib-filter-bar").children(
+                            visible_filter_tabs.into_iter().enumerate().map(|(idx, tab)| {
+                                let is_active = tab == active_tab;
+                                let count = match tab {
+                                    LibraryFilterTab::All => memo.count_all,
+                                    LibraryFilterTab::Watching => memo.count_watching,
+                                    LibraryFilterTab::NewEpisodes => memo.count_new_episodes,
+                                    LibraryFilterTab::Watchlist => memo.count_watchlist,
+                                    LibraryFilterTab::Watched => memo.count_watched,
+                                };
+                                let label = format!("{} ({count})", tab.label());
+                                glass_segmented_item(
+                                    ("lib-filter-tab", idx),
+                                    label,
+                                    is_active,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.select_library_filter_tab(tab, cx);
+                                    }),
+                                )
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(sp(8.0))
+                            // Inline instant filter input.
+                            .child(search_field(
+                                SearchFieldProps::new(
+                                    "lib-search-box",
+                                    search_display.clone(),
+                                    "Filter library...",
+                                    !has_search_query,
+                                    search_focused,
+                                )
+                                .clear_id("lib-search-clear")
+                                .width_px(Some(216.0))
+                                .on_focus(cx.listener(|this, _, _, cx| {
+                                    this.library_sort_dropdown_open = false;
+                                    this.focused_input = Some(FocusedInput::LibrarySearch);
+                                    cx.notify();
+                                }))
+                                .on_clear(cx.listener(|this, _, _, cx| {
+                                    this.clear_library_search(cx);
+                                })),
+                            ))
+                            // Type filter pills (All | Movies | Series).
+                            .child(
+                                glass_segmented_bar("lib-type-bar").children(
+                                    LibraryTypeFilter::ALL.into_iter().enumerate().map(
+                                        |(idx, tf)| {
+                                            let is_active = tf == active_type;
+                                            let label = match tf {
+                                                LibraryTypeFilter::All => "All",
+                                                LibraryTypeFilter::Movies => "Movies",
+                                                LibraryTypeFilter::Shows => "Series",
+                                            };
+                                            glass_segmented_item(
+                                                ("lib-type-pill", idx),
+                                                label,
+                                                is_active,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.library_type_filter = tf;
+                                                    this.library_sort_dropdown_open = false;
+                                                    this.kb_focus_index = None;
+                                                    this.reset_library_scroll();
+                                                    cx.notify();
+                                                }),
+                                            )
+                                        },
+                                    ),
+                                ),
+                            )
+                            // Sort dropdown.
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(dropdown_trigger(
+                                        DropdownTriggerProps::new(
+                                            "lib-sort-pill",
+                                            active_sort.label(),
+                                            sort_open,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.library_sort_dropdown_open =
+                                                    !this.library_sort_dropdown_open;
+                                                if this.focused_input
+                                                    == Some(FocusedInput::LibrarySearch)
+                                                {
+                                                    this.focused_input = None;
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .leading_icon(Some(IconName::Sliders)),
+                                    ))
+                                    .when(sort_open, |wrap| {
+                                        wrap.child(
+                                            deferred(
+                                                glass_dropdown_panel("lib-sort-menu", 216.0)
+                                                    .absolute()
+                                                    .top(sp(42.0))
+                                                    .right_0()
+                                                    .children(
+                                                        LibrarySortCriterion::ALL
+                                                            .into_iter()
+                                                            .enumerate()
+                                                            .map(|(idx, crit)| {
+                                                                glass_dropdown_option(
+                                                                    ("lib-sort-opt", idx),
+                                                                    crit.label(),
+                                                                    None,
+                                                                    crit == active_sort,
+                                                                    cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            this.library_sort_criterion =
+                                                                                crit;
+                                                                            this.library_sort_order = match crit {
+                                                                                LibrarySortCriterion::TitleAsc => {
+                                                                                    LibrarySortOrder::Title
+                                                                                }
+                                                                                _ => {
+                                                                                    LibrarySortOrder::Recent
+                                                                                }
+                                                                            };
+                                                                            this.library_sort_dropdown_open =
+                                                                                false;
+                                                                            this.kb_focus_index =
+                                                                                None;
+                                                                            this.reset_library_scroll();
+                                                                            cx.notify();
+                                                                        },
+                                                                    ),
+                                                                )
+                                                            }),
+                                                    ),
+                                            )
+                                            .with_priority(10),
+                                        )
+                                    }),
+                            )
+                            // 3 Persisted View Mode Switcher (PosterGrid | WideBackdrops | CompactList).
+                            .child(
+                                glass_segmented_bar("lib-view-mode-bar").children(
+                                    LibraryViewMode::ALL.into_iter().enumerate().map(
+                                        |(idx, mode)| {
+                                            let is_active = mode == active_view_mode;
+                                            let icon = match mode {
+                                                LibraryViewMode::PosterGrid => IconName::GridFour,
+                                                LibraryViewMode::WideBackdrops => IconName::Rows,
+                                                LibraryViewMode::CompactList => IconName::List,
+                                            };
+                                            let weight = if is_active {
+                                                IconWeight::Fill
+                                            } else {
+                                                IconWeight::Regular
+                                            };
+                                            let icon_fg = if is_active {
+                                                theme.segment_active_text
+                                            } else {
+                                                theme.text_secondary
+                                            };
+                                            div()
+                                                .id(("lib-view-mode-btn", idx))
+                                                .w(sp(30.0))
+                                                .h(sp(30.0))
+                                                .rounded(px(RADIUS_POSTER))
+                                                .cursor_pointer()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .when(is_active, |b| {
+                                                    b.bg(rgb(theme.segment_active_bg))
+                                                })
+                                                .when(!is_active, |b| {
+                                                    b.hover(move |s| {
+                                                        s.bg(rgba(theme.glass_row_hover_bg))
+                                                    })
+                                                })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        if this.preferences.library_view_mode
+                                                            != mode
+                                                        {
+                                                            this.preferences.library_view_mode =
+                                                                mode;
+                                                            let _ = this.preferences.save();
+                                                            this.library_sort_dropdown_open = false;
+                                                            this.kb_focus_index = None;
+                                                            this.reset_library_scroll();
+                                                            cx.notify();
+                                                        }
+                                                    }),
+                                                )
+                                                .child(svg_icon_weighted(
+                                                    icon,
+                                                    weight,
+                                                    14.5 * theme.ui_scale,
+                                                    rgb(icon_fg),
+                                                ))
+                                        },
+                                    ),
+                                ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_library_grid_inner(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = active_theme();
+        let mut memo = self.get_or_update_memoized_library();
+        if self.library_filter_tab == LibraryFilterTab::NewEpisodes && memo.count_new_episodes == 0
+        {
+            self.library_filter_tab = LibraryFilterTab::All;
+            memo = self.get_or_update_memoized_library();
+        }
+        let aux = self.get_or_update_library_aux();
+        let notif_counts_arc = Arc::clone(&aux.notif_counts);
+        let active_tab = self.library_filter_tab;
+        let active_type = self.library_type_filter;
+        let active_sort = self.library_sort_criterion;
+        let active_view_mode = self.preferences.library_view_mode;
+        let search_trimmed_non_empty = !self.library_search_query.trim().is_empty();
 
         let filtered_arc = Arc::clone(&memo.filtered_items);
         let total_filtered = filtered_arc.len();
@@ -160,607 +624,255 @@ impl AppShell {
                 .collect()
         });
 
-        let show_up_next_shelf = !search_trimmed_non_empty
-            && matches!(
-                active_tab,
-                LibraryFilterTab::All | LibraryFilterTab::Watching | LibraryFilterTab::NewEpisodes
-            )
-            && !aux.up_next_items.is_empty();
-        let up_next_arc = Arc::clone(&aux.up_next_items);
-
-        let visible_filter_tabs: Vec<LibraryFilterTab> = LibraryFilterTab::ALL
-            .into_iter()
-            .filter(|tab| *tab != LibraryFilterTab::NewEpisodes || memo.count_new_episodes > 0)
-            .collect();
-
-        let content_area: AnyElement = if total_filtered == 0 {
+        if total_filtered == 0 {
             self.active_scroll_suppressed.set(true);
-            render_library_empty_state(
+            return render_library_empty_state(
                 active_tab,
                 active_type,
                 memo.count_all,
                 search_trimmed_non_empty,
                 self.library_search_query.trim(),
                 cx,
-            )
-        } else {
-            match active_view_mode {
-                LibraryViewMode::PosterGrid => {
-                    let columns = poster_metrics.columns;
-                    let row_count = poster_metrics.layout.row_count;
-                    let row_stride_px = poster_metrics.row_stride_px;
-                    let card_width_px = poster_metrics.card_width_px;
-                    let image_height_px = poster_metrics.image_height_px;
-                    let items_for_grid = Arc::clone(&filtered_arc);
-                    let slab = self.get_or_update_library_card_slab(
-                        &memo,
-                        &aux,
-                        LibraryViewMode::PosterGrid,
-                        poster_aspect,
-                        theme.preset,
-                    );
-                    let cards_for_grid = Arc::clone(&slab.cards);
+            );
+        }
 
-                    gpui::uniform_list(
-                        "library-poster-grid",
-                        row_count,
-                        cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
-                            let kb_focus_index = this.kb_focus_index;
-                            let render_theme = active_theme();
-                            let dispatcher =
-                                build_library_card_dispatcher(&items_for_grid, None, cx);
-                            let toggle_watched = build_library_toggle_watched_dispatcher(
-                                &items_for_grid,
-                                &cards_for_grid,
-                                cx,
-                            );
+        match active_view_mode {
+            LibraryViewMode::PosterGrid => {
+                let columns = poster_metrics.columns;
+                let row_count = poster_metrics.layout.row_count;
+                let row_stride_px = poster_metrics.row_stride_px;
+                let card_width_px = poster_metrics.card_width_px;
+                let image_height_px = poster_metrics.image_height_px;
+                let items_for_grid = Arc::clone(&filtered_arc);
+                let slab = self.get_or_update_library_card_slab(
+                    &memo,
+                    &aux,
+                    LibraryViewMode::PosterGrid,
+                    poster_aspect,
+                    theme.preset,
+                );
+                let cards_for_grid = Arc::clone(&slab.cards);
 
-                            visible_rows
-                                .map(|row_idx| {
-                                    let range = slice_row_items(total_filtered, columns, row_idx);
-                                    let empty_slots = columns.saturating_sub(range.len());
-
-                                    div()
-                                        .id(("library-poster-row", row_idx))
-                                        .w_full()
-                                        .h(px(row_stride_px))
-                                        .pb(px(grid_gap))
-                                        .flex()
-                                        .items_start()
-                                        .gap(px(grid_gap))
-                                        .children(range.map(|idx| {
-                                            let card = &cards_for_grid[idx];
-                                            let poster_tex = card.poster_url.as_deref().and_then(
-                                                |u| this.poster_cache.resolve_poster_image(u),
-                                            );
-                                            let is_focused = kb_focus_index == Some(idx);
-                                            let card_image_h = if card.aspect == poster_aspect {
-                                                image_height_px
-                                            } else {
-                                                (card_width_px * card.aspect.height_over_width())
-                                                    .ceil()
-                                                    .min(image_height_px)
-                                            };
-                                            let toggle_watched_btn =
-                                                build_card_toggle_watched_button(
-                                                    "lib-poster-watch",
-                                                    idx,
-                                                    card.watched,
-                                                    &render_theme,
-                                                    &toggle_watched,
-                                                );
-
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .h_full()
-                                                .child(render_prepared_poster_card(
-                                                    PreparedPosterRenderCtx::new(
-                                                        idx,
-                                                        card,
-                                                        "library-card",
-                                                        &dispatcher,
-                                                    )
-                                                    .image(poster_tex)
-                                                    .image_height_px(Some(card_image_h))
-                                                    .is_focused(is_focused)
-                                                    .quick_action(Some(toggle_watched_btn)),
-                                                ))
-                                        }))
-                                        .children(
-                                            (0..empty_slots)
-                                                .map(|_| div().flex_1().min_w(px(0.0))),
-                                        )
-                                })
-                                .collect()
-                        }),
-                    )
-                    .track_scroll(&self.library_grid_scroll_handle)
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.0))
-                    .into_any_element()
-                }
-                LibraryViewMode::WideBackdrops => {
-                    let columns = wide_metrics.columns;
-                    let row_count = wide_metrics.layout.row_count;
-                    let row_stride_px = wide_metrics.row_stride_px;
-                    let image_height_px = wide_metrics.image_height_px;
-                    let items_for_wide = Arc::clone(&filtered_arc);
-                    let slab = self.get_or_update_library_card_slab(
-                        &memo,
-                        &aux,
-                        LibraryViewMode::WideBackdrops,
-                        PosterAspect::Landscape16x9,
-                        theme.preset,
-                    );
-                    let cards_for_wide = Arc::clone(&slab.cards);
-                    let wide_urls_for_grid = Arc::clone(&slab.wide_urls);
-
-                    gpui::uniform_list(
-                        "library-wide-grid",
-                        row_count,
-                        cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
-                            let kb_focus_index = this.kb_focus_index;
-                            let render_theme = active_theme();
-                            let dispatcher = build_library_card_dispatcher(
-                                &items_for_wide,
-                                Some(Arc::clone(&wide_urls_for_grid)),
-                                cx,
-                            );
-                            let toggle_watched = build_library_toggle_watched_dispatcher(
-                                &items_for_wide,
-                                &cards_for_wide,
-                                cx,
-                            );
-
-                            visible_rows
-                                .map(|row_idx| {
-                                    let range = slice_row_items(total_filtered, columns, row_idx);
-                                    let empty_slots = columns.saturating_sub(range.len());
-
-                                    div()
-                                        .id(("library-wide-row", row_idx))
-                                        .w_full()
-                                        .h(px(row_stride_px))
-                                        .pb(px(grid_gap))
-                                        .flex()
-                                        .items_start()
-                                        .gap(px(grid_gap))
-                                        .children(range.map(|idx| {
-                                            let card = &cards_for_wide[idx];
-                                            let wide_url = wide_urls_for_grid
-                                                .get(idx)
-                                                .and_then(|u| u.as_deref());
-                                            let wide_tex =
-                                                this.poster_cache.resolve_widescreen_or_poster(
-                                                    wide_url,
-                                                    card.poster_url.as_deref(),
-                                                );
-                                            let is_focused = kb_focus_index == Some(idx);
-                                            let toggle_watched_btn =
-                                                build_card_toggle_watched_button(
-                                                    "lib-wide-watch",
-                                                    idx,
-                                                    card.watched,
-                                                    &render_theme,
-                                                    &toggle_watched,
-                                                );
-
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .h_full()
-                                                .child(render_prepared_poster_card(
-                                                    PreparedPosterRenderCtx::new(
-                                                        idx,
-                                                        card,
-                                                        "library-wide-card",
-                                                        &dispatcher,
-                                                    )
-                                                    .image(wide_tex)
-                                                    .image_height_px(Some(image_height_px))
-                                                    .is_focused(is_focused)
-                                                    .quick_action(Some(toggle_watched_btn)),
-                                                ))
-                                        }))
-                                        .children(
-                                            (0..empty_slots)
-                                                .map(|_| div().flex_1().min_w(px(0.0))),
-                                        )
-                                })
-                                .collect()
-                        }),
-                    )
-                    .track_scroll(&self.library_grid_scroll_handle)
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.0))
-                    .into_any_element()
-                }
-                LibraryViewMode::CompactList => {
-                    let row_h_px = (64.0 * theme.ui_scale).ceil();
-                    let row_gap_px = (6.0 * theme.ui_scale).ceil();
-                    let row_stride_px = row_h_px + row_gap_px;
-                    let items_for_list = Arc::clone(&filtered_arc);
-                    let notifs_for_list = Arc::clone(&notif_counts_arc);
-
-                    gpui::uniform_list(
-                        "library-compact-list",
-                        total_filtered,
-                        cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
-                            let kb_focus_index = this.kb_focus_index;
-
-                            visible_rows
-                                .map(|idx| {
-                                    let (li, st) = &items_for_list[idx];
-                                    let notif_count =
-                                        notifs_for_list.get(&li.id).copied().unwrap_or(0);
-                                    let is_focused = kb_focus_index == Some(idx);
-
-                                    div()
-                                        .id(("library-list-wrap", idx))
-                                        .w_full()
-                                        .h(px(row_stride_px))
-                                        .pb(px(row_gap_px))
-                                        .child(this.render_library_compact_row(
-                                            &items_for_list,
-                                            idx,
-                                            *st,
-                                            notif_count,
-                                            row_h_px,
-                                            is_focused,
-                                            cx,
-                                        ))
-                                })
-                                .collect()
-                        }),
-                    )
-                    .track_scroll(&self.library_grid_scroll_handle)
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.0))
-                    .into_any_element()
-                }
-            }
-        };
-
-        div()
-            .id("library-view-root")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(px(0.0))
-            .w_full()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    let mut changed = false;
-                    if this.library_sort_dropdown_open {
-                        this.library_sort_dropdown_open = false;
-                        changed = true;
-                    }
-                    if this.focused_input == Some(FocusedInput::LibrarySearch) {
-                        this.focused_input = None;
-                        changed = true;
-                    }
-                    if changed {
-                        cx.notify();
-                    }
-                }),
-            )
-            .child(
-                full_height_page_container(PageWidth::Wide, viewport_w)
-                    // 1. Canonical Page Header with frosted glass stat pills.
-                    .child(render_page_header(
-                        PageHeader::new("Library")
-                            .right_slot(Some(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(sp(8.0))
-                                    .child(render_library_stat_pill(
-                                        "lib-stat-watching",
-                                        IconName::Play,
-                                        IconWeight::Fill,
-                                        theme.status_watching,
-                                        memo.count_watching.to_string(),
-                                        "Watching",
-                                        active_tab == LibraryFilterTab::Watching,
-                                        Some(click_handler(cx.listener(|this, _, _, cx| {
-                                            this.select_library_filter_tab(
-                                                LibraryFilterTab::Watching,
-                                                cx,
-                                            );
-                                        }))),
-                                    ))
-                                    .child(render_library_stat_pill(
-                                        "lib-stat-saved",
-                                        IconName::Bookmark,
-                                        if active_tab == LibraryFilterTab::Watchlist {
-                                            IconWeight::Fill
-                                        } else {
-                                            IconWeight::Regular
-                                        },
-                                        theme.status_watchlist,
-                                        memo.count_watchlist.to_string(),
-                                        "Saved",
-                                        active_tab == LibraryFilterTab::Watchlist,
-                                        Some(click_handler(cx.listener(|this, _, _, cx| {
-                                            this.select_library_filter_tab(
-                                                LibraryFilterTab::Watchlist,
-                                                cx,
-                                            );
-                                        }))),
-                                    ))
-                                    .child(render_library_stat_pill(
-                                        "lib-stat-watched",
-                                        IconName::Check,
-                                        IconWeight::Regular,
-                                        theme.status_watched,
-                                        memo.count_watched.to_string(),
-                                        "Watched",
-                                        active_tab == LibraryFilterTab::Watched,
-                                        Some(click_handler(cx.listener(|this, _, _, cx| {
-                                            this.select_library_filter_tab(
-                                                LibraryFilterTab::Watched,
-                                                cx,
-                                            );
-                                        }))),
-                                    ))
-                                    .child(render_library_stat_pill(
-                                        "lib-stat-hours",
-                                        IconName::Clock,
-                                        IconWeight::Regular,
-                                        theme.accent_amber,
-                                        memo.hours_logged.to_string(),
-                                        "Hours",
-                                        false,
-                                        None,
-                                    ))
-                                    .into_any_element(),
-                            )),
-                    ))
-                    // 2. "New Episodes & Up Next" Highlight Shelf.
-                    .when(show_up_next_shelf, |col| {
-                        col.child(self.render_library_up_next_shelf(
-                            &up_next_arc,
-                            memo.count_new_episodes,
-                            active_tab,
+                gpui::uniform_list(
+                    "library-poster-grid",
+                    row_count,
+                    cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
+                        let kb_focus_index = this.kb_focus_index;
+                        let render_theme = active_theme();
+                        let dispatcher =
+                            build_library_card_dispatcher(&items_for_grid, None, cx);
+                        let toggle_watched = build_library_toggle_watched_dispatcher(
+                            &items_for_grid,
+                            &cards_for_grid,
                             cx,
-                        ))
-                    })
-                    // 3. Unified Floating Frosted Glass Toolbar.
-                    .child(
-                        toolbar_bar()
-                            .child(
-                                glass_segmented_bar("lib-filter-bar").children(
-                                    visible_filter_tabs.into_iter().enumerate().map(
-                                        |(idx, tab)| {
-                                            let is_active = tab == active_tab;
-                                            let count = match tab {
-                                                LibraryFilterTab::All => memo.count_all,
-                                                LibraryFilterTab::Watching => memo.count_watching,
-                                                LibraryFilterTab::NewEpisodes => {
-                                                    memo.count_new_episodes
-                                                }
-                                                LibraryFilterTab::Watchlist => memo.count_watchlist,
-                                                LibraryFilterTab::Watched => memo.count_watched,
-                                            };
-                                            let label = format!("{} ({count})", tab.label());
-                                            glass_segmented_item(
-                                                ("lib-filter-tab", idx),
-                                                label,
-                                                is_active,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.select_library_filter_tab(tab, cx);
-                                                }),
-                                            )
-                                        },
-                                    ),
-                                ),
-                            )
-                            .child(
+                        );
+
+                        visible_rows
+                            .map(|row_idx| {
+                                let range = slice_row_items(total_filtered, columns, row_idx);
+                                let empty_slots = columns.saturating_sub(range.len());
+
                                 div()
+                                    .id(("library-poster-row", row_idx))
+                                    .w_full()
+                                    .h(px(row_stride_px))
+                                    .pb(px(grid_gap))
                                     .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(sp(8.0))
-                                    // Inline instant filter input.
-                                    .child(search_field(
-                                        SearchFieldProps::new(
-                                            "lib-search-box",
-                                            search_display.clone(),
-                                            "Filter library...",
-                                            !has_search_query,
-                                            search_focused,
-                                        )
-                                        .clear_id("lib-search-clear")
-                                        .width_px(Some(216.0))
-                                        .on_focus(cx.listener(|this, _, _, cx| {
-                                            this.library_sort_dropdown_open = false;
-                                            this.focused_input = Some(FocusedInput::LibrarySearch);
-                                            cx.notify();
-                                        }))
-                                        .on_clear(cx.listener(|this, _, _, cx| {
-                                            this.clear_library_search(cx);
-                                        })),
-                                    ))
-                                    // Type filter pills (All | Movies | Series).
-                                    .child(
-                                        glass_segmented_bar("lib-type-bar").children(
-                                            LibraryTypeFilter::ALL.into_iter().enumerate().map(
-                                                |(idx, tf)| {
-                                                    let is_active = tf == active_type;
-                                                    let label = match tf {
-                                                        LibraryTypeFilter::All => "All",
-                                                        LibraryTypeFilter::Movies => "Movies",
-                                                        LibraryTypeFilter::Shows => "Series",
-                                                    };
-                                                    glass_segmented_item(
-                                                        ("lib-type-pill", idx),
-                                                        label,
-                                                        is_active,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            this.library_type_filter = tf;
-                                                            this.library_sort_dropdown_open = false;
-                                                            this.kb_focus_index = None;
-                                                            this.reset_library_scroll();
-                                                            cx.notify();
-                                                        }),
-                                                    )
-                                                },
-                                            ),
-                                        ),
-                                    )
-                                    // Sort dropdown.
-                                    .child(
+                                    .items_start()
+                                    .gap(px(grid_gap))
+                                    .children(range.map(|idx| {
+                                        let card = &cards_for_grid[idx];
+                                        let poster_tex = card.poster_url.as_deref().and_then(|u| {
+                                            this.poster_cache.resolve_poster_image(u)
+                                        });
+                                        let is_focused = kb_focus_index == Some(idx);
+                                        let card_image_h = if card.aspect == poster_aspect {
+                                            image_height_px
+                                        } else {
+                                            (card_width_px * card.aspect.height_over_width())
+                                                .ceil()
+                                                .min(image_height_px)
+                                        };
+                                        let toggle_watched_btn = build_card_toggle_watched_button(
+                                            "lib-poster-watch",
+                                            idx,
+                                            card.watched,
+                                            &render_theme,
+                                            &toggle_watched,
+                                        );
+
                                         div()
-                                            .relative()
-                                            .child(dropdown_trigger(
-                                                DropdownTriggerProps::new(
-                                                    "lib-sort-pill",
-                                                    active_sort.label(),
-                                                    sort_open,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.library_sort_dropdown_open =
-                                                            !this.library_sort_dropdown_open;
-                                                        if this.focused_input
-                                                            == Some(FocusedInput::LibrarySearch)
-                                                        {
-                                                            this.focused_input = None;
-                                                        }
-                                                        cx.notify();
-                                                    }),
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .h_full()
+                                            .child(render_prepared_poster_card(
+                                                PreparedPosterRenderCtx::new(
+                                                    idx,
+                                                    card,
+                                                    "library-card",
+                                                    &dispatcher,
                                                 )
-                                                .leading_icon(Some(IconName::Sliders)),
+                                                .image(poster_tex)
+                                                .image_height_px(Some(card_image_h))
+                                                .is_focused(is_focused)
+                                                .quick_action(Some(toggle_watched_btn)),
                                             ))
-                                            .when(sort_open, |wrap| {
-                                                wrap.child(
-                                                    deferred(
-                                                        glass_dropdown_panel("lib-sort-menu", 216.0)
-                                                            .absolute()
-                                                            .top(sp(42.0))
-                                                            .right_0()
-                                                            .children(
-                                                                LibrarySortCriterion::ALL
-                                                                    .into_iter()
-                                                                    .enumerate()
-                                                                    .map(|(idx, crit)| {
-                                                                        glass_dropdown_option(
-                                                                            ("lib-sort-opt", idx),
-                                                                            crit.label(),
-                                                                            None,
-                                                                            crit == active_sort,
-                                                                            cx.listener(
-                                                                                move |this,
-                                                                                      _,
-                                                                                      _,
-                                                                                      cx| {
-                                                                                    this.library_sort_criterion =
-                                                                                        crit;
-                                                                                    this.library_sort_order = match crit {
-                                                                                        LibrarySortCriterion::TitleAsc => {
-                                                                                            LibrarySortOrder::Title
-                                                                                        }
-                                                                                        _ => {
-                                                                                            LibrarySortOrder::Recent
-                                                                                        }
-                                                                                    };
-                                                                                    this.library_sort_dropdown_open =
-                                                                                        false;
-                                                                                    this.kb_focus_index =
-                                                                                        None;
-                                                                                    this.reset_library_scroll();
-                                                                                    cx.notify();
-                                                                                },
-                                                                            ),
-                                                                        )
-                                                                    }),
-                                                            ),
-                                                    )
-                                                    .with_priority(10),
-                                                )
-                                            }),
+                                    }))
+                                    .children(
+                                        (0..empty_slots)
+                                            .map(|_| div().flex_1().min_w(px(0.0))),
                                     )
-                                    // 3 Persisted View Mode Switcher (PosterGrid | WideBackdrops | CompactList).
-                                    .child(
-                                        glass_segmented_bar("lib-view-mode-bar").children(
-                                            LibraryViewMode::ALL.into_iter().enumerate().map(
-                                                |(idx, mode)| {
-                                                    let is_active = mode == active_view_mode;
-                                                    let icon = match mode {
-                                                        LibraryViewMode::PosterGrid => {
-                                                            IconName::GridFour
-                                                        }
-                                                        LibraryViewMode::WideBackdrops => {
-                                                            IconName::Rows
-                                                        }
-                                                        LibraryViewMode::CompactList => {
-                                                            IconName::List
-                                                        }
-                                                    };
-                                                    let weight = if is_active {
-                                                        IconWeight::Fill
-                                                    } else {
-                                                        IconWeight::Regular
-                                                    };
-                                                    let icon_fg = if is_active {
-                                                        theme.segment_active_text
-                                                    } else {
-                                                        theme.text_secondary
-                                                    };
-                                                    div()
-                                                        .id(("lib-view-mode-btn", idx))
-                                                        .w(sp(30.0))
-                                                        .h(sp(30.0))
-                                                        .rounded(px(RADIUS_POSTER))
-                                                        .cursor_pointer()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .when(is_active, |b| {
-                                                            b.bg(rgb(theme.segment_active_bg))
-                                                        })
-                                                        .when(!is_active, |b| {
-                                                            b.hover(move |s| {
-                                                                s.bg(rgba(theme.glass_row_hover_bg))
-                                                            })
-                                                        })
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(move |this, _, _, cx| {
-                                                                cx.stop_propagation();
-                                                                if this.preferences.library_view_mode
-                                                                    != mode
-                                                                {
-                                                                    this.preferences
-                                                                        .library_view_mode = mode;
-                                                                    let _ = this.preferences.save();
-                                                                    this.library_sort_dropdown_open =
-                                                                        false;
-                                                                    this.kb_focus_index = None;
-                                                                    this.reset_library_scroll();
-                                                                    cx.notify();
-                                                                }
-                                                            }),
-                                                        )
-                                                        .child(svg_icon_weighted(
-                                                            icon,
-                                                            weight,
-                                                            14.5 * theme.ui_scale,
-                                                            rgb(icon_fg),
-                                                        ))
-                                                },
-                                            ),
-                                        ),
-                                    ),
-                            ),
-                    )
-                    // 4. Virtualized Content Surface (PosterGrid | WideBackdrops | CompactList).
-                    .child(content_area),
-            )
+                            })
+                            .collect()
+                    }),
+                )
+                .track_scroll(&self.library_grid_scroll_handle)
+                .flex_1()
+                .w_full()
+                .min_h(px(0.0))
+                .into_any_element()
+            }
+            LibraryViewMode::WideBackdrops => {
+                let columns = wide_metrics.columns;
+                let row_count = wide_metrics.layout.row_count;
+                let row_stride_px = wide_metrics.row_stride_px;
+                let image_height_px = wide_metrics.image_height_px;
+                let items_for_wide = Arc::clone(&filtered_arc);
+                let slab = self.get_or_update_library_card_slab(
+                    &memo,
+                    &aux,
+                    LibraryViewMode::WideBackdrops,
+                    PosterAspect::Landscape16x9,
+                    theme.preset,
+                );
+                let cards_for_wide = Arc::clone(&slab.cards);
+                let wide_urls_for_grid = Arc::clone(&slab.wide_urls);
+
+                gpui::uniform_list(
+                    "library-wide-grid",
+                    row_count,
+                    cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
+                        let kb_focus_index = this.kb_focus_index;
+                        let render_theme = active_theme();
+                        let dispatcher = build_library_card_dispatcher(
+                            &items_for_wide,
+                            Some(Arc::clone(&wide_urls_for_grid)),
+                            cx,
+                        );
+                        let toggle_watched = build_library_toggle_watched_dispatcher(
+                            &items_for_wide,
+                            &cards_for_wide,
+                            cx,
+                        );
+
+                        visible_rows
+                            .map(|row_idx| {
+                                let range = slice_row_items(total_filtered, columns, row_idx);
+                                let empty_slots = columns.saturating_sub(range.len());
+
+                                div()
+                                    .id(("library-wide-row", row_idx))
+                                    .w_full()
+                                    .h(px(row_stride_px))
+                                    .pb(px(grid_gap))
+                                    .flex()
+                                    .items_start()
+                                    .gap(px(grid_gap))
+                                    .children(range.map(|idx| {
+                                        let card = &cards_for_wide[idx];
+                                        let wide_url = wide_urls_for_grid
+                                            .get(idx)
+                                            .and_then(|u| u.as_deref());
+                                        let wide_tex =
+                                            this.poster_cache.resolve_widescreen_or_poster(
+                                                wide_url,
+                                                card.poster_url.as_deref(),
+                                            );
+                                        let is_focused = kb_focus_index == Some(idx);
+                                        let toggle_watched_btn = build_card_toggle_watched_button(
+                                            "lib-wide-watch",
+                                            idx,
+                                            card.watched,
+                                            &render_theme,
+                                            &toggle_watched,
+                                        );
+
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .h_full()
+                                            .child(render_prepared_poster_card(
+                                                PreparedPosterRenderCtx::new(
+                                                    idx,
+                                                    card,
+                                                    "library-wide-card",
+                                                    &dispatcher,
+                                                )
+                                                .image(wide_tex)
+                                                .image_height_px(Some(image_height_px))
+                                                .is_focused(is_focused)
+                                                .quick_action(Some(toggle_watched_btn)),
+                                            ))
+                                    }))
+                                    .children(
+                                        (0..empty_slots)
+                                            .map(|_| div().flex_1().min_w(px(0.0))),
+                                    )
+                            })
+                            .collect()
+                    }),
+                )
+                .track_scroll(&self.library_grid_scroll_handle)
+                .flex_1()
+                .w_full()
+                .min_h(px(0.0))
+                .into_any_element()
+            }
+            LibraryViewMode::CompactList => {
+                let row_h_px = (64.0 * theme.ui_scale).ceil();
+                let row_gap_px = (6.0 * theme.ui_scale).ceil();
+                let row_stride_px = row_h_px + row_gap_px;
+                let items_for_list = Arc::clone(&filtered_arc);
+                let notifs_for_list = Arc::clone(&notif_counts_arc);
+
+                gpui::uniform_list(
+                    "library-compact-list",
+                    total_filtered,
+                    cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
+                        let kb_focus_index = this.kb_focus_index;
+
+                        visible_rows
+                            .map(|idx| {
+                                let (li, st) = &items_for_list[idx];
+                                let notif_count =
+                                    notifs_for_list.get(&li.id).copied().unwrap_or(0);
+                                let is_focused = kb_focus_index == Some(idx);
+
+                                div()
+                                    .id(("library-list-wrap", idx))
+                                    .w_full()
+                                    .h(px(row_stride_px))
+                                    .pb(px(row_gap_px))
+                                    .child(this.render_library_compact_row(
+                                        &items_for_list,
+                                        idx,
+                                        *st,
+                                        notif_count,
+                                        row_h_px,
+                                        is_focused,
+                                        cx,
+                                    ))
+                            })
+                            .collect()
+                    }),
+                )
+                .track_scroll(&self.library_grid_scroll_handle)
+                .flex_1()
+                .w_full()
+                .min_h(px(0.0))
+                .into_any_element()
+            }
+        }
     }
 
     fn select_library_filter_tab(&mut self, tab: LibraryFilterTab, cx: &mut Context<Self>) {
@@ -954,6 +1066,18 @@ impl AppShell {
                     .into_any_element()
             });
 
+        let mut any_pending_images = false;
+        let cards: Vec<AnyElement> = (0..entries.len())
+            .map(|idx| {
+                let (el, pending) = self.render_library_up_next_card(entries, idx, cx);
+                if pending {
+                    any_pending_images = true;
+                }
+                el
+            })
+            .collect();
+        self.library_up_next_pending_images.set(any_pending_images);
+
         div()
             .id("library-up-next-shelf")
             .flex_shrink_0()
@@ -977,9 +1101,7 @@ impl AppShell {
                     .flex()
                     .items_stretch()
                     .gap(sp(12.0))
-                    .children((0..entries.len()).map(|idx| {
-                        self.render_library_up_next_card(entries, idx, cx)
-                    })),
+                    .children(cards),
             )
             .into_any_element()
     }
@@ -989,7 +1111,7 @@ impl AppShell {
         entries: &Arc<Vec<UpNextHighlightEntry>>,
         idx: usize,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> (AnyElement, bool) {
         let entry = &entries[idx];
         let li = &entry.item;
         let notif_count = entry.notification_count;
@@ -998,6 +1120,7 @@ impl AppShell {
             wide_url.as_deref(),
             li.poster.as_ref().map(|u| u.as_str()),
         );
+        let is_pending = wide_tex.is_none() && (wide_url.is_some() || li.poster.is_some());
         let progress = clamp_progress_fraction(library_item_progress_fraction(li, entry.status));
         let ep_code = format_movietracker_episode_code(li.state.video_id.as_deref());
         let remaining = format_library_remaining_time(li);
@@ -1083,7 +1206,7 @@ impl AppShell {
             props = props.episode_badge(code, false);
         }
 
-        render_landscape_card(props)
+        (render_landscape_card(props), is_pending)
     }
 
     fn get_or_update_memoized_library(&self) -> MemoizedLibraryView {

@@ -51,6 +51,12 @@ pub const SCROLLBAR_TOPNAV_CLEARANCE_PX: f32 = 72.0;
 /// Bottom window inset (at 100% UI scale) for the vertical scrollbar rail.
 pub const SCROLLBAR_BOTTOM_INSET_PX: f32 = 10.0;
 
+/// Definite cached bounding-box width (at 100% UI scale) for `BackToTopView`.
+pub const BACK_TO_TOP_CACHED_WIDTH_PX: f32 = 152.0;
+
+/// Definite cached bounding-box height (at 100% UI scale) for `BackToTopView`.
+pub const BACK_TO_TOP_CACHED_HEIGHT_PX: f32 = 42.0;
+
 /// Minimum vertical delta (in logical pixels) required before scrollbar dragging
 /// mutates scroll offset or triggers a view notification.
 pub const SCROLLBAR_DRAG_EPSILON_PX: f32 = 0.5;
@@ -279,8 +285,10 @@ pub struct ScrollbarElement {
     route_hash: u64,
     handle: ScrollHandle,
     is_hero_route: bool,
-    suppressed: bool,
-    notify_entity_id: EntityId,
+    overlay_suppressed: bool,
+    content_suppressed: Rc<Cell<bool>>,
+    scroll_host_entity_id: EntityId,
+    chrome_notify_entity_id: EntityId,
     drag_state: Rc<RefCell<Option<ScrollbarDragState>>>,
     hovered_state: Rc<Cell<bool>>,
     last_chrome_flags: Rc<Cell<(bool, bool)>>,
@@ -295,8 +303,10 @@ impl ScrollbarElement {
         route_hash: u64,
         handle: ScrollHandle,
         is_hero_route: bool,
-        suppressed: bool,
-        notify_entity_id: EntityId,
+        overlay_suppressed: bool,
+        content_suppressed: Rc<Cell<bool>>,
+        scroll_host_entity_id: EntityId,
+        chrome_notify_entity_id: EntityId,
         drag_state: Rc<RefCell<Option<ScrollbarDragState>>>,
         hovered_state: Rc<Cell<bool>>,
         last_chrome_flags: Rc<Cell<(bool, bool)>>,
@@ -308,8 +318,10 @@ impl ScrollbarElement {
             route_hash,
             handle,
             is_hero_route,
-            suppressed,
-            notify_entity_id,
+            overlay_suppressed,
+            content_suppressed,
+            scroll_host_entity_id,
+            chrome_notify_entity_id,
             drag_state,
             hovered_state,
             last_chrome_flags,
@@ -372,16 +384,18 @@ impl Element for ScrollbarElement {
         // Gate follow-up notifications strictly on the two coarse chrome booleans
         // (TopNav scrolled >= 24px, Back-to-top visible > 320px). Never notify on
         // raw scroll_y, max_offset_y, or bounds deltas.
-        let post_flags = scroll_chrome_flags(post_scroll_y, self.suppressed);
+        let suppressed = self.overlay_suppressed || self.content_suppressed.get();
+        let post_flags = scroll_chrome_flags(post_scroll_y, suppressed);
         if post_flags != self.last_chrome_flags.get() {
             self.last_chrome_flags.set(post_flags);
-            let entity_id = self.notify_entity_id;
+            let chrome_entity_id = self.chrome_notify_entity_id;
             window.on_next_frame(move |_window, cx| {
-                cx.notify(entity_id);
+                cx.notify(chrome_entity_id);
             });
         }
 
-        if self.suppressed {
+        if suppressed {
+            *self.drag_state.borrow_mut() = None;
             self.hovered_state.set(false);
             return None;
         }
@@ -448,7 +462,7 @@ impl Element for ScrollbarElement {
         _cx: &mut App,
     ) {
         let is_dragging = self.drag_state.borrow().is_some();
-        let entity_id = self.notify_entity_id;
+        let entity_id = self.scroll_host_entity_id;
 
         // Register Capture-phase drag listeners ONLY while actively dragging.
         // When idle, zero capture listeners are installed on the window.
@@ -618,9 +632,9 @@ fn back_to_top_shadow(is_light: bool) -> Vec<BoxShadow> {
     vec![BoxShadow::new(px(0.0), px(2.0), color.into()).blur_radius(px(6.0))]
 }
 
-/// Renders the floating glass "Back to top" pill button anchored bottom-right.
-pub fn render_back_to_top_button(
-    viewport_w: f32,
+/// Renders the floating glass "Back to top" pill button without outer absolute
+/// positioning so it can live inside a fixed-bounds cached `BackToTopView`.
+pub fn render_back_to_top_pill(
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let theme = active_theme();
@@ -629,15 +643,11 @@ pub fn render_back_to_top_button(
     } else {
         theme.accent
     };
-    let right_inset = back_to_top_right_inset_px(viewport_w, theme.ui_scale);
 
     div()
         .id("ferrite-back-to-top-btn")
         .occlude()
         .cursor_pointer()
-        .absolute()
-        .bottom(sp(24.0))
-        .right(px(right_inset))
         .rounded(px(RADIUS_PILL))
         .bg(rgba(theme.glass_popover_bg))
         .border_1()
@@ -675,6 +685,20 @@ pub fn render_back_to_top_button(
                         .child("Back to top"),
                 ),
         )
+}
+
+/// Renders the floating glass "Back to top" pill button anchored bottom-right.
+#[allow(dead_code)]
+pub fn render_back_to_top_button(
+    viewport_w: f32,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let theme = active_theme();
+    let right_inset = back_to_top_right_inset_px(viewport_w, theme.ui_scale);
+    render_back_to_top_pill(on_click)
+        .absolute()
+        .bottom(sp(24.0))
+        .right(px(right_inset))
 }
 
 #[cfg(test)]

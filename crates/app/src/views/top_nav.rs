@@ -1,6 +1,6 @@
 use gpui::{
     div, prelude::*, px, rgb, rgba, AnimationExt, BoxShadow, Context, FontWeight, MouseButton,
-    SharedString, Window, WindowControlArea,
+    Render, SharedString, WeakEntity, Window, WindowControlArea,
 };
 
 use crate::{
@@ -15,6 +15,36 @@ use crate::{
 };
 
 pub const TOPNAV_SCROLLED_THRESHOLD_PX: f32 = 24.0;
+pub const TOPNAV_HEIGHT_REST_PX: f32 = 68.0;
+pub const TOPNAV_HEIGHT_SCROLLED_PX: f32 = 60.0;
+
+/// Cached child view boundary for the floating TopNav bar.
+///
+/// Holds only a [`WeakEntity<AppShell>`] (no strong reference cycle) and relies on
+/// `AppShell`'s `observe_self` cache-key hub + definite cached bounds (`68px` / `60px`)
+/// so scrolling content never re-renders, re-layouts, or re-paints TopNav.
+pub struct TopNavView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl TopNavView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for TopNavView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().size_full().into_any_element();
+        };
+        shell.update(cx, |shell, shell_cx| {
+            shell
+                .render_floating_topnav(window, shell_cx)
+                .into_any_element()
+        })
+    }
+}
 
 pub const PRIMARY_NAV_TABS: [SidebarTab; 4] = [
     SidebarTab::Home,
@@ -667,14 +697,10 @@ impl AppShell {
 
         div()
             .id("topnav-titlebar")
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
+            .size_full()
             .when(!is_fullscreen, |el| {
                 el.window_control_area(WindowControlArea::Drag)
             })
-            .h(if is_scrolled { sp(60.0) } else { sp(68.0) })
             .px(px(nav_gutter_px))
             .when(!is_scrolled, |el| el.pt(sp(8.0)))
             .when(is_scrolled, |el| {

@@ -10,10 +10,11 @@ use std::{
 
 use gpui::{
     div, img, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, AnimationExt,
-    AsyncApp, ClipboardItem, Context, CursorStyle, Decorations, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, KeyUpEvent, MouseButton, NavigationDirection, ObjectFit, PathPromptOptions,
-    Render, RenderImage, ResizeEdge, ScrollDelta, ScrollHandle, SharedString, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowControlArea,
+    AnyElement, AsyncApp, ClipboardItem, Context, CursorStyle, Decorations, Entity, FocusHandle,
+    Focusable, FontWeight, KeyDownEvent, KeyUpEvent, MouseButton, NavigationDirection, ObjectFit,
+    PathPromptOptions, Render, RenderImage, ResizeEdge, ScrollDelta, ScrollHandle, SharedString,
+    StyleRefinement, Subscription, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowControlArea,
 };
 use gpui_mpv::{
     extract_audio_pcm_s16le_8khz, extract_embedded_text_subtitle_window, MpvThumbnailer,
@@ -77,15 +78,27 @@ use crate::{
         MAX_AUTO_FAILOVER_ATTEMPTS, STREAM_PAGE_SIZE,
     },
     theme::{
-        active_theme, glass_capsule_shadow, obsidian_fade_in, sp, transparent_cutout, ui_sans,
-        AccentChoice, CardDensityChoice, ThemePreset, UiScaleChoice, RADIUS_CONTROL, RADIUS_PILL,
+        active_theme, active_theme_version, glass_capsule_shadow, obsidian_fade_in, sp,
+        transparent_cutout, ui_sans, AccentChoice, CardDensityChoice, ThemePreset, UiScaleChoice,
+        RADIUS_CONTROL, RADIUS_PILL,
     },
     ui::{
-        render_back_to_top_button, scroll_chrome_flags, should_show_back_to_top,
-        ScrollbarDragState, ScrollbarElement,
+        back_to_top_right_inset_px, is_compact_viewport, render_back_to_top_pill,
+        scroll_chrome_flags, should_show_back_to_top, ScrollbarDragState, ScrollbarElement,
+        BACK_TO_TOP_CACHED_HEIGHT_PX, BACK_TO_TOP_CACHED_WIDTH_PX,
     },
     ui_components::{click_handler, glass_dropdown_panel, ClickHandler},
     updater::{self, AppliedUpdateOutcome, UpdateStatus},
+    views::{
+        discover_view::{
+            discover_hidden_footer_open, DiscoverChromeView, DiscoverGridView,
+            DiscoverSourceRailView,
+        },
+        library_view::{LibraryChromeView, LibraryGridView},
+        top_nav::{
+            is_topnav_scrolled, TopNavView, TOPNAV_HEIGHT_REST_PX, TOPNAV_HEIGHT_SCROLLED_PX,
+        },
+    },
 };
 
 fn shared_opensubhash_http_client() -> Option<&'static reqwest13::Client> {
@@ -105,6 +118,190 @@ const PREWARM_HEAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_NAV_HISTORY: usize = 64;
 const HEAP_TRIM_MIN_INTERVAL: Duration = Duration::from_secs(10);
 const SCROLL_HOVER_PREFETCH_COOLDOWN: Duration = Duration::from_millis(150);
+
+#[inline]
+fn hash_str(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[inline]
+fn hash_opt_str(s: Option<&str>) -> Option<u64> {
+    s.map(hash_str)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TopNavCacheKey {
+    theme_ver: u64,
+    active_tab: Option<SidebarTab>,
+    can_back: bool,
+    can_forward: bool,
+    is_scrolled: bool,
+    compact_width: bool,
+    avatar_menu_open: bool,
+    command_palette_open: bool,
+    palette_query_hash: u64,
+    palette_cursor: Option<usize>,
+    palette_selected_all: bool,
+    palette_focused: bool,
+    auth_email_hash: Option<u64>,
+    has_clipboard_addon: bool,
+    update_badge_hash: Option<(u64, bool)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AmbientCacheKey {
+    theme_ver: u64,
+    is_player: bool,
+    url_hash: Option<u64>,
+    tex_ptr: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackToTopCacheKey {
+    theme_ver: u64,
+    right_inset_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoverSourceRailCacheKey {
+    theme_ver: u64,
+    discover_state_rev: u64,
+    discover_prefs_rev: u64,
+    catalog_search_hash: u64,
+    catalog_search_focused: bool,
+    catalog_search_cursor: Option<usize>,
+    catalog_search_selected_all: bool,
+    hidden_footer_open: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoverChromeCacheKey {
+    theme_ver: u64,
+    discover_state_rev: u64,
+    hide_watched_lib_rev: u64,
+    rail_open: bool,
+    hide_watched: bool,
+    open_dropdown_hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LibraryChromeCacheKey {
+    theme_ver: u64,
+    library_state_rev: u64,
+    board_state_rev: u64,
+    filter_tab: LibraryFilterTab,
+    type_filter: LibraryTypeFilter,
+    sort_criterion: LibrarySortCriterion,
+    sort_dropdown_open: bool,
+    view_mode: LibraryViewMode,
+    search_hash: u64,
+    search_focused: bool,
+    search_cursor: Option<usize>,
+    search_selected_all: bool,
+    pending_poster_rev: u64,
+}
+
+#[derive(Default)]
+pub struct CachedViewKeys {
+    pub(crate) top_nav: Option<TopNavCacheKey>,
+    pub(crate) ambient: Option<AmbientCacheKey>,
+    pub(crate) back_to_top: Option<BackToTopCacheKey>,
+    pub(crate) discover_rail: Option<DiscoverSourceRailCacheKey>,
+    pub(crate) discover_chrome: Option<DiscoverChromeCacheKey>,
+    pub(crate) library_chrome: Option<LibraryChromeCacheKey>,
+}
+
+/// Cached child view boundary for the top ambient hero backdrop bleed (`460px` tall).
+pub struct AmbientBackdropView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl AmbientBackdropView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for AmbientBackdropView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().size_full().into_any_element();
+        };
+        shell.update(cx, |shell, _| shell.render_ambient_backdrop_inner())
+    }
+}
+
+/// Uncached child view boundary that hosts the active scrollable route content.
+///
+/// GPUI's scroll handler (`div.rs:3487`) calls `cx.notify(window.current_view())`.
+/// Mounting route content inside `ActiveScrollHostView` ensures scroll wheel ticks
+/// dirty ONLY `ActiveScrollHostView` and ancestor `AppShell`, leaving cached sibling
+/// chrome (`TopNavView`, `AmbientBackdropView`, `BackToTopView`) completely clean.
+pub struct ActiveScrollHostView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl ActiveScrollHostView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for ActiveScrollHostView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().size_full().into_any_element();
+        };
+        shell.update(cx, |shell, shell_cx| {
+            shell.active_scroll_suppressed.set(false);
+            let el = shell.render_active_route_content(window, shell_cx);
+            if shell.ambient_backdrop_dirty.replace(false) {
+                let ambient_id = shell.ambient_view.entity_id();
+                window.on_next_frame(move |_, cx| {
+                    cx.notify(ambient_id);
+                });
+            }
+            el
+        })
+    }
+}
+
+/// Cached child view boundary for the floating bottom-right "Back to top" pill.
+pub struct BackToTopView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl BackToTopView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for BackToTopView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().size_full().into_any_element();
+        };
+        let shell_weak = self.shell.clone();
+        let _ = shell;
+        let _ = cx;
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_end()
+            .child(render_back_to_top_pill(move |_, _, cx| {
+                if let Some(shell) = shell_weak.upgrade() {
+                    shell.update(cx, |this, cx| {
+                        this.scroll_active_route_to_top(cx);
+                    });
+                }
+            }))
+            .into_any_element()
+    }
+}
 
 pub struct AppShell {
     pub focus_handle: FocusHandle,
@@ -142,10 +339,12 @@ pub struct AppShell {
 
     pub board_state_rev: u64,
     pub discover_state_rev: u64,
+    pub discover_prefs_rev: u64,
     pub library_state_rev: u64,
     pub calendar_state_rev: u64,
     pub meta_state_rev: u64,
     pub search_state_rev: u64,
+    pub poster_decode_rev: u64,
     pub search_debounce_seq: u64,
     pub hover_prefetch_seq: u64,
     pub hover_prefetch_target: Option<String>,
@@ -212,7 +411,22 @@ pub struct AppShell {
     pub last_scroll_chrome_flags: Rc<Cell<(bool, bool)>>,
     pub last_scroll_at: Rc<Cell<Option<Instant>>>,
     pub last_observed_scroll: Rc<Cell<(u64, f32)>>,
-    pub active_scroll_suppressed: Cell<bool>,
+    pub active_scroll_suppressed: Rc<Cell<bool>>,
+    pub ambient_backdrop_dirty: Cell<bool>,
+    pub discover_chrome_height: Rc<Cell<Option<(u64, f32)>>>,
+    pub library_chrome_height: Rc<Cell<Option<(u64, f32)>>>,
+    pub library_up_next_pending_images: Rc<Cell<bool>>,
+    pub ambient_view: Entity<AmbientBackdropView>,
+    pub active_scroll_host: Entity<ActiveScrollHostView>,
+    pub top_nav_view: Entity<TopNavView>,
+    pub back_to_top_view: Entity<BackToTopView>,
+    pub discover_source_rail_view: Entity<DiscoverSourceRailView>,
+    pub discover_chrome_view: Entity<DiscoverChromeView>,
+    pub discover_grid_view: Entity<DiscoverGridView>,
+    pub library_chrome_view: Entity<LibraryChromeView>,
+    pub library_grid_view: Entity<LibraryGridView>,
+    pub cached_view_keys: CachedViewKeys,
+    pub _subscriptions: Vec<Subscription>,
     pub cached_auth_email: Option<String>,
     pub cached_auth_initial: Option<String>,
     pub episode_list_scrolled_key: Option<(String, String)>,
@@ -373,7 +587,13 @@ impl AppShell {
                     .timer(Duration::from_millis(33))
                     .await;
                 while poster_rx.try_recv().is_ok() {}
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                if this
+                    .update(cx, |shell, cx| {
+                        shell.poster_decode_rev = shell.poster_decode_rev.wrapping_add(1);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -447,6 +667,25 @@ impl AppShell {
             AppRoute::Tab(SidebarTab::Home)
         };
 
+        let shell_weak = cx.weak_entity();
+        let ambient_view = cx.new(|_| AmbientBackdropView::new(shell_weak.clone()));
+        let active_scroll_host = cx.new(|_| ActiveScrollHostView::new(shell_weak.clone()));
+        let top_nav_view = cx.new(|_| TopNavView::new(shell_weak.clone()));
+        let back_to_top_view = cx.new(|_| BackToTopView::new(shell_weak.clone()));
+        let discover_source_rail_view = cx.new(|_| DiscoverSourceRailView::new(shell_weak.clone()));
+        let discover_chrome_view = cx.new(|_| DiscoverChromeView::new(shell_weak.clone()));
+        let discover_grid_view = cx.new(|_| DiscoverGridView::new(shell_weak.clone()));
+        let library_chrome_view = cx.new(|_| LibraryChromeView::new(shell_weak.clone()));
+        let library_grid_view = cx.new(|_| LibraryGridView::new(shell_weak));
+
+        let subscriptions = vec![
+            cx.observe_self(|shell, cx| shell.sync_cached_view_invalidations(cx)),
+            cx.observe_window_bounds(window, |shell, _, _| {
+                shell.discover_chrome_height.set(None);
+                shell.library_chrome_height.set(None);
+            }),
+        ];
+
         let mut shell = Self {
             focus_handle,
             tokio_handle: services.tokio_handle,
@@ -481,10 +720,12 @@ impl AppShell {
             kb_focus_items_key: None,
             board_state_rev: 1,
             discover_state_rev: 1,
+            discover_prefs_rev: 1,
             library_state_rev: 1,
             calendar_state_rev: 1,
             meta_state_rev: 1,
             search_state_rev: 1,
+            poster_decode_rev: 0,
             search_debounce_seq: 0,
             hover_prefetch_seq: 0,
             hover_prefetch_target: None,
@@ -546,7 +787,22 @@ impl AppShell {
             last_scroll_chrome_flags: Rc::new(Cell::new((false, false))),
             last_scroll_at: Rc::new(Cell::new(None)),
             last_observed_scroll: Rc::new(Cell::new((0, 0.0))),
-            active_scroll_suppressed: Cell::new(false),
+            active_scroll_suppressed: Rc::new(Cell::new(false)),
+            ambient_backdrop_dirty: Cell::new(false),
+            discover_chrome_height: Rc::new(Cell::new(None)),
+            library_chrome_height: Rc::new(Cell::new(None)),
+            library_up_next_pending_images: Rc::new(Cell::new(false)),
+            ambient_view,
+            active_scroll_host,
+            top_nav_view,
+            back_to_top_view,
+            discover_source_rail_view,
+            discover_chrome_view,
+            discover_grid_view,
+            library_chrome_view,
+            library_grid_view,
+            cached_view_keys: CachedViewKeys::default(),
+            _subscriptions: subscriptions,
             cached_auth_email,
             cached_auth_initial,
             episode_list_scrolled_key: None,
@@ -761,6 +1017,270 @@ impl AppShell {
                 .filter(|s| s.starts_with("tt"))
         };
         imdb_id.map(|tt| format!("https://images.metahub.space/background/medium/{tt}/img"))
+    }
+
+    pub(crate) fn set_ambient_hero_backdrop_url(&mut self, url: Option<String>) {
+        if url.is_some() && self.ambient_hero_backdrop_url != url {
+            self.ambient_hero_backdrop_url = url;
+            self.ambient_backdrop_dirty.set(true);
+        }
+    }
+
+    pub(crate) fn compute_top_nav_cache_key(&self) -> TopNavCacheKey {
+        let scroll_y = self.current_route_scroll_y();
+        let update_badge_hash = self
+            .update_status
+            .available_version()
+            .map(|v| (hash_str(v), self.update_status.is_ready_to_restart()));
+        TopNavCacheKey {
+            theme_ver: active_theme_version(),
+            active_tab: self.route.active_sidebar_tab(),
+            can_back: !self.nav_history.is_empty(),
+            can_forward: !self.nav_forward.is_empty(),
+            is_scrolled: is_topnav_scrolled(scroll_y),
+            compact_width: is_compact_viewport(self.viewport_size_px.0),
+            avatar_menu_open: self.avatar_menu_open,
+            command_palette_open: self.command_palette_open,
+            palette_query_hash: hash_str(&self.palette_query),
+            palette_cursor: self.input_cursors.get(&FocusedInput::CommandPalette).copied(),
+            palette_selected_all: self
+                .input_selected_all
+                .contains(&FocusedInput::CommandPalette),
+            palette_focused: self.focused_input == Some(FocusedInput::CommandPalette),
+            auth_email_hash: hash_opt_str(self.cached_auth_email.as_deref()),
+            has_clipboard_addon: self.clipboard_addon_suggestion.is_some(),
+            update_badge_hash,
+        }
+    }
+
+    pub(crate) fn compute_ambient_cache_key(&self) -> AmbientCacheKey {
+        let theme = active_theme();
+        let is_player = self.route.is_player();
+        let (url_hash, tex_ptr) = if !is_player && theme.ambient_bleed {
+            let url = self.ambient_hero_backdrop_url.as_deref();
+            let tex_ptr = url
+                .and_then(|u| self.poster_cache.resolve_ambient_bleed(u))
+                .map(|tex| Arc::as_ptr(&tex) as usize)
+                .unwrap_or(0);
+            (hash_opt_str(url), tex_ptr)
+        } else {
+            (None, 0)
+        };
+        AmbientCacheKey {
+            theme_ver: active_theme_version(),
+            is_player,
+            url_hash,
+            tex_ptr,
+        }
+    }
+
+    pub(crate) fn compute_back_to_top_cache_key(&self) -> BackToTopCacheKey {
+        let theme = active_theme();
+        let right_inset = back_to_top_right_inset_px(self.viewport_size_px.0, theme.ui_scale);
+        BackToTopCacheKey {
+            theme_ver: active_theme_version(),
+            right_inset_bits: right_inset.to_bits(),
+        }
+    }
+
+    pub(crate) fn compute_discover_rail_cache_key(&self) -> DiscoverSourceRailCacheKey {
+        DiscoverSourceRailCacheKey {
+            theme_ver: active_theme_version(),
+            discover_state_rev: self.discover_state_rev,
+            discover_prefs_rev: self.discover_prefs_rev,
+            catalog_search_hash: hash_str(&self.discover_catalog_search),
+            catalog_search_focused: self.focused_input == Some(FocusedInput::DiscoverCatalogSearch),
+            catalog_search_cursor: self
+                .input_cursors
+                .get(&FocusedInput::DiscoverCatalogSearch)
+                .copied(),
+            catalog_search_selected_all: self
+                .input_selected_all
+                .contains(&FocusedInput::DiscoverCatalogSearch),
+            hidden_footer_open: discover_hidden_footer_open(),
+        }
+    }
+
+    pub(crate) fn compute_discover_chrome_cache_key(&self) -> DiscoverChromeCacheKey {
+        let open_dropdown_hash = match &self.discover_open_dropdown {
+            None => 0,
+            Some(DiscoverDropdown::Format) => 1,
+            Some(DiscoverDropdown::Catalog) => 2,
+            Some(DiscoverDropdown::Genre) => 3,
+            Some(DiscoverDropdown::Extra(name)) => {
+                let mut h = DefaultHasher::new();
+                4u8.hash(&mut h);
+                name.hash(&mut h);
+                h.finish().max(5)
+            }
+        };
+        let hide_watched = self.preferences.discover_hide_watched;
+        DiscoverChromeCacheKey {
+            theme_ver: active_theme_version(),
+            discover_state_rev: self.discover_state_rev,
+            hide_watched_lib_rev: if hide_watched {
+                self.library_state_rev
+            } else {
+                0
+            },
+            rail_open: self.preferences.discover_source_rail_open,
+            hide_watched,
+            open_dropdown_hash,
+        }
+    }
+
+    pub(crate) fn compute_library_chrome_cache_key(&self) -> LibraryChromeCacheKey {
+        let pending_poster_rev = if self.library_up_next_pending_images.get() {
+            self.poster_decode_rev
+        } else {
+            0
+        };
+        LibraryChromeCacheKey {
+            theme_ver: active_theme_version(),
+            library_state_rev: self.library_state_rev,
+            board_state_rev: self.board_state_rev,
+            filter_tab: self.library_filter_tab,
+            type_filter: self.library_type_filter,
+            sort_criterion: self.library_sort_criterion,
+            sort_dropdown_open: self.library_sort_dropdown_open,
+            view_mode: self.preferences.library_view_mode,
+            search_hash: hash_str(&self.library_search_query),
+            search_focused: self.focused_input == Some(FocusedInput::LibrarySearch),
+            search_cursor: self
+                .input_cursors
+                .get(&FocusedInput::LibrarySearch)
+                .copied(),
+            search_selected_all: self
+                .input_selected_all
+                .contains(&FocusedInput::LibrarySearch),
+            pending_poster_rev,
+        }
+    }
+
+    /// Synchronously invalidates ONLY the `.cached(...)` child views whose
+    /// state slice actually changed when `AppShell` is notified.
+    ///
+    /// Runs inside `App::flush_effects()` BEFORE `window.draw()` (0-frame lag),
+    /// and NEVER fires on scroll ticks because scrolling notifies child scroll
+    /// host entities rather than `AppShell`.
+    fn sync_cached_view_invalidations(&mut self, cx: &mut Context<Self>) {
+        let theme = active_theme();
+        if !self.route.is_player() && theme.ambient_bleed {
+            self.sync_ambient_backdrop_for_render();
+        }
+
+        let top_nav_key = self.compute_top_nav_cache_key();
+        if self.cached_view_keys.top_nav != Some(top_nav_key) {
+            self.cached_view_keys.top_nav = Some(top_nav_key);
+            gpui::App::notify(cx, self.top_nav_view.entity_id());
+        }
+
+        let ambient_key = self.compute_ambient_cache_key();
+        if self.cached_view_keys.ambient != Some(ambient_key) {
+            self.cached_view_keys.ambient = Some(ambient_key);
+            gpui::App::notify(cx, self.ambient_view.entity_id());
+        }
+
+        let back_to_top_key = self.compute_back_to_top_cache_key();
+        if self.cached_view_keys.back_to_top != Some(back_to_top_key) {
+            self.cached_view_keys.back_to_top = Some(back_to_top_key);
+            gpui::App::notify(cx, self.back_to_top_view.entity_id());
+        }
+
+        match self.route {
+            AppRoute::Tab(SidebarTab::Discover) => {
+                let rail_key = self.compute_discover_rail_cache_key();
+                if self.cached_view_keys.discover_rail != Some(rail_key) {
+                    self.cached_view_keys.discover_rail = Some(rail_key);
+                    gpui::App::notify(cx, self.discover_source_rail_view.entity_id());
+                }
+                let chrome_key = self.compute_discover_chrome_cache_key();
+                if self.cached_view_keys.discover_chrome != Some(chrome_key) {
+                    self.cached_view_keys.discover_chrome = Some(chrome_key);
+                    gpui::App::notify(cx, self.discover_chrome_view.entity_id());
+                }
+            }
+            AppRoute::Tab(SidebarTab::Library) => {
+                let chrome_key = self.compute_library_chrome_cache_key();
+                if self.cached_view_keys.library_chrome != Some(chrome_key) {
+                    self.cached_view_keys.library_chrome = Some(chrome_key);
+                    gpui::App::notify(cx, self.library_chrome_view.entity_id());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn render_ambient_backdrop_inner(&self) -> AnyElement {
+        let theme = active_theme();
+        if self.route.is_player() || !theme.ambient_bleed {
+            return div().size_full().into_any_element();
+        }
+        let Some(tex) = self
+            .ambient_hero_backdrop_url
+            .as_deref()
+            .and_then(|u| self.poster_cache.resolve_ambient_bleed(u))
+        else {
+            return div().size_full().into_any_element();
+        };
+        let bleed_opacity = if theme.is_light { 0.16 } else { 0.21 };
+        let top_fade = (theme.bg_canvas << 8) | 0x26;
+        div()
+            .size_full()
+            .overflow_hidden()
+            .child(
+                img(tex)
+                    .size_full()
+                    .absolute()
+                    .inset_0()
+                    .object_fit(ObjectFit::Cover)
+                    .opacity(bleed_opacity),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(rgba(top_fade), 0.0),
+                        linear_color_stop(rgb(theme.bg_canvas), 1.0),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    pub(crate) fn render_active_route_content(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match self.route.clone() {
+            AppRoute::Player => self.render_player_view(window, cx).into_any_element(),
+            AppRoute::Tab(SidebarTab::Home) => self.render_board_view(cx).into_any_element(),
+            AppRoute::Tab(SidebarTab::Discover) => {
+                self.render_discover_view(window, cx).into_any_element()
+            }
+            AppRoute::Tab(SidebarTab::Calendar) => {
+                self.render_calendar_view(cx).into_any_element()
+            }
+            AppRoute::Tab(SidebarTab::Library) => {
+                self.render_library_view(window, cx).into_any_element()
+            }
+            AppRoute::Tab(SidebarTab::Addons) => self.render_addons_view(cx).into_any_element(),
+            AppRoute::Tab(SidebarTab::Settings) => self.render_settings_view(cx).into_any_element(),
+            AppRoute::Tab(SidebarTab::Account) => self.render_auth_view(cx).into_any_element(),
+            AppRoute::MetaDetails {
+                type_name,
+                id,
+                video_id,
+            } => self
+                .render_meta_details_view(&type_name, &id, video_id.as_deref(), cx)
+                .into_any_element(),
+            AppRoute::Search { query } => self.render_search_view(&query, cx).into_any_element(),
+            AppRoute::Person { person_key, name } => self
+                .render_person_view(&person_key, &name, cx)
+                .into_any_element(),
+        }
     }
 
     fn sync_ambient_backdrop_for_render(&mut self) {
@@ -2202,11 +2722,19 @@ impl AppShell {
             || self.context_menu.is_some()
     }
 
+    fn active_scroll_notify_entity_id(&self) -> gpui::EntityId {
+        match self.route {
+            AppRoute::Tab(SidebarTab::Discover) => self.discover_grid_view.entity_id(),
+            AppRoute::Tab(SidebarTab::Library) => self.library_grid_view.entity_id(),
+            _ => self.active_scroll_host.entity_id(),
+        }
+    }
+
     fn render_active_route_scroll_controls(
         &self,
         is_hero_route: bool,
         cx: &mut Context<Self>,
-    ) -> (Option<gpui::AnyElement>, Option<gpui::Stateful<gpui::Div>>) {
+    ) -> (Option<AnyElement>, Option<AnyElement>) {
         if self.route.is_player() {
             return (None, None);
         }
@@ -2215,8 +2743,8 @@ impl AppShell {
             return (None, None);
         };
 
-        let suppressed =
-            self.active_scroll_suppressed.get() || self.has_blocking_scroll_overlay();
+        let overlay_suppressed = self.has_blocking_scroll_overlay();
+        let suppressed = self.active_scroll_suppressed.get() || overlay_suppressed;
         let scroll_y = (-handle.offset().y / px(1.0)).max(0.0);
         let rendered_flags = scroll_chrome_flags(scroll_y, suppressed);
         self.last_scroll_chrome_flags.set(rendered_flags);
@@ -2226,15 +2754,17 @@ impl AppShell {
         route_key.hash(&mut hasher);
         let route_hash = hasher.finish();
 
-        // Mounted as a sibling AFTER `active_content` so `ScrollbarElement::prepaint`
-        // reads live post-prepaint `offset`, `max_offset`, and `bounds` and paints the
-        // track/thumb directly in `paint()` with zero follow-up double-renders.
+        // Mounted as a sibling AFTER `active_scroll_host` so `ScrollbarElement::prepaint`
+        // reads live post-prepaint `offset`, `max_offset`, `bounds`, and `active_scroll_suppressed`
+        // and paints the track/thumb directly in `paint()` with zero follow-up double-renders.
         let scrollbar_el = ScrollbarElement::new(
             route_key,
             route_hash,
             handle,
             is_hero_route,
-            suppressed,
+            overlay_suppressed,
+            Rc::clone(&self.active_scroll_suppressed),
+            self.active_scroll_notify_entity_id(),
             cx.entity_id(),
             Rc::clone(&self.scrollbar_drag),
             Rc::clone(&self.scrollbar_hovered),
@@ -2244,13 +2774,20 @@ impl AppShell {
         )
         .into_any_element();
 
+        let theme = active_theme();
         let back_to_top_el = (!suppressed && should_show_back_to_top(scroll_y)).then(|| {
-            render_back_to_top_button(
-                self.viewport_size_px.0,
-                cx.listener(|this, _, _, cx| {
-                    this.scroll_active_route_to_top(cx);
-                }),
-            )
+            let right_inset = back_to_top_right_inset_px(self.viewport_size_px.0, theme.ui_scale);
+            self.back_to_top_view
+                .clone()
+                .cached(
+                    StyleRefinement::default()
+                        .absolute()
+                        .bottom(sp(24.0))
+                        .right(px(right_inset))
+                        .w(sp(BACK_TO_TOP_CACHED_WIDTH_PX))
+                        .h(sp(BACK_TO_TOP_CACHED_HEIGHT_PX)),
+                )
+                .into_any_element()
         });
 
         (Some(scrollbar_el), back_to_top_el)
@@ -7896,84 +8433,43 @@ impl Render for AppShell {
         if is_player || self.has_blocking_scroll_overlay() || drag_route_mismatch {
             self.clear_scrollbar_interaction();
         }
-        self.active_scroll_suppressed.set(false);
 
         let transition_key = SharedString::from(current_route_key);
         let resize_handles_el = Self::render_csd_resize_handles(window);
 
-        let active_content = match self.route.clone() {
-            AppRoute::Player => self.render_player_view(window, cx).into_any_element(),
-            AppRoute::Tab(SidebarTab::Home) => self.render_board_view(cx).into_any_element(),
-            AppRoute::Tab(SidebarTab::Discover) => {
-                self.render_discover_view(window, cx).into_any_element()
-            }
-            AppRoute::Tab(SidebarTab::Calendar) => {
-                self.render_calendar_view(cx).into_any_element()
-            }
-            AppRoute::Tab(SidebarTab::Library) => {
-                self.render_library_view(window, cx).into_any_element()
-            }
-            AppRoute::Tab(SidebarTab::Addons) => self.render_addons_view(cx).into_any_element(),
-            AppRoute::Tab(SidebarTab::Settings) => self.render_settings_view(cx).into_any_element(),
-            AppRoute::Tab(SidebarTab::Account) => self.render_auth_view(cx).into_any_element(),
-            AppRoute::MetaDetails {
-                type_name,
-                id,
-                video_id,
-            } => self
-                .render_meta_details_view(&type_name, &id, video_id.as_deref(), cx)
-                .into_any_element(),
-            AppRoute::Search { query } => self.render_search_view(&query, cx).into_any_element(),
-            AppRoute::Person { person_key, name } => self
-                .render_person_view(&person_key, &name, cx)
-                .into_any_element(),
-        };
+        let active_content = self.active_scroll_host.clone().into_any_element();
 
-        let ambient_layer = if !is_player && theme.ambient_bleed {
+        let ambient_layer = (!is_player && theme.ambient_bleed).then(|| {
             self.sync_ambient_backdrop_for_render();
-            self.ambient_hero_backdrop_url
-                .as_deref()
-                .and_then(|u| self.poster_cache.resolve_ambient_bleed(u))
-                .map(|tex| {
-                    let bleed_opacity = if theme.is_light { 0.16 } else { 0.21 };
-                    let top_fade = (theme.bg_canvas << 8) | 0x26;
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(460.0))
-                        .overflow_hidden()
-                        .child(
-                            img(tex)
-                                .size_full()
-                                .absolute()
-                                .inset_0()
-                                .object_fit(ObjectFit::Cover)
-                                .opacity(bleed_opacity),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .bg(linear_gradient(
-                                    180.0,
-                                    linear_color_stop(rgba(top_fade), 0.0),
-                                    linear_color_stop(rgb(theme.bg_canvas), 1.0),
-                                )),
-                        )
-                })
-        } else {
-            None
-        };
+            self.ambient_view.clone().cached(
+                StyleRefinement::default()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(460.0)),
+            )
+        });
 
-        if self.active_scroll_suppressed.get() {
-            self.clear_scrollbar_interaction();
-        }
         let is_dragging_scrollbar = self.scrollbar_drag.borrow().is_some();
         let (scrollbar_el, back_to_top_el) =
             self.render_active_route_scroll_controls(is_hero_route, cx);
-        let topnav_el = (!is_player).then(|| self.render_floating_topnav(window, cx));
+        let topnav_el = (!is_player).then(|| {
+            let is_scrolled = is_topnav_scrolled(self.current_route_scroll_y());
+            let nav_h = if is_scrolled {
+                sp(TOPNAV_HEIGHT_SCROLLED_PX)
+            } else {
+                sp(TOPNAV_HEIGHT_REST_PX)
+            };
+            self.top_nav_view.clone().cached(
+                StyleRefinement::default()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(nav_h),
+            )
+        });
         let quick_peek_el = (!is_player)
             .then(|| self.render_quick_peek_drawer(cx))
             .flatten();

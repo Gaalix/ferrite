@@ -500,9 +500,7 @@ impl AppShell {
             enriched.as_ref().and_then(|e| e.poster_url.as_deref()),
             meta.preview.poster.as_ref(),
         );
-        if resolved_backdrop_url.is_some() {
-            self.ambient_hero_backdrop_url = resolved_backdrop_url;
-        }
+        self.set_ambient_hero_backdrop_url(resolved_backdrop_url);
 
         let (mut credit_directors, mut credit_cast) = enriched
             .as_ref()
@@ -1612,9 +1610,7 @@ impl AppShell {
             None,
             preview.poster.as_ref(),
         );
-        if resolved_backdrop_url.is_some() {
-            self.ambient_hero_backdrop_url = resolved_backdrop_url;
-        }
+        self.set_ambient_hero_backdrop_url(resolved_backdrop_url);
 
         let loading_type = preview.r#type.clone();
         let loading_genres = preview.genres.clone();

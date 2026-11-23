@@ -2,6 +2,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     ops::Range,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -11,7 +12,8 @@ use std::{
 
 use gpui::{
     deferred, div, point, prelude::*, px, relative, rgb, rgba, Animation, AnimationExt,
-    AnyElement, Context, ElementId, FontWeight, MouseButton, SharedString, Window,
+    AnyElement, Context, ElementId, FontWeight, MouseButton, Render, SharedString, StyleRefinement,
+    WeakEntity, Window,
 };
 use stremio_core_runtime::{
     resolve_addon_for_request_base,
@@ -37,9 +39,9 @@ use crate::{
         LibraryStatusTab, QuickPeekTarget, ToastKind,
     },
     theme::{
-        active_theme, mono_font, placeholder_tint_for_id_with_preset, sentence_case_label, sp,
-        tabular_nums, ui_sans, ThemePalette, ThemePreset, RADIUS_CONTROL, RADIUS_PILL,
-        RADIUS_POSTER,
+        active_theme, active_theme_version, mono_font, placeholder_tint_for_id_with_preset,
+        sentence_case_label, sp, tabular_nums, ui_sans, ThemePalette, ThemePreset, RADIUS_CONTROL,
+        RADIUS_PILL, RADIUS_POSTER,
     },
     ui::{
         card_action_dispatcher, choice_pill, compute_app_grid_metrics, dropdown_trigger,
@@ -49,6 +51,7 @@ use crate::{
         render_prepared_poster_card, search_field, toolbar_bar, DropdownTriggerProps,
         EmptyStateProps, PageHeader, PageWidth, PosterCardAction, PosterCardCapabilities,
         PosterMetrics, PreparedPosterCard, PreparedPosterRenderCtx, SearchFieldProps,
+        PAGE_SECTION_GAP_PX,
     },
     virtual_grid::{slice_row_items, PosterAspect},
 };
@@ -191,6 +194,83 @@ fn collect_selectable_extra_options(
 
 static SURPRISE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static HIDDEN_FOOTER_OPEN: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub(crate) fn discover_hidden_footer_open() -> bool {
+    HIDDEN_FOOTER_OPEN.load(Ordering::Relaxed)
+}
+
+/// Cached child view boundary for Discover's left source rail (`248px * ui_scale`).
+pub struct DiscoverSourceRailView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl DiscoverSourceRailView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for DiscoverSourceRailView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().size_full().into_any_element();
+        };
+        shell.update(cx, |shell, shell_cx| {
+            let theme = active_theme();
+            let snap = shell.cached_discover_snapshot();
+            shell.render_discover_source_rail(&snap, &theme, shell_cx)
+        })
+    }
+}
+
+/// Cached child view boundary for Discover's PageHeader + Toolbar chrome.
+pub struct DiscoverChromeView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl DiscoverChromeView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for DiscoverChromeView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().w_full().into_any_element();
+        };
+        shell.update(cx, |shell, shell_cx| {
+            shell.render_discover_chrome_inner(shell_cx)
+        })
+    }
+}
+
+/// Uncached child view boundary owning Discover's `uniform_list` poster grid.
+///
+/// Scrolling the grid calls `cx.notify(discover_grid_view_id)`, skipping render,
+/// layout, prepaint, and paint of `DiscoverSourceRailView`, `DiscoverChromeView`,
+/// `TopNavView`, `AmbientBackdropView`, and `BackToTopView`.
+pub struct DiscoverGridView {
+    shell: WeakEntity<AppShell>,
+}
+
+impl DiscoverGridView {
+    pub fn new(shell: WeakEntity<AppShell>) -> Self {
+        Self { shell }
+    }
+}
+
+impl Render for DiscoverGridView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shell) = self.shell.upgrade() else {
+            return div().flex_1().w_full().min_h(px(0.0)).into_any_element();
+        };
+        shell.update(cx, |shell, shell_cx| {
+            shell.render_discover_grid_inner(window, shell_cx)
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 struct AddonCatalogGroup {
@@ -648,10 +728,6 @@ impl AppShell {
             HIDDEN_FOOTER_OPEN.store(false, Ordering::Relaxed);
         }
 
-        let theme = active_theme();
-        let snap = self.cached_discover_snapshot();
-        let statuses_arc = self.cached_library_statuses();
-
         let raw_viewport_w = f32::from(window.viewport_size().width);
         let viewport_w = if raw_viewport_w > 0.0 && raw_viewport_w.is_finite() {
             raw_viewport_w
@@ -660,21 +736,78 @@ impl AppShell {
         };
 
         let rail_open = self.preferences.discover_source_rail_open;
-        let rail_width_px = if rail_open {
-            SOURCE_RAIL_WIDTH_PX * theme.ui_scale
-        } else {
-            0.0
-        };
+        let source_rail_el = rail_open.then(|| {
+            self.discover_source_rail_view.clone().cached(
+                StyleRefinement::default()
+                    .w(sp(SOURCE_RAIL_WIDTH_PX))
+                    .h_full()
+                    .min_h(px(0.0))
+                    .flex_shrink_0(),
+            )
+        });
 
-        let source_rail_el = rail_open.then(|| self.render_discover_source_rail(&snap, &theme, cx));
-        let main_canvas = self.render_discover_catalog_grid(
-            &snap,
-            &statuses_arc,
-            viewport_w,
-            rail_width_px,
-            &theme,
-            cx,
-        );
+        let mut layout_sig_hasher = DefaultHasher::new();
+        (
+            viewport_w.to_bits(),
+            rail_open,
+            active_theme_version(),
+            self.discover_state_rev,
+            self.preferences.discover_hide_watched,
+            self.discover_open_dropdown.is_some(),
+        )
+            .hash(&mut layout_sig_hasher);
+        let chrome_layout_sig = layout_sig_hasher.finish();
+
+        // Keep DiscoverChromeView uncached while a dropdown is open or on the 1st measure
+        // frame of a new layout signature; reuse its cached prepaint/paint on all scroll frames.
+        let cached_chrome_h = if self.discover_open_dropdown.is_none() {
+            self.discover_chrome_height
+                .get()
+                .and_then(|(sig, h)| (sig == chrome_layout_sig && h > 1.0).then_some(h))
+        } else {
+            None
+        };
+        let chrome_el: AnyElement = match cached_chrome_h {
+            Some(h) => self
+                .discover_chrome_view
+                .clone()
+                .cached(
+                    StyleRefinement::default()
+                        .w_full()
+                        .h(px(h))
+                        .flex_shrink_0(),
+                )
+                .into_any_element(),
+            None => self.discover_chrome_view.clone().into_any_element(),
+        };
+        let height_cell = Rc::clone(&self.discover_chrome_height);
+        let chrome_slot = div()
+            .on_children_prepainted(move |bounds, _, _| {
+                if let Some(b) = bounds.first() {
+                    let h = f32::from(b.size.height);
+                    if h > 1.0 && height_cell.get() != Some((chrome_layout_sig, h)) {
+                        height_cell.set(Some((chrome_layout_sig, h)));
+                    }
+                }
+            })
+            .id("discover-chrome-slot")
+            .w_full()
+            .flex_shrink_0()
+            .child(chrome_el);
+
+        let main_canvas = div()
+            .id("discover-grid-canvas")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .child(
+                full_height_page_container(PageWidth::Wide, viewport_w)
+                    .child(chrome_slot)
+                    .child(self.discover_grid_view.clone()),
+            );
 
         div()
             .id("discover-view-root")
@@ -909,6 +1042,7 @@ impl AppShell {
                                 &addon_name_for_click,
                                 is_active_addon,
                             );
+                            this.discover_prefs_rev = this.discover_prefs_rev.wrapping_add(1);
                             let _ = this.preferences.save();
                             cx.notify();
                         }),
@@ -985,10 +1119,7 @@ impl AppShell {
 
         div()
             .id("discover-source-rail")
-            .w(sp(SOURCE_RAIL_WIDTH_PX))
-            .h_full()
-            .min_h(px(0.0))
-            .flex_shrink_0()
+            .size_full()
             .bg(rgba(theme.glass_card_bg))
             .border_t_1()
             .border_r_1()
@@ -1090,6 +1221,7 @@ impl AppShell {
                                 &up_key,
                                 -1,
                             ) {
+                                this.discover_prefs_rev = this.discover_prefs_rev.wrapping_add(1);
                                 let _ = this.preferences.save();
                                 cx.notify();
                             }
@@ -1125,6 +1257,7 @@ impl AppShell {
                                 &down_key,
                                 1,
                             ) {
+                                this.discover_prefs_rev = this.discover_prefs_rev.wrapping_add(1);
                                 let _ = this.preferences.save();
                                 cx.notify();
                             }
@@ -1169,6 +1302,7 @@ impl AppShell {
                             &mut this.preferences.pinned_discover_catalogs,
                             unpin_key.clone(),
                         );
+                        this.discover_prefs_rev = this.discover_prefs_rev.wrapping_add(1);
                         let _ = this.preferences.save();
                         this.push_toast(
                             ToastKind::Info,
@@ -1347,6 +1481,7 @@ impl AppShell {
                                 &mut this.preferences.pinned_discover_catalogs,
                                 pin_key.clone(),
                             );
+                            this.discover_prefs_rev = this.discover_prefs_rev.wrapping_add(1);
                             let _ = this.preferences.save();
                             this.push_toast(
                                 ToastKind::Info,
@@ -1387,6 +1522,7 @@ impl AppShell {
                                 &mut this.preferences.hidden_discover_catalogs,
                                 hide_key.clone(),
                             ) {
+                                this.discover_prefs_rev = this.discover_prefs_rev.wrapping_add(1);
                                 let _ = this.preferences.save();
                                 this.push_toast(
                                     ToastKind::Info,
@@ -1623,6 +1759,8 @@ impl AppShell {
                                         );
                                         HIDDEN_FOOTER_OPEN.store(false, Ordering::Relaxed);
                                         if restored > 0 {
+                                            this.discover_prefs_rev =
+                                                this.discover_prefs_rev.wrapping_add(1);
                                             let _ = this.preferences.save();
                                             this.push_toast(
                                                 ToastKind::Success,
@@ -1714,6 +1852,8 @@ impl AppShell {
                                                     &mut this.preferences.hidden_discover_catalogs,
                                                     &restore_key,
                                                 ) {
+                                                    this.discover_prefs_rev =
+                                                        this.discover_prefs_rev.wrapping_add(1);
                                                     if this
                                                         .preferences
                                                         .hidden_discover_catalogs
@@ -1755,48 +1895,46 @@ impl AppShell {
         )
     }
 
-    fn render_discover_catalog_grid(
-        &mut self,
-        snap: &DiscoverViewSnapshot,
+    fn discover_visible_indices(
+        &self,
+        raw_items_arc: &Arc<Vec<MetaItemPreview>>,
         statuses_arc: &Arc<HashMap<String, LibraryStatusTab>>,
-        viewport_w: f32,
-        rail_width_px: f32,
-        theme: &ThemePalette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = *theme;
+        hide_watched: bool,
+    ) -> (Option<Arc<Vec<usize>>>, usize) {
+        if !hide_watched {
+            return (None, 0_usize);
+        }
+        let disc_rev = self.discover_state_rev;
+        let lib_rev = self.library_state_rev;
+        let cached = {
+            let guard = self.memoized_discover_unwatched.lock();
+            guard.as_ref().and_then(|(dr, lr, hw, indices, hidden)| {
+                (*dr == disc_rev && *lr == lib_rev && *hw == hide_watched)
+                    .then(|| (Arc::clone(indices), *hidden))
+            })
+        };
+        let (indices_arc, hidden) = match cached {
+            Some(hit) => hit,
+            None => {
+                let (indices, hidden) = filter_unwatched_indices(raw_items_arc, statuses_arc);
+                let indices_arc = Arc::new(indices);
+                *self.memoized_discover_unwatched.lock() =
+                    Some((disc_rev, lib_rev, hide_watched, Arc::clone(&indices_arc), hidden));
+                (indices_arc, hidden)
+            }
+        };
+        (Some(indices_arc), hidden)
+    }
+
+    fn render_discover_chrome_inner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = active_theme();
+        let snap = self.cached_discover_snapshot();
+        let statuses_arc = self.cached_library_statuses();
         let rail_open = self.preferences.discover_source_rail_open;
         let hide_watched = self.preferences.discover_hide_watched;
-
         let raw_items_arc = Arc::clone(&snap.items);
-        let raw_total_items = raw_items_arc.len();
-        let (visible_indices_opt, hidden_watched_count) = if hide_watched {
-            let disc_rev = self.discover_state_rev;
-            let lib_rev = self.library_state_rev;
-            let cached = {
-                let guard = self.memoized_discover_unwatched.lock();
-                guard.as_ref().and_then(|(dr, lr, hw, indices, hidden)| {
-                    (*dr == disc_rev && *lr == lib_rev && *hw == hide_watched)
-                        .then(|| (Arc::clone(indices), *hidden))
-                })
-            };
-            let (indices_arc, hidden) = match cached {
-                Some(hit) => hit,
-                None => {
-                    let (indices, hidden) = filter_unwatched_indices(&raw_items_arc, statuses_arc);
-                    let indices_arc = Arc::new(indices);
-                    *self.memoized_discover_unwatched.lock() =
-                        Some((disc_rev, lib_rev, hide_watched, Arc::clone(&indices_arc), hidden));
-                    (indices_arc, hidden)
-                }
-            };
-            (Some(indices_arc), hidden)
-        } else {
-            (None, 0_usize)
-        };
-        let total_items = visible_indices_opt
-            .as_ref()
-            .map_or(raw_total_items, |v| v.len());
+        let (_, hidden_watched_count) =
+            self.discover_visible_indices(&raw_items_arc, &statuses_arc, hide_watched);
 
         let genre_extra = snap
             .extras
@@ -1831,7 +1969,82 @@ impl AppShell {
         let has_catalog_filters = has_genre_filter || non_genre_filtered_count > 0;
         let active_filter_count =
             usize::from(hide_watched) + usize::from(has_genre_filter) + non_genre_filtered_count;
-        let has_active_filters = active_filter_count > 0;
+
+        let header_subtitle: Option<SharedString> = if !active_catalog_title.is_empty() {
+            Some(match active_catalog_addon.as_deref() {
+                Some(addon) if !addon.is_empty() => format!("{active_catalog_title} · {addon}").into(),
+                _ => active_catalog_title.clone().into(),
+            })
+        } else {
+            None
+        };
+        let header_right = if snap.is_loading {
+            Some(neutral_chip("Loading…").into_any_element())
+        } else if hide_watched && hidden_watched_count > 0 {
+            Some(neutral_chip(format!("{hidden_watched_count} watched hidden")).into_any_element())
+        } else {
+            None
+        };
+        let page_header = render_page_header(
+            PageHeader::new("Discover")
+                .subtitle(header_subtitle)
+                .right_slot(header_right),
+        );
+
+        let toolbar = self.render_discover_toolbar(
+            &snap,
+            &active_catalog_title,
+            active_catalog_addon.as_deref(),
+            selected_catalog_default_request,
+            genre_extra.as_ref(),
+            has_genre_filter,
+            &non_genre_extras,
+            hide_watched,
+            hidden_watched_count,
+            active_filter_count,
+            has_catalog_filters,
+            &raw_items_arc,
+            &statuses_arc,
+            rail_open,
+            &theme,
+            cx,
+        );
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(theme.sp(PAGE_SECTION_GAP_PX))
+            .child(page_header)
+            .child(toolbar)
+            .into_any_element()
+    }
+
+    fn render_discover_grid_inner(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = active_theme();
+        let snap = self.cached_discover_snapshot();
+        let statuses_arc = self.cached_library_statuses();
+        let raw_viewport_w = f32::from(window.viewport_size().width);
+        let viewport_w = if raw_viewport_w > 0.0 && raw_viewport_w.is_finite() {
+            raw_viewport_w
+        } else {
+            self.viewport_size_px.0.max(1024.0)
+        };
+        let rail_open = self.preferences.discover_source_rail_open;
+        let rail_width_px = if rail_open {
+            SOURCE_RAIL_WIDTH_PX * theme.ui_scale
+        } else {
+            0.0
+        };
+        let hide_watched = self.preferences.discover_hide_watched;
+
+        let raw_items_arc = Arc::clone(&snap.items);
+        let raw_total_items = raw_items_arc.len();
+        let (visible_indices_opt, hidden_watched_count) =
+            self.discover_visible_indices(&raw_items_arc, &statuses_arc, hide_watched);
+        let total_items = visible_indices_opt
+            .as_ref()
+            .map_or(raw_total_items, |v| v.len());
 
         let grid_aspect = if let Some(indices) = visible_indices_opt.as_ref() {
             infer_grid_poster_aspect(indices.iter().map(|&i| &raw_items_arc[i].poster_shape))
@@ -1854,7 +2067,13 @@ impl AppShell {
         let image_height_px = metrics.image_height_px;
 
         let mut kb_hasher = DefaultHasher::new();
-        ("discover", self.discover_state_rev, self.library_state_rev, hide_watched, columns)
+        (
+            "discover",
+            self.discover_state_rev,
+            self.library_state_rev,
+            hide_watched,
+            columns,
+        )
             .hash(&mut kb_hasher);
         let kb_key = kb_hasher.finish();
         self.sync_kb_focus_items_cached(kb_key, || {
@@ -1880,256 +2099,212 @@ impl AppShell {
         let is_loading = snap.is_loading;
         let has_next_page = snap.has_next_page;
 
-        let header_subtitle: Option<SharedString> = if !active_catalog_title.is_empty() {
-            Some(match active_catalog_addon.as_deref() {
-                Some(addon) if !addon.is_empty() => format!("{active_catalog_title} · {addon}").into(),
-                _ => active_catalog_title.clone().into(),
-            })
-        } else {
-            None
-        };
-        let header_right = if is_loading {
-            Some(neutral_chip("Loading…").into_any_element())
-        } else if hide_watched && hidden_watched_count > 0 {
-            Some(neutral_chip(format!("{hidden_watched_count} watched hidden")).into_any_element())
-        } else {
-            None
-        };
-        let page_header = render_page_header(
-            PageHeader::new("Discover")
-                .subtitle(header_subtitle)
-                .right_slot(header_right),
-        );
-
-        let toolbar = self.render_discover_toolbar(
-            snap,
-            &active_catalog_title,
-            active_catalog_addon.as_deref(),
-            selected_catalog_default_request.clone(),
-            genre_extra.as_ref(),
-            has_genre_filter,
-            &non_genre_extras,
-            hide_watched,
-            hidden_watched_count,
-            active_filter_count,
-            has_catalog_filters,
-            &raw_items_arc,
-            statuses_arc,
-            rail_open,
-            &theme,
-            cx,
-        );
-
-        let grid_body = if is_loading && raw_total_items == 0 {
+        if is_loading && raw_total_items == 0 {
             self.active_scroll_suppressed.set(true);
-            render_discover_skeleton_grid(
+            return render_discover_skeleton_grid(
                 columns,
                 image_height_px,
                 row_stride_px,
                 gap_px,
                 &theme,
-            )
-        } else if total_items == 0 {
+            );
+        }
+        if total_items == 0 {
             self.active_scroll_suppressed.set(true);
-            render_discover_empty_state(
+            let selected_catalog_default_request = snap
+                .catalogs
+                .iter()
+                .find(|c| c.catalog.selected)
+                .or_else(|| snap.catalogs.first())
+                .map(|c| c.catalog.request.clone());
+            let has_extra_filters = snap
+                .extras
+                .iter()
+                .any(|e| !e.options.is_empty() && is_extra_filtered(e));
+            let has_active_filters = hide_watched || has_extra_filters;
+            return render_discover_empty_state(
                 has_active_filters,
                 hide_watched && hidden_watched_count > 0,
                 selected_catalog_default_request,
                 cx,
-            )
-        } else {
-            let cards_for_grid = self.get_or_update_discover_card_slab(
-                &raw_items_arc,
-                visible_indices_opt.as_ref(),
-                statuses_arc,
-                hide_watched,
-                grid_aspect,
-                theme.preset,
             );
-            let items_for_grid = Arc::clone(&raw_items_arc);
-            let indices_for_grid = visible_indices_opt.clone();
-            gpui::uniform_list(
-                "discover-poster-grid",
-                row_count,
-                cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
-                    if row_count > 0
-                        && !visible_rows.is_empty()
-                        && visible_rows.end + 2 >= row_count
-                        && has_next_page
-                        && !is_loading
-                        && this.discover_last_next_page_len.get() != Some(raw_total_items)
-                    {
-                        this.discover_last_next_page_len.set(Some(raw_total_items));
-                        this.core.dispatch(
-                            Action::CatalogWithFilters(ActionCatalogWithFilters::LoadNextPage),
-                            Some(DesktopModelField::Discover),
-                        );
-                    }
+        }
 
-                    let kb_focus_index = this.kb_focus_index;
-                    let items_for_dispatch = Arc::clone(&items_for_grid);
-                    let indices_for_dispatch = indices_for_grid.clone();
-                    let cards_for_dispatch = Arc::clone(&cards_for_grid);
-                    let shell_weak = cx.entity().downgrade();
-                    let dispatcher = card_action_dispatcher(move |item_idx, action, _window, cx| {
-                        let Some(shell) = shell_weak.upgrade() else {
-                            return;
-                        };
-                        let raw_idx = indices_for_dispatch
-                            .as_ref()
-                            .map_or(item_idx, |indices| indices[item_idx]);
-                        let Some(it) = items_for_dispatch.get(raw_idx) else {
-                            return;
-                        };
-                        let in_library = cards_for_dispatch
-                            .get(item_idx)
-                            .is_some_and(|c| c.in_library);
-                        let _ = shell.update(cx, |this, cx| match action {
-                            PosterCardAction::Open | PosterCardAction::MiddleClick => {
-                                this.open_meta_details(it.r#type.clone(), it.id.clone(), None, cx);
-                            }
-                            PosterCardAction::QuickPlay => {
-                                this.quick_resume_or_open(
-                                    it.r#type.clone(),
-                                    it.id.clone(),
-                                    None,
-                                    cx,
-                                );
-                            }
-                            PosterCardAction::QuickPeek => {
-                                this.open_quick_peek(
-                                    QuickPeekTarget {
-                                        type_name: it.r#type.clone(),
-                                        id: it.id.clone(),
-                                        video_id: None,
-                                        title: it.name.clone(),
-                                        preview: Some(it.clone()),
-                                    },
-                                    cx,
-                                );
-                            }
-                            PosterCardAction::ToggleLibrary => {
-                                this.core.toggle_library_item(it.clone());
-                                let (kind, msg) = if in_library {
-                                    (ToastKind::Info, "Removed from library")
-                                } else {
-                                    (ToastKind::Success, "Added to library")
-                                };
-                                this.push_toast(kind, msg, Some(it.name.clone()), cx);
-                                cx.notify();
-                            }
-                            PosterCardAction::ContextMenu(position) => {
-                                let (lib_in, is_watched, can_rewind, vid) =
-                                    this.core.with_model(|m| {
-                                        m.ctx
-                                            .library
-                                            .items
-                                            .get(&it.id)
-                                            .filter(|li| !li.removed)
-                                            .map(|li| {
-                                                (
-                                                    !li.temp,
-                                                    li.watched(),
-                                                    li.state.time_offset > 0,
-                                                    li.state.video_id.clone(),
-                                                )
-                                            })
-                                            .unwrap_or((false, false, false, None))
-                                    });
-                                let menu = BrowsingContextMenu::new(
-                                    position,
-                                    it.r#type.clone(),
-                                    it.id.clone(),
-                                    it.name.clone(),
-                                )
-                                .video_id(vid)
-                                .preview(Some(it.clone()))
-                                .is_in_library(lib_in)
-                                .is_watched(is_watched)
-                                .can_rewind_cw(can_rewind);
-                                this.open_browsing_context_menu(menu, cx);
-                            }
-                            PosterCardAction::Hover(hovered) => {
-                                let bg = it.background.as_ref().map(|u| u.as_str());
-                                this.on_card_hover_prefetch(&it.r#type, &it.id, bg, hovered, cx);
-                            }
-                        });
-                    });
+        let cards_for_grid = self.get_or_update_discover_card_slab(
+            &raw_items_arc,
+            visible_indices_opt.as_ref(),
+            &statuses_arc,
+            hide_watched,
+            grid_aspect,
+            theme.preset,
+        );
+        let items_for_grid = Arc::clone(&raw_items_arc);
+        let indices_for_grid = visible_indices_opt;
+        gpui::uniform_list(
+            "discover-poster-grid",
+            row_count,
+            cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
+                if row_count > 0
+                    && !visible_rows.is_empty()
+                    && visible_rows.end + 2 >= row_count
+                    && has_next_page
+                    && !is_loading
+                    && this.discover_last_next_page_len.get() != Some(raw_total_items)
+                {
+                    this.discover_last_next_page_len.set(Some(raw_total_items));
+                    this.core.dispatch(
+                        Action::CatalogWithFilters(ActionCatalogWithFilters::LoadNextPage),
+                        Some(DesktopModelField::Discover),
+                    );
+                }
 
-                    visible_rows
-                        .map(|row_idx| {
-                            let range = slice_row_items(total_items, columns, row_idx);
-                            let empty_slots = columns.saturating_sub(range.len());
-
-                            div()
-                                .id(("discover-row", row_idx))
-                                .w_full()
-                                .h(px(row_stride_px))
-                                .pb(px(gap_px))
-                                .flex()
-                                .items_start()
-                                .gap(px(gap_px))
-                                .children(range.map(|item_idx| {
-                                    let card = &cards_for_grid[item_idx];
-                                    let poster_tex = card
-                                        .poster_url
-                                        .as_deref()
-                                        .and_then(|u| this.poster_cache.resolve_poster_image(u));
-                                    let is_focused = kb_focus_index == Some(item_idx);
-                                    let card_image_h = if card.aspect == grid_aspect {
-                                        image_height_px
-                                    } else {
-                                        (card_width_px * card.aspect.height_over_width())
-                                            .ceil()
-                                            .min(image_height_px)
-                                    };
-
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .h_full()
-                                        .child(render_prepared_poster_card(
-                                            PreparedPosterRenderCtx::new(
-                                                item_idx,
-                                                card,
-                                                "discover-card",
-                                                &dispatcher,
+                let kb_focus_index = this.kb_focus_index;
+                let items_for_dispatch = Arc::clone(&items_for_grid);
+                let indices_for_dispatch = indices_for_grid.clone();
+                let cards_for_dispatch = Arc::clone(&cards_for_grid);
+                let shell_weak = cx.entity().downgrade();
+                let dispatcher = card_action_dispatcher(move |item_idx, action, _window, cx| {
+                    let Some(shell) = shell_weak.upgrade() else {
+                        return;
+                    };
+                    let raw_idx = indices_for_dispatch
+                        .as_ref()
+                        .map_or(item_idx, |indices| indices[item_idx]);
+                    let Some(it) = items_for_dispatch.get(raw_idx) else {
+                        return;
+                    };
+                    let in_library = cards_for_dispatch
+                        .get(item_idx)
+                        .is_some_and(|c| c.in_library);
+                    let _ = shell.update(cx, |this, cx| match action {
+                        PosterCardAction::Open | PosterCardAction::MiddleClick => {
+                            this.open_meta_details(it.r#type.clone(), it.id.clone(), None, cx);
+                        }
+                        PosterCardAction::QuickPlay => {
+                            this.quick_resume_or_open(
+                                it.r#type.clone(),
+                                it.id.clone(),
+                                None,
+                                cx,
+                            );
+                        }
+                        PosterCardAction::QuickPeek => {
+                            this.open_quick_peek(
+                                QuickPeekTarget {
+                                    type_name: it.r#type.clone(),
+                                    id: it.id.clone(),
+                                    video_id: None,
+                                    title: it.name.clone(),
+                                    preview: Some(it.clone()),
+                                },
+                                cx,
+                            );
+                        }
+                        PosterCardAction::ToggleLibrary => {
+                            this.core.toggle_library_item(it.clone());
+                            let (kind, msg) = if in_library {
+                                (ToastKind::Info, "Removed from library")
+                            } else {
+                                (ToastKind::Success, "Added to library")
+                            };
+                            this.push_toast(kind, msg, Some(it.name.clone()), cx);
+                            cx.notify();
+                        }
+                        PosterCardAction::ContextMenu(position) => {
+                            let (lib_in, is_watched, can_rewind, vid) =
+                                this.core.with_model(|m| {
+                                    m.ctx
+                                        .library
+                                        .items
+                                        .get(&it.id)
+                                        .filter(|li| !li.removed)
+                                        .map(|li| {
+                                            (
+                                                !li.temp,
+                                                li.watched(),
+                                                li.state.time_offset > 0,
+                                                li.state.video_id.clone(),
                                             )
-                                            .image(poster_tex)
-                                            .image_height_px(Some(card_image_h))
-                                            .is_focused(is_focused),
-                                        ))
-                                }))
-                                .children(
-                                    (0..empty_slots)
-                                        .map(|_| div().flex_1().min_w(px(0.0))),
-                                )
-                        })
-                        .collect()
-                }),
-            )
-            .track_scroll(&self.discover_grid_scroll_handle)
-            .flex_1()
-            .w_full()
-            .min_h(px(0.0))
-            .into_any_element()
-        };
+                                        })
+                                        .unwrap_or((false, false, false, None))
+                                });
+                            let menu = BrowsingContextMenu::new(
+                                position,
+                                it.r#type.clone(),
+                                it.id.clone(),
+                                it.name.clone(),
+                            )
+                            .video_id(vid)
+                            .preview(Some(it.clone()))
+                            .is_in_library(lib_in)
+                            .is_watched(is_watched)
+                            .can_rewind_cw(can_rewind);
+                            this.open_browsing_context_menu(menu, cx);
+                        }
+                        PosterCardAction::Hover(hovered) => {
+                            let bg = it.background.as_ref().map(|u| u.as_str());
+                            this.on_card_hover_prefetch(&it.r#type, &it.id, bg, hovered, cx);
+                        }
+                    });
+                });
 
-        div()
-            .id("discover-grid-canvas")
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            .child(
-                full_height_page_container(PageWidth::Wide, viewport_w)
-                    .child(page_header)
-                    .child(toolbar)
-                    .child(grid_body),
-            )
-            .into_any_element()
+                visible_rows
+                    .map(|row_idx| {
+                        let range = slice_row_items(total_items, columns, row_idx);
+                        let empty_slots = columns.saturating_sub(range.len());
+
+                        div()
+                            .id(("discover-row", row_idx))
+                            .w_full()
+                            .h(px(row_stride_px))
+                            .pb(px(gap_px))
+                            .flex()
+                            .items_start()
+                            .gap(px(gap_px))
+                            .children(range.map(|item_idx| {
+                                let card = &cards_for_grid[item_idx];
+                                let poster_tex = card
+                                    .poster_url
+                                    .as_deref()
+                                    .and_then(|u| this.poster_cache.resolve_poster_image(u));
+                                let is_focused = kb_focus_index == Some(item_idx);
+                                let card_image_h = if card.aspect == grid_aspect {
+                                    image_height_px
+                                } else {
+                                    (card_width_px * card.aspect.height_over_width())
+                                        .ceil()
+                                        .min(image_height_px)
+                                };
+
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .h_full()
+                                    .child(render_prepared_poster_card(
+                                        PreparedPosterRenderCtx::new(
+                                            item_idx,
+                                            card,
+                                            "discover-card",
+                                            &dispatcher,
+                                        )
+                                        .image(poster_tex)
+                                        .image_height_px(Some(card_image_h))
+                                        .is_focused(is_focused),
+                                    ))
+                            }))
+                            .children(
+                                (0..empty_slots)
+                                    .map(|_| div().flex_1().min_w(px(0.0))),
+                            )
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(&self.discover_grid_scroll_handle)
+        .flex_1()
+        .w_full()
+        .min_h(px(0.0))
+        .into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
