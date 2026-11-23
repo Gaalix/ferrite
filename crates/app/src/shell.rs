@@ -156,9 +156,11 @@ pub struct AppShell {
     pub memoized_discover_catalog: parking_lot::Mutex<Option<(u64, DiscoverViewSnapshot)>>,
     pub memoized_discover_unwatched:
         parking_lot::Mutex<Option<(u64, u64, bool, Arc<Vec<usize>>, usize)>>,
+    pub memoized_discover_cards: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     pub discover_last_next_page_len: Cell<Option<usize>>,
     pub memoized_library_items: parking_lot::Mutex<Option<MemoizedLibraryView>>,
     pub memoized_library_aux_cache: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    pub memoized_library_cards: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     pub memoized_board_cache: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     pub memoized_calendar_cache: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     pub memoized_meta_details_cache:
@@ -491,9 +493,11 @@ impl AppShell {
             memoized_enriched_streams: None,
             memoized_discover_catalog: parking_lot::Mutex::new(None),
             memoized_discover_unwatched: parking_lot::Mutex::new(None),
+            memoized_discover_cards: parking_lot::Mutex::new(None),
             discover_last_next_page_len: Cell::new(None),
             memoized_library_items: parking_lot::Mutex::new(None),
             memoized_library_aux_cache: parking_lot::Mutex::new(None),
+            memoized_library_cards: parking_lot::Mutex::new(None),
             memoized_board_cache: parking_lot::Mutex::new(None),
             memoized_calendar_cache: parking_lot::Mutex::new(None),
             memoized_meta_details_cache: parking_lot::Mutex::new(None),

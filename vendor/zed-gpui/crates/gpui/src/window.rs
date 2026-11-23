@@ -1090,6 +1090,7 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    window_control_hitboxes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -4394,6 +4395,7 @@ impl Window {
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -4412,6 +4414,12 @@ impl Window {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes
+                [range.start.window_control_hitboxes_index..range.end.window_control_hitboxes_index]
                 .iter()
                 .cloned(),
         );
@@ -10671,6 +10679,102 @@ mod tests {
         // the hover.
         let widen = |root: &mut Root, _: &mut Window, _: &mut Context<Root>| root.width = px(300.);
         assert_eq!(update_and_draw(window, &child, cx, widen).0, 1.);
+    }
+
+    #[gpui::test]
+    fn cached_view_preserves_window_control_hitboxes(cx: &mut TestAppContext) {
+        use crate::WindowControlArea;
+
+        struct Titlebar {
+            renders: usize,
+        }
+
+        impl Render for Titlebar {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders += 1;
+                div()
+                    .size_full()
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        div()
+                            .occlude()
+                            .size(px(20.))
+                            .window_control_area(WindowControlArea::Close),
+                    )
+            }
+        }
+
+        struct Root {
+            titlebar: crate::Entity<Titlebar>,
+        }
+
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size(px(200.)).child(
+                    self.titlebar
+                        .clone()
+                        .cached(crate::StyleRefinement::default().size(px(100.))),
+                )
+            }
+        }
+
+        let titlebar = cx.new(|_| Titlebar { renders: 0 });
+        let window = cx.add_window(|_, _| Root {
+            titlebar: titlebar.clone(),
+        });
+
+        let expected_areas = [WindowControlArea::Drag, WindowControlArea::Close];
+
+        let first_ids = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                assert_eq!(titlebar.read(cx).renders, 1);
+                let areas: Vec<_> = window
+                    .rendered_frame
+                    .window_control_hitboxes
+                    .iter()
+                    .map(|(area, _)| *area)
+                    .collect();
+                assert_eq!(areas, expected_areas);
+                window
+                    .rendered_frame
+                    .window_control_hitboxes
+                    .iter()
+                    .map(|(_, hitbox)| hitbox.id)
+                    .collect::<Vec<_>>()
+            })
+            .expect("first draw");
+
+        // Re-drawing Root without dirtying Titlebar must reuse the cached subtree AND
+        // replay all window_control_hitboxes across consecutive cached frames.
+        for _ in 0..2 {
+            window
+                .update(cx, |_, _, cx| cx.notify())
+                .expect("notify root");
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                assert_eq!(
+                    titlebar.read(cx).renders,
+                    1,
+                    "titlebar should hit cache when only root is notified"
+                );
+                let areas: Vec<_> = window
+                    .rendered_frame
+                    .window_control_hitboxes
+                    .iter()
+                    .map(|(area, _)| *area)
+                    .collect();
+                let ids: Vec<_> = window
+                    .rendered_frame
+                    .window_control_hitboxes
+                    .iter()
+                    .map(|(_, hitbox)| hitbox.id)
+                    .collect();
+                assert_eq!(areas, expected_areas);
+                assert_eq!(ids, first_ids);
+            })
+            .expect("cached redraw");
+        }
     }
 
     #[gpui::test]

@@ -523,6 +523,13 @@ thread_local! {
     };
 }
 
+/// Returns the monotonic theme version counter incremented whenever theme,
+/// accent, ambient bleed, UI scale, or card density changes.
+#[inline]
+pub fn active_theme_version() -> u64 {
+    ACTIVE_THEME_VERSION.load(Ordering::Acquire)
+}
+
 /// Returns the active `ThemePalette` via a lock-free thread-local cache synchronized
 /// with an atomic version counter (zero `RwLock` contention on the UI thread hot path).
 #[inline]
@@ -1240,6 +1247,7 @@ mod tests {
     #[test]
     fn active_theme_rwlock_updates_and_scales_sp_pixels() {
         let initial = active_theme();
+        let v0 = active_theme_version();
         assert_eq!(initial.preset, ThemePreset::EtherealDark);
         assert_eq!(initial.accent_choice, AccentChoice::EmberCoral);
 
@@ -1250,6 +1258,8 @@ mod tests {
             UiScaleChoice::S125.factor(),
             CardDensityChoice::Cinema,
         );
+        let v1 = active_theme_version();
+        assert!(v1 > v0);
         let updated = active_theme();
         assert_eq!(updated.preset, ThemePreset::LightMist);
         assert!(updated.is_light);
@@ -1280,6 +1290,7 @@ mod tests {
             1.0,
             CardDensityChoice::Comfortable,
         );
+        assert!(active_theme_version() > v1);
         assert_eq!(sp(16.0), px(16.0));
         assert_eq!(active_theme().sp(16.0), px(16.0));
         assert!(poster_card_shadow().is_empty());

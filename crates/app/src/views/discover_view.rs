@@ -11,7 +11,7 @@ use std::{
 
 use gpui::{
     deferred, div, point, prelude::*, px, relative, rgb, rgba, Animation, AnimationExt,
-    AnyElement, Context, ElementId, FontWeight, MouseButton, MouseDownEvent, SharedString, Window,
+    AnyElement, Context, ElementId, FontWeight, MouseButton, SharedString, Window,
 };
 use stremio_core_runtime::{
     resolve_addon_for_request_base,
@@ -37,16 +37,18 @@ use crate::{
         LibraryStatusTab, QuickPeekTarget, ToastKind,
     },
     theme::{
-        active_theme, mono_font, sentence_case_label, sp, tabular_nums, ui_sans, ThemePalette,
-        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        active_theme, mono_font, placeholder_tint_for_id_with_preset, sentence_case_label, sp,
+        tabular_nums, ui_sans, ThemePalette, ThemePreset, RADIUS_CONTROL, RADIUS_PILL,
+        RADIUS_POSTER,
     },
     ui::{
-        choice_pill, compute_app_grid_metrics, dropdown_trigger, full_height_page_container,
-        glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar, glass_segmented_item,
-        glass_switch, infer_grid_poster_aspect, neutral_chip, primary_accent_button,
-        render_empty_state, render_page_header, render_poster_card, search_field, toolbar_bar,
-        DropdownTriggerProps, EmptyStateProps, PageHeader, PageWidth, PosterCardProps,
-        PosterMetrics, SearchFieldProps,
+        card_action_dispatcher, choice_pill, compute_app_grid_metrics, dropdown_trigger,
+        full_height_page_container, glass_dropdown_option, glass_dropdown_panel,
+        glass_segmented_bar, glass_segmented_item, glass_switch, infer_grid_poster_aspect,
+        neutral_chip, primary_accent_button, render_empty_state, render_page_header,
+        render_prepared_poster_card, search_field, toolbar_bar, DropdownTriggerProps,
+        EmptyStateProps, PageHeader, PageWidth, PosterCardAction, PosterCardCapabilities,
+        PosterMetrics, PreparedPosterCard, PreparedPosterRenderCtx, SearchFieldProps,
     },
     virtual_grid::{slice_row_items, PosterAspect},
 };
@@ -363,43 +365,93 @@ fn restore_all_catalog_keys(hidden: &mut Vec<String>) -> usize {
     count
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiscoverCardSlabKey {
+    discover_state_rev: u64,
+    library_state_rev: u64,
+    hide_watched: bool,
+    grid_aspect: PosterAspect,
+    theme_preset: ThemePreset,
+}
+
+struct CachedDiscoverCardSlab {
+    key: DiscoverCardSlabKey,
+    cards: Arc<[PreparedPosterCard]>,
+}
+
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    let n_bytes = needle_lower.as_bytes();
+    if n_bytes.is_empty() {
+        return true;
+    }
+    let h_bytes = haystack.as_bytes();
+    if h_bytes.len() < n_bytes.len() {
+        return false;
+    }
+    h_bytes
+        .windows(n_bytes.len())
+        .any(|w| w.iter().zip(n_bytes).all(|(a, b)| a.to_ascii_lowercase() == *b))
+}
+
 fn partition_and_group_catalogs(
     catalogs: &[DiscoverCatalogOption],
     pinned_keys: &[String],
     hidden_keys: &[String],
     query_lower: &str,
 ) -> (Vec<DiscoverCatalogOption>, Vec<AddonCatalogGroup>) {
-    let hidden_set: HashSet<&str> = hidden_keys.iter().map(String::as_str).collect();
-    let pinned_index: HashMap<&str, usize> = pinned_keys
-        .iter()
-        .enumerate()
-        .map(|(pos, key)| (key.as_str(), pos))
-        .collect();
+    let has_hidden = !hidden_keys.is_empty();
+    let has_pinned = !pinned_keys.is_empty();
+    let hidden_set: HashSet<&str> = if has_hidden {
+        hidden_keys.iter().map(String::as_str).collect()
+    } else {
+        HashSet::new()
+    };
+    let pinned_index: HashMap<&str, usize> = if has_pinned {
+        pinned_keys
+            .iter()
+            .enumerate()
+            .map(|(pos, key)| (key.as_str(), pos))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
-    let mut pinned_with_order: Vec<(usize, DiscoverCatalogOption)> = Vec::new();
-    let mut groups: Vec<AddonCatalogGroup> = Vec::new();
-    let mut group_indices: HashMap<String, usize> = HashMap::new();
+    let mut pinned_with_order: Vec<(usize, DiscoverCatalogOption)> =
+        Vec::with_capacity(pinned_keys.len());
+    let mut groups: Vec<AddonCatalogGroup> = Vec::with_capacity(catalogs.len().min(16));
+    let mut key_buf = String::new();
 
     for opt in catalogs {
-        let key = catalog_pin_key(&opt.catalog.request);
-        if hidden_set.contains(key.as_str()) {
-            continue;
+        if has_hidden || has_pinned {
+            key_buf.clear();
+            use std::fmt::Write as _;
+            let _ = write!(
+                key_buf,
+                "{}::{}::{}",
+                opt.catalog.request.base, opt.catalog.request.path.r#type, opt.catalog.request.path.id
+            );
+            if has_hidden && hidden_set.contains(key_buf.as_str()) {
+                continue;
+            }
         }
 
         if !query_lower.is_empty() {
-            let title_match = opt.title.to_ascii_lowercase().contains(query_lower);
+            let title_match = contains_ascii_case_insensitive(&opt.title, query_lower);
             let addon_match = opt
                 .addon_name
                 .as_deref()
-                .is_some_and(|a| a.to_ascii_lowercase().contains(query_lower));
+                .is_some_and(|a| contains_ascii_case_insensitive(a, query_lower));
             if !title_match && !addon_match {
                 continue;
             }
         }
 
-        if let Some(&pin_pos) = pinned_index.get(key.as_str()) {
-            pinned_with_order.push((pin_pos, opt.clone()));
-            continue;
+        if has_pinned {
+            if let Some(&pin_pos) = pinned_index.get(key_buf.as_str()) {
+                pinned_with_order.push((pin_pos, opt.clone()));
+                continue;
+            }
         }
 
         let addon_label = opt
@@ -408,13 +460,13 @@ fn partition_and_group_catalogs(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("Other Addons");
-        let group_key = addon_label.to_ascii_lowercase();
 
-        if let Some(&idx) = group_indices.get(&group_key) {
-            groups[idx].items.push(opt.clone());
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|g| g.addon_name.eq_ignore_ascii_case(addon_label))
+        {
+            group.items.push(opt.clone());
         } else {
-            let idx = groups.len();
-            group_indices.insert(group_key, idx);
             groups.push(AddonCatalogGroup {
                 addon_name: addon_label.to_owned(),
                 items: vec![opt.clone()],
@@ -1868,7 +1920,6 @@ impl AppShell {
             cx,
         );
 
-        let statuses_for_grid = Arc::clone(statuses_arc);
         let grid_body = if is_loading && raw_total_items == 0 {
             self.active_scroll_suppressed.set(true);
             render_discover_skeleton_grid(
@@ -1887,6 +1938,14 @@ impl AppShell {
                 cx,
             )
         } else {
+            let cards_for_grid = self.get_or_update_discover_card_slab(
+                &raw_items_arc,
+                visible_indices_opt.as_ref(),
+                statuses_arc,
+                hide_watched,
+                grid_aspect,
+                theme.preset,
+            );
             let items_for_grid = Arc::clone(&raw_items_arc);
             let indices_for_grid = visible_indices_opt.clone();
             gpui::uniform_list(
@@ -1908,6 +1967,94 @@ impl AppShell {
                     }
 
                     let kb_focus_index = this.kb_focus_index;
+                    let items_for_dispatch = Arc::clone(&items_for_grid);
+                    let indices_for_dispatch = indices_for_grid.clone();
+                    let cards_for_dispatch = Arc::clone(&cards_for_grid);
+                    let shell_weak = cx.entity().downgrade();
+                    let dispatcher = card_action_dispatcher(move |item_idx, action, _window, cx| {
+                        let Some(shell) = shell_weak.upgrade() else {
+                            return;
+                        };
+                        let raw_idx = indices_for_dispatch
+                            .as_ref()
+                            .map_or(item_idx, |indices| indices[item_idx]);
+                        let Some(it) = items_for_dispatch.get(raw_idx) else {
+                            return;
+                        };
+                        let in_library = cards_for_dispatch
+                            .get(item_idx)
+                            .is_some_and(|c| c.in_library);
+                        let _ = shell.update(cx, |this, cx| match action {
+                            PosterCardAction::Open | PosterCardAction::MiddleClick => {
+                                this.open_meta_details(it.r#type.clone(), it.id.clone(), None, cx);
+                            }
+                            PosterCardAction::QuickPlay => {
+                                this.quick_resume_or_open(
+                                    it.r#type.clone(),
+                                    it.id.clone(),
+                                    None,
+                                    cx,
+                                );
+                            }
+                            PosterCardAction::QuickPeek => {
+                                this.open_quick_peek(
+                                    QuickPeekTarget {
+                                        type_name: it.r#type.clone(),
+                                        id: it.id.clone(),
+                                        video_id: None,
+                                        title: it.name.clone(),
+                                        preview: Some(it.clone()),
+                                    },
+                                    cx,
+                                );
+                            }
+                            PosterCardAction::ToggleLibrary => {
+                                this.core.toggle_library_item(it.clone());
+                                let (kind, msg) = if in_library {
+                                    (ToastKind::Info, "Removed from library")
+                                } else {
+                                    (ToastKind::Success, "Added to library")
+                                };
+                                this.push_toast(kind, msg, Some(it.name.clone()), cx);
+                                cx.notify();
+                            }
+                            PosterCardAction::ContextMenu(position) => {
+                                let (lib_in, is_watched, can_rewind, vid) =
+                                    this.core.with_model(|m| {
+                                        m.ctx
+                                            .library
+                                            .items
+                                            .get(&it.id)
+                                            .filter(|li| !li.removed)
+                                            .map(|li| {
+                                                (
+                                                    !li.temp,
+                                                    li.watched(),
+                                                    li.state.time_offset > 0,
+                                                    li.state.video_id.clone(),
+                                                )
+                                            })
+                                            .unwrap_or((false, false, false, None))
+                                    });
+                                let menu = BrowsingContextMenu::new(
+                                    position,
+                                    it.r#type.clone(),
+                                    it.id.clone(),
+                                    it.name.clone(),
+                                )
+                                .video_id(vid)
+                                .preview(Some(it.clone()))
+                                .is_in_library(lib_in)
+                                .is_watched(is_watched)
+                                .can_rewind_cw(can_rewind);
+                                this.open_browsing_context_menu(menu, cx);
+                            }
+                            PosterCardAction::Hover(hovered) => {
+                                let bg = it.background.as_ref().map(|u| u.as_str());
+                                this.on_card_hover_prefetch(&it.r#type, &it.id, bg, hovered, cx);
+                            }
+                        });
+                    });
 
                     visible_rows
                         .map(|row_idx| {
@@ -1923,18 +2070,16 @@ impl AppShell {
                                 .items_start()
                                 .gap(px(gap_px))
                                 .children(range.map(|item_idx| {
-                                    let raw_idx = indices_for_grid
-                                        .as_ref()
-                                        .map_or(item_idx, |indices| indices[item_idx]);
-                                    let item = &items_for_grid[raw_idx];
-                                    let st = statuses_for_grid.get(&item.id).copied();
+                                    let card = &cards_for_grid[item_idx];
+                                    let poster_tex = card
+                                        .poster_url
+                                        .as_deref()
+                                        .and_then(|u| this.poster_cache.resolve_poster_image(u));
                                     let is_focused = kb_focus_index == Some(item_idx);
-                                    let card_aspect =
-                                        PosterAspect::from_stremio_poster_shape(&item.poster_shape);
-                                    let card_image_h = if card_aspect == grid_aspect {
+                                    let card_image_h = if card.aspect == grid_aspect {
                                         image_height_px
                                     } else {
-                                        (card_width_px * card_aspect.height_over_width())
+                                        (card_width_px * card.aspect.height_over_width())
                                             .ceil()
                                             .min(image_height_px)
                                     };
@@ -1943,16 +2088,16 @@ impl AppShell {
                                         .flex_1()
                                         .min_w(px(0.0))
                                         .h_full()
-                                        .child(this.render_discover_poster_card(
-                                            ("discover-card", item_idx),
-                                            &items_for_grid,
-                                            raw_idx,
-                                            st,
-                                            card_aspect,
-                                            None,
-                                            card_image_h,
-                                            is_focused,
-                                            cx,
+                                        .child(render_prepared_poster_card(
+                                            PreparedPosterRenderCtx::new(
+                                                item_idx,
+                                                card,
+                                                "discover-card",
+                                                &dispatcher,
+                                            )
+                                            .image(poster_tex)
+                                            .image_height_px(Some(card_image_h))
+                                            .is_focused(is_focused),
                                         ))
                                 }))
                                 .children(
@@ -3022,133 +3167,81 @@ impl AppShell {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_discover_poster_card(
+    fn get_or_update_discover_card_slab(
         &self,
-        id: impl Into<ElementId>,
-        items_arc: &Arc<Vec<MetaItemPreview>>,
-        raw_idx: usize,
-        lib_status: Option<LibraryStatusTab>,
-        aspect: PosterAspect,
-        fixed_width_px: Option<f32>,
-        image_height_px: f32,
-        is_focused: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let item = &items_arc[raw_idx];
-        let poster_tex = self
-            .poster_cache
-            .resolve_poster_url(item.poster.as_ref().or(item.background.as_ref()));
-        let rating = extract_imdb_rating(item).map(SharedString::from);
-        let subtitle = format_discover_card_subtitle(item);
-        let in_library = lib_status.is_some();
+        raw_items: &[MetaItemPreview],
+        visible_indices: Option<&Arc<Vec<usize>>>,
+        statuses: &HashMap<String, LibraryStatusTab>,
+        hide_watched: bool,
+        grid_aspect: PosterAspect,
+        theme_preset: ThemePreset,
+    ) -> Arc<[PreparedPosterCard]> {
+        let key = DiscoverCardSlabKey {
+            discover_state_rev: self.discover_state_rev,
+            library_state_rev: self.library_state_rev,
+            hide_watched,
+            grid_aspect,
+            theme_preset,
+        };
 
-        let open_items = Arc::clone(items_arc);
-        let peek_items = Arc::clone(items_arc);
-        let play_items = Arc::clone(items_arc);
-        let toggle_items = Arc::clone(items_arc);
-        let ctx_items = Arc::clone(items_arc);
-        let hover_items = Arc::clone(items_arc);
-        let mid_items = Arc::clone(items_arc);
-
-        let card_el = render_poster_card(
-            PosterCardProps::new(id, item.name.clone(), &item.id)
-                .subtitle(Some(subtitle))
-                .image(poster_tex)
-                .aspect(aspect)
-                .fixed_width_px(fixed_width_px)
-                .image_height_px(Some(image_height_px))
-                .status_tab(lib_status)
-                .imdb_rating(rating)
-                .in_library(in_library)
-                .is_focused(is_focused)
-                .on_open(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    let it = &open_items[raw_idx];
-                    this.open_meta_details(it.r#type.clone(), it.id.clone(), None, cx);
-                }))
-                .on_quick_peek(cx.listener(move |this, _, _, cx| {
-                    let it = &peek_items[raw_idx];
-                    this.open_quick_peek(
-                        QuickPeekTarget {
-                            type_name: it.r#type.clone(),
-                            id: it.id.clone(),
-                            video_id: None,
-                            title: it.name.clone(),
-                            preview: Some(it.clone()),
-                        },
-                        cx,
-                    );
-                }))
-                .on_quick_play(cx.listener(move |this, _, _, cx| {
-                    let it = &play_items[raw_idx];
-                    this.quick_resume_or_open(it.r#type.clone(), it.id.clone(), None, cx);
-                }))
-                .on_toggle_library(cx.listener(move |this, _, _, cx| {
-                    let it = &toggle_items[raw_idx];
-                    this.core.toggle_library_item(it.clone());
-                    let (kind, msg) = if in_library {
-                        (ToastKind::Info, "Removed from library")
-                    } else {
-                        (ToastKind::Success, "Added to library")
-                    };
-                    this.push_toast(kind, msg, Some(it.name.clone()), cx);
-                    cx.notify();
-                }))
-                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    let it = &ctx_items[raw_idx];
-                    let (lib_in, is_watched, can_rewind, vid) = this.core.with_model(|m| {
-                        m.ctx
-                            .library
-                            .items
-                            .get(&it.id)
-                            .filter(|li| !li.removed)
-                            .map(|li| {
-                                (
-                                    !li.temp,
-                                    li.watched(),
-                                    li.state.time_offset > 0,
-                                    li.state.video_id.clone(),
-                                )
-                            })
-                            .unwrap_or((false, false, false, None))
-                    });
-                    let menu = BrowsingContextMenu::new(
-                        ev.position,
-                        it.r#type.clone(),
-                        it.id.clone(),
-                        it.name.clone(),
-                    )
-                    .video_id(vid)
-                    .preview(Some(it.clone()))
-                    .is_in_library(lib_in)
-                    .is_watched(is_watched)
-                    .can_rewind_cw(can_rewind);
-                    this.open_browsing_context_menu(menu, cx);
-                }))
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    let it = &hover_items[raw_idx];
-                    let bg = it.background.as_ref().map(|u| u.as_str());
-                    this.on_card_hover_prefetch(&it.r#type, &it.id, bg, *hovered, cx);
-                })),
-        );
-
-        let mut wrapper = div().on_mouse_down(
-            MouseButton::Middle,
-            cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                let it = &mid_items[raw_idx];
-                this.open_meta_details(it.r#type.clone(), it.id.clone(), None, cx);
-            }),
-        );
-
-        if fixed_width_px.is_some() {
-            wrapper = wrapper.flex_shrink_0();
-        } else {
-            wrapper = wrapper.w_full().min_w(px(0.0));
+        {
+            let guard = self.memoized_discover_cards.lock();
+            if let Some(any_arc) = guard.as_ref() {
+                if let Ok(cached) = Arc::clone(any_arc).downcast::<CachedDiscoverCardSlab>() {
+                    if cached.key == key {
+                        return Arc::clone(&cached.cards);
+                    }
+                }
+            }
         }
 
-        wrapper.child(card_el).into_any_element()
+        let total = visible_indices.map_or(raw_items.len(), |indices| indices.len());
+        let mut cards = Vec::with_capacity(total);
+        for item_idx in 0..total {
+            let raw_idx = visible_indices.map_or(item_idx, |indices| indices[item_idx]);
+            let item = &raw_items[raw_idx];
+            let lib_status = statuses.get(&item.id).copied();
+            let in_library = lib_status.is_some();
+            let watched = matches!(lib_status, Some(LibraryStatusTab::Watched));
+            let aspect = PosterAspect::from_stremio_poster_shape(&item.poster_shape);
+            let tint = placeholder_tint_for_id_with_preset(&item.id, theme_preset);
+            let year = item
+                .release_info
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let subtitle = format_discover_card_subtitle(item);
+            let rating = extract_imdb_rating(item);
+            let poster_url = item
+                .poster
+                .as_ref()
+                .or(item.background.as_ref())
+                .map(|u| u.as_str());
+            let type_badge = sentence_case_label(&item.r#type);
+
+            cards.push(
+                PreparedPosterCard::with_tint(SharedString::new(&item.name), tint)
+                    .subtitle(Some(subtitle))
+                    .year_str(year)
+                    .imdb_rating_str(rating.as_deref())
+                    .type_badge(Some(SharedString::from(type_badge)))
+                    .poster_url_str(poster_url)
+                    .aspect(aspect)
+                    .status_tab(lib_status)
+                    .in_library(in_library)
+                    .watched(watched)
+                    .capabilities(PosterCardCapabilities::ALL),
+            );
+        }
+
+        let cards_arc: Arc<[PreparedPosterCard]> = Arc::from(cards);
+        let cached = Arc::new(CachedDiscoverCardSlab {
+            key,
+            cards: Arc::clone(&cards_arc),
+        });
+        *self.memoized_discover_cards.lock() =
+            Some(cached as Arc<dyn std::any::Any + Send + Sync>);
+        cards_arc
     }
 }
 

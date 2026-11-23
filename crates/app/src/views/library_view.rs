@@ -2,11 +2,12 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
     ops::Range,
+    rc::Rc,
     sync::Arc,
 };
 
 use gpui::{
-    deferred, div, img, point, prelude::*, px, relative, rgb, rgba, AnyElement, Context,
+    deferred, div, img, point, prelude::*, px, relative, rgb, rgba, AnyElement, App, Context,
     FontWeight, MouseButton, MouseDownEvent, ObjectFit, SharedString, Window,
 };
 use stremio_core_runtime::stremio_core::types::library::LibraryItem;
@@ -22,18 +23,21 @@ use crate::{
         QuickPeekTarget, SidebarTab, ToastKind,
     },
     theme::{
-        active_theme, mono_font, placeholder_tint_for_id, sentence_case_label, sp, tabular_nums,
-        ui_sans, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        active_theme, mono_font, placeholder_tint_for_id, placeholder_tint_for_id_with_preset,
+        sentence_case_label, sp, tabular_nums, ui_sans, ThemePalette, ThemePreset, RADIUS_CARD,
+        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
     ui::{
-        clamp_progress_fraction, click_handler, compute_app_grid_metrics,
+        card_action_dispatcher, clamp_progress_fraction, click_handler, compute_app_grid_metrics,
         compute_app_landscape_grid_metrics, dropdown_trigger, format_notification_badge_label,
         full_height_page_container, glass_dropdown_option, glass_dropdown_panel,
         glass_segmented_bar, glass_segmented_item, infer_grid_poster_aspect, primary_accent_button,
-        render_empty_state, render_landscape_card, render_page_header, render_poster_card,
-        render_section_header, search_field, secondary_glass_button, toolbar_bar, ClickHandler,
-        DropdownTriggerProps, EmptyStateProps, LandscapeCardProps, PageHeader, PageWidth,
-        PosterCardProps, PosterMetrics, SearchFieldProps, SectionHeader,
+        render_empty_state, render_landscape_card, render_page_header,
+        render_prepared_poster_card, render_section_header, search_field, secondary_glass_button,
+        toolbar_bar, CardActionDispatcher, ClickHandler, DropdownTriggerProps, EmptyStateProps,
+        LandscapeCardProps, PageHeader, PageWidth, PosterCardAction, PosterCardCapabilities,
+        PosterMetrics, PreparedPosterCard, PreparedPosterRenderCtx, SearchFieldProps,
+        SectionHeader,
     },
     virtual_grid::{slice_row_items, PosterAspect},
 };
@@ -52,6 +56,27 @@ struct CachedLibraryAux {
     notif_counts: Arc<HashMap<String, usize>>,
     up_next_items: Arc<Vec<UpNextHighlightEntry>>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LibraryCardSlabKey {
+    library_rev: u64,
+    notification_rev: u64,
+    filter_tab: LibraryFilterTab,
+    type_filter: LibraryTypeFilter,
+    sort_criterion: LibrarySortCriterion,
+    view_mode: LibraryViewMode,
+    aspect: PosterAspect,
+    theme_preset: ThemePreset,
+    search_query: String,
+}
+
+struct CachedLibraryCardSlab {
+    key: LibraryCardSlabKey,
+    cards: Arc<[PreparedPosterCard]>,
+    wide_urls: Arc<[Option<SharedString>]>,
+}
+
+type ToggleWatchedDispatcher = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 impl AppShell {
     pub fn render_library_view(
@@ -167,13 +192,28 @@ impl AppShell {
                     let card_width_px = poster_metrics.card_width_px;
                     let image_height_px = poster_metrics.image_height_px;
                     let items_for_grid = Arc::clone(&filtered_arc);
-                    let notifs_for_grid = Arc::clone(&notif_counts_arc);
+                    let slab = self.get_or_update_library_card_slab(
+                        &memo,
+                        &aux,
+                        LibraryViewMode::PosterGrid,
+                        poster_aspect,
+                        theme.preset,
+                    );
+                    let cards_for_grid = Arc::clone(&slab.cards);
 
                     gpui::uniform_list(
                         "library-poster-grid",
                         row_count,
                         cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
                             let kb_focus_index = this.kb_focus_index;
+                            let render_theme = active_theme();
+                            let dispatcher =
+                                build_library_card_dispatcher(&items_for_grid, None, cx);
+                            let toggle_watched = build_library_toggle_watched_dispatcher(
+                                &items_for_grid,
+                                &cards_for_grid,
+                                cx,
+                            );
 
                             visible_rows
                                 .map(|row_idx| {
@@ -189,35 +229,42 @@ impl AppShell {
                                         .items_start()
                                         .gap(px(grid_gap))
                                         .children(range.map(|idx| {
-                                            let (li, st) = &items_for_grid[idx];
-                                            let notif_count =
-                                                notifs_for_grid.get(&li.id).copied().unwrap_or(0);
+                                            let card = &cards_for_grid[idx];
+                                            let poster_tex = card.poster_url.as_deref().and_then(
+                                                |u| this.poster_cache.resolve_poster_image(u),
+                                            );
                                             let is_focused = kb_focus_index == Some(idx);
-                                            let card_aspect =
-                                                PosterAspect::from_stremio_poster_shape(
-                                                    &li.poster_shape,
-                                                );
-                                            let card_image_h = if card_aspect == poster_aspect {
+                                            let card_image_h = if card.aspect == poster_aspect {
                                                 image_height_px
                                             } else {
-                                                (card_width_px * card_aspect.height_over_width())
+                                                (card_width_px * card.aspect.height_over_width())
                                                     .ceil()
                                                     .min(image_height_px)
                                             };
+                                            let toggle_watched_btn =
+                                                build_card_toggle_watched_button(
+                                                    "lib-poster-watch",
+                                                    idx,
+                                                    card.watched,
+                                                    &render_theme,
+                                                    &toggle_watched,
+                                                );
 
                                             div()
                                                 .flex_1()
                                                 .min_w(px(0.0))
                                                 .h_full()
-                                                .child(this.render_library_poster_card(
-                                                    &items_for_grid,
-                                                    idx,
-                                                    *st,
-                                                    notif_count,
-                                                    card_aspect,
-                                                    card_image_h,
-                                                    is_focused,
-                                                    cx,
+                                                .child(render_prepared_poster_card(
+                                                    PreparedPosterRenderCtx::new(
+                                                        idx,
+                                                        card,
+                                                        "library-card",
+                                                        &dispatcher,
+                                                    )
+                                                    .image(poster_tex)
+                                                    .image_height_px(Some(card_image_h))
+                                                    .is_focused(is_focused)
+                                                    .quick_action(Some(toggle_watched_btn)),
                                                 ))
                                         }))
                                         .children(
@@ -240,13 +287,32 @@ impl AppShell {
                     let row_stride_px = wide_metrics.row_stride_px;
                     let image_height_px = wide_metrics.image_height_px;
                     let items_for_wide = Arc::clone(&filtered_arc);
-                    let notifs_for_wide = Arc::clone(&notif_counts_arc);
+                    let slab = self.get_or_update_library_card_slab(
+                        &memo,
+                        &aux,
+                        LibraryViewMode::WideBackdrops,
+                        PosterAspect::Landscape16x9,
+                        theme.preset,
+                    );
+                    let cards_for_wide = Arc::clone(&slab.cards);
+                    let wide_urls_for_grid = Arc::clone(&slab.wide_urls);
 
                     gpui::uniform_list(
                         "library-wide-grid",
                         row_count,
                         cx.processor(move |this, visible_rows: Range<usize>, _window, cx| {
                             let kb_focus_index = this.kb_focus_index;
+                            let render_theme = active_theme();
+                            let dispatcher = build_library_card_dispatcher(
+                                &items_for_wide,
+                                Some(Arc::clone(&wide_urls_for_grid)),
+                                cx,
+                            );
+                            let toggle_watched = build_library_toggle_watched_dispatcher(
+                                &items_for_wide,
+                                &cards_for_wide,
+                                cx,
+                            );
 
                             visible_rows
                                 .map(|row_idx| {
@@ -262,23 +328,40 @@ impl AppShell {
                                         .items_start()
                                         .gap(px(grid_gap))
                                         .children(range.map(|idx| {
-                                            let (li, st) = &items_for_wide[idx];
-                                            let notif_count =
-                                                notifs_for_wide.get(&li.id).copied().unwrap_or(0);
+                                            let card = &cards_for_wide[idx];
+                                            let wide_url = wide_urls_for_grid
+                                                .get(idx)
+                                                .and_then(|u| u.as_deref());
+                                            let wide_tex =
+                                                this.poster_cache.resolve_widescreen_or_poster(
+                                                    wide_url,
+                                                    card.poster_url.as_deref(),
+                                                );
                                             let is_focused = kb_focus_index == Some(idx);
+                                            let toggle_watched_btn =
+                                                build_card_toggle_watched_button(
+                                                    "lib-wide-watch",
+                                                    idx,
+                                                    card.watched,
+                                                    &render_theme,
+                                                    &toggle_watched,
+                                                );
 
                                             div()
                                                 .flex_1()
                                                 .min_w(px(0.0))
                                                 .h_full()
-                                                .child(this.render_library_wide_card(
-                                                    &items_for_wide,
-                                                    idx,
-                                                    *st,
-                                                    notif_count,
-                                                    image_height_px,
-                                                    is_focused,
-                                                    cx,
+                                                .child(render_prepared_poster_card(
+                                                    PreparedPosterRenderCtx::new(
+                                                        idx,
+                                                        card,
+                                                        "library-wide-card",
+                                                        &dispatcher,
+                                                    )
+                                                    .image(wide_tex)
+                                                    .image_height_px(Some(image_height_px))
+                                                    .is_focused(is_focused)
+                                                    .quick_action(Some(toggle_watched_btn)),
                                                 ))
                                         }))
                                         .children(
@@ -1208,296 +1291,94 @@ impl AppShell {
         memo
     }
 
-    fn build_card_toggle_watched_button(
+    fn get_or_update_library_card_slab(
         &self,
-        id_prefix: &'static str,
-        items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
-        idx: usize,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = active_theme();
-        let is_watched = items[idx].0.watched();
-        let items_for_watch = Arc::clone(items);
-        let badge_fg = if theme.is_light {
-            0xFFFFFF
-        } else {
-            theme.bg_canvas
+        memo: &MemoizedLibraryView,
+        aux: &CachedLibraryAux,
+        view_mode: LibraryViewMode,
+        aspect: PosterAspect,
+        theme_preset: ThemePreset,
+    ) -> Arc<CachedLibraryCardSlab> {
+        let key = LibraryCardSlabKey {
+            library_rev: memo.library_rev,
+            notification_rev: memo.notification_rev,
+            filter_tab: memo.filter_tab,
+            type_filter: memo.type_filter,
+            sort_criterion: memo.sort_criterion,
+            view_mode,
+            aspect,
+            theme_preset,
+            search_query: memo.search_query.clone(),
         };
 
-        div()
-            .id((id_prefix, idx))
-            .cursor_pointer()
-            .w(sp(30.0))
-            .h(sp(30.0))
-            .rounded(px(RADIUS_PILL))
-            .bg(if is_watched {
-                rgb(theme.status_watched)
-            } else {
-                rgba(0x0B0D14D9)
-            })
-            .border_1()
-            .border_color(if is_watched {
-                rgb(theme.status_watched)
-            } else {
-                rgba(0xFFFFFF33)
-            })
-            .hover(move |s| {
-                s.bg(rgb(theme.accent_press))
-                    .border_color(rgb(theme.accent))
-            })
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    let li = &items_for_watch[idx].0;
-                    let next_watched = !is_watched;
-                    this.core
-                        .mark_library_item_watched(li.id.clone(), next_watched);
-                    this.push_toast(
-                        ToastKind::Info,
-                        if next_watched {
-                            "Marked as watched"
-                        } else {
-                            "Marked as unwatched"
-                        },
-                        Some(li.name.clone()),
-                        cx,
-                    );
-                    cx.notify();
-                }),
-            )
-            .child(svg_icon(
-                IconName::Check,
-                13.0 * theme.ui_scale,
-                if is_watched {
-                    rgb(badge_fg)
-                } else {
-                    rgb(0xF5F1E8)
-                },
-            ))
-            .into_any_element()
-    }
+        {
+            let guard = self.memoized_library_cards.lock();
+            if let Some(any_arc) = guard.as_ref() {
+                if let Ok(cached) = Arc::clone(any_arc).downcast::<CachedLibraryCardSlab>() {
+                    if cached.key == key {
+                        return cached;
+                    }
+                }
+            }
+        }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_library_poster_card(
-        &self,
-        items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
-        idx: usize,
-        status: LibraryStatusTab,
-        notification_count: usize,
-        aspect: PosterAspect,
-        image_height_px: f32,
-        is_focused: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let li = &items[idx].0;
-        let poster_tex = self.poster_cache.resolve_poster_url(li.poster.as_ref());
-        let type_label = sentence_case_label(&li.r#type);
-        let subtitle: SharedString =
-            match format_movietracker_episode_code(li.state.video_id.as_deref()) {
-                Some(ep) => format!("{type_label} · {ep}").into(),
-                None => type_label.into(),
+        let items = &memo.filtered_items;
+        let is_wide = view_mode == LibraryViewMode::WideBackdrops;
+        let mut cards = Vec::with_capacity(items.len());
+        let mut wide_urls = if is_wide {
+            Vec::with_capacity(items.len())
+        } else {
+            Vec::new()
+        };
+
+        for (li, status) in items.iter() {
+            let notif_count = aux.notif_counts.get(&li.id).copied().unwrap_or(0);
+            let tint = placeholder_tint_for_id_with_preset(&li.id, theme_preset);
+            let type_label = sentence_case_label(&li.r#type);
+            let progress_fraction = library_item_progress_fraction(li, *status);
+            let poster_url = li.poster.as_ref().map(|u| u.as_str());
+
+            let (card_aspect, subtitle) = if is_wide {
+                wide_urls.push(
+                    self.resolve_library_widescreen_url(li)
+                        .map(SharedString::from),
+                );
+                (
+                    PosterAspect::Landscape16x9,
+                    format_wide_card_subtitle(li, *status, notif_count),
+                )
+            } else {
+                let sub: SharedString =
+                    match format_movietracker_episode_code(li.state.video_id.as_deref()) {
+                        Some(ep) => format!("{type_label} · {ep}").into(),
+                        None => SharedString::from(type_label.clone()),
+                    };
+                (PosterAspect::from_stremio_poster_shape(&li.poster_shape), sub)
             };
-        let progress_fraction = library_item_progress_fraction(li, status);
 
-        let open_items = Arc::clone(items);
-        let play_items = Arc::clone(items);
-        let remove_items = Arc::clone(items);
-        let peek_items = Arc::clone(items);
-        let ctx_items = Arc::clone(items);
-        let hover_items = Arc::clone(items);
+            cards.push(
+                PreparedPosterCard::with_tint(SharedString::new(&li.name), tint)
+                    .subtitle(Some(subtitle))
+                    .type_badge(Some(SharedString::from(type_label)))
+                    .poster_url_str(poster_url)
+                    .aspect(card_aspect)
+                    .status_tab(Some(*status))
+                    .notification_count(notif_count)
+                    .progress_fraction(progress_fraction)
+                    .in_library(true)
+                    .watched(li.watched())
+                    .capabilities(PosterCardCapabilities::STANDARD_BROWSING),
+            );
+        }
 
-        let toggle_watched_btn =
-            self.build_card_toggle_watched_button("lib-poster-watch", items, idx, cx);
-
-        render_poster_card(
-            PosterCardProps::new(("library-card", idx), li.name.clone(), &li.id)
-                .subtitle(Some(subtitle))
-                .image(poster_tex)
-                .aspect(aspect)
-                .image_height_px(Some(image_height_px))
-                .status_tab(Some(status))
-                .notification_count(notification_count)
-                .progress_fraction(progress_fraction)
-                .in_library(true)
-                .is_focused(is_focused)
-                .on_open(cx.listener(move |this, _, _, cx| {
-                    let li = &open_items[idx].0;
-                    this.open_meta_details(
-                        li.r#type.clone(),
-                        li.id.clone(),
-                        li.state.video_id.clone(),
-                        cx,
-                    );
-                }))
-                .on_quick_play(cx.listener(move |this, _, _, cx| {
-                    let li = &play_items[idx].0;
-                    this.quick_resume_or_open(
-                        li.r#type.clone(),
-                        li.id.clone(),
-                        li.state.video_id.clone(),
-                        cx,
-                    );
-                }))
-                .on_toggle_library(cx.listener(move |this, _, _, cx| {
-                    let li = &remove_items[idx].0;
-                    this.core.remove_from_library(li.id.clone());
-                    this.push_toast(
-                        ToastKind::Info,
-                        "Removed from library",
-                        Some(li.name.clone()),
-                        cx,
-                    );
-                    cx.notify();
-                }))
-                .on_quick_peek(cx.listener(move |this, _, _, cx| {
-                    let li = &peek_items[idx].0;
-                    this.open_quick_peek(
-                        QuickPeekTarget {
-                            type_name: li.r#type.clone(),
-                            id: li.id.clone(),
-                            video_id: li.state.video_id.clone(),
-                            title: li.name.clone(),
-                            preview: None,
-                        },
-                        cx,
-                    );
-                }))
-                .quick_action(Some(toggle_watched_btn))
-                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    let li = &ctx_items[idx].0;
-                    let menu = BrowsingContextMenu::new(
-                        ev.position,
-                        li.r#type.clone(),
-                        li.id.clone(),
-                        li.name.clone(),
-                    )
-                    .video_id(li.state.video_id.clone())
-                    .is_in_library(true)
-                    .is_watched(li.watched())
-                    .can_rewind_cw(li.state.time_offset > 0);
-                    this.open_browsing_context_menu(menu, cx);
-                }))
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    let li = &hover_items[idx].0;
-                    this.on_card_hover_prefetch(&li.r#type, &li.id, None, *hovered, cx);
-                })),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_library_wide_card(
-        &self,
-        items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
-        idx: usize,
-        status: LibraryStatusTab,
-        notification_count: usize,
-        image_height_px: f32,
-        is_focused: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let li = &items[idx].0;
-        let wide_url = self.resolve_library_widescreen_url(li);
-        let wide_tex = self.poster_cache.resolve_widescreen_or_poster(
-            wide_url.as_deref(),
-            li.poster.as_ref().map(|u| u.as_str()),
-        );
-        let subtitle = format_wide_card_subtitle(li, status, notification_count);
-        let progress_fraction = library_item_progress_fraction(li, status);
-
-        let open_items = Arc::clone(items);
-        let play_items = Arc::clone(items);
-        let remove_items = Arc::clone(items);
-        let peek_items = Arc::clone(items);
-        let ctx_items = Arc::clone(items);
-        let hover_items = Arc::clone(items);
-        let hover_bg = wide_url;
-
-        let toggle_watched_btn =
-            self.build_card_toggle_watched_button("lib-wide-watch", items, idx, cx);
-
-        render_poster_card(
-            PosterCardProps::new(("library-wide-card", idx), li.name.clone(), &li.id)
-                .subtitle(Some(subtitle))
-                .image(wide_tex)
-                .aspect(PosterAspect::Landscape16x9)
-                .image_height_px(Some(image_height_px))
-                .status_tab(Some(status))
-                .notification_count(notification_count)
-                .progress_fraction(progress_fraction)
-                .in_library(true)
-                .is_focused(is_focused)
-                .on_open(cx.listener(move |this, _, _, cx| {
-                    let li = &open_items[idx].0;
-                    this.open_meta_details(
-                        li.r#type.clone(),
-                        li.id.clone(),
-                        li.state.video_id.clone(),
-                        cx,
-                    );
-                }))
-                .on_quick_play(cx.listener(move |this, _, _, cx| {
-                    let li = &play_items[idx].0;
-                    this.quick_resume_or_open(
-                        li.r#type.clone(),
-                        li.id.clone(),
-                        li.state.video_id.clone(),
-                        cx,
-                    );
-                }))
-                .on_toggle_library(cx.listener(move |this, _, _, cx| {
-                    let li = &remove_items[idx].0;
-                    this.core.remove_from_library(li.id.clone());
-                    this.push_toast(
-                        ToastKind::Info,
-                        "Removed from library",
-                        Some(li.name.clone()),
-                        cx,
-                    );
-                    cx.notify();
-                }))
-                .on_quick_peek(cx.listener(move |this, _, _, cx| {
-                    let li = &peek_items[idx].0;
-                    this.open_quick_peek(
-                        QuickPeekTarget {
-                            type_name: li.r#type.clone(),
-                            id: li.id.clone(),
-                            video_id: li.state.video_id.clone(),
-                            title: li.name.clone(),
-                            preview: None,
-                        },
-                        cx,
-                    );
-                }))
-                .quick_action(Some(toggle_watched_btn))
-                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    let li = &ctx_items[idx].0;
-                    let menu = BrowsingContextMenu::new(
-                        ev.position,
-                        li.r#type.clone(),
-                        li.id.clone(),
-                        li.name.clone(),
-                    )
-                    .video_id(li.state.video_id.clone())
-                    .is_in_library(true)
-                    .is_watched(li.watched())
-                    .can_rewind_cw(li.state.time_offset > 0);
-                    this.open_browsing_context_menu(menu, cx);
-                }))
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    let li = &hover_items[idx].0;
-                    this.on_card_hover_prefetch(
-                        &li.r#type,
-                        &li.id,
-                        hover_bg.as_deref(),
-                        *hovered,
-                        cx,
-                    );
-                })),
-        )
+        let slab = Arc::new(CachedLibraryCardSlab {
+            key,
+            cards: Arc::from(cards),
+            wide_urls: Arc::from(wide_urls),
+        });
+        *self.memoized_library_cards.lock() =
+            Some(Arc::clone(&slab) as Arc<dyn std::any::Any + Send + Sync>);
+        slab
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1936,6 +1817,173 @@ impl AppShell {
             )
             .into_any_element()
     }
+}
+
+fn build_library_card_dispatcher(
+    items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
+    wide_urls: Option<Arc<[Option<SharedString>]>>,
+    cx: &mut Context<AppShell>,
+) -> CardActionDispatcher {
+    let items_for_dispatch = Arc::clone(items);
+    let shell_weak = cx.entity().downgrade();
+    card_action_dispatcher(move |idx, action, _window, cx| {
+        let Some(shell) = shell_weak.upgrade() else {
+            return;
+        };
+        let Some((li, _)) = items_for_dispatch.get(idx) else {
+            return;
+        };
+        let hover_bg = wide_urls
+            .as_ref()
+            .and_then(|urls| urls.get(idx))
+            .and_then(|u| u.as_deref());
+        let _ = shell.update(cx, |this, cx| match action {
+            PosterCardAction::Open | PosterCardAction::MiddleClick => {
+                this.open_meta_details(
+                    li.r#type.clone(),
+                    li.id.clone(),
+                    li.state.video_id.clone(),
+                    cx,
+                );
+            }
+            PosterCardAction::QuickPlay => {
+                this.quick_resume_or_open(
+                    li.r#type.clone(),
+                    li.id.clone(),
+                    li.state.video_id.clone(),
+                    cx,
+                );
+            }
+            PosterCardAction::ToggleLibrary => {
+                this.core.remove_from_library(li.id.clone());
+                this.push_toast(
+                    ToastKind::Info,
+                    "Removed from library",
+                    Some(li.name.clone()),
+                    cx,
+                );
+                cx.notify();
+            }
+            PosterCardAction::QuickPeek => {
+                this.open_quick_peek(
+                    QuickPeekTarget {
+                        type_name: li.r#type.clone(),
+                        id: li.id.clone(),
+                        video_id: li.state.video_id.clone(),
+                        title: li.name.clone(),
+                        preview: None,
+                    },
+                    cx,
+                );
+            }
+            PosterCardAction::ContextMenu(position) => {
+                let menu = BrowsingContextMenu::new(
+                    position,
+                    li.r#type.clone(),
+                    li.id.clone(),
+                    li.name.clone(),
+                )
+                .video_id(li.state.video_id.clone())
+                .is_in_library(true)
+                .is_watched(li.watched())
+                .can_rewind_cw(li.state.time_offset > 0);
+                this.open_browsing_context_menu(menu, cx);
+            }
+            PosterCardAction::Hover(hovered) => {
+                this.on_card_hover_prefetch(&li.r#type, &li.id, hover_bg, hovered, cx);
+            }
+        });
+    })
+}
+
+fn build_library_toggle_watched_dispatcher(
+    items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
+    cards: &Arc<[PreparedPosterCard]>,
+    cx: &mut Context<AppShell>,
+) -> ToggleWatchedDispatcher {
+    let items_for_watch = Arc::clone(items);
+    let cards_for_watch = Arc::clone(cards);
+    let shell_weak = cx.entity().downgrade();
+    Rc::new(move |idx, _window, cx| {
+        let Some(shell) = shell_weak.upgrade() else {
+            return;
+        };
+        let Some((li, _)) = items_for_watch.get(idx) else {
+            return;
+        };
+        let is_watched = cards_for_watch.get(idx).is_some_and(|c| c.watched);
+        let next_watched = !is_watched;
+        let _ = shell.update(cx, |this, cx| {
+            this.core
+                .mark_library_item_watched(li.id.clone(), next_watched);
+            this.push_toast(
+                ToastKind::Info,
+                if next_watched {
+                    "Marked as watched"
+                } else {
+                    "Marked as unwatched"
+                },
+                Some(li.name.clone()),
+                cx,
+            );
+            cx.notify();
+        });
+    })
+}
+
+fn build_card_toggle_watched_button(
+    id_prefix: &'static str,
+    idx: usize,
+    is_watched: bool,
+    theme: &ThemePalette,
+    dispatcher: &ToggleWatchedDispatcher,
+) -> AnyElement {
+    let theme = *theme;
+    let badge_fg = if theme.is_light {
+        0xFFFFFF
+    } else {
+        theme.bg_canvas
+    };
+    let dispatch = Rc::clone(dispatcher);
+
+    div()
+        .id((id_prefix, idx))
+        .cursor_pointer()
+        .w(sp(30.0))
+        .h(sp(30.0))
+        .rounded(px(RADIUS_PILL))
+        .bg(if is_watched {
+            rgb(theme.status_watched)
+        } else {
+            rgba(0x0B0D14D9)
+        })
+        .border_1()
+        .border_color(if is_watched {
+            rgb(theme.status_watched)
+        } else {
+            rgba(0xFFFFFF33)
+        })
+        .hover(move |s| {
+            s.bg(rgb(theme.accent_press))
+                .border_color(rgb(theme.accent))
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            dispatch(idx, window, cx);
+        })
+        .child(svg_icon(
+            IconName::Check,
+            13.0 * theme.ui_scale,
+            if is_watched {
+                rgb(badge_fg)
+            } else {
+                rgb(0xF5F1E8)
+            },
+        ))
+        .into_any_element()
 }
 
 fn library_item_progress_fraction(li: &LibraryItem, status: LibraryStatusTab) -> Option<f32> {
