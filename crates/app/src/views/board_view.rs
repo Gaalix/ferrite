@@ -34,9 +34,9 @@ use crate::{
         PlaybackCandidate, QuickPeekTarget, SidebarTab, ToastKind,
     },
     theme::{
-        active_theme, editorial_serif, glass_capsule_shadow, mono_font, placeholder_tint_for_id,
-        sentence_case_label, sp, tabular_nums, ui_sans, ThemePalette, RADIUS_CONTROL, RADIUS_PILL,
-        RADIUS_POSTER, RADIUS_SHEET,
+        active_theme, editorial_serif, glass_capsule_shadow, mono_font,
+        placeholder_tint_for_id_with_preset, sentence_case_label, tabular_nums, ui_sans,
+        ThemePalette, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER, RADIUS_SHEET,
     },
     ui::{
         landscape_card_dimensions, page_gutter_px, primary_accent_button, render_empty_state,
@@ -281,31 +281,44 @@ impl AppShell {
 
         let mut kb_cards: Vec<KbFocusableCard> = Vec::new();
         let hero_stage_el = if let Some(hero_h) = hero_height {
-            let cw_scroll = self
-                .board_shelf_scrolls
-                .entry(CW_FILMSTRIP_SCROLL_KEY)
-                .or_default()
-                .clone();
-            let featured_scroll = self
-                .board_shelf_scrolls
-                .entry(FEATURED_DOCK_SCROLL_KEY)
-                .or_default()
-                .clone();
+            if scroll_y <= hero_h + VERTICAL_OVERSCAN_PX {
+                let cw_scroll = self
+                    .board_shelf_scrolls
+                    .entry(CW_FILMSTRIP_SCROLL_KEY)
+                    .or_default()
+                    .clone();
+                let featured_scroll = self
+                    .board_shelf_scrolls
+                    .entry(FEATURED_DOCK_SCROLL_KEY)
+                    .or_default()
+                    .clone();
 
-            Some(self.render_hero_stage(
-                &snapshot,
-                hero_mode,
-                has_cw && has_featured,
-                hero_h,
-                side_pad,
-                container_w,
-                &cw_scroll,
-                &featured_scroll,
-                &library_statuses,
-                &mut kb_cards,
-                &theme,
-                cx,
-            ))
+                Some(
+                    self.render_hero_stage(
+                        &snapshot,
+                        hero_mode,
+                        has_cw && has_featured,
+                        hero_h,
+                        side_pad,
+                        container_w,
+                        &cw_scroll,
+                        &featured_scroll,
+                        &library_statuses,
+                        &mut kb_cards,
+                        &theme,
+                        cx,
+                    )
+                    .into_any_element(),
+                )
+            } else {
+                Some(
+                    div()
+                        .id("home-hero-spacer")
+                        .w_full()
+                        .h(px(hero_h))
+                        .into_any_element(),
+                )
+            }
         } else {
             None
         };
@@ -371,12 +384,10 @@ impl AppShell {
 
         let kb_row_offset = usize::from(show_hero_stage);
         let total_shelves_rendered = shelf_layouts.len();
-        let mut mounted_shelves_count = 0_usize;
         let mut shelf_elements = Vec::with_capacity(shelf_layouts.len());
 
         for (shelf_pos, layout) in shelf_layouts.into_iter().enumerate() {
             if layout.is_visible_y {
-                mounted_shelves_count += 1;
                 let scroll_handle = visible_shelf_handles
                     .get(&layout.shelf.meta.raw_index)
                     .cloned()
@@ -408,7 +419,6 @@ impl AppShell {
             }
         }
 
-        let has_virtualized_shelves = total_shelves_rendered > mounted_shelves_count;
         let has_any_content = has_cw || total_shelves_rendered > 0;
         let total_board_catalogs = snapshot.total_board_catalogs;
         let has_more_shelves = shelf_limit < total_board_catalogs;
@@ -417,9 +427,9 @@ impl AppShell {
         self.set_kb_focus_items(kb_cards);
 
         let shelves_top_pad = if show_hero_stage {
-            sp(PAGE_SECTION_GAP_PX)
+            theme.sp(PAGE_SECTION_GAP_PX)
         } else {
-            sp(88.0)
+            theme.sp(88.0)
         };
 
         div()
@@ -428,11 +438,12 @@ impl AppShell {
             .size_full()
             .overflow_y_scroll()
             .on_scroll(cx.listener(move |this, ev: &ScrollEvent, _, cx| {
+                // GPUI's ScrollHandle listener already notifies the view on scroll offset changes;
+                // only notify here when we expand `visible_board_shelves` near the bottom.
                 let down_px = match ev.delta {
                     ScrollDelta::Pixels(p) => (-p.y) / px(1.0),
                     ScrollDelta::Lines(l) => (-l.y) * 36.0,
                 };
-                let mut should_notify = false;
                 if down_px > 0.0
                     && this.visible_board_shelves < total_board_catalogs
                     && scroll_near_bottom(&this.board_scroll_handle, down_px, 420.0)
@@ -442,14 +453,8 @@ impl AppShell {
                     if next > old {
                         this.visible_board_shelves = next;
                         this.core.load_board_range(old..next);
-                        should_notify = true;
+                        cx.notify();
                     }
-                }
-                if down_px.abs() > 0.1 && has_virtualized_shelves {
-                    should_notify = true;
-                }
-                if should_notify {
-                    cx.notify();
                 }
             }))
             .child(
@@ -463,10 +468,10 @@ impl AppShell {
                             .w_full()
                             .px(px(side_pad))
                             .pt(shelves_top_pad)
-                            .pb(sp(PAGE_PADDING_BOTTOM_PX))
+                            .pb(theme.sp(PAGE_PADDING_BOTTOM_PX))
                             .flex()
                             .flex_col()
-                            .gap(sp(PAGE_SECTION_GAP_PX))
+                            .gap(theme.sp(PAGE_SECTION_GAP_PX))
                             .when(!has_any_content, |el| {
                                 el.child(Self::render_empty_board_banner(cx))
                             })
@@ -474,11 +479,11 @@ impl AppShell {
                             .when(has_more_shelves, |el| {
                                 el.child(
                                     div()
-                                        .pt(sp(4.0))
+                                        .pt(theme.sp(4.0))
                                         .flex()
                                         .items_center()
                                         .justify_between()
-                                        .gap(sp(16.0))
+                                        .gap(theme.sp(16.0))
                                         .child(
                                             div()
                                                 .font(mono_font())
@@ -493,8 +498,8 @@ impl AppShell {
                                             div()
                                                 .id("btn-board-show-more-shelves")
                                                 .cursor_pointer()
-                                                .h(sp(36.0))
-                                                .px(sp(16.0))
+                                                .h(theme.sp(36.0))
+                                                .px(theme.sp(16.0))
                                                 .rounded(px(RADIUS_PILL))
                                                 .bg(rgba(theme.glass_trough_bg))
                                                 .border_1()
@@ -510,7 +515,7 @@ impl AppShell {
                                                 .items_center()
                                                 .gap(px(6.0))
                                                 .font(ui_sans(FontWeight::MEDIUM))
-                                                .text_size(sp(13.0))
+                                                .text_size(theme.sp(13.0))
                                                 .text_color(rgb(theme.text_secondary))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
@@ -762,7 +767,10 @@ impl AppShell {
             .h(px(hero_height_px))
             .relative()
             .overflow_hidden()
-            .bg(rgb(placeholder_tint_for_id(&active.id)))
+            .bg(rgb(placeholder_tint_for_id_with_preset(
+                &active.id,
+                theme.preset,
+            )))
             .when_some(backdrop_tex, |el, tex| {
                 el.child(
                     img(tex)
@@ -778,7 +786,7 @@ impl AppShell {
                     .relative()
                     .size_full()
                     .px(px(side_pad))
-                    .pt(sp(84.0))
+                    .pt(theme.sp(84.0))
                     .pb(px(18.0))
                     .flex()
                     .flex_col()
@@ -809,7 +817,7 @@ impl AppShell {
                                             .items_center()
                                             .gap(px(8.0))
                                             .font(mono_font())
-                                            .text_size(sp(11.5))
+                                            .text_size(theme.sp(11.5))
                                             .text_color(rgb(HERO_INK_SECONDARY))
                                             .child(
                                                 div()
@@ -861,7 +869,7 @@ impl AppShell {
                                     } else {
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(sp(44.0))
+                                            .text_size(theme.sp(44.0))
                                             .line_height(relative(1.04))
                                             .text_color(rgb(HERO_INK_PRIMARY))
                                             .truncate()
@@ -873,10 +881,10 @@ impl AppShell {
                                         el.child(
                                             div()
                                                 .max_w(px(560.0))
-                                                .text_size(sp(13.5))
-                                                .line_height(sp(19.5))
+                                                .text_size(theme.sp(13.5))
+                                                .line_height(theme.sp(19.5))
                                                 .text_color(rgb(HERO_INK_SECONDARY))
-                                                .max_h(sp(40.0))
+                                                .max_h(theme.sp(40.0))
                                                 .overflow_hidden()
                                                 .child(desc),
                                         )
@@ -893,8 +901,8 @@ impl AppShell {
                                                 div()
                                                     .id("hero-primary-play-btn")
                                                     .cursor_pointer()
-                                                    .h(sp(38.0))
-                                                    .px(sp(20.0))
+                                                    .h(theme.sp(38.0))
+                                                    .px(theme.sp(20.0))
                                                     .rounded(px(RADIUS_PILL))
                                                     .bg(rgb(accent))
                                                     .hover(move |s| s.bg(rgb(accent_hover)))
@@ -902,10 +910,10 @@ impl AppShell {
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
-                                                    .gap(sp(8.0))
+                                                    .gap(theme.sp(8.0))
                                                     .font(ui_sans(FontWeight::SEMIBOLD))
                                                     .font_features(tabular_nums())
-                                                    .text_size(sp(13.5))
+                                                    .text_size(theme.sp(13.5))
                                                     .text_color(rgb(cta_on_accent))
                                                     .on_mouse_down(
                                                         MouseButton::Left,
@@ -1115,7 +1123,7 @@ impl AppShell {
     #[allow(clippy::too_many_arguments)]
     fn render_hero_cw_dock(
         &self,
-        cw_cards: &[ContinueWatchingCard],
+        cw_cards: &Arc<[ContinueWatchingCard]>,
         cw_total_count: usize,
         active_cw_idx: usize,
         show_mode_switcher: bool,
@@ -1168,99 +1176,85 @@ impl AppShell {
                 col: idx,
             });
 
-            let open_type = li.r#type.clone();
-            let open_id = li.id.clone();
-            let open_vid = li.state.video_id.clone();
-
-            let play_type = li.r#type.clone();
-            let play_id = li.id.clone();
-            let play_vid = li.state.video_id.clone();
-
-            let peek_type = li.r#type.clone();
-            let peek_id = li.id.clone();
-            let peek_vid = li.state.video_id.clone();
-            let peek_title = li.name.clone();
-            let peek_preview = cw.preview.clone();
-
-            let ctx_type = li.r#type.clone();
-            let ctx_id = li.id.clone();
-            let ctx_vid = li.state.video_id.clone();
-            let ctx_title = li.name.clone();
-            let ctx_preview = cw.preview.clone();
-
-            let hover_type = li.r#type.clone();
-            let hover_id = li.id.clone();
+            let cards_open = Arc::clone(cw_cards);
+            let cards_play = Arc::clone(cw_cards);
+            let cards_peek = Arc::clone(cw_cards);
+            let cards_ctx = Arc::clone(cw_cards);
+            let cards_hover = Arc::clone(cw_cards);
             let hover_bg = wide_url;
 
-            let mut props = LandscapeCardProps::new(
-                ("hero-cw-card", idx),
-                li.name.clone(),
-                li.id.clone(),
-            )
-            .width_px(Some(dims.card_w))
-            .image(wide_tex)
-            .subtitle(Some(SharedString::from(status_sub)))
-            .notification_count(cw.notification_count)
-            .progress_fraction(progress_frac)
-            .is_active(is_active)
-            .is_focused(is_kb_focused)
-            .on_open(cx.listener(move |this, _, _, cx| {
-                this.board_active_cw_idx = idx;
-                this.open_meta_details(
-                    open_type.clone(),
-                    open_id.clone(),
-                    open_vid.clone(),
-                    cx,
-                );
-            }))
-            .on_quick_play(cx.listener(move |this, _, _, cx| {
-                this.quick_resume_or_open(
-                    play_type.clone(),
-                    play_id.clone(),
-                    play_vid.clone(),
-                    cx,
-                );
-            }))
-            .on_quick_peek(cx.listener(move |this, _, _, cx| {
-                this.open_quick_peek(
-                    QuickPeekTarget {
-                        type_name: peek_type.clone(),
-                        id: peek_id.clone(),
-                        video_id: peek_vid.clone(),
-                        title: peek_title.clone(),
-                        preview: peek_preview.clone(),
-                    },
-                    cx,
-                );
-            }))
-            .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                this.open_browsing_context_menu(
-                    BrowsingContextMenu::new(
-                        ev.position,
-                        ctx_type.clone(),
-                        ctx_id.clone(),
-                        ctx_title.clone(),
-                    )
-                    .video_id(ctx_vid.clone())
-                    .preview(ctx_preview.clone())
-                    .is_in_library(in_library)
-                    .is_watched(is_watched)
-                    .can_rewind_cw(true),
-                    cx,
-                );
-            }))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                this.handle_hero_dock_card_hover(
-                    idx,
-                    false,
-                    cw_count,
-                    &hover_type,
-                    &hover_id,
-                    hover_bg.as_deref(),
-                    *hovered,
-                    cx,
-                );
-            }));
+            let mut props = LandscapeCardProps::new(("hero-cw-card", idx), li.name.clone(), &li.id)
+                .width_px(Some(dims.card_w))
+                .image(wide_tex)
+                .subtitle(Some(SharedString::from(status_sub)))
+                .notification_count(cw.notification_count)
+                .progress_fraction(progress_frac)
+                .is_active(is_active)
+                .is_focused(is_kb_focused)
+                .on_open(cx.listener(move |this, _, _, cx| {
+                    let li = &cards_open[idx].library_item;
+                    this.board_active_cw_idx = idx;
+                    this.open_meta_details(
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.state.video_id.clone(),
+                        cx,
+                    );
+                }))
+                .on_quick_play(cx.listener(move |this, _, _, cx| {
+                    let li = &cards_play[idx].library_item;
+                    this.quick_resume_or_open(
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.state.video_id.clone(),
+                        cx,
+                    );
+                }))
+                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    let cw = &cards_peek[idx];
+                    let li = &cw.library_item;
+                    this.open_quick_peek(
+                        QuickPeekTarget {
+                            type_name: li.r#type.clone(),
+                            id: li.id.clone(),
+                            video_id: li.state.video_id.clone(),
+                            title: li.name.clone(),
+                            preview: cw.preview.clone(),
+                        },
+                        cx,
+                    );
+                }))
+                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let cw = &cards_ctx[idx];
+                    let li = &cw.library_item;
+                    this.open_browsing_context_menu(
+                        BrowsingContextMenu::new(
+                            ev.position,
+                            li.r#type.clone(),
+                            li.id.clone(),
+                            li.name.clone(),
+                        )
+                        .video_id(li.state.video_id.clone())
+                        .preview(cw.preview.clone())
+                        .is_in_library(in_library)
+                        .is_watched(is_watched)
+                        .can_rewind_cw(true),
+                        cx,
+                    );
+                }))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let li = &cards_hover[idx].library_item;
+                    this.handle_hero_dock_card_hover(
+                        idx,
+                        false,
+                        cw_count,
+                        &li.r#type,
+                        &li.id,
+                        hover_bg.as_deref(),
+                        *hovered,
+                        cx,
+                    );
+                }));
 
             if let Some(code) = ep_code {
                 props = props.episode_badge(code, false);
@@ -1290,7 +1284,7 @@ impl AppShell {
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(sp(13.0))
+                                    .text_size(theme.sp(13.0))
                                     .text_color(rgb(HERO_INK_PRIMARY))
                                     .child("Continue Watching"),
                             )
@@ -1310,7 +1304,7 @@ impl AppShell {
                                     })
                                     .font(ui_sans(FontWeight::MEDIUM))
                                     .font_features(tabular_nums())
-                                    .text_size(sp(12.0))
+                                    .text_size(theme.sp(12.0))
                                     .text_color(rgb(HERO_INK_SECONDARY))
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -1380,7 +1374,7 @@ impl AppShell {
     #[allow(clippy::too_many_arguments)]
     fn render_hero_featured_dock(
         &self,
-        candidates: &[HomeSpotlightCandidate],
+        candidates: &Arc<[HomeSpotlightCandidate]>,
         active_idx: usize,
         show_mode_switcher: bool,
         container_w: f32,
@@ -1408,25 +1402,24 @@ impl AppShell {
 
             let year = spot
                 .year
-                .clone()
-                .or_else(|| enriched.as_ref().and_then(|e| e.year.clone()));
+                .as_deref()
+                .or_else(|| enriched.as_ref().and_then(|e| e.year.as_deref()));
             let imdb_rating = spot
                 .imdb_rating
-                .clone()
-                .or_else(|| enriched.as_ref().and_then(|e| e.imdb_rating.clone()));
+                .as_deref()
+                .or_else(|| enriched.as_ref().and_then(|e| e.imdb_rating.as_deref()));
             let genre = spot
                 .genres
                 .first()
-                .cloned()
-                .or_else(|| enriched.as_ref().and_then(|e| e.genres.first().cloned()));
+                .map(String::as_str)
+                .or_else(|| enriched.as_ref().and_then(|e| e.genres.first().map(String::as_str)));
             let clean_rating = imdb_rating
-                .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
             let meta_lead = format_featured_card_meta_lead(
-                year.as_deref(),
-                genre.as_deref(),
+                year,
+                genre,
                 &spot.r#type,
                 clean_rating.is_some(),
             );
@@ -1447,98 +1440,82 @@ impl AppShell {
                 col: idx,
             });
 
-            let open_type = spot.r#type.clone();
-            let open_id = spot.id.clone();
-            let open_vid = spot.video_id.clone();
-
-            let play_type = spot.r#type.clone();
-            let play_id = spot.id.clone();
-            let play_vid = spot.video_id.clone();
-
-            let peek_type = spot.r#type.clone();
-            let peek_id = spot.id.clone();
-            let peek_vid = spot.video_id.clone();
-            let peek_title = spot.name.clone();
-            let peek_preview = spot.preview.clone();
-
-            let ctx_type = spot.r#type.clone();
-            let ctx_id = spot.id.clone();
-            let ctx_vid = spot.video_id.clone();
-            let ctx_title = spot.name.clone();
-            let ctx_preview = spot.preview.clone();
-
-            let hover_type = spot.r#type.clone();
-            let hover_id = spot.id.clone();
+            let cands_open = Arc::clone(candidates);
+            let cands_play = Arc::clone(candidates);
+            let cands_peek = Arc::clone(candidates);
+            let cands_ctx = Arc::clone(candidates);
+            let cands_hover = Arc::clone(candidates);
             let hover_bg = wide_url;
 
-            let props = LandscapeCardProps::new(
-                ("hero-featured-card", idx),
-                spot.name.clone(),
-                spot.id.clone(),
-            )
-            .width_px(Some(dims.card_w))
-            .image(thumb_tex)
-            .subtitle(Some(SharedString::from(meta_lead)))
-            .imdb_rating(clean_rating.map(SharedString::from))
-            .is_active(is_active)
-            .is_focused(is_kb_focused)
-            .on_open(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.board_spotlight_idx = idx;
-                this.open_meta_details(
-                    open_type.clone(),
-                    open_id.clone(),
-                    open_vid.clone(),
-                    cx,
-                );
-            }))
-            .on_quick_play(cx.listener(move |this, _, _, cx| {
-                this.quick_resume_or_open(
-                    play_type.clone(),
-                    play_id.clone(),
-                    play_vid.clone(),
-                    cx,
-                );
-            }))
-            .on_quick_peek(cx.listener(move |this, _, _, cx| {
-                this.open_quick_peek(
-                    QuickPeekTarget {
-                        type_name: peek_type.clone(),
-                        id: peek_id.clone(),
-                        video_id: peek_vid.clone(),
-                        title: peek_title.clone(),
-                        preview: peek_preview.clone(),
-                    },
-                    cx,
-                );
-            }))
-            .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                this.open_browsing_context_menu(
-                    BrowsingContextMenu::new(
-                        ev.position,
-                        ctx_type.clone(),
-                        ctx_id.clone(),
-                        ctx_title.clone(),
-                    )
-                    .video_id(ctx_vid.clone())
-                    .preview(ctx_preview.clone())
-                    .is_in_library(in_library)
-                    .is_watched(is_watched),
-                    cx,
-                );
-            }))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                this.handle_hero_dock_card_hover(
-                    idx,
-                    true,
-                    spot_count,
-                    &hover_type,
-                    &hover_id,
-                    hover_bg.as_deref(),
-                    *hovered,
-                    cx,
-                );
-            }));
+            let props = LandscapeCardProps::new(("hero-featured-card", idx), spot.name.clone(), &spot.id)
+                .width_px(Some(dims.card_w))
+                .image(thumb_tex)
+                .subtitle(Some(SharedString::from(meta_lead)))
+                .imdb_rating(clean_rating.map(SharedString::from))
+                .is_active(is_active)
+                .is_focused(is_kb_focused)
+                .on_open(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let spot = &cands_open[idx];
+                    this.board_spotlight_idx = idx;
+                    this.open_meta_details(
+                        spot.r#type.clone(),
+                        spot.id.clone(),
+                        spot.video_id.clone(),
+                        cx,
+                    );
+                }))
+                .on_quick_play(cx.listener(move |this, _, _, cx| {
+                    let spot = &cands_play[idx];
+                    this.quick_resume_or_open(
+                        spot.r#type.clone(),
+                        spot.id.clone(),
+                        spot.video_id.clone(),
+                        cx,
+                    );
+                }))
+                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    let spot = &cands_peek[idx];
+                    this.open_quick_peek(
+                        QuickPeekTarget {
+                            type_name: spot.r#type.clone(),
+                            id: spot.id.clone(),
+                            video_id: spot.video_id.clone(),
+                            title: spot.name.clone(),
+                            preview: spot.preview.clone(),
+                        },
+                        cx,
+                    );
+                }))
+                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let spot = &cands_ctx[idx];
+                    this.open_browsing_context_menu(
+                        BrowsingContextMenu::new(
+                            ev.position,
+                            spot.r#type.clone(),
+                            spot.id.clone(),
+                            spot.name.clone(),
+                        )
+                        .video_id(spot.video_id.clone())
+                        .preview(spot.preview.clone())
+                        .is_in_library(in_library)
+                        .is_watched(is_watched),
+                        cx,
+                    );
+                }))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let spot = &cands_hover[idx];
+                    this.handle_hero_dock_card_hover(
+                        idx,
+                        true,
+                        spot_count,
+                        &spot.r#type,
+                        &spot.id,
+                        hover_bg.as_deref(),
+                        *hovered,
+                        cx,
+                    );
+                }));
 
             card_els.push(render_landscape_card(props));
         }
@@ -1564,7 +1541,7 @@ impl AppShell {
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(sp(13.0))
+                                    .text_size(theme.sp(13.0))
                                     .text_color(rgb(HERO_INK_PRIMARY))
                                     .child("Featured Picks"),
                             )
@@ -1800,6 +1777,7 @@ impl AppShell {
             div()
                 .w_full()
                 .h(px(card_h + 4.0))
+                .flex_shrink_0()
                 .overflow_hidden()
                 .flex()
                 .items_start()
@@ -1859,27 +1837,17 @@ impl AppShell {
                     col: item_idx,
                 });
 
-                let open_type = item.r#type.clone();
-                let open_id = item.id.clone();
-                let play_type = item.r#type.clone();
-                let play_id = item.id.clone();
-                let toggle_preview = item.clone();
-                let peek_type = item.r#type.clone();
-                let peek_id = item.id.clone();
-                let peek_title = item.name.clone();
-                let peek_preview = item.clone();
-                let ctx_type = item.r#type.clone();
-                let ctx_id = item.id.clone();
-                let ctx_title = item.name.clone();
-                let ctx_preview = item.clone();
-                let hover_type = item.r#type.clone();
-                let hover_id = item.id.clone();
-                let hover_bg = item.background.as_ref().map(|u| u.to_string());
+                let items_open = Arc::clone(&shelf.items);
+                let items_play = Arc::clone(&shelf.items);
+                let items_toggle = Arc::clone(&shelf.items);
+                let items_peek = Arc::clone(&shelf.items);
+                let items_ctx = Arc::clone(&shelf.items);
+                let items_hover = Arc::clone(&shelf.items);
 
                 let mut props = PosterCardProps::new(
                     ("board-poster", raw_index * 10_000 + item_idx),
                     item.name.clone(),
-                    item.id.clone(),
+                    &item.id,
                 )
                 .subtitle(Some(SharedString::from(subtitle)))
                 .image(image_tex)
@@ -1890,46 +1858,51 @@ impl AppShell {
                 .in_library(in_library)
                 .is_focused(is_focused)
                 .on_open(cx.listener(move |this, _, _, cx| {
-                    this.open_meta_details(open_type.clone(), open_id.clone(), None, cx);
+                    let item = &items_open[item_idx];
+                    this.open_meta_details(item.r#type.clone(), item.id.clone(), None, cx);
                 }))
                 .on_quick_play(cx.listener(move |this, _, _, cx| {
-                    this.quick_resume_or_open(play_type.clone(), play_id.clone(), None, cx);
+                    let item = &items_play[item_idx];
+                    this.quick_resume_or_open(item.r#type.clone(), item.id.clone(), None, cx);
                 }))
                 .on_toggle_library(cx.listener(move |this, _, _, cx| {
-                    this.core.toggle_library_item(toggle_preview.clone());
+                    this.core.toggle_library_item(items_toggle[item_idx].clone());
                     cx.notify();
                 }))
                 .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    let item = &items_peek[item_idx];
                     this.open_quick_peek(
                         QuickPeekTarget {
-                            type_name: peek_type.clone(),
-                            id: peek_id.clone(),
+                            type_name: item.r#type.clone(),
+                            id: item.id.clone(),
                             video_id: None,
-                            title: peek_title.clone(),
-                            preview: Some(peek_preview.clone()),
+                            title: item.name.clone(),
+                            preview: Some(item.clone()),
                         },
                         cx,
                     );
                 }))
                 .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let item = &items_ctx[item_idx];
                     this.open_browsing_context_menu(
                         BrowsingContextMenu::new(
                             ev.position,
-                            ctx_type.clone(),
-                            ctx_id.clone(),
-                            ctx_title.clone(),
+                            item.r#type.clone(),
+                            item.id.clone(),
+                            item.name.clone(),
                         )
-                        .preview(Some(ctx_preview.clone()))
+                        .preview(Some(item.clone()))
                         .is_in_library(in_library)
                         .is_watched(is_watched),
                         cx,
                     );
                 }))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let item = &items_hover[item_idx];
                     this.on_card_hover_prefetch(
-                        &hover_type,
-                        &hover_id,
-                        hover_bg.as_deref(),
+                        &item.r#type,
+                        &item.id,
+                        item.background.as_ref().map(|u| u.as_str()),
                         *hovered,
                         cx,
                     );
@@ -1946,27 +1919,27 @@ impl AppShell {
                 .id(("board-shelf-carousel", raw_index))
                 .w_full()
                 .h(px(card_h + 4.0))
+                .flex_shrink_0()
                 .overflow_x_scroll()
                 .track_scroll(&shelf_scroll)
-                .on_scroll(cx.listener(move |this, ev: &ScrollEvent, _, cx| {
+                .on_scroll(cx.listener(move |this, ev: &ScrollEvent, _, _cx| {
+                    // GPUI's ScrollHandle listener notifies on offset change; only trigger pagination here.
                     let right_px = match ev.delta {
                         ScrollDelta::Pixels(p) => -f32::from(p.x),
                         ScrollDelta::Lines(l) => (-l.x) * 48.0,
                     };
-                    if right_px.abs() < 0.1 {
+                    if right_px <= 0.1 {
                         return;
                     }
                     let max_x = (scroll_ev.max_offset().x / px(1.0)).max(0.0);
                     let cur_x = (-scroll_ev.offset().x / px(1.0)).max(0.0);
-                    if right_px > 0.0
-                        && can_load_more
+                    if can_load_more
                         && !is_loading
                         && max_x > 0.0
                         && cur_x + right_px + 320.0 >= max_x
                     {
                         this.core.load_board_next_page(raw_index);
                     }
-                    cx.notify();
                 }))
                 .child(
                     div()
@@ -2000,14 +1973,14 @@ impl AppShell {
         let pinned_badge = is_pinned.then(|| {
             div()
                 .flex_shrink_0()
-                .px(sp(8.0))
-                .py(sp(2.0))
+                .px(theme.sp(8.0))
+                .py(theme.sp(2.0))
                 .rounded(px(RADIUS_PILL))
                 .bg(rgba(theme.accent_soft))
                 .border_1()
                 .border_color(rgba(theme.border_accent))
                 .font(mono_font())
-                .text_size(sp(10.5))
+                .text_size(theme.sp(10.5))
                 .text_color(rgb(accent_ink))
                 .child("Pinned")
                 .into_any_element()
@@ -2017,7 +1990,7 @@ impl AppShell {
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(sp(6.0))
+            .gap(theme.sp(6.0))
             .child(render_shelf_icon_button(
                 ("shelf-prev", raw_index),
                 IconName::ChevronLeft,
@@ -2079,9 +2052,9 @@ impl AppShell {
                 div()
                     .id(("shelf-see-all", raw_index))
                     .cursor_pointer()
-                    .h(sp(30.0))
-                    .px(sp(11.0))
-                    .ml(sp(4.0))
+                    .h(theme.sp(30.0))
+                    .px(theme.sp(11.0))
+                    .ml(theme.sp(4.0))
                     .rounded(px(RADIUS_PILL))
                     .bg(rgba(theme.glass_trough_bg))
                     .border_1()
@@ -2093,9 +2066,9 @@ impl AppShell {
                     })
                     .flex()
                     .items_center()
-                    .gap(sp(4.0))
+                    .gap(theme.sp(4.0))
                     .font(ui_sans(FontWeight::MEDIUM))
-                    .text_size(sp(12.5))
+                    .text_size(theme.sp(12.5))
                     .text_color(rgb(theme.text_secondary))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2120,16 +2093,20 @@ impl AppShell {
             SectionHeader::new(meta.title.clone())
                 .subtitle(meta.subtitle.clone().map(SharedString::from))
                 .inline_badge(pinned_badge)
-                .right_slot(Some(shelf_controls.into_any_element())),
+                .right_slot(Some(shelf_controls.into_any_element()))
+                .single_line(true),
         );
 
+        // Exact `.h(px(shelf_total_h)).overflow_hidden()` matches spacer height so
+        // `max_offset_y` stays strictly invariant when shelves cross overscan boundaries.
         div()
             .id(("board-shelf", raw_index))
             .w_full()
-            .min_h(px(shelf_total_h))
+            .h(px(shelf_total_h))
+            .overflow_hidden()
             .flex()
             .flex_col()
-            .gap(sp(SHELF_HEADER_GAP_PX))
+            .gap(theme.sp(SHELF_HEADER_GAP_PX))
             .child(shelf_header)
             .child(body_el)
     }
@@ -2165,8 +2142,8 @@ impl AppShell {
                         div()
                             .id("btn-board-hidden-drawer")
                             .cursor_pointer()
-                            .h(sp(36.0))
-                            .px(sp(14.0))
+                            .h(theme.sp(36.0))
+                            .px(theme.sp(14.0))
                             .rounded(px(RADIUS_PILL))
                             .bg(rgba(theme.glass_trough_bg))
                             .border_1()
@@ -2183,7 +2160,7 @@ impl AppShell {
                             .items_center()
                             .gap(px(8.0))
                             .font(ui_sans(FontWeight::MEDIUM))
-                            .text_size(sp(13.0))
+                            .text_size(theme.sp(13.0))
                             .text_color(if is_open {
                                 rgb(theme.text_primary)
                             } else {
@@ -2227,7 +2204,7 @@ impl AppShell {
                                     this.restore_all_hidden_shelves(cx);
                                 }),
                             )
-                            .h(sp(34.0))
+                            .h(theme.sp(34.0))
                             .rounded(px(RADIUS_PILL)),
                         )
                     }),
@@ -2253,8 +2230,8 @@ impl AppShell {
                             div()
                                 .id(("btn-board-restore-shelf", idx))
                                 .cursor_pointer()
-                                .h(sp(34.0))
-                                .px(sp(12.0))
+                                .h(theme.sp(34.0))
+                                .px(theme.sp(12.0))
                                 .rounded(px(RADIUS_CONTROL))
                                 .bg(rgba(theme.glass_card_bg))
                                 .border_1()
@@ -2267,7 +2244,7 @@ impl AppShell {
                                 .items_center()
                                 .gap(px(8.0))
                                 .font(ui_sans(FontWeight::MEDIUM))
-                                .text_size(sp(12.5))
+                                .text_size(theme.sp(12.5))
                                 .text_color(rgb(theme.text_primary))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -3593,5 +3570,57 @@ mod tests {
             compute_dock_scroll_target_x(300.0, 800.0, 600.0, 1, 214.0, 12.0),
             Some(226.0)
         );
+    }
+
+    #[test]
+    fn shelf_total_height_covers_single_line_header_gap_and_card_across_densities_and_scales() {
+        use crate::theme::{build_palette, AccentChoice, CardDensityChoice, ThemePreset};
+
+        for ui_scale in [0.9_f32, 1.0, 1.1, 1.25] {
+            // Single-line SectionHeader rendered height:
+            // - title line: 26.0 * 1.1 = 28.6 * ui_scale; right controls height: 30.0 * ui_scale.
+            // - with subtitle: 28.6 + 2.0 (gap) + 16.0 (explicit subtitle line-height) = 46.6 * ui_scale.
+            let title_only_header_h = (26.0 * 1.1_f32).max(30.0) * ui_scale;
+            let subtitle_header_h = (26.0 * 1.1 + 2.0 + 16.0) * ui_scale;
+            let header_gap_h = (SHELF_HEADER_GAP_PX * ui_scale).ceil();
+
+            for density in CardDensityChoice::ALL {
+                let theme = build_palette(
+                    ThemePreset::EtherealDark,
+                    AccentChoice::EmberCoral,
+                    true,
+                    ui_scale,
+                    density,
+                );
+                let poster_metrics = PosterMetrics::from_theme(&theme);
+
+                for aspect in [
+                    PosterAspect::Portrait2x3,
+                    PosterAspect::Square1x1,
+                    PosterAspect::Landscape16x9,
+                ] {
+                    let (_card_w, img_h, card_h) = shelf_card_dimensions(aspect, &theme);
+                    assert!(
+                        card_h >= img_h + poster_metrics.metadata_height_px,
+                        "card_h ({card_h}) must fit poster ({img_h}) + meta ({}) at scale {ui_scale}",
+                        poster_metrics.metadata_height_px
+                    );
+
+                    let total_no_sub = shelf_total_height_px(card_h, false, ui_scale);
+                    let required_no_sub = title_only_header_h + header_gap_h + (card_h + 4.0);
+                    assert!(
+                        total_no_sub >= required_no_sub,
+                        "shelf height without subtitle ({total_no_sub}) < required ({required_no_sub}) at scale {ui_scale}, density {density:?}, aspect {aspect:?}"
+                    );
+
+                    let total_with_sub = shelf_total_height_px(card_h, true, ui_scale);
+                    let required_with_sub = subtitle_header_h + header_gap_h + (card_h + 4.0);
+                    assert!(
+                        total_with_sub >= required_with_sub,
+                        "shelf height with subtitle ({total_with_sub}) < required ({required_with_sub}) at scale {ui_scale}, density {density:?}, aspect {aspect:?}"
+                    );
+                }
+            }
+        }
     }
 }

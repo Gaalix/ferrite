@@ -1,36 +1,29 @@
 use std::{
-    cmp::Reverse,
-    collections::{HashMap, HashSet},
+    cmp::{Ordering, Reverse},
+    collections::HashSet,
+    hash::{Hash, Hasher},
     ops::Range,
     sync::Arc,
 };
 
-use gpui::{
-    div, img, prelude::*, px, rgb, rgba, AnyElement, Context, ElementId, FontWeight, MouseButton,
-    MouseDownEvent, SharedString,
-};
+use gpui::{div, img, prelude::*, px, rgb, rgba, Context, FontWeight, MouseButton, SharedString};
 use stremio_core_runtime::{EditorialMediaHit, PersonFilmography};
 
 use crate::{
     icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
-    state::{
-        AppRoute, BrowsingContextMenu, KbFocusableCard, LibraryStatusTab, PersonDeptFilter,
-        QuickPeekTarget,
-    },
+    state::{AppRoute, KbFocusableCard, PersonDeptFilter},
     theme::{
-        active_theme, editorial_serif, mono_font, poster_card_shadow, sentence_case_label, sp,
-        ui_sans, RADIUS_CARD, RADIUS_PILL, RADIUS_POSTER,
+        active_theme, editorial_serif, mono_font, poster_card_shadow, sentence_case_label, ui_sans,
+        RADIUS_CARD, RADIUS_PILL, RADIUS_POSTER,
     },
     ui::{
         choice_pill, compute_app_grid_metrics, glass_segmented_bar, glass_segmented_item,
         meta_divider, neutral_chip, page_container, render_empty_state, render_page_header,
-        render_poster_card, render_section_header, EmptyStateProps, PageHeader, PageWidth,
-        PosterCardProps, PosterMetrics, SectionHeader,
+        render_section_header, EmptyStateProps, PageHeader, PageWidth, PosterMetrics,
+        SectionHeader,
     },
-    views::search_view::{
-        editorial_hit_to_meta_preview, hit_library_status, hit_target_id, person_initials,
-    },
+    views::search_view::{hit_target_id, hit_target_id_ref, person_initials},
     virtual_grid::{slice_row_items, PosterAspect},
 };
 
@@ -61,52 +54,62 @@ fn truncate_bio_at_word_boundary(bio: &str, max_chars: usize) -> (String, bool) 
     (format!("{prefix}..."), true)
 }
 
+const CREW_JOB_TOKENS: &[&str] = &[
+    "director",
+    "co-director",
+    "series director",
+    "assistant director",
+    "writer",
+    "screenplay",
+    "story",
+    "creator",
+    "producer",
+    "executive producer",
+    "co-producer",
+    "associate producer",
+    "line producer",
+    "cinematography",
+    "director of photography",
+    "editor",
+    "film editor",
+    "composer",
+    "original music composer",
+    "music",
+    "costume design",
+    "production design",
+    "casting",
+    "art direction",
+];
+
 fn is_directing_role(role: &str) -> bool {
     role.split(&[',', '/', '&'][..]).any(|part| {
-        matches!(
-            part.trim().to_ascii_lowercase().as_str(),
-            "director" | "co-director" | "series director"
-        )
+        let trimmed = part.trim();
+        trimmed.eq_ignore_ascii_case("director")
+            || trimmed.eq_ignore_ascii_case("co-director")
+            || trimmed.eq_ignore_ascii_case("series director")
     })
 }
 
 fn is_crew_job_token(part: &str) -> bool {
-    matches!(
-        part.trim().to_ascii_lowercase().as_str(),
-        "director"
-            | "co-director"
-            | "series director"
-            | "assistant director"
-            | "writer"
-            | "screenplay"
-            | "story"
-            | "creator"
-            | "producer"
-            | "executive producer"
-            | "co-producer"
-            | "associate producer"
-            | "line producer"
-            | "cinematography"
-            | "director of photography"
-            | "editor"
-            | "film editor"
-            | "composer"
-            | "original music composer"
-            | "music"
-            | "costume design"
-            | "production design"
-            | "casting"
-            | "art direction"
-    )
+    let trimmed = part.trim();
+    CREW_JOB_TOKENS
+        .iter()
+        .any(|job| trimmed.eq_ignore_ascii_case(job))
 }
 
 fn is_crew_only_role(role: &str) -> bool {
-    let parts: Vec<&str> = role
+    let mut has_any = false;
+    for part in role
         .split(&[',', '/', '&'][..])
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .collect();
-    !parts.is_empty() && parts.into_iter().all(is_crew_job_token)
+    {
+        has_any = true;
+        if !is_crew_job_token(part) {
+            return false;
+        }
+    }
+    has_any
 }
 
 fn format_person_credit_subtitle(hit: &EditorialMediaHit) -> Option<SharedString> {
@@ -116,8 +119,8 @@ fn format_person_credit_subtitle(hit: &EditorialMediaHit) -> Option<SharedString
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let lower = raw_role.to_ascii_lowercase();
-        let formatted = if lower.starts_with("as ")
+        let starts_with_as = raw_role.len() >= 3 && raw_role.as_bytes()[..3].eq_ignore_ascii_case(b"as ");
+        let formatted = if starts_with_as
             || raw_role.eq_ignore_ascii_case("cast")
             || raw_role.eq_ignore_ascii_case("self")
             || raw_role.eq_ignore_ascii_case("himself")
@@ -140,16 +143,53 @@ fn format_person_credit_subtitle(hit: &EditorialMediaHit) -> Option<SharedString
 }
 
 fn parse_credit_year(hit: &EditorialMediaHit) -> u32 {
-    hit.year
-        .as_deref()
-        .map(|y| {
-            y.trim()
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-        })
-        .and_then(|digits| digits.parse::<u32>().ok())
-        .unwrap_or(0)
+    let Some(raw) = hit.year.as_deref() else {
+        return 0;
+    };
+    let mut acc: u32 = 0;
+    let mut saw_digit = false;
+    for &b in raw.trim().as_bytes() {
+        if b.is_ascii_digit() {
+            saw_digit = true;
+            acc = acc.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+        } else {
+            break;
+        }
+    }
+    if saw_digit {
+        acc
+    } else {
+        0
+    }
+}
+
+fn cmp_ascii_case_insensitive(a: &str, b: &str) -> Ordering {
+    for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
+        let ord = ba.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+#[derive(Clone, Copy)]
+struct AsciiCaseInsensitiveStr<'a>(&'a str);
+
+impl PartialEq for AsciiCaseInsensitiveStr<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(other.0)
+    }
+}
+
+impl Eq for AsciiCaseInsensitiveStr<'_> {}
+
+impl Hash for AsciiCaseInsensitiveStr<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for &b in self.0.as_bytes() {
+            state.write_u8(b.to_ascii_lowercase());
+        }
+    }
 }
 
 fn filter_and_sort_person_credits(
@@ -157,13 +197,16 @@ fn filter_and_sort_person_credits(
     dept_filter: PersonDeptFilter,
     sort_recent: bool,
 ) -> Vec<EditorialMediaHit> {
-    let mut seen: HashSet<(String, String)> =
+    let mut seen: HashSet<(AsciiCaseInsensitiveStr<'_>, &str)> =
         HashSet::with_capacity(filmo.movies.len() + filmo.series.len());
     let mut credits: Vec<EditorialMediaHit> = Vec::new();
     let is_primary_director = filmo.department.eq_ignore_ascii_case("Directing");
 
     for hit in filmo.movies.iter().chain(filmo.series.iter()) {
-        let key = (hit.media_type.to_ascii_lowercase(), hit_target_id(hit));
+        let key = (
+            AsciiCaseInsensitiveStr(hit.media_type.as_str()),
+            hit_target_id_ref(hit),
+        );
         if !seen.insert(key) {
             continue;
         }
@@ -185,12 +228,12 @@ fn filter_and_sort_person_credits(
             Reverse(parse_credit_year(a))
                 .cmp(&Reverse(parse_credit_year(b)))
                 .then_with(|| Reverse(a.score).cmp(&Reverse(b.score)))
-                .then_with(|| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+                .then_with(|| cmp_ascii_case_insensitive(&a.title, &b.title))
         } else {
             Reverse(a.score)
                 .cmp(&Reverse(b.score))
                 .then_with(|| Reverse(parse_credit_year(a)).cmp(&Reverse(parse_credit_year(b))))
-                .then_with(|| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+                .then_with(|| cmp_ascii_case_insensitive(&a.title, &b.title))
         }
     });
 
@@ -198,100 +241,6 @@ fn filter_and_sort_person_credits(
 }
 
 impl AppShell {
-    #[allow(clippy::too_many_arguments)]
-    fn render_person_credit_card(
-        &self,
-        element_id: impl Into<ElementId>,
-        hit: &EditorialMediaHit,
-        subtitle: Option<SharedString>,
-        image_height_px: f32,
-        library_statuses: &HashMap<String, LibraryStatusTab>,
-        is_focused: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let target_id = hit_target_id(hit);
-        let lib_status = hit_library_status(hit, library_statuses);
-        let in_library = lib_status.is_some();
-        let is_watched = lib_status == Some(LibraryStatusTab::Watched);
-        let poster_tex = hit
-            .poster_url
-            .as_deref()
-            .and_then(|u| self.poster_cache.resolve_poster_image(u));
-        let preview = editorial_hit_to_meta_preview(hit);
-
-        let open_type = hit.media_type.clone();
-        let open_id = target_id.clone();
-        let play_type = hit.media_type.clone();
-        let play_id = target_id.clone();
-        let toggle_preview = preview.clone();
-        let peek_type = hit.media_type.clone();
-        let peek_id = target_id.clone();
-        let peek_title = hit.title.clone();
-        let peek_preview = preview.clone();
-        let ctx_type = hit.media_type.clone();
-        let ctx_id = target_id.clone();
-        let ctx_title = hit.title.clone();
-        let ctx_preview = preview;
-        let hover_type = hit.media_type.clone();
-        let hover_id = target_id.clone();
-        let hover_bg = hit.backdrop_url.clone();
-
-        let props = PosterCardProps::new(element_id, hit.title.clone(), target_id)
-            .subtitle(subtitle)
-            .image(poster_tex)
-            .aspect(PosterAspect::Portrait2x3)
-            .image_height_px(Some(image_height_px))
-            .status_tab(lib_status)
-            .imdb_rating(hit.imdb_rating.clone().map(SharedString::from))
-            .in_library(in_library)
-            .is_focused(is_focused)
-            .on_open(cx.listener(move |this, _, _, cx| {
-                this.open_editorial_media_hit(open_type.clone(), open_id.clone(), None, cx);
-            }))
-            .on_quick_play(cx.listener(move |this, _, _, cx| {
-                this.trigger_editorial_quick_play(play_type.clone(), play_id.clone(), cx);
-            }))
-            .on_toggle_library(cx.listener(move |this, _, _, cx| {
-                this.core.toggle_library_item(toggle_preview.clone());
-                cx.notify();
-            }))
-            .on_quick_peek(cx.listener(move |this, _, _, cx| {
-                this.open_quick_peek(
-                    QuickPeekTarget {
-                        type_name: peek_type.clone(),
-                        id: peek_id.clone(),
-                        video_id: None,
-                        title: peek_title.clone(),
-                        preview: Some(peek_preview.clone()),
-                    },
-                    cx,
-                );
-            }))
-            .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                let menu = BrowsingContextMenu::new(
-                    ev.position,
-                    ctx_type.clone(),
-                    ctx_id.clone(),
-                    ctx_title.clone(),
-                )
-                .preview(Some(ctx_preview.clone()))
-                .is_in_library(in_library)
-                .is_watched(is_watched);
-                this.open_browsing_context_menu(menu, cx);
-            }))
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                this.on_card_hover_prefetch(
-                    &hover_type,
-                    &hover_id,
-                    hover_bg.as_deref(),
-                    *hovered,
-                    cx,
-                );
-            }));
-
-        render_poster_card(props)
-    }
-
     pub fn render_person_view(
         &mut self,
         _route_person_key: &str,
@@ -300,48 +249,10 @@ impl AppShell {
     ) -> impl IntoElement {
         let t = active_theme();
         let accent_ink = if t.is_light { t.accent_press } else { t.accent };
-        let filmo = self.active_person_filmography.clone();
-        let display_name = filmo
-            .as_ref()
-            .filter(|f| !f.name.trim().is_empty())
-            .map(|f| f.name.clone())
-            .unwrap_or_else(|| route_name.to_owned());
-        let department = filmo
-            .as_ref()
-            .map(|f| f.department.clone())
-            .unwrap_or_else(|| "Acting".to_owned());
-        let headshot_tex = filmo
-            .as_ref()
-            .and_then(|f| f.headshot_url.as_deref())
-            .and_then(|u| self.poster_cache.resolve_poster_image(u));
-        let initials = person_initials(&display_name);
 
-        let library_statuses = self.cached_library_statuses();
-
-        let has_tmdb = {
-            let cfg = self.core.private_integrations();
-            cfg.tmdb_enabled && cfg.has_tmdb_configured()
-        };
-
-        let bio_block = filmo
-            .as_ref()
-            .and_then(|f| f.biography.as_deref())
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .map(|bio| {
-                let is_long = bio.chars().count() > BIO_COLLAPSE_CHARS;
-                let text = if self.person_bio_expanded || !is_long {
-                    bio.to_owned()
-                } else {
-                    truncate_bio_at_word_boundary(bio, BIO_COLLAPSE_CHARS).0
-                };
-                (text, is_long)
-            });
-
-        let total_raw_credits = filmo
-            .as_ref()
-            .map_or(0, |f| f.movies.len() + f.series.len());
-        let credits: Vec<EditorialMediaHit> = filmo
+        let viewport_w = self.viewport_size_px.0;
+        let credits: Vec<EditorialMediaHit> = self
+            .active_person_filmography
             .as_ref()
             .map(|f| {
                 filter_and_sort_person_credits(
@@ -353,7 +264,6 @@ impl AppShell {
             .unwrap_or_default();
 
         let total_credits = credits.len();
-        let viewport_w = self.viewport_size_px.0;
         let poster = PosterMetrics::from_theme(&t);
         let grid_gap = poster.gap_px;
         let metrics = compute_app_grid_metrics(
@@ -383,7 +293,43 @@ impl AppShell {
             .collect();
         self.set_kb_focus_items(kb_items);
 
-        let credits_arc = Arc::new(credits);
+        let filmo = self.active_person_filmography.as_ref();
+        let display_name = filmo
+            .filter(|f| !f.name.trim().is_empty())
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| route_name.to_owned());
+        let department = filmo
+            .map(|f| f.department.clone())
+            .unwrap_or_else(|| "Acting".to_owned());
+        let headshot_tex = filmo
+            .and_then(|f| f.headshot_url.as_deref())
+            .and_then(|u| self.poster_cache.resolve_poster_image(u));
+        let initials = person_initials(&display_name);
+
+        let library_statuses = self.cached_library_statuses();
+
+        let has_tmdb = {
+            let cfg = self.core.private_integrations();
+            cfg.tmdb_enabled && cfg.has_tmdb_configured()
+        };
+
+        let bio_block = filmo
+            .and_then(|f| f.biography.as_deref())
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(|bio| {
+                let is_long = bio.chars().count() > BIO_COLLAPSE_CHARS;
+                let text = if self.person_bio_expanded || !is_long {
+                    bio.to_owned()
+                } else {
+                    truncate_bio_at_word_boundary(bio, BIO_COLLAPSE_CHARS).0
+                };
+                (text, is_long)
+            });
+
+        let total_raw_credits = filmo.map_or(0, |f| f.movies.len() + f.series.len());
+
+        let credits_arc: Arc<[EditorialMediaHit]> = Arc::from(credits);
         let statuses_arc = Arc::clone(&library_statuses);
 
         let total_grid_h = row_count as f32 * row_stride_px;
@@ -433,25 +379,25 @@ impl AppShell {
                     ))
                     .child(
                         div()
-                            .p(sp(24.0))
+                            .p(t.sp(24.0))
                             .rounded(px(RADIUS_CARD))
                             .bg(rgba(t.glass_card_bg))
                             .border_1()
                             .border_color(rgba(t.glass_border))
                             .flex()
                             .items_start()
-                            .gap(sp(24.0))
+                            .gap(t.sp(24.0))
                             .child(
                                 div()
-                                    .w(sp(128.0))
-                                    .h(sp(168.0))
+                                    .w(t.sp(128.0))
+                                    .h(t.sp(168.0))
                                     .flex_shrink_0()
                                     .rounded(px(RADIUS_POSTER))
                                     .overflow_hidden()
                                     .bg(rgb(t.bg_elevated))
                                     .border_1()
                                     .border_color(rgba(t.glass_border))
-                                    .shadow(poster_card_shadow())
+                                    .when(t.is_light, |el| el.shadow(poster_card_shadow()))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -463,7 +409,7 @@ impl AppShell {
                                     } else {
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(sp(38.0))
+                                            .text_size(t.sp(38.0))
                                             .text_color(rgb(t.text_secondary))
                                             .child(initials)
                                             .into_any_element()
@@ -475,13 +421,13 @@ impl AppShell {
                                     .min_w(px(0.0))
                                     .flex()
                                     .flex_col()
-                                    .gap(sp(10.0))
+                                    .gap(t.sp(10.0))
                                     .child(
                                         div()
                                             .flex()
                                             .flex_wrap()
                                             .items_center()
-                                            .gap(sp(10.0))
+                                            .gap(t.sp(10.0))
                                             .font(mono_font())
                                             .text_xs()
                                             .text_color(rgb(t.text_secondary))
@@ -491,32 +437,30 @@ impl AppShell {
                                                     .child(department),
                                             )
                                             .when_some(
-                                                filmo.as_ref().and_then(|f| f.birthday.clone()),
+                                                filmo.and_then(|f| f.birthday.as_deref()),
                                                 |el, bday| {
                                                     el.child(meta_divider())
                                                         .child(format!("Born {bday}"))
                                                 },
                                             )
                                             .when_some(
-                                                filmo
-                                                    .as_ref()
-                                                    .and_then(|f| f.place_of_birth.clone()),
+                                                filmo.and_then(|f| f.place_of_birth.clone()),
                                                 |el, pob| el.child(meta_divider()).child(pob),
                                             ),
                                     )
                                     .when_some(bio_block, |el, (bio_text, is_long)| {
                                         el.child(
                                             div()
-                                                .mt(sp(4.0))
+                                                .mt(t.sp(4.0))
                                                 .max_w(px(780.0))
                                                 .flex()
                                                 .flex_col()
                                                 .items_start()
-                                                .gap(sp(8.0))
+                                                .gap(t.sp(8.0))
                                                 .child(
                                                     div()
-                                                        .text_size(sp(14.0))
-                                                        .line_height(sp(21.0))
+                                                        .text_size(t.sp(14.0))
+                                                        .line_height(t.sp(21.0))
                                                         .text_color(rgb(t.text_secondary))
                                                         .child(bio_text),
                                                 )
@@ -525,8 +469,8 @@ impl AppShell {
                                                         div()
                                                             .id("person-bio-toggle")
                                                             .cursor_pointer()
-                                                            .h(sp(28.0))
-                                                            .px(sp(11.0))
+                                                            .h(t.sp(28.0))
+                                                            .px(t.sp(11.0))
                                                             .rounded(px(RADIUS_PILL))
                                                             .bg(rgba(t.glass_trough_bg))
                                                             .border_1()
@@ -539,9 +483,9 @@ impl AppShell {
                                                             })
                                                             .flex()
                                                             .items_center()
-                                                            .gap(sp(5.0))
+                                                            .gap(t.sp(5.0))
                                                             .font(ui_sans(FontWeight::MEDIUM))
-                                                            .text_size(sp(12.0))
+                                                            .text_size(t.sp(12.0))
                                                             .text_color(rgb(accent_ink))
                                                             .on_mouse_down(
                                                                 MouseButton::Left,
@@ -578,7 +522,7 @@ impl AppShell {
                             .flex()
                             .flex_wrap()
                             .items_center()
-                            .gap(sp(10.0))
+                            .gap(t.sp(10.0))
                             .child(glass_segmented_bar("person-dept-filter").children(
                                 PersonDeptFilter::ALL.into_iter().enumerate().map(|(idx, dept)| {
                                     glass_segmented_item(
@@ -686,9 +630,10 @@ impl AppShell {
                                                                     .min_w(px(0.0))
                                                                     .h_full()
                                                                     .child(
-                                                                        this.render_person_credit_card(
+                                                                        this.render_editorial_poster_card(
                                                                             ("person-credit-card", item_idx),
-                                                                            hit,
+                                                                            &credits_arc,
+                                                                            item_idx,
                                                                             sub,
                                                                             image_height_px,
                                                                             &statuses_arc,

@@ -138,6 +138,7 @@ pub struct AppShell {
     pub input_selected_all: HashSet<FocusedInput>,
     pub kb_focus_index: Option<usize>,
     pub kb_focus_items: Vec<KbFocusableCard>,
+    pub kb_focus_items_key: Option<u64>,
 
     pub board_state_rev: u64,
     pub discover_state_rev: u64,
@@ -153,9 +154,15 @@ pub struct AppShell {
     pub memoized_library_statuses: parking_lot::Mutex<(u64, Arc<HashMap<String, LibraryStatusTab>>)>,
     pub memoized_enriched_streams: Option<MemoizedEnrichedStreams>,
     pub memoized_discover_catalog: parking_lot::Mutex<Option<(u64, DiscoverViewSnapshot)>>,
+    pub memoized_discover_unwatched:
+        parking_lot::Mutex<Option<(u64, u64, bool, Arc<Vec<usize>>, usize)>>,
     pub discover_last_next_page_len: Cell<Option<usize>>,
     pub memoized_library_items: parking_lot::Mutex<Option<MemoizedLibraryView>>,
+    pub memoized_library_aux_cache: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     pub memoized_board_cache: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    pub memoized_calendar_cache: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    pub memoized_meta_details_cache:
+        parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
 
     pub auth_email_input: String,
     pub auth_password_input: String,
@@ -346,6 +353,7 @@ impl AppShell {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let _ = this.update(cx, |shell, cx| {
+                            shell.bump_state_revisions(&[DesktopModelField::Ctx]);
                             shell.refresh_cached_auth();
                             shell.sync_player_from_core_model(cx);
                             cx.notify();
@@ -468,6 +476,7 @@ impl AppShell {
             input_selected_all: HashSet::new(),
             kb_focus_index: None,
             kb_focus_items: Vec::new(),
+            kb_focus_items_key: None,
             board_state_rev: 1,
             discover_state_rev: 1,
             library_state_rev: 1,
@@ -481,9 +490,13 @@ impl AppShell {
             memoized_library_statuses: parking_lot::Mutex::new((0, Arc::new(HashMap::new()))),
             memoized_enriched_streams: None,
             memoized_discover_catalog: parking_lot::Mutex::new(None),
+            memoized_discover_unwatched: parking_lot::Mutex::new(None),
             discover_last_next_page_len: Cell::new(None),
             memoized_library_items: parking_lot::Mutex::new(None),
+            memoized_library_aux_cache: parking_lot::Mutex::new(None),
             memoized_board_cache: parking_lot::Mutex::new(None),
+            memoized_calendar_cache: parking_lot::Mutex::new(None),
+            memoized_meta_details_cache: parking_lot::Mutex::new(None),
             auth_email_input: String::new(),
             auth_password_input: String::new(),
             addon_url_input: cli_addon_url.clone().unwrap_or_default(),
@@ -865,6 +878,7 @@ impl AppShell {
                                 .is_some_and(|p| p.id == req_id)
                             {
                                 shell.synthetic_tmdb_meta = Some((req_id, synthetic));
+                                shell.memoized_meta_details_cache.lock().take();
                                 cx.notify();
                             }
                         });
@@ -1103,6 +1117,7 @@ impl AppShell {
     }
 
     pub fn set_kb_focus_items(&mut self, items: Vec<KbFocusableCard>) {
+        self.kb_focus_items_key = None;
         self.kb_focus_items = items;
         if let Some(idx) = self.kb_focus_index {
             if self.kb_focus_items.is_empty() {
@@ -1111,6 +1126,18 @@ impl AppShell {
                 self.kb_focus_index = Some(self.kb_focus_items.len() - 1);
             }
         }
+    }
+
+    pub fn sync_kb_focus_items_cached(
+        &mut self,
+        key: u64,
+        build: impl FnOnce() -> Vec<KbFocusableCard>,
+    ) {
+        if self.kb_focus_items_key == Some(key) {
+            return;
+        }
+        self.set_kb_focus_items(build());
+        self.kb_focus_items_key = Some(key);
     }
 
     pub fn clear_palette_query(&mut self, cx: &mut Context<Self>) {
@@ -2360,6 +2387,7 @@ impl AppShell {
         self.clear_scrollbar_interaction();
         self.kb_focus_index = None;
         self.kb_focus_items.clear();
+        self.kb_focus_items_key = None;
     }
 
     fn apply_nav_entry(&mut self, entry: NavHistoryEntry, cx: &mut Context<Self>) {
@@ -2983,6 +3011,7 @@ impl AppShell {
                     );
                     if still_on_tmdb_route {
                         shell.synthetic_tmdb_meta = Some((id, synthetic));
+                        shell.memoized_meta_details_cache.lock().take();
                         cx.notify();
                     }
                 });
@@ -3433,6 +3462,7 @@ impl AppShell {
         self.command_palette_open = false;
         self.kb_focus_index = None;
         self.kb_focus_items.clear();
+        self.kb_focus_items_key = None;
         self.expanded_stream_rows.clear();
         self.next_episode_prewarmed = false;
         self.prewarmed_next = None;

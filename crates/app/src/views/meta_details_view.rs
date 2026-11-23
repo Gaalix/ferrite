@@ -70,6 +70,17 @@ const HERO_GLASS_BORDER: u32 = 0xFFFFFF26;
 const HERO_GLASS_BORDER_STRONG: u32 = 0xFFFFFF42;
 const HERO_DIVIDER: u32 = 0xFFFFFF24;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetaDetailsCacheKey {
+    meta_state_rev: u64,
+    library_state_rev: u64,
+    has_debrid: bool,
+    synthetic_matches: bool,
+    route_type: String,
+    route_id: String,
+    route_video_id: Option<String>,
+}
+
 struct MetaDetailsSnapshot {
     meta: MetaItem,
     meta_request: ResourceRequest,
@@ -83,6 +94,13 @@ struct MetaDetailsSnapshot {
     library_item: Option<LibraryItem>,
     watched: Option<WatchedBitField>,
     last_used_stream: Option<(Url, Stream)>,
+    seasons: Vec<u32>,
+    episodes_by_season: std::collections::HashMap<u32, Arc<Vec<Video>>>,
+}
+
+struct CachedMetaDetailsSnapshot {
+    key: MetaDetailsCacheKey,
+    snapshot: MetaDetailsSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -167,117 +185,200 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_debrid = self.has_debrid_access();
-        let synthetic_fallback = self
+        let synthetic_matches = self
             .synthetic_tmdb_meta
             .as_ref()
-            .and_then(|(sid, m)| (sid == route_id).then(|| m.clone()));
-        let memo_slot = &mut self.memoized_meta_streams;
+            .is_some_and(|(sid, _)| sid == route_id);
 
-        let details_snap = self.core.with_model(|model| {
-            let meta_pair = resolve_ready_meta_item(&model.meta_details.meta_items)
-                .map(|(m, req)| (m.clone(), req))
-                .or_else(|| {
-                    synthetic_fallback.map(|m| {
-                        let req = model
-                            .meta_details
-                            .meta_items
-                            .first()
-                            .map(|r| r.request.clone())
-                            .unwrap_or_else(|| {
-                                build_default_meta_request(
-                                    &CINEMETA_URL,
-                                    &m.preview.r#type,
-                                    &m.preview.id,
-                                )
-                            });
-                        (m, req)
+        let cached_hit = {
+            let guard = self.memoized_meta_details_cache.lock();
+            guard.as_ref().and_then(|any_arc| {
+                Arc::clone(any_arc)
+                    .downcast::<CachedMetaDetailsSnapshot>()
+                    .ok()
+                    .filter(|c| {
+                        c.key.meta_state_rev == self.meta_state_rev
+                            && c.key.library_state_rev == self.library_state_rev
+                            && c.key.has_debrid == has_debrid
+                            && c.key.synthetic_matches == synthetic_matches
+                            && c.key.route_type == route_type
+                            && c.key.route_id == route_id
+                            && c.key.route_video_id.as_deref() == route_video_id
                     })
-                });
-            let is_meta_loading = model
-                .meta_details
-                .meta_items
-                .iter()
-                .any(|r| matches!(r.content, Some(Loadable::Loading)));
+            })
+        };
 
-            let Some((meta, meta_request)) = meta_pair else {
-                let cached = find_cached_preview_in_model(model, route_id);
-                return Err((is_meta_loading, cached.map(Box::new)));
-            };
-
-            let selected_stream_vid = model
-                .meta_details
-                .selected
+        let (snap_arc, snapshot_fresh) = if let Some(hit) = cached_hit {
+            (hit, false)
+        } else {
+            let synthetic_fallback = self
+                .synthetic_tmdb_meta
                 .as_ref()
-                .and_then(|s| s.stream_path.as_ref())
-                .map(|p| p.id.clone());
-            let has_stream_request = selected_stream_vid.is_some();
-            let has_stream_addons = !model.ctx.profile.addons.is_empty();
+                .and_then(|(sid, m)| (sid == route_id).then(|| m.clone()));
+            let memo_slot = &mut self.memoized_meta_streams;
 
-            let in_library = model
-                .ctx
-                .library
-                .items
-                .get(&meta.preview.id)
-                .or_else(|| model.ctx.library.items.get(route_id))
-                .is_some_and(|i| !i.removed);
-            let library_item = model
-                .meta_details
-                .library_item
-                .clone()
-                .or_else(|| model.ctx.library.items.get(&meta.preview.id).cloned())
-                .or_else(|| model.ctx.library.items.get(route_id).cloned());
-            let watched = model.meta_details.watched.clone();
-            let last_used_stream =
-                model
-                    .meta_details
-                    .last_used_stream
-                    .as_ref()
-                    .and_then(|res| match &res.content {
-                        Some(Loadable::Ready(Some(stream))) => {
-                            Some((res.request.base.clone(), stream.clone()))
-                        }
-                        _ => None,
+            let details_snap = self.core.with_model(|model| {
+                let meta_pair = resolve_ready_meta_item(&model.meta_details.meta_items)
+                    .map(|(m, req)| (m.clone(), req))
+                    .or_else(|| {
+                        synthetic_fallback.map(|m| {
+                            let req = model
+                                .meta_details
+                                .meta_items
+                                .first()
+                                .map(|r| r.request.clone())
+                                .unwrap_or_else(|| {
+                                    build_default_meta_request(
+                                        &CINEMETA_URL,
+                                        &m.preview.r#type,
+                                        &m.preview.id,
+                                    )
+                                });
+                            (m, req)
+                        })
                     });
+                let is_meta_loading = model
+                    .meta_details
+                    .meta_items
+                    .iter()
+                    .any(|r| matches!(r.content, Some(Loadable::Loading)));
 
-            let active_video_id = pick_default_series_episode_id(
-                &meta,
-                selected_stream_vid.as_deref().or(route_video_id),
-                library_item
+                let Some((meta, meta_request)) = meta_pair else {
+                    let cached = find_cached_preview_in_model(model, route_id);
+                    return Err((is_meta_loading, cached.map(Box::new)));
+                };
+
+                let selected_stream_vid = model
+                    .meta_details
+                    .selected
                     .as_ref()
-                    .and_then(|li| li.state.video_id.as_deref()),
-            )
-            .unwrap_or_else(|| meta.preview.id.clone());
+                    .and_then(|s| s.stream_path.as_ref())
+                    .map(|p| p.id.clone());
+                let has_stream_request = selected_stream_vid.is_some();
+                let has_stream_addons = !model.ctx.profile.addons.is_empty();
 
-            let (addon_playable_arc, _, stream_addons_ready, stream_addons_total) =
-                sync_memoized_meta_streams(
-                    memo_slot,
-                    route_type,
-                    route_id,
-                    &active_video_id,
-                    has_debrid,
+                let in_library = model
+                    .ctx
+                    .library
+                    .items
+                    .get(&meta.preview.id)
+                    .or_else(|| model.ctx.library.items.get(route_id))
+                    .is_some_and(|i| !i.removed);
+                let library_item = model
+                    .meta_details
+                    .library_item
+                    .clone()
+                    .or_else(|| model.ctx.library.items.get(&meta.preview.id).cloned())
+                    .or_else(|| model.ctx.library.items.get(route_id).cloned());
+                let watched = model.meta_details.watched.clone();
+                let last_used_stream =
                     model
                         .meta_details
-                        .meta_streams
-                        .iter()
-                        .chain(model.meta_details.streams.iter()),
-                    &model.ctx.profile.addons,
-                );
+                        .last_used_stream
+                        .as_ref()
+                        .and_then(|res| match &res.content {
+                            Some(Loadable::Ready(Some(stream))) => {
+                                Some((res.request.base.clone(), stream.clone()))
+                            }
+                            _ => None,
+                        });
 
-            Ok(MetaDetailsSnapshot {
-                meta,
-                meta_request,
-                active_video_id,
-                addon_playable_arc,
-                stream_addons_ready,
-                stream_addons_total,
-                has_stream_request,
-                has_stream_addons,
-                in_library,
-                library_item,
-                watched,
-                last_used_stream,
-            })
-        });
+                let active_video_id = pick_default_series_episode_id(
+                    &meta,
+                    selected_stream_vid.as_deref().or(route_video_id),
+                    library_item
+                        .as_ref()
+                        .and_then(|li| li.state.video_id.as_deref()),
+                )
+                .unwrap_or_else(|| meta.preview.id.clone());
+
+                let (addon_playable_arc, _, stream_addons_ready, stream_addons_total) =
+                    sync_memoized_meta_streams(
+                        memo_slot,
+                        route_type,
+                        route_id,
+                        &active_video_id,
+                        has_debrid,
+                        model
+                            .meta_details
+                            .meta_streams
+                            .iter()
+                            .chain(model.meta_details.streams.iter()),
+                        &model.ctx.profile.addons,
+                    );
+
+                let mut seasons: Vec<u32> = meta
+                    .videos
+                    .iter()
+                    .filter_map(|v| v.series_info.as_ref().map(|s| s.season))
+                    .collect();
+                seasons.sort_unstable();
+                seasons.dedup();
+                if seasons.len() > 1 && seasons.first() == Some(&0) {
+                    let zero = seasons.remove(0);
+                    seasons.push(zero);
+                }
+                let mut episodes_by_season =
+                    std::collections::HashMap::with_capacity(seasons.len());
+                for &season in &seasons {
+                    let eps: Vec<Video> = meta
+                        .videos_by_season(season)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    episodes_by_season.insert(season, Arc::new(eps));
+                }
+
+                Ok(MetaDetailsSnapshot {
+                    meta,
+                    meta_request,
+                    active_video_id,
+                    addon_playable_arc,
+                    stream_addons_ready,
+                    stream_addons_total,
+                    has_stream_request,
+                    has_stream_addons,
+                    in_library,
+                    library_item,
+                    watched,
+                    last_used_stream,
+                    seasons,
+                    episodes_by_season,
+                })
+            });
+
+            match details_snap {
+                Ok(snapshot) => {
+                    let arc = Arc::new(CachedMetaDetailsSnapshot {
+                        key: MetaDetailsCacheKey {
+                            meta_state_rev: self.meta_state_rev,
+                            library_state_rev: self.library_state_rev,
+                            has_debrid,
+                            synthetic_matches,
+                            route_type: route_type.to_owned(),
+                            route_id: route_id.to_owned(),
+                            route_video_id: route_video_id.map(str::to_owned),
+                        },
+                        snapshot,
+                    });
+                    *self.memoized_meta_details_cache.lock() =
+                        Some(Arc::clone(&arc) as Arc<dyn std::any::Any + Send + Sync>);
+                    (arc, true)
+                }
+                Err((is_meta_loading, cached_preview)) => {
+                    self.active_scroll_suppressed.set(true);
+                    return self
+                        .render_loading_meta_details_view(
+                            route_type,
+                            route_id,
+                            is_meta_loading,
+                            cached_preview.map(|b| *b),
+                            cx,
+                        )
+                        .into_any_element();
+                }
+            }
+        };
 
         let MetaDetailsSnapshot {
             meta,
@@ -292,23 +393,22 @@ impl AppShell {
             library_item,
             watched,
             last_used_stream,
-        } = match details_snap {
-            Ok(ready) => ready,
-            Err((is_meta_loading, cached_preview)) => {
-                self.active_scroll_suppressed.set(true);
-                return self
-                    .render_loading_meta_details_view(
-                        route_type,
-                        route_id,
-                        is_meta_loading,
-                        cached_preview.map(|b| *b),
-                        cx,
-                    )
-                    .into_any_element();
-            }
-        };
+            seasons,
+            episodes_by_season,
+        } = &snap_arc.snapshot;
+        let stream_addons_ready = *stream_addons_ready;
+        let stream_addons_total = *stream_addons_total;
+        let has_stream_request = *has_stream_request;
+        let has_stream_addons = *has_stream_addons;
+        let in_library = *in_library;
 
-        self.maybe_trigger_stream_enrichments(cx);
+        if snapshot_fresh
+            || self.prowlarr_fallback_key.as_ref().is_none_or(|(t, id, vid)| {
+                t != route_type || id != &meta.preview.id || vid != active_video_id
+            })
+        {
+            self.maybe_trigger_stream_enrichments(cx);
+        }
         self.request_background_enrichment_if_needed(&meta.preview.r#type, &meta.preview.id, cx);
         let enriched = self.core.cached_enriched_meta(&meta.preview.id);
         if let Some(col_id) = enriched
@@ -320,12 +420,9 @@ impl AppShell {
         }
 
         let private_cfg = self.core.private_integrations();
-        let prowlarr_slice = if self.prowlarr_fallback_key.as_ref()
-            == Some(&(
-                route_type.to_owned(),
-                meta.preview.id.clone(),
-                active_video_id.clone(),
-            )) {
+        let prowlarr_slice = if self.prowlarr_fallback_key.as_ref().is_some_and(|(t, id, vid)| {
+            t == route_type && id == &meta.preview.id && vid == active_video_id
+        }) {
             self.prowlarr_fallback_streams.as_slice()
         } else {
             &[]
@@ -334,8 +431,8 @@ impl AppShell {
         let (all_playable_arc, available_addons_arc) = sync_memoized_enriched_streams(
             &mut self.memoized_enriched_streams,
             &meta.preview.id,
-            &active_video_id,
-            &addon_playable_arc,
+            active_video_id,
+            addon_playable_arc,
             prowlarr_slice,
             self.prowlarr_request_seq,
             private_cfg.active_debrid,
@@ -345,46 +442,30 @@ impl AppShell {
         let last_used_orig_idx =
             find_last_used_stream_index(&all_playable_arc, last_used_stream.as_ref());
 
-        let mut seasons: Vec<u32> = meta
-            .videos
-            .iter()
-            .filter_map(|v| v.series_info.as_ref().map(|s| s.season))
-            .collect();
-        seasons.sort_unstable();
-        seasons.dedup();
-        if seasons.len() > 1 && seasons.first() == Some(&0) {
-            let zero = seasons.remove(0);
-            seasons.push(zero);
-        }
-
         let active_season = self
             .selected_season
             .filter(|s| seasons.contains(s))
             .or_else(|| {
                 meta.videos
                     .iter()
-                    .find(|v| v.id == active_video_id)
+                    .find(|v| v.id == *active_video_id)
                     .and_then(|v| v.series_info.as_ref().map(|s| s.season))
             })
             .or_else(|| seasons.first().copied());
 
-        let season_episodes = Arc::new(match active_season {
-            Some(season) => meta
-                .videos_by_season(season)
-                .into_iter()
-                .cloned()
-                .collect(),
-            None => Vec::new(),
-        });
+        let season_episodes = active_season
+            .and_then(|season| episodes_by_season.get(&season))
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(Vec::new()));
 
-        let active_episode_obj = meta.videos.iter().find(|v| v.id == active_video_id);
+        let active_episode_obj = meta.videos.iter().find(|v| v.id == *active_video_id);
         let active_ep_code = active_episode_obj
             .and_then(|ep| {
                 ep.series_info
                     .as_ref()
                     .map(|si| format!("S{} E{}", si.season, si.episode))
             })
-            .or_else(|| format_movietracker_episode_code(Some(&active_video_id)));
+            .or_else(|| format_movietracker_episode_code(Some(active_video_id)));
 
         let episode_header_label = active_episode_obj.map(|ep| match &ep.series_info {
             Some(si) => format!("S{} E{} - {}", si.season, si.episode, ep.title),
@@ -841,11 +922,11 @@ impl AppShell {
                         StreamPickerPanelArgs {
                             type_name: &meta.preview.r#type,
                             meta_id: &meta.preview.id,
-                            active_video_id: &active_video_id,
+                            active_video_id,
                             title: &meta.preview.name,
                             episode_label: episode_header_label,
                             runtime_minutes,
-                            meta_request,
+                            meta_request: meta_request.clone(),
                             resume_secs,
                             has_debrid,
                             all_playable_arc,
@@ -1378,25 +1459,16 @@ impl AppShell {
                             }
                         };
 
-                        let open_type = hit.media_type.clone();
-                        let open_id = hit_id.clone();
-                        let play_type = hit.media_type.clone();
-                        let play_id = hit_id.clone();
-                        let hover_type = hit.media_type.clone();
-                        let hover_id = hit_id.clone();
-                        let hover_bg = hit.backdrop_url.clone();
-                        let ctx_type = hit.media_type.clone();
-                        let ctx_id = hit_id.clone();
-                        let ctx_title = hit.title.clone();
-                        let peek_type = hit.media_type.clone();
-                        let peek_id = hit_id.clone();
-                        let peek_title = hit.title.clone();
-                        let preview_for_toggle = editorial_hit_to_preview(hit, &hit_id);
-                        let preview_for_peek = preview_for_toggle.clone();
-                        let preview_for_ctx = preview_for_toggle.clone();
+                        let hit_arc = Arc::new((hit_id, hit.clone()));
+                        let open_hit = Arc::clone(&hit_arc);
+                        let play_hit = Arc::clone(&hit_arc);
+                        let toggle_hit = Arc::clone(&hit_arc);
+                        let peek_hit = Arc::clone(&hit_arc);
+                        let hover_hit = Arc::clone(&hit_arc);
+                        let ctx_hit = Arc::clone(&hit_arc);
 
                         render_poster_card(
-                            PosterCardProps::new((rail_id, idx), hit.title.clone(), hit_id)
+                            PosterCardProps::new((rail_id, idx), hit.title.clone(), &hit_arc.0)
                                 .subtitle(subtitle)
                                 .image(tex)
                                 .aspect(PosterAspect::Portrait2x3)
@@ -1407,54 +1479,57 @@ impl AppShell {
                                 .imdb_rating(hit.imdb_rating.clone().map(SharedString::from))
                                 .on_open(cx.listener(move |this, _, _, cx| {
                                     this.open_editorial_media_hit(
-                                        open_type.clone(),
-                                        open_id.clone(),
+                                        open_hit.1.media_type.clone(),
+                                        open_hit.0.clone(),
                                         None,
                                         cx,
                                     );
                                 }))
                                 .on_quick_play(cx.listener(move |this, _, _, cx| {
                                     this.quick_resume_or_open(
-                                        play_type.clone(),
-                                        play_id.clone(),
+                                        play_hit.1.media_type.clone(),
+                                        play_hit.0.clone(),
                                         None,
                                         cx,
                                     );
                                 }))
                                 .on_toggle_library(cx.listener(move |this, _, _, cx| {
-                                    this.core.toggle_library_item(preview_for_toggle.clone());
+                                    let preview = editorial_hit_to_preview(&toggle_hit.1, &toggle_hit.0);
+                                    this.core.toggle_library_item(preview);
                                     cx.notify();
                                 }))
                                 .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                                    let preview = editorial_hit_to_preview(&peek_hit.1, &peek_hit.0);
                                     this.open_quick_peek(
                                         QuickPeekTarget {
-                                            type_name: peek_type.clone(),
-                                            id: peek_id.clone(),
+                                            type_name: peek_hit.1.media_type.clone(),
+                                            id: peek_hit.0.clone(),
                                             video_id: None,
-                                            title: peek_title.clone(),
-                                            preview: Some(preview_for_peek.clone()),
+                                            title: peek_hit.1.title.clone(),
+                                            preview: Some(preview),
                                         },
                                         cx,
                                     );
                                 }))
                                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                     this.on_card_hover_prefetch(
-                                        &hover_type,
-                                        &hover_id,
-                                        hover_bg.as_deref(),
+                                        &hover_hit.1.media_type,
+                                        &hover_hit.0,
+                                        hover_hit.1.backdrop_url.as_deref(),
                                         *hovered,
                                         cx,
                                     );
                                 }))
                                 .on_context_menu(cx.listener(
                                     move |this, ev: &MouseDownEvent, _, cx| {
+                                        let preview = editorial_hit_to_preview(&ctx_hit.1, &ctx_hit.0);
                                         let menu = BrowsingContextMenu::new(
                                             ev.position,
-                                            ctx_type.clone(),
-                                            ctx_id.clone(),
-                                            ctx_title.clone(),
+                                            ctx_hit.1.media_type.clone(),
+                                            ctx_hit.0.clone(),
+                                            ctx_hit.1.title.clone(),
                                         )
-                                        .preview(Some(preview_for_ctx.clone()))
+                                        .preview(Some(preview))
                                         .is_in_library(in_lib)
                                         .is_watched(is_watched);
                                         this.open_browsing_context_menu(menu, cx);

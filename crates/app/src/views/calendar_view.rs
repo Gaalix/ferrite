@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::{Datelike, Local, Months, NaiveDate};
 use gpui::{
@@ -62,24 +62,47 @@ struct CwNotificationAlert {
     notifications: usize,
 }
 
-impl AppShell {
-    pub fn render_calendar_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let local_today = Local::now().date_naive();
+struct CachedCalendarSnapshot {
+    calendar_rev: u64,
+    library_rev: u64,
+    board_rev: u64,
+    local_today: NaiveDate,
+    selected: YearMonthDate,
+    prev_ym: YearMonthDate,
+    next_ym: YearMonthDate,
+    today_day: Option<u32>,
+    days_in_month: u32,
+    first_weekday: u32,
+    is_loading: bool,
+    days_map: HashMap<u32, Vec<CalendarEpisodeEntry>>,
+    up_next_entries: Arc<Vec<CalendarEpisodeEntry>>,
+    total_episodes: usize,
+    active_days_count: usize,
+    cw_alerts: Vec<CwNotificationAlert>,
+}
 
-        let (
-            selected,
-            prev_ym,
-            next_ym,
-            today_day,
-            days_in_month,
-            first_weekday,
-            is_loading,
-            days_map,
-            up_next_entries,
-            total_episodes,
-            active_days_count,
-            cw_alerts,
-        ) = self.core.with_model(|model| {
+impl AppShell {
+    fn cached_calendar_snapshot(&self, local_today: NaiveDate) -> Arc<CachedCalendarSnapshot> {
+        let calendar_rev = self.calendar_state_rev;
+        let library_rev = self.library_state_rev;
+        let board_rev = self.board_state_rev;
+
+        {
+            let guard = self.memoized_calendar_cache.lock();
+            if let Some(any_arc) = guard.as_ref() {
+                if let Ok(cached) = Arc::clone(any_arc).downcast::<CachedCalendarSnapshot>() {
+                    if cached.calendar_rev == calendar_rev
+                        && cached.library_rev == library_rev
+                        && cached.board_rev == board_rev
+                        && cached.local_today == local_today
+                    {
+                        return cached;
+                    }
+                }
+            }
+        }
+
+        let snap = self.core.with_model(|model| {
             let selected = model
                 .calendar
                 .selected
@@ -236,7 +259,11 @@ impl AppShell {
                 later_upcoming
             };
 
-            (
+            CachedCalendarSnapshot {
+                calendar_rev,
+                library_rev,
+                board_rev,
+                local_today,
                 selected,
                 prev_ym,
                 next_ym,
@@ -244,13 +271,35 @@ impl AppShell {
                 days_in_month,
                 first_weekday,
                 is_loading,
-                per_day,
-                strip_entries,
-                ep_count,
-                non_empty_days,
-                alerts,
-            )
+                days_map: per_day,
+                up_next_entries: Arc::new(strip_entries),
+                total_episodes: ep_count,
+                active_days_count: non_empty_days,
+                cw_alerts: alerts,
+            }
         });
+
+        let arc = Arc::new(snap);
+        *self.memoized_calendar_cache.lock() =
+            Some(Arc::clone(&arc) as Arc<dyn std::any::Any + Send + Sync>);
+        arc
+    }
+
+    pub fn render_calendar_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let local_today = Local::now().date_naive();
+        let snap = self.cached_calendar_snapshot(local_today);
+        let selected = &snap.selected;
+        let prev_ym = &snap.prev_ym;
+        let next_ym = &snap.next_ym;
+        let today_day = snap.today_day;
+        let days_in_month = snap.days_in_month;
+        let first_weekday = snap.first_weekday;
+        let is_loading = snap.is_loading;
+        let days_map = &snap.days_map;
+        let up_next_entries = &snap.up_next_entries;
+        let total_episodes = snap.total_episodes;
+        let active_days_count = snap.active_days_count;
+        let cw_alerts = &snap.cw_alerts;
 
         let t = active_theme();
         let is_current_month =
@@ -266,7 +315,7 @@ impl AppShell {
             None
         } else {
             Some(
-                self.render_cw_notification_strip(&cw_alerts, t, cx)
+                self.render_cw_notification_strip(cw_alerts, t, cx)
                     .into_any_element(),
             )
         };
@@ -275,7 +324,7 @@ impl AppShell {
             None
         } else {
             Some(
-                self.render_up_next_strip(&up_next_entries, local_today, &mut kb_cards, cx)
+                self.render_up_next_strip(up_next_entries, local_today, &mut kb_cards, cx)
                     .into_any_element(),
             )
         };
@@ -286,7 +335,7 @@ impl AppShell {
             self.render_monthly_release_grid(
                 &grid_cells,
                 today_day,
-                &days_map,
+                days_map,
                 &mut kb_cards,
                 t,
                 cx,
@@ -541,7 +590,7 @@ impl AppShell {
 
     fn render_up_next_strip(
         &self,
-        entries: &[CalendarEpisodeEntry],
+        entries: &Arc<Vec<CalendarEpisodeEntry>>,
         local_today: NaiveDate,
         kb_cards: &mut Vec<KbFocusableCard>,
         cx: &mut Context<Self>,
@@ -576,21 +625,9 @@ impl AppShell {
                 col: idx,
             });
 
-            let open_type = entry.meta_type.clone();
-            let open_id = entry.meta_id.clone();
-            let open_vid = entry.video_id.clone();
-
-            let ctx_type = entry.meta_type.clone();
-            let ctx_id = entry.meta_id.clone();
-            let ctx_vid = entry.video_id.clone();
-            let ctx_title = format!("{} · {}", entry.series_name, entry.episode_badge_spaced);
-            let ctx_preview = entry.preview.clone();
-            let ctx_in_lib = entry.in_library;
-            let ctx_watched = entry.is_item_watched;
-
-            let hover_type = entry.meta_type.clone();
-            let hover_id = entry.meta_id.clone();
-            let hover_bg = entry.backdrop_url.clone();
+            let open_entries = Arc::clone(entries);
+            let ctx_entries = Arc::clone(entries);
+            let hover_entries = Arc::clone(entries);
 
             let air_badge = if is_today_pill {
                 LandscapeCardBadge::accent(date_label)
@@ -602,7 +639,7 @@ impl AppShell {
                 LandscapeCardProps::new(
                     ("cal-upnext-card", idx),
                     entry.series_name.clone(),
-                    entry.meta_id.clone(),
+                    &entry.meta_id,
                 )
                 .image(card_tex)
                 .subtitle(Some(entry.episode_title.clone().into()))
@@ -612,33 +649,37 @@ impl AppShell {
                 .is_active(is_today_pill)
                 .is_focused(is_focused)
                 .on_open(cx.listener(move |this, _, _, cx| {
+                    let e = &open_entries[idx];
                     this.open_meta_details(
-                        open_type.clone(),
-                        open_id.clone(),
-                        Some(open_vid.clone()),
+                        e.meta_type.clone(),
+                        e.meta_id.clone(),
+                        Some(e.video_id.clone()),
                         cx,
                     );
                 }))
                 .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let e = &ctx_entries[idx];
+                    let ctx_title = format!("{} · {}", e.series_name, e.episode_badge_spaced);
                     this.open_browsing_context_menu(
                         BrowsingContextMenu::new(
                             ev.position,
-                            ctx_type.clone(),
-                            ctx_id.clone(),
-                            ctx_title.clone(),
+                            e.meta_type.clone(),
+                            e.meta_id.clone(),
+                            ctx_title,
                         )
-                        .video_id(Some(ctx_vid.clone()))
-                        .preview(Some(ctx_preview.clone()))
-                        .is_in_library(ctx_in_lib)
-                        .is_watched(ctx_watched),
+                        .video_id(Some(e.video_id.clone()))
+                        .preview(Some(e.preview.clone()))
+                        .is_in_library(e.in_library)
+                        .is_watched(e.is_item_watched),
                         cx,
                     );
                 }))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let e = &hover_entries[idx];
                     this.on_card_hover_prefetch(
-                        &hover_type,
-                        &hover_id,
-                        hover_bg.as_deref(),
+                        &e.meta_type,
+                        &e.meta_id,
+                        e.backdrop_url.as_deref(),
                         *hovered,
                         cx,
                     );

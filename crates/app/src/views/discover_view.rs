@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -40,12 +41,12 @@ use crate::{
         RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
     ui::{
-        choice_pill, click_handler, compute_app_grid_metrics, dropdown_trigger,
-        full_height_page_container, glass_dropdown_option, glass_dropdown_panel,
-        glass_segmented_bar, glass_segmented_item, glass_switch, hover_handler,
-        infer_grid_poster_aspect, neutral_chip, primary_accent_button, render_empty_state,
-        render_page_header, render_poster_card, search_field, toolbar_bar, DropdownTriggerProps,
-        EmptyStateProps, PageHeader, PageWidth, PosterCardProps, PosterMetrics, SearchFieldProps,
+        choice_pill, compute_app_grid_metrics, dropdown_trigger, full_height_page_container,
+        glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar, glass_segmented_item,
+        glass_switch, infer_grid_poster_aspect, neutral_chip, primary_accent_button,
+        render_empty_state, render_page_header, render_poster_card, search_field, toolbar_bar,
+        DropdownTriggerProps, EmptyStateProps, PageHeader, PageWidth, PosterCardProps,
+        PosterMetrics, SearchFieldProps,
     },
     virtual_grid::{slice_row_items, PosterAspect},
 };
@@ -368,13 +369,20 @@ fn partition_and_group_catalogs(
     hidden_keys: &[String],
     query_lower: &str,
 ) -> (Vec<DiscoverCatalogOption>, Vec<AddonCatalogGroup>) {
+    let hidden_set: HashSet<&str> = hidden_keys.iter().map(String::as_str).collect();
+    let pinned_index: HashMap<&str, usize> = pinned_keys
+        .iter()
+        .enumerate()
+        .map(|(pos, key)| (key.as_str(), pos))
+        .collect();
+
     let mut pinned_with_order: Vec<(usize, DiscoverCatalogOption)> = Vec::new();
     let mut groups: Vec<AddonCatalogGroup> = Vec::new();
     let mut group_indices: HashMap<String, usize> = HashMap::new();
 
     for opt in catalogs {
         let key = catalog_pin_key(&opt.catalog.request);
-        if hidden_keys.iter().any(|hidden| hidden == &key) {
+        if hidden_set.contains(key.as_str()) {
             continue;
         }
 
@@ -389,7 +397,7 @@ fn partition_and_group_catalogs(
             }
         }
 
-        if let Some(pin_pos) = pinned_keys.iter().position(|k| k == &key) {
+        if let Some(&pin_pos) = pinned_index.get(key.as_str()) {
             pinned_with_order.push((pin_pos, opt.clone()));
             continue;
         }
@@ -399,8 +407,7 @@ fn partition_and_group_catalogs(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("Other Addons")
-            .to_owned();
+            .unwrap_or("Other Addons");
         let group_key = addon_label.to_ascii_lowercase();
 
         if let Some(&idx) = group_indices.get(&group_key) {
@@ -409,7 +416,7 @@ fn partition_and_group_catalogs(
             let idx = groups.len();
             group_indices.insert(group_key, idx);
             groups.push(AddonCatalogGroup {
-                addon_name: addon_label,
+                addon_name: addon_label.to_owned(),
                 items: vec![opt.clone()],
             });
         }
@@ -549,19 +556,29 @@ fn pick_surprise_item_index(
     Some(pool[chosen_slot])
 }
 
+fn filter_unwatched_indices(
+    items: &[MetaItemPreview],
+    statuses: &HashMap<String, LibraryStatusTab>,
+) -> (Vec<usize>, usize) {
+    let mut visible = Vec::with_capacity(items.len());
+    let mut hidden_count = 0_usize;
+    for (idx, item) in items.iter().enumerate() {
+        if statuses.get(&item.id).copied() == Some(LibraryStatusTab::Watched) {
+            hidden_count += 1;
+        } else {
+            visible.push(idx);
+        }
+    }
+    (visible, hidden_count)
+}
+
+#[cfg(test)]
 fn filter_unwatched_items(
     items: &[MetaItemPreview],
     statuses: &HashMap<String, LibraryStatusTab>,
 ) -> (Vec<MetaItemPreview>, usize) {
-    let mut visible = Vec::with_capacity(items.len());
-    let mut hidden_count = 0_usize;
-    for item in items {
-        if statuses.get(&item.id).copied() == Some(LibraryStatusTab::Watched) {
-            hidden_count += 1;
-        } else {
-            visible.push(item.clone());
-        }
-    }
+    let (indices, hidden_count) = filter_unwatched_indices(items, statuses);
+    let visible = indices.into_iter().map(|i| items[i].clone()).collect();
     (visible, hidden_count)
 }
 
@@ -1701,13 +1718,33 @@ impl AppShell {
 
         let raw_items_arc = Arc::clone(&snap.items);
         let raw_total_items = raw_items_arc.len();
-        let (items_arc, hidden_watched_count) = if hide_watched {
-            let (filtered, hidden) = filter_unwatched_items(&raw_items_arc, statuses_arc);
-            (Arc::new(filtered), hidden)
+        let (visible_indices_opt, hidden_watched_count) = if hide_watched {
+            let disc_rev = self.discover_state_rev;
+            let lib_rev = self.library_state_rev;
+            let cached = {
+                let guard = self.memoized_discover_unwatched.lock();
+                guard.as_ref().and_then(|(dr, lr, hw, indices, hidden)| {
+                    (*dr == disc_rev && *lr == lib_rev && *hw == hide_watched)
+                        .then(|| (Arc::clone(indices), *hidden))
+                })
+            };
+            let (indices_arc, hidden) = match cached {
+                Some(hit) => hit,
+                None => {
+                    let (indices, hidden) = filter_unwatched_indices(&raw_items_arc, statuses_arc);
+                    let indices_arc = Arc::new(indices);
+                    *self.memoized_discover_unwatched.lock() =
+                        Some((disc_rev, lib_rev, hide_watched, Arc::clone(&indices_arc), hidden));
+                    (indices_arc, hidden)
+                }
+            };
+            (Some(indices_arc), hidden)
         } else {
-            (raw_items_arc, 0_usize)
+            (None, 0_usize)
         };
-        let total_items = items_arc.len();
+        let total_items = visible_indices_opt
+            .as_ref()
+            .map_or(raw_total_items, |v| v.len());
 
         let genre_extra = snap
             .extras
@@ -1744,7 +1781,11 @@ impl AppShell {
             usize::from(hide_watched) + usize::from(has_genre_filter) + non_genre_filtered_count;
         let has_active_filters = active_filter_count > 0;
 
-        let grid_aspect = infer_grid_poster_aspect(items_arc.iter().map(|i| &i.poster_shape));
+        let grid_aspect = if let Some(indices) = visible_indices_opt.as_ref() {
+            infer_grid_poster_aspect(indices.iter().map(|&i| &raw_items_arc[i].poster_shape))
+        } else {
+            infer_grid_poster_aspect(raw_items_arc.iter().map(|i| &i.poster_shape))
+        };
         let poster_metrics = PosterMetrics::from_theme(&theme);
         let gap_px = poster_metrics.gap_px;
         let metrics = compute_app_grid_metrics(
@@ -1760,20 +1801,29 @@ impl AppShell {
         let card_width_px = metrics.card_width_px;
         let image_height_px = metrics.image_height_px;
 
-        let kb_items: Vec<KbFocusableCard> = items_arc
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| KbFocusableCard {
-                route: AppRoute::MetaDetails {
-                    type_name: item.r#type.clone(),
-                    id: item.id.clone(),
-                    video_id: None,
-                },
-                row: idx / columns,
-                col: idx % columns,
-            })
-            .collect();
-        self.set_kb_focus_items(kb_items);
+        let mut kb_hasher = DefaultHasher::new();
+        ("discover", self.discover_state_rev, self.library_state_rev, hide_watched, columns)
+            .hash(&mut kb_hasher);
+        let kb_key = kb_hasher.finish();
+        self.sync_kb_focus_items_cached(kb_key, || {
+            (0..total_items)
+                .map(|idx| {
+                    let raw_idx = visible_indices_opt
+                        .as_ref()
+                        .map_or(idx, |indices| indices[idx]);
+                    let item = &raw_items_arc[raw_idx];
+                    KbFocusableCard {
+                        route: AppRoute::MetaDetails {
+                            type_name: item.r#type.clone(),
+                            id: item.id.clone(),
+                            video_id: None,
+                        },
+                        row: idx / columns,
+                        col: idx % columns,
+                    }
+                })
+                .collect()
+        });
 
         let is_loading = snap.is_loading;
         let has_next_page = snap.has_next_page;
@@ -1811,7 +1861,7 @@ impl AppShell {
             hidden_watched_count,
             active_filter_count,
             has_catalog_filters,
-            &items_arc,
+            &raw_items_arc,
             statuses_arc,
             rail_open,
             &theme,
@@ -1837,6 +1887,8 @@ impl AppShell {
                 cx,
             )
         } else {
+            let items_for_grid = Arc::clone(&raw_items_arc);
+            let indices_for_grid = visible_indices_opt.clone();
             gpui::uniform_list(
                 "discover-poster-grid",
                 row_count,
@@ -1871,7 +1923,10 @@ impl AppShell {
                                 .items_start()
                                 .gap(px(gap_px))
                                 .children(range.map(|item_idx| {
-                                    let item = items_arc[item_idx].clone();
+                                    let raw_idx = indices_for_grid
+                                        .as_ref()
+                                        .map_or(item_idx, |indices| indices[item_idx]);
+                                    let item = &items_for_grid[raw_idx];
                                     let st = statuses_for_grid.get(&item.id).copied();
                                     let is_focused = kb_focus_index == Some(item_idx);
                                     let card_aspect =
@@ -1890,7 +1945,8 @@ impl AppShell {
                                         .h_full()
                                         .child(this.render_discover_poster_card(
                                             ("discover-card", item_idx),
-                                            item,
+                                            &items_for_grid,
+                                            raw_idx,
                                             st,
                                             card_aspect,
                                             None,
@@ -2149,17 +2205,17 @@ impl AppShell {
         let title_owned = active_catalog_title.to_owned();
         let addon_owned = active_catalog_addon.map(str::to_owned);
 
-        let cat_query_trimmed = self.discover_catalog_search.trim().to_ascii_lowercase();
-        let has_cat_query = !cat_query_trimmed.is_empty();
-
-        let (pinned_catalogs, addon_groups) = partition_and_group_catalogs(
-            &snap.catalogs,
-            &self.preferences.pinned_discover_catalogs,
-            &self.preferences.hidden_discover_catalogs,
-            &cat_query_trimmed,
-        );
-
         let popover = is_open.then(|| {
+            let cat_query_trimmed = self.discover_catalog_search.trim().to_ascii_lowercase();
+            let has_cat_query = !cat_query_trimmed.is_empty();
+
+            let (pinned_catalogs, addon_groups) = partition_and_group_catalogs(
+                &snap.catalogs,
+                &self.preferences.pinned_discover_catalogs,
+                &self.preferences.hidden_discover_catalogs,
+                &cat_query_trimmed,
+            );
+
             let search_box = self.render_discover_catalog_search_box(
                 "discover-popover-search-box",
                 "discover-popover-search-clear",
@@ -2280,8 +2336,9 @@ impl AppShell {
                     .or((pinned_empty && total_groups > 0).then_some(0));
 
                 let mut remaining_groups = total_groups;
-                if let Some(group_idx) = current_group_idx {
-                    let group = addon_groups.into_iter().nth(group_idx).unwrap();
+                if let Some(group) =
+                    current_group_idx.and_then(|idx| addon_groups.into_iter().nth(idx))
+                {
                     remaining_groups = total_groups.saturating_sub(1);
                     list_body = list_body.child(render_group_section(
                         0,
@@ -2969,7 +3026,8 @@ impl AppShell {
     fn render_discover_poster_card(
         &self,
         id: impl Into<ElementId>,
-        item: MetaItemPreview,
+        items_arc: &Arc<Vec<MetaItemPreview>>,
+        raw_idx: usize,
         lib_status: Option<LibraryStatusTab>,
         aspect: PosterAspect,
         fixed_width_px: Option<f32>,
@@ -2977,39 +3035,24 @@ impl AppShell {
         is_focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let base_id = Arc::new(id.into());
-
+        let item = &items_arc[raw_idx];
         let poster_tex = self
             .poster_cache
             .resolve_poster_url(item.poster.as_ref().or(item.background.as_ref()));
-        let rating = extract_imdb_rating(&item).map(SharedString::from);
-        let subtitle = format_discover_card_subtitle(&item);
-
-        let peek_item = item.clone();
-        let details_type = item.r#type.clone();
-        let details_id = item.id.clone();
-
-        let mid_type = item.r#type.clone();
-        let mid_id = item.id.clone();
-
-        let play_type = item.r#type.clone();
-        let play_id = item.id.clone();
-
-        let toggle_preview = item.clone();
-        let toggle_name = item.name.clone();
+        let rating = extract_imdb_rating(item).map(SharedString::from);
+        let subtitle = format_discover_card_subtitle(item);
         let in_library = lib_status.is_some();
 
-        let hover_type = item.r#type.clone();
-        let hover_id = item.id.clone();
-        let hover_bg = item.background.as_ref().map(|u| u.to_string());
-
-        let ctx_preview = item.clone();
-        let ctx_type = item.r#type.clone();
-        let ctx_id = item.id.clone();
-        let ctx_name = item.name.clone();
+        let open_items = Arc::clone(items_arc);
+        let peek_items = Arc::clone(items_arc);
+        let play_items = Arc::clone(items_arc);
+        let toggle_items = Arc::clone(items_arc);
+        let ctx_items = Arc::clone(items_arc);
+        let hover_items = Arc::clone(items_arc);
+        let mid_items = Arc::clone(items_arc);
 
         let card_el = render_poster_card(
-            PosterCardProps::new((*base_id).clone(), item.name, item.id)
+            PosterCardProps::new(id, item.name.clone(), &item.id)
                 .subtitle(Some(subtitle))
                 .image(poster_tex)
                 .aspect(aspect)
@@ -3019,83 +3062,83 @@ impl AppShell {
                 .imdb_rating(rating)
                 .in_library(in_library)
                 .is_focused(is_focused)
-                .on_open(click_handler(cx.listener(move |this, _, _, cx| {
+                .on_open(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.open_meta_details(details_type.clone(), details_id.clone(), None, cx);
-                })))
-                .on_quick_peek(click_handler(cx.listener(move |this, _, _, cx| {
+                    let it = &open_items[raw_idx];
+                    this.open_meta_details(it.r#type.clone(), it.id.clone(), None, cx);
+                }))
+                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    let it = &peek_items[raw_idx];
                     this.open_quick_peek(
                         QuickPeekTarget {
-                            type_name: peek_item.r#type.clone(),
-                            id: peek_item.id.clone(),
+                            type_name: it.r#type.clone(),
+                            id: it.id.clone(),
                             video_id: None,
-                            title: peek_item.name.clone(),
-                            preview: Some(peek_item.clone()),
+                            title: it.name.clone(),
+                            preview: Some(it.clone()),
                         },
                         cx,
                     );
-                })))
-                .on_quick_play(click_handler(cx.listener(move |this, _, _, cx| {
-                    this.quick_resume_or_open(play_type.clone(), play_id.clone(), None, cx);
-                })))
-                .on_toggle_library(click_handler(cx.listener(move |this, _, _, cx| {
-                    this.core.toggle_library_item(toggle_preview.clone());
+                }))
+                .on_quick_play(cx.listener(move |this, _, _, cx| {
+                    let it = &play_items[raw_idx];
+                    this.quick_resume_or_open(it.r#type.clone(), it.id.clone(), None, cx);
+                }))
+                .on_toggle_library(cx.listener(move |this, _, _, cx| {
+                    let it = &toggle_items[raw_idx];
+                    this.core.toggle_library_item(it.clone());
                     let (kind, msg) = if in_library {
                         (ToastKind::Info, "Removed from library")
                     } else {
                         (ToastKind::Success, "Added to library")
                     };
-                    this.push_toast(kind, msg, Some(toggle_name.clone()), cx);
+                    this.push_toast(kind, msg, Some(it.name.clone()), cx);
                     cx.notify();
-                })))
-                .on_context_menu(click_handler(cx.listener(
-                    move |this, ev: &MouseDownEvent, _, cx| {
-                        let (lib_in, is_watched, can_rewind, vid) = this.core.with_model(|m| {
-                            m.ctx
-                                .library
-                                .items
-                                .get(&ctx_id)
-                                .filter(|li| !li.removed)
-                                .map(|li| {
-                                    (
-                                        !li.temp,
-                                        li.watched(),
-                                        li.state.time_offset > 0,
-                                        li.state.video_id.clone(),
-                                    )
-                                })
-                                .unwrap_or((false, false, false, None))
-                        });
-                        let menu = BrowsingContextMenu::new(
-                            ev.position,
-                            ctx_type.clone(),
-                            ctx_id.clone(),
-                            ctx_name.clone(),
-                        )
-                        .video_id(vid)
-                        .preview(Some(ctx_preview.clone()))
-                        .is_in_library(lib_in)
-                        .is_watched(is_watched)
-                        .can_rewind_cw(can_rewind);
-                        this.open_browsing_context_menu(menu, cx);
-                    },
-                )))
-                .on_hover(hover_handler(cx.listener(move |this, hovered, _, cx| {
-                    this.on_card_hover_prefetch(
-                        &hover_type,
-                        &hover_id,
-                        hover_bg.as_deref(),
-                        *hovered,
-                        cx,
-                    );
-                }))),
+                }))
+                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let it = &ctx_items[raw_idx];
+                    let (lib_in, is_watched, can_rewind, vid) = this.core.with_model(|m| {
+                        m.ctx
+                            .library
+                            .items
+                            .get(&it.id)
+                            .filter(|li| !li.removed)
+                            .map(|li| {
+                                (
+                                    !li.temp,
+                                    li.watched(),
+                                    li.state.time_offset > 0,
+                                    li.state.video_id.clone(),
+                                )
+                            })
+                            .unwrap_or((false, false, false, None))
+                    });
+                    let menu = BrowsingContextMenu::new(
+                        ev.position,
+                        it.r#type.clone(),
+                        it.id.clone(),
+                        it.name.clone(),
+                    )
+                    .video_id(vid)
+                    .preview(Some(it.clone()))
+                    .is_in_library(lib_in)
+                    .is_watched(is_watched)
+                    .can_rewind_cw(can_rewind);
+                    this.open_browsing_context_menu(menu, cx);
+                }))
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    let it = &hover_items[raw_idx];
+                    let bg = it.background.as_ref().map(|u| u.as_str());
+                    this.on_card_hover_prefetch(&it.r#type, &it.id, bg, *hovered, cx);
+                })),
         );
 
         let mut wrapper = div().on_mouse_down(
             MouseButton::Middle,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.open_meta_details(mid_type.clone(), mid_id.clone(), None, cx);
+                let it = &mid_items[raw_idx];
+                this.open_meta_details(it.r#type.clone(), it.id.clone(), None, cx);
             }),
         );
 

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
+    ops::Range,
+    sync::Arc,
+};
 
 use gpui::{
     deferred, div, img, point, prelude::*, px, relative, rgb, rgba, AnyElement, Context,
@@ -24,11 +29,11 @@ use crate::{
         clamp_progress_fraction, click_handler, compute_app_grid_metrics,
         compute_app_landscape_grid_metrics, dropdown_trigger, format_notification_badge_label,
         full_height_page_container, glass_dropdown_option, glass_dropdown_panel,
-        glass_segmented_bar, glass_segmented_item, hover_handler, infer_grid_poster_aspect,
-        primary_accent_button, render_empty_state, render_landscape_card, render_page_header,
-        render_poster_card, render_section_header, search_field, secondary_glass_button,
-        toolbar_bar, ClickHandler, DropdownTriggerProps, EmptyStateProps, LandscapeCardProps,
-        PageHeader, PageWidth, PosterCardProps, PosterMetrics, SearchFieldProps, SectionHeader,
+        glass_segmented_bar, glass_segmented_item, infer_grid_poster_aspect, primary_accent_button,
+        render_empty_state, render_landscape_card, render_page_header, render_poster_card,
+        render_section_header, search_field, secondary_glass_button, toolbar_bar, ClickHandler,
+        DropdownTriggerProps, EmptyStateProps, LandscapeCardProps, PageHeader, PageWidth,
+        PosterCardProps, PosterMetrics, SearchFieldProps, SectionHeader,
     },
     virtual_grid::{slice_row_items, PosterAspect},
 };
@@ -39,6 +44,13 @@ struct UpNextHighlightEntry {
     item: LibraryItem,
     status: LibraryStatusTab,
     notification_count: usize,
+}
+
+struct CachedLibraryAux {
+    library_rev: u64,
+    notification_rev: u64,
+    notif_counts: Arc<HashMap<String, usize>>,
+    up_next_items: Arc<Vec<UpNextHighlightEntry>>,
 }
 
 impl AppShell {
@@ -56,7 +68,8 @@ impl AppShell {
             memo = self.get_or_update_memoized_library();
         }
 
-        let notif_counts_arc = self.library_notification_counts();
+        let aux = self.get_or_update_library_aux();
+        let notif_counts_arc = Arc::clone(&aux.notif_counts);
         let active_tab = self.library_filter_tab;
         let active_type = self.library_type_filter;
         let active_sort = self.library_sort_criterion;
@@ -92,31 +105,43 @@ impl AppShell {
             LibraryViewMode::WideBackdrops => wide_metrics.columns,
             LibraryViewMode::CompactList => 1,
         };
-        let kb_items: Vec<KbFocusableCard> = filtered_arc
-            .iter()
-            .enumerate()
-            .map(|(idx, (li, _))| KbFocusableCard {
-                route: AppRoute::MetaDetails {
-                    type_name: li.r#type.clone(),
-                    id: li.id.clone(),
-                    video_id: li.state.video_id.clone(),
-                },
-                row: idx / kb_columns,
-                col: idx % kb_columns,
-            })
-            .collect();
-        self.set_kb_focus_items(kb_items);
+        let mut kb_hasher = DefaultHasher::new();
+        (
+            "library",
+            memo.library_rev,
+            memo.notification_rev,
+            std::mem::discriminant(&active_tab),
+            std::mem::discriminant(&active_type),
+            std::mem::discriminant(&active_sort),
+            std::mem::discriminant(&active_view_mode),
+            kb_columns,
+            memo.search_query.as_str(),
+        )
+            .hash(&mut kb_hasher);
+        let kb_key = kb_hasher.finish();
+        self.sync_kb_focus_items_cached(kb_key, || {
+            filtered_arc
+                .iter()
+                .enumerate()
+                .map(|(idx, (li, _))| KbFocusableCard {
+                    route: AppRoute::MetaDetails {
+                        type_name: li.r#type.clone(),
+                        id: li.id.clone(),
+                        video_id: li.state.video_id.clone(),
+                    },
+                    row: idx / kb_columns,
+                    col: idx % kb_columns,
+                })
+                .collect()
+        });
 
-        let up_next_items = if !search_trimmed_non_empty
+        let show_up_next_shelf = !search_trimmed_non_empty
             && matches!(
                 active_tab,
                 LibraryFilterTab::All | LibraryFilterTab::Watching | LibraryFilterTab::NewEpisodes
-            ) {
-            self.collect_library_up_next_items(&notif_counts_arc)
-        } else {
-            Vec::new()
-        };
-        let show_up_next_shelf = !up_next_items.is_empty();
+            )
+            && !aux.up_next_items.is_empty();
+        let up_next_arc = Arc::clone(&aux.up_next_items);
 
         let visible_filter_tabs: Vec<LibraryFilterTab> = LibraryFilterTab::ALL
             .into_iter()
@@ -185,8 +210,8 @@ impl AppShell {
                                                 .min_w(px(0.0))
                                                 .h_full()
                                                 .child(this.render_library_poster_card(
+                                                    &items_for_grid,
                                                     idx,
-                                                    li,
                                                     *st,
                                                     notif_count,
                                                     card_aspect,
@@ -247,8 +272,8 @@ impl AppShell {
                                                 .min_w(px(0.0))
                                                 .h_full()
                                                 .child(this.render_library_wide_card(
+                                                    &items_for_wide,
                                                     idx,
-                                                    li,
                                                     *st,
                                                     notif_count,
                                                     image_height_px,
@@ -296,8 +321,8 @@ impl AppShell {
                                         .h(px(row_stride_px))
                                         .pb(px(row_gap_px))
                                         .child(this.render_library_compact_row(
+                                            &items_for_list,
                                             idx,
-                                            li,
                                             *st,
                                             notif_count,
                                             row_h_px,
@@ -417,7 +442,7 @@ impl AppShell {
                     // 2. "New Episodes & Up Next" Highlight Shelf.
                     .when(show_up_next_shelf, |col| {
                         col.child(self.render_library_up_next_shelf(
-                            &up_next_items,
+                            &up_next_arc,
                             memo.count_new_episodes,
                             active_tab,
                             cx,
@@ -711,17 +736,38 @@ impl AppShell {
         })
     }
 
-    fn collect_library_up_next_items(
-        &self,
-        notif_counts: &HashMap<String, usize>,
-    ) -> Vec<UpNextHighlightEntry> {
-        let mut entries: Vec<UpNextHighlightEntry> = self.core.with_model(|model| {
+    fn get_or_update_library_aux(&self) -> Arc<CachedLibraryAux> {
+        let library_rev = self.library_state_rev;
+        let notification_rev = self.board_state_rev;
+
+        {
+            let guard = self.memoized_library_aux_cache.lock();
+            if let Some(any_arc) = guard.as_ref() {
+                if let Ok(cached) = Arc::clone(any_arc).downcast::<CachedLibraryAux>() {
+                    if cached.library_rev == library_rev
+                        && cached.notification_rev == notification_rev
+                    {
+                        return cached;
+                    }
+                }
+            }
+        }
+
+        let (notif_counts, mut entries) = self.core.with_model(|model| {
+            let counts: HashMap<String, usize> = model
+                .continue_watching_preview
+                .items
+                .iter()
+                .filter(|item| item.notifications > 0)
+                .map(|item| (item.library_item.id.clone(), item.notifications))
+                .collect();
+
             let mut out = Vec::new();
             let mut visit = |li: &LibraryItem| {
                 let Some(status) = classify_library_item_status(li) else {
                     return;
                 };
-                let notif = notif_counts.get(&li.id).copied().unwrap_or(0);
+                let notif = counts.get(&li.id).copied().unwrap_or(0);
                 let is_active_up_next = notif > 0
                     || (status == LibraryStatusTab::Watching
                         && (li.state.time_offset > 0
@@ -745,7 +791,7 @@ impl AppShell {
                     visit(li);
                 }
             }
-            out
+            (counts, out)
         });
 
         entries.sort_by(|a, b| {
@@ -762,12 +808,21 @@ impl AppShell {
                 })
         });
         entries.truncate(UP_NEXT_SHELF_LIMIT);
-        entries
+
+        let arc = Arc::new(CachedLibraryAux {
+            library_rev,
+            notification_rev,
+            notif_counts: Arc::new(notif_counts),
+            up_next_items: Arc::new(entries),
+        });
+        *self.memoized_library_aux_cache.lock() =
+            Some(Arc::clone(&arc) as Arc<dyn std::any::Any + Send + Sync>);
+        arc
     }
 
     fn render_library_up_next_shelf(
         &self,
-        entries: &[UpNextHighlightEntry],
+        entries: &Arc<Vec<UpNextHighlightEntry>>,
         new_episodes_count: usize,
         active_tab: LibraryFilterTab,
         cx: &mut Context<Self>,
@@ -839,8 +894,8 @@ impl AppShell {
                     .flex()
                     .items_stretch()
                     .gap(sp(12.0))
-                    .children(entries.iter().enumerate().map(|(idx, entry)| {
-                        self.render_library_up_next_card(idx, entry, cx)
+                    .children((0..entries.len()).map(|idx| {
+                        self.render_library_up_next_card(entries, idx, cx)
                     })),
             )
             .into_any_element()
@@ -848,10 +903,11 @@ impl AppShell {
 
     fn render_library_up_next_card(
         &self,
+        entries: &Arc<Vec<UpNextHighlightEntry>>,
         idx: usize,
-        entry: &UpNextHighlightEntry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let entry = &entries[idx];
         let li = &entry.item;
         let notif_count = entry.notification_count;
         let wide_url = self.resolve_library_widescreen_url(li);
@@ -870,82 +926,75 @@ impl AppShell {
             (false, None) => Some(sentence_case_label(&li.r#type).into()),
         };
 
-        let open_type = li.r#type.clone();
-        let open_id = li.id.clone();
-        let open_vid = li.state.video_id.clone();
-
-        let play_type = li.r#type.clone();
-        let play_id = li.id.clone();
-        let play_vid = li.state.video_id.clone();
-
-        let peek_target = QuickPeekTarget {
-            type_name: li.r#type.clone(),
-            id: li.id.clone(),
-            video_id: li.state.video_id.clone(),
-            title: li.name.clone(),
-            preview: None,
-        };
-
-        let ctx_type = li.r#type.clone();
-        let ctx_id = li.id.clone();
-        let ctx_name = li.name.clone();
-        let ctx_vid = li.state.video_id.clone();
-        let ctx_watched = li.watched();
-        let ctx_can_rewind = li.state.time_offset > 0;
-
-        let hover_type = li.r#type.clone();
-        let hover_id = li.id.clone();
+        let open_entries = Arc::clone(entries);
+        let play_entries = Arc::clone(entries);
+        let peek_entries = Arc::clone(entries);
+        let ctx_entries = Arc::clone(entries);
+        let hover_entries = Arc::clone(entries);
         let hover_bg = wide_url;
 
-        let mut props =
-            LandscapeCardProps::new(("lib-up-next-card", idx), li.name.clone(), li.id.clone())
-                .image(wide_tex)
-                .subtitle(subtitle)
-                .notification_count(notif_count)
-                .progress_fraction(progress)
-                .play_label(Some(SharedString::new_static("Resume")))
-                .on_open(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.open_meta_details(
-                        open_type.clone(),
-                        open_id.clone(),
-                        open_vid.clone(),
-                        cx,
-                    );
-                }))
-                .on_quick_play(cx.listener(move |this, _, _, cx| {
-                    this.quick_resume_or_open(
-                        play_type.clone(),
-                        play_id.clone(),
-                        play_vid.clone(),
-                        cx,
-                    );
-                }))
-                .on_quick_peek(cx.listener(move |this, _, _, cx| {
-                    this.open_quick_peek(peek_target.clone(), cx);
-                }))
-                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    let menu = BrowsingContextMenu::new(
-                        ev.position,
-                        ctx_type.clone(),
-                        ctx_id.clone(),
-                        ctx_name.clone(),
-                    )
-                    .video_id(ctx_vid.clone())
-                    .is_in_library(true)
-                    .is_watched(ctx_watched)
-                    .can_rewind_cw(ctx_can_rewind);
-                    this.open_browsing_context_menu(menu, cx);
-                }))
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    this.on_card_hover_prefetch(
-                        &hover_type,
-                        &hover_id,
-                        hover_bg.as_deref(),
-                        *hovered,
-                        cx,
-                    );
-                }));
+        let mut props = LandscapeCardProps::new(("lib-up-next-card", idx), li.name.clone(), &li.id)
+            .image(wide_tex)
+            .subtitle(subtitle)
+            .notification_count(notif_count)
+            .progress_fraction(progress)
+            .play_label(Some(SharedString::new_static("Resume")))
+            .on_open(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                let li = &open_entries[idx].item;
+                this.open_meta_details(
+                    li.r#type.clone(),
+                    li.id.clone(),
+                    li.state.video_id.clone(),
+                    cx,
+                );
+            }))
+            .on_quick_play(cx.listener(move |this, _, _, cx| {
+                let li = &play_entries[idx].item;
+                this.quick_resume_or_open(
+                    li.r#type.clone(),
+                    li.id.clone(),
+                    li.state.video_id.clone(),
+                    cx,
+                );
+            }))
+            .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                let li = &peek_entries[idx].item;
+                this.open_quick_peek(
+                    QuickPeekTarget {
+                        type_name: li.r#type.clone(),
+                        id: li.id.clone(),
+                        video_id: li.state.video_id.clone(),
+                        title: li.name.clone(),
+                        preview: None,
+                    },
+                    cx,
+                );
+            }))
+            .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                let li = &ctx_entries[idx].item;
+                let menu = BrowsingContextMenu::new(
+                    ev.position,
+                    li.r#type.clone(),
+                    li.id.clone(),
+                    li.name.clone(),
+                )
+                .video_id(li.state.video_id.clone())
+                .is_in_library(true)
+                .is_watched(li.watched())
+                .can_rewind_cw(li.state.time_offset > 0);
+                this.open_browsing_context_menu(menu, cx);
+            }))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                let li = &hover_entries[idx].item;
+                this.on_card_hover_prefetch(
+                    &li.r#type,
+                    &li.id,
+                    hover_bg.as_deref(),
+                    *hovered,
+                    cx,
+                );
+            }));
 
         if let Some(code) = ep_code {
             props = props.episode_badge(code, false);
@@ -1159,30 +1208,16 @@ impl AppShell {
         memo
     }
 
-    fn library_notification_counts(&self) -> Arc<HashMap<String, usize>> {
-        let counts: HashMap<String, usize> = self.core.with_model(|model| {
-            model
-                .continue_watching_preview
-                .items
-                .iter()
-                .filter(|item| item.notifications > 0)
-                .map(|item| (item.library_item.id.clone(), item.notifications))
-                .collect()
-        });
-        Arc::new(counts)
-    }
-
     fn build_card_toggle_watched_button(
         &self,
         id_prefix: &'static str,
+        items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
         idx: usize,
-        li: &LibraryItem,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = active_theme();
-        let is_watched = li.watched();
-        let watch_id = li.id.clone();
-        let watch_name = li.name.clone();
+        let is_watched = items[idx].0.watched();
+        let items_for_watch = Arc::clone(items);
         let badge_fg = if theme.is_light {
             0xFFFFFF
         } else {
@@ -1217,9 +1252,10 @@ impl AppShell {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
+                    let li = &items_for_watch[idx].0;
                     let next_watched = !is_watched;
                     this.core
-                        .mark_library_item_watched(watch_id.clone(), next_watched);
+                        .mark_library_item_watched(li.id.clone(), next_watched);
                     this.push_toast(
                         ToastKind::Info,
                         if next_watched {
@@ -1227,7 +1263,7 @@ impl AppShell {
                         } else {
                             "Marked as unwatched"
                         },
-                        Some(watch_name.clone()),
+                        Some(li.name.clone()),
                         cx,
                     );
                     cx.notify();
@@ -1248,8 +1284,8 @@ impl AppShell {
     #[allow(clippy::too_many_arguments)]
     fn render_library_poster_card(
         &self,
+        items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
         idx: usize,
-        li: &LibraryItem,
         status: LibraryStatusTab,
         notification_count: usize,
         aspect: PosterAspect,
@@ -1257,6 +1293,7 @@ impl AppShell {
         is_focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let li = &items[idx].0;
         let poster_tex = self.poster_cache.resolve_poster_url(li.poster.as_ref());
         let type_label = sentence_case_label(&li.r#type);
         let subtitle: SharedString =
@@ -1266,40 +1303,18 @@ impl AppShell {
             };
         let progress_fraction = library_item_progress_fraction(li, status);
 
-        let open_type = li.r#type.clone();
-        let open_id = li.id.clone();
-        let open_vid = li.state.video_id.clone();
-
-        let play_type = li.r#type.clone();
-        let play_id = li.id.clone();
-        let play_vid = li.state.video_id.clone();
-
-        let remove_id = li.id.clone();
-        let remove_name = li.name.clone();
-
-        let peek_target = QuickPeekTarget {
-            type_name: li.r#type.clone(),
-            id: li.id.clone(),
-            video_id: li.state.video_id.clone(),
-            title: li.name.clone(),
-            preview: None,
-        };
-
-        let ctx_type = li.r#type.clone();
-        let ctx_id = li.id.clone();
-        let ctx_name = li.name.clone();
-        let ctx_vid = li.state.video_id.clone();
-        let ctx_watched = li.watched();
-        let ctx_can_rewind = li.state.time_offset > 0;
-
-        let hover_type = li.r#type.clone();
-        let hover_id = li.id.clone();
+        let open_items = Arc::clone(items);
+        let play_items = Arc::clone(items);
+        let remove_items = Arc::clone(items);
+        let peek_items = Arc::clone(items);
+        let ctx_items = Arc::clone(items);
+        let hover_items = Arc::clone(items);
 
         let toggle_watched_btn =
-            self.build_card_toggle_watched_button("lib-poster-watch", idx, li, cx);
+            self.build_card_toggle_watched_button("lib-poster-watch", items, idx, cx);
 
         render_poster_card(
-            PosterCardProps::new(("library-card", idx), li.name.clone(), li.id.clone())
+            PosterCardProps::new(("library-card", idx), li.name.clone(), &li.id)
                 .subtitle(Some(subtitle))
                 .image(poster_tex)
                 .aspect(aspect)
@@ -1309,68 +1324,82 @@ impl AppShell {
                 .progress_fraction(progress_fraction)
                 .in_library(true)
                 .is_focused(is_focused)
-                .on_open(click_handler(cx.listener(move |this, _, _, cx| {
+                .on_open(cx.listener(move |this, _, _, cx| {
+                    let li = &open_items[idx].0;
                     this.open_meta_details(
-                        open_type.clone(),
-                        open_id.clone(),
-                        open_vid.clone(),
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.state.video_id.clone(),
                         cx,
                     );
-                })))
-                .on_quick_play(click_handler(cx.listener(move |this, _, _, cx| {
+                }))
+                .on_quick_play(cx.listener(move |this, _, _, cx| {
+                    let li = &play_items[idx].0;
                     this.quick_resume_or_open(
-                        play_type.clone(),
-                        play_id.clone(),
-                        play_vid.clone(),
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.state.video_id.clone(),
                         cx,
                     );
-                })))
-                .on_toggle_library(click_handler(cx.listener(move |this, _, _, cx| {
-                    this.core.remove_from_library(remove_id.clone());
+                }))
+                .on_toggle_library(cx.listener(move |this, _, _, cx| {
+                    let li = &remove_items[idx].0;
+                    this.core.remove_from_library(li.id.clone());
                     this.push_toast(
                         ToastKind::Info,
                         "Removed from library",
-                        Some(remove_name.clone()),
+                        Some(li.name.clone()),
                         cx,
                     );
                     cx.notify();
-                })))
-                .on_quick_peek(click_handler(cx.listener(move |this, _, _, cx| {
-                    this.open_quick_peek(peek_target.clone(), cx);
-                })))
+                }))
+                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    let li = &peek_items[idx].0;
+                    this.open_quick_peek(
+                        QuickPeekTarget {
+                            type_name: li.r#type.clone(),
+                            id: li.id.clone(),
+                            video_id: li.state.video_id.clone(),
+                            title: li.name.clone(),
+                            preview: None,
+                        },
+                        cx,
+                    );
+                }))
                 .quick_action(Some(toggle_watched_btn))
-                .on_context_menu(click_handler(cx.listener(
-                    move |this, ev: &MouseDownEvent, _, cx| {
-                        let menu = BrowsingContextMenu::new(
-                            ev.position,
-                            ctx_type.clone(),
-                            ctx_id.clone(),
-                            ctx_name.clone(),
-                        )
-                        .video_id(ctx_vid.clone())
-                        .is_in_library(true)
-                        .is_watched(ctx_watched)
-                        .can_rewind_cw(ctx_can_rewind);
-                        this.open_browsing_context_menu(menu, cx);
-                    },
-                )))
-                .on_hover(hover_handler(cx.listener(move |this, hovered, _, cx| {
-                    this.on_card_hover_prefetch(&hover_type, &hover_id, None, *hovered, cx);
-                }))),
+                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let li = &ctx_items[idx].0;
+                    let menu = BrowsingContextMenu::new(
+                        ev.position,
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.name.clone(),
+                    )
+                    .video_id(li.state.video_id.clone())
+                    .is_in_library(true)
+                    .is_watched(li.watched())
+                    .can_rewind_cw(li.state.time_offset > 0);
+                    this.open_browsing_context_menu(menu, cx);
+                }))
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    let li = &hover_items[idx].0;
+                    this.on_card_hover_prefetch(&li.r#type, &li.id, None, *hovered, cx);
+                })),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn render_library_wide_card(
         &self,
+        items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
         idx: usize,
-        li: &LibraryItem,
         status: LibraryStatusTab,
         notification_count: usize,
         image_height_px: f32,
         is_focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let li = &items[idx].0;
         let wide_url = self.resolve_library_widescreen_url(li);
         let wide_tex = self.poster_cache.resolve_widescreen_or_poster(
             wide_url.as_deref(),
@@ -1379,41 +1408,19 @@ impl AppShell {
         let subtitle = format_wide_card_subtitle(li, status, notification_count);
         let progress_fraction = library_item_progress_fraction(li, status);
 
-        let open_type = li.r#type.clone();
-        let open_id = li.id.clone();
-        let open_vid = li.state.video_id.clone();
-
-        let play_type = li.r#type.clone();
-        let play_id = li.id.clone();
-        let play_vid = li.state.video_id.clone();
-
-        let remove_id = li.id.clone();
-        let remove_name = li.name.clone();
-
-        let peek_target = QuickPeekTarget {
-            type_name: li.r#type.clone(),
-            id: li.id.clone(),
-            video_id: li.state.video_id.clone(),
-            title: li.name.clone(),
-            preview: None,
-        };
-
-        let ctx_type = li.r#type.clone();
-        let ctx_id = li.id.clone();
-        let ctx_name = li.name.clone();
-        let ctx_vid = li.state.video_id.clone();
-        let ctx_watched = li.watched();
-        let ctx_can_rewind = li.state.time_offset > 0;
-
-        let hover_type = li.r#type.clone();
-        let hover_id = li.id.clone();
+        let open_items = Arc::clone(items);
+        let play_items = Arc::clone(items);
+        let remove_items = Arc::clone(items);
+        let peek_items = Arc::clone(items);
+        let ctx_items = Arc::clone(items);
+        let hover_items = Arc::clone(items);
         let hover_bg = wide_url;
 
         let toggle_watched_btn =
-            self.build_card_toggle_watched_button("lib-wide-watch", idx, li, cx);
+            self.build_card_toggle_watched_button("lib-wide-watch", items, idx, cx);
 
         render_poster_card(
-            PosterCardProps::new(("library-wide-card", idx), li.name.clone(), li.id.clone())
+            PosterCardProps::new(("library-wide-card", idx), li.name.clone(), &li.id)
                 .subtitle(Some(subtitle))
                 .image(wide_tex)
                 .aspect(PosterAspect::Landscape16x9)
@@ -1423,74 +1430,88 @@ impl AppShell {
                 .progress_fraction(progress_fraction)
                 .in_library(true)
                 .is_focused(is_focused)
-                .on_open(click_handler(cx.listener(move |this, _, _, cx| {
+                .on_open(cx.listener(move |this, _, _, cx| {
+                    let li = &open_items[idx].0;
                     this.open_meta_details(
-                        open_type.clone(),
-                        open_id.clone(),
-                        open_vid.clone(),
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.state.video_id.clone(),
                         cx,
                     );
-                })))
-                .on_quick_play(click_handler(cx.listener(move |this, _, _, cx| {
+                }))
+                .on_quick_play(cx.listener(move |this, _, _, cx| {
+                    let li = &play_items[idx].0;
                     this.quick_resume_or_open(
-                        play_type.clone(),
-                        play_id.clone(),
-                        play_vid.clone(),
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.state.video_id.clone(),
                         cx,
                     );
-                })))
-                .on_toggle_library(click_handler(cx.listener(move |this, _, _, cx| {
-                    this.core.remove_from_library(remove_id.clone());
+                }))
+                .on_toggle_library(cx.listener(move |this, _, _, cx| {
+                    let li = &remove_items[idx].0;
+                    this.core.remove_from_library(li.id.clone());
                     this.push_toast(
                         ToastKind::Info,
                         "Removed from library",
-                        Some(remove_name.clone()),
+                        Some(li.name.clone()),
                         cx,
                     );
                     cx.notify();
-                })))
-                .on_quick_peek(click_handler(cx.listener(move |this, _, _, cx| {
-                    this.open_quick_peek(peek_target.clone(), cx);
-                })))
+                }))
+                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    let li = &peek_items[idx].0;
+                    this.open_quick_peek(
+                        QuickPeekTarget {
+                            type_name: li.r#type.clone(),
+                            id: li.id.clone(),
+                            video_id: li.state.video_id.clone(),
+                            title: li.name.clone(),
+                            preview: None,
+                        },
+                        cx,
+                    );
+                }))
                 .quick_action(Some(toggle_watched_btn))
-                .on_context_menu(click_handler(cx.listener(
-                    move |this, ev: &MouseDownEvent, _, cx| {
-                        let menu = BrowsingContextMenu::new(
-                            ev.position,
-                            ctx_type.clone(),
-                            ctx_id.clone(),
-                            ctx_name.clone(),
-                        )
-                        .video_id(ctx_vid.clone())
-                        .is_in_library(true)
-                        .is_watched(ctx_watched)
-                        .can_rewind_cw(ctx_can_rewind);
-                        this.open_browsing_context_menu(menu, cx);
-                    },
-                )))
-                .on_hover(hover_handler(cx.listener(move |this, hovered, _, cx| {
+                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let li = &ctx_items[idx].0;
+                    let menu = BrowsingContextMenu::new(
+                        ev.position,
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.name.clone(),
+                    )
+                    .video_id(li.state.video_id.clone())
+                    .is_in_library(true)
+                    .is_watched(li.watched())
+                    .can_rewind_cw(li.state.time_offset > 0);
+                    this.open_browsing_context_menu(menu, cx);
+                }))
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    let li = &hover_items[idx].0;
                     this.on_card_hover_prefetch(
-                        &hover_type,
-                        &hover_id,
+                        &li.r#type,
+                        &li.id,
                         hover_bg.as_deref(),
                         *hovered,
                         cx,
                     );
-                }))),
+                })),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn render_library_compact_row(
         &self,
+        items: &Arc<Vec<(LibraryItem, LibraryStatusTab)>>,
         idx: usize,
-        li: &LibraryItem,
         status: LibraryStatusTab,
         notification_count: usize,
         row_height_px: f32,
         is_focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let li = &items[idx].0;
         let theme = active_theme();
         let thumb_tex = self.poster_cache.resolve_thumbnail_url(li.poster.as_ref());
         let type_label = sentence_case_label(&li.r#type);
@@ -1523,33 +1544,12 @@ impl AppShell {
         let status_bg = (status_color << 8) | if theme.is_light { 0x1F } else { 0x1A };
         let status_border = (status_color << 8) | if theme.is_light { 0x55 } else { 0x47 };
 
-        let open_type = li.r#type.clone();
-        let open_id = li.id.clone();
-        let open_vid = li.state.video_id.clone();
-
-        let play_type = li.r#type.clone();
-        let play_id = li.id.clone();
-        let play_vid = li.state.video_id.clone();
-
-        let watch_id = li.id.clone();
-        let watch_name = li.name.clone();
-
-        let peek_target = QuickPeekTarget {
-            type_name: li.r#type.clone(),
-            id: li.id.clone(),
-            video_id: li.state.video_id.clone(),
-            title: li.name.clone(),
-            preview: None,
-        };
-
-        let ctx_type = li.r#type.clone();
-        let ctx_id = li.id.clone();
-        let ctx_name = li.name.clone();
-        let ctx_vid = li.state.video_id.clone();
-        let ctx_can_rewind = li.state.time_offset > 0;
-
-        let hover_type = li.r#type.clone();
-        let hover_id = li.id.clone();
+        let open_items = Arc::clone(items);
+        let ctx_items = Arc::clone(items);
+        let hover_items = Arc::clone(items);
+        let play_items = Arc::clone(items);
+        let watch_items = Arc::clone(items);
+        let peek_items = Arc::clone(items);
 
         div()
             .id(("library-compact-row", idx))
@@ -1585,10 +1585,11 @@ impl AppShell {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
+                    let li = &open_items[idx].0;
                     this.open_meta_details(
-                        open_type.clone(),
-                        open_id.clone(),
-                        open_vid.clone(),
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.state.video_id.clone(),
                         cx,
                     );
                 }),
@@ -1597,21 +1598,23 @@ impl AppShell {
                 MouseButton::Right,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
+                    let li = &ctx_items[idx].0;
                     let menu = BrowsingContextMenu::new(
                         ev.position,
-                        ctx_type.clone(),
-                        ctx_id.clone(),
-                        ctx_name.clone(),
+                        li.r#type.clone(),
+                        li.id.clone(),
+                        li.name.clone(),
                     )
-                    .video_id(ctx_vid.clone())
+                    .video_id(li.state.video_id.clone())
                     .is_in_library(true)
                     .is_watched(is_watched)
-                    .can_rewind_cw(ctx_can_rewind);
+                    .can_rewind_cw(li.state.time_offset > 0);
                     this.open_browsing_context_menu(menu, cx);
                 }),
             )
             .on_hover(cx.listener(move |this, hovered, _, cx| {
-                this.on_card_hover_prefetch(&hover_type, &hover_id, None, *hovered, cx);
+                let li = &hover_items[idx].0;
+                this.on_card_hover_prefetch(&li.r#type, &li.id, None, *hovered, cx);
             }))
             // Left: poster thumb + title + badges + episode/progress bar.
             .child(
@@ -1791,10 +1794,11 @@ impl AppShell {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
+                                    let li = &play_items[idx].0;
                                     this.quick_resume_or_open(
-                                        play_type.clone(),
-                                        play_id.clone(),
-                                        play_vid.clone(),
+                                        li.r#type.clone(),
+                                        li.id.clone(),
+                                        li.state.video_id.clone(),
                                         cx,
                                     );
                                 }),
@@ -1850,9 +1854,10 @@ impl AppShell {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
+                                    let li = &watch_items[idx].0;
                                     let next_watched = !is_watched;
                                     this.core.mark_library_item_watched(
-                                        watch_id.clone(),
+                                        li.id.clone(),
                                         next_watched,
                                     );
                                     this.push_toast(
@@ -1862,7 +1867,7 @@ impl AppShell {
                                         } else {
                                             "Marked as unwatched"
                                         },
-                                        Some(watch_name.clone()),
+                                        Some(li.name.clone()),
                                         cx,
                                     );
                                     cx.notify();
@@ -1908,7 +1913,17 @@ impl AppShell {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.open_quick_peek(peek_target.clone(), cx);
+                                    let li = &peek_items[idx].0;
+                                    this.open_quick_peek(
+                                        QuickPeekTarget {
+                                            type_name: li.r#type.clone(),
+                                            id: li.id.clone(),
+                                            video_id: li.state.video_id.clone(),
+                                            title: li.name.clone(),
+                                            preview: None,
+                                        },
+                                        cx,
+                                    );
                                 }),
                             )
                             .child(svg_icon(

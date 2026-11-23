@@ -1130,6 +1130,10 @@ impl PosterCache {
             return epoch;
         }
 
+        // Clear the flag BEFORE sweeping so any concurrent `insert_ready_and_wake`
+        // that pushes an already-swept LRU over capacity re-sets it to `true`
+        // without being clobbered by a trailing `store(false)`.
+        self.inner.lru_over_capacity.swap(false, Ordering::AcqRel);
         let mut still_over = false;
         let mut swept = {
             let mut lru = self.inner.decoded_lru.lock();
@@ -1157,9 +1161,9 @@ impl PosterCache {
             swept.extend(lru.sweep_to_capacity(epoch));
             still_over |= lru.is_over_capacity();
         }
-        self.inner
-            .lru_over_capacity
-            .store(still_over, Ordering::Release);
+        if still_over {
+            self.inner.lru_over_capacity.store(true, Ordering::Release);
+        }
         if !swept.is_empty() {
             self.inner.evicted_images.lock().extend(swept);
             self.inner.has_evicted_images.store(true, Ordering::Release);
@@ -1276,12 +1280,39 @@ impl PosterCache {
         hero_keep: usize,
         ambient_keep: usize,
     ) {
-        let mut newly_evicted = self.inner.decoded_lru.lock().trim_to_limit(decoded_keep);
-        newly_evicted.extend(self.inner.thumb_lru.lock().trim_to_limit(thumb_keep));
-        newly_evicted.extend(self.inner.still_lru.lock().trim_to_limit(still_keep));
-        newly_evicted.extend(self.inner.hero_lru.lock().trim_to_limit(hero_keep));
-        newly_evicted.extend(self.inner.ambient_lru.lock().trim_to_limit(ambient_keep));
-        self.inner.lru_over_capacity.store(false, Ordering::Release);
+        // Clear BEFORE trimming so concurrent inserts after an LRU unlocks
+        // cannot lose their `true` mark to a trailing `store(false)`.
+        self.inner.lru_over_capacity.swap(false, Ordering::AcqRel);
+        let mut still_over = false;
+        let mut newly_evicted = {
+            let mut lru = self.inner.decoded_lru.lock();
+            let ev = lru.trim_to_limit(decoded_keep);
+            still_over |= lru.is_over_capacity();
+            ev
+        };
+        {
+            let mut lru = self.inner.thumb_lru.lock();
+            newly_evicted.extend(lru.trim_to_limit(thumb_keep));
+            still_over |= lru.is_over_capacity();
+        }
+        {
+            let mut lru = self.inner.still_lru.lock();
+            newly_evicted.extend(lru.trim_to_limit(still_keep));
+            still_over |= lru.is_over_capacity();
+        }
+        {
+            let mut lru = self.inner.hero_lru.lock();
+            newly_evicted.extend(lru.trim_to_limit(hero_keep));
+            still_over |= lru.is_over_capacity();
+        }
+        {
+            let mut lru = self.inner.ambient_lru.lock();
+            newly_evicted.extend(lru.trim_to_limit(ambient_keep));
+            still_over |= lru.is_over_capacity();
+        }
+        if still_over {
+            self.inner.lru_over_capacity.store(true, Ordering::Release);
+        }
         if !newly_evicted.is_empty() {
             self.inner.evicted_images.lock().extend(newly_evicted);
             self.inner.has_evicted_images.store(true, Ordering::Release);

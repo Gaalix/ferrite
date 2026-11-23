@@ -186,6 +186,9 @@ pub struct SectionHeader {
     pub inline_badge: Option<AnyElement>,
     pub subtitle: Option<SharedString>,
     pub right_slot: Option<AnyElement>,
+    /// When `true`, prevents header rows/controls from wrapping onto a second line and truncates
+    /// long titles with an ellipsis so fixed-height virtualized shelves never clip.
+    pub single_line: bool,
 }
 
 impl SectionHeader {
@@ -196,6 +199,7 @@ impl SectionHeader {
             inline_badge: None,
             subtitle: None,
             right_slot: None,
+            single_line: false,
         }
     }
 
@@ -218,15 +222,23 @@ impl SectionHeader {
         self.right_slot = slot.into();
         self
     }
+
+    pub fn single_line(mut self, single_line: bool) -> Self {
+        self.single_line = single_line;
+        self
+    }
 }
 
 /// Renders the canonical Ferrite section header (`editorial_serif()` `sp(26.0)`).
 pub fn render_section_header(props: SectionHeader) -> Div {
     let theme = active_theme();
+    let single_line = props.single_line;
 
     let title_row = div()
+        .w_full()
+        .min_w(px(0.0))
         .flex()
-        .flex_wrap()
+        .when(!single_line, |el| el.flex_wrap())
         .items_baseline()
         .gap(theme.sp(10.0))
         .child(
@@ -235,6 +247,7 @@ pub fn render_section_header(props: SectionHeader) -> Div {
                 .text_size(theme.sp(26.0))
                 .line_height(relative(1.1))
                 .text_color(rgb(theme.text_primary))
+                .when(single_line, |el| el.min_w(px(0.0)).truncate())
                 .child(props.title),
         )
         .when_some(props.count_badge, |row, badge| {
@@ -254,6 +267,7 @@ pub fn render_section_header(props: SectionHeader) -> Div {
                 div()
                     .font(ui_sans(FontWeight::NORMAL))
                     .text_size(theme.sp(12.5))
+                    .line_height(theme.sp(16.0))
                     .text_color(rgb(theme.text_muted))
                     .truncate()
                     .child(sub),
@@ -264,7 +278,7 @@ pub fn render_section_header(props: SectionHeader) -> Div {
         .w_full()
         .flex_shrink_0()
         .flex()
-        .flex_wrap()
+        .when(!single_line, |el| el.flex_wrap())
         .items_end()
         .justify_between()
         .gap(theme.sp(12.0))

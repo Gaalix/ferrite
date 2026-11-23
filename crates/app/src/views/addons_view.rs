@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use gpui::{
     div, prelude::*, px, rgb, rgba, AsyncApp, ClipboardItem, Context, FontWeight, MouseButton,
@@ -17,8 +20,7 @@ use crate::{
     shell::AppShell,
     state::{addon_matches_search_query, AddonCategoryFilter, AddonSubTab, FocusedInput, ToastKind},
     theme::{
-        active_theme, mono_font, sp, ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL,
-        RADIUS_PILL,
+        active_theme, mono_font, ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL,
     },
     ui::{
         choice_pill, glass_segmented_bar, glass_segmented_item, glass_switch, meta_divider,
@@ -45,19 +47,28 @@ struct DirectoryAddonCard {
 impl AppShell {
     pub fn render_addons_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = active_theme();
-        let (active_addons, remote_descriptors, remote_loading) = self.core.with_model(|model| {
-            let active = model.ctx.profile.addons.clone();
-            let mut remote = Vec::new();
-            let mut loading = false;
-            for page in &model.remote_addons.catalog {
-                match &page.content {
-                    Some(Loadable::Ready(list)) => remote.extend(list.iter().cloned()),
-                    Some(Loadable::Loading) => loading = true,
-                    _ => {}
+        let is_explore = self.addon_sub_tab == AddonSubTab::Explore;
+        let (active_addons, directory_cards, total_directory, remote_loading) =
+            self.core.with_model(|model| {
+                let active = model.ctx.profile.addons.clone();
+                let mut loading = false;
+                let mut remote_refs: Vec<&Descriptor> = Vec::new();
+                for page in &model.remote_addons.catalog {
+                    match &page.content {
+                        Some(Loadable::Ready(list)) => remote_refs.extend(list.iter()),
+                        Some(Loadable::Loading) => loading = true,
+                        _ => {}
+                    }
                 }
-            }
-            (active, remote, loading)
-        });
+                if is_explore {
+                    let cards = build_deduplicated_directory_refs(&remote_refs);
+                    let count = cards.len();
+                    (active, cards, count, loading)
+                } else {
+                    let count = count_deduplicated_directory_refs(&remote_refs);
+                    (active, Vec::new(), count, loading)
+                }
+            });
 
         let muted_addons = self.core.list_muted_addons();
         let telemetry_map = self.core.addon_telemetry();
@@ -65,9 +76,6 @@ impl AppShell {
 
         let total_active = active_addons.len();
         let total_installed_and_muted = total_active + muted_addons.len();
-
-        let directory_cards = build_deduplicated_directory(&remote_descriptors);
-        let total_directory = directory_cards.len();
 
         div()
             .id("addons-studio-scroll")
@@ -82,18 +90,19 @@ impl AppShell {
                         t,
                         cx,
                     ))
-                    .when_some(self.clipboard_addon_suggestion.clone(), |el, clip_url| {
+                    .when_some(self.clipboard_addon_suggestion.as_deref(), |el, clip_url| {
                         let is_update = is_clipboard_url_in_place_update(
-                            &clip_url,
+                            clip_url,
                             &active_addons,
                             &muted_addons,
                         );
-                        el.child(self.render_clipboard_addon_bar(&clip_url, is_update, t, cx))
+                        el.child(self.render_clipboard_addon_bar(clip_url, is_update, t, cx))
                     })
                     .child(self.render_universal_manifest_bar(t, cx))
                     .child(self.render_addons_toolbar(
                         total_installed_and_muted,
                         total_directory,
+                        t,
                         cx,
                     ))
                     .child(match self.addon_sub_tab {
@@ -130,15 +139,15 @@ impl AppShell {
         let has_cache = cache_stats.entries > 0 || cache_stats.hits > 0;
 
         let stats_pill = div()
-            .h(sp(34.0))
-            .px(sp(14.0))
+            .h(t.sp(34.0))
+            .px(t.sp(14.0))
             .rounded(px(RADIUS_PILL))
             .bg(rgba(t.glass_card_bg))
             .border_1()
             .border_color(rgba(t.glass_border))
             .flex()
             .items_center()
-            .gap(sp(10.0))
+            .gap(t.sp(10.0))
             .font(mono_font())
             .text_xs()
             .text_color(rgb(t.text_secondary))
@@ -203,8 +212,8 @@ impl AppShell {
         };
 
         div()
-            .px(sp(16.0))
-            .py(sp(11.0))
+            .px(t.sp(16.0))
+            .py(t.sp(11.0))
             .rounded(px(RADIUS_CARD))
             .bg(rgba(t.glass_card_bg))
             .border_1()
@@ -212,14 +221,14 @@ impl AppShell {
             .flex()
             .items_center()
             .justify_between()
-            .gap(sp(14.0))
+            .gap(t.sp(14.0))
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
                     .flex()
                     .items_center()
-                    .gap(sp(10.0))
+                    .gap(t.sp(10.0))
                     .child(svg_icon_weighted(
                         IconName::Clipboard,
                         IconWeight::Regular,
@@ -230,7 +239,7 @@ impl AppShell {
                         div()
                             .flex_shrink_0()
                             .font(ui_sans(FontWeight::SEMIBOLD))
-                            .text_size(sp(13.0))
+                            .text_size(t.sp(13.0))
                             .text_color(rgb(t.text_primary))
                             .child(if is_update {
                                 "Updated addon link on clipboard"
@@ -255,13 +264,13 @@ impl AppShell {
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(sp(8.0))
+                    .gap(t.sp(8.0))
                     .child(
                         div()
                             .id("btn-clipboard-install-addon")
                             .cursor_pointer()
-                            .h(sp(30.0))
-                            .px(sp(13.0))
+                            .h(t.sp(30.0))
+                            .px(t.sp(13.0))
                             .rounded(px(RADIUS_CONTROL))
                             .bg(rgb(t.accent))
                             .hover(move |s| s.bg(rgb(t.accent_hover)))
@@ -286,8 +295,8 @@ impl AppShell {
                         div()
                             .id("btn-clipboard-dismiss-addon")
                             .cursor_pointer()
-                            .w(sp(28.0))
-                            .h(sp(28.0))
+                            .w(t.sp(28.0))
+                            .h(t.sp(28.0))
                             .rounded(px(RADIUS_CONTROL))
                             .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                             .flex()
@@ -335,22 +344,22 @@ impl AppShell {
                 .is_some_and(|u| self.installing_addon_urls.contains(u.as_str()));
 
         div()
-            .p(sp(14.0))
+            .p(t.sp(14.0))
             .rounded(px(RADIUS_CARD))
             .bg(rgba(t.glass_card_bg))
             .border_1()
             .border_color(rgba(t.glass_border))
             .flex()
             .items_center()
-            .gap(sp(10.0))
+            .gap(t.sp(10.0))
             .child(
                 div()
                     .id("input-addon-manifest-url")
                     .cursor_text()
                     .flex_1()
                     .min_w(px(0.0))
-                    .h(sp(40.0))
-                    .px(sp(14.0))
+                    .h(t.sp(40.0))
+                    .px(t.sp(14.0))
                     .rounded(px(RADIUS_CONTROL))
                     .bg(rgba(t.glass_trough_bg))
                     .border_1()
@@ -361,7 +370,7 @@ impl AppShell {
                     })
                     .flex()
                     .items_center()
-                    .gap(sp(10.0))
+                    .gap(t.sp(10.0))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -381,7 +390,7 @@ impl AppShell {
                             .min_w(px(0.0))
                             .truncate()
                             .font(mono_font())
-                            .text_size(sp(13.0))
+                            .text_size(t.sp(13.0))
                             .text_color(if self.addon_url_input.is_empty() && !url_focused {
                                 rgb(t.text_muted)
                             } else {
@@ -394,8 +403,8 @@ impl AppShell {
                 div()
                     .id("btn-paste-manifest-url")
                     .cursor_pointer()
-                    .h(sp(40.0))
-                    .px(sp(14.0))
+                    .h(t.sp(40.0))
+                    .px(t.sp(14.0))
                     .rounded(px(RADIUS_CONTROL))
                     .bg(rgba(t.glass_trough_bg))
                     .border_1()
@@ -406,9 +415,9 @@ impl AppShell {
                     })
                     .flex()
                     .items_center()
-                    .gap(sp(6.0))
+                    .gap(t.sp(6.0))
                     .font(ui_sans(FontWeight::MEDIUM))
-                    .text_size(sp(13.0))
+                    .text_size(t.sp(13.0))
                     .text_color(rgb(t.text_primary))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -439,16 +448,16 @@ impl AppShell {
                 div()
                     .id("btn-install-manifest-url")
                     .cursor_pointer()
-                    .h(sp(40.0))
-                    .px(sp(18.0))
+                    .h(t.sp(40.0))
+                    .px(t.sp(18.0))
                     .rounded(px(RADIUS_CONTROL))
                     .bg(rgb(t.accent))
                     .hover(move |s| s.bg(rgb(t.accent_hover)))
                     .flex()
                     .items_center()
-                    .gap(sp(6.0))
+                    .gap(t.sp(6.0))
                     .font(ui_sans(FontWeight::SEMIBOLD))
-                    .text_size(sp(13.5))
+                    .text_size(t.sp(13.5))
                     .text_color(rgb(t.cta_on_accent))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -470,6 +479,7 @@ impl AppShell {
         &self,
         installed_count: usize,
         directory_count: usize,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let search_focused = self.focused_input == Some(FocusedInput::AddonSearch);
@@ -479,7 +489,7 @@ impl AppShell {
         div()
             .flex()
             .flex_col()
-            .gap(sp(12.0))
+            .gap(t.sp(12.0))
             .child(
                 toolbar_bar()
                     .child(
@@ -531,7 +541,7 @@ impl AppShell {
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(sp(8.0))
+                    .gap(t.sp(8.0))
                     .children(AddonCategoryFilter::ALL.into_iter().enumerate().map(
                         |(idx, pill)| {
                             let active = self.addon_category_filter == pill;
@@ -632,7 +642,7 @@ impl AppShell {
         div()
             .flex()
             .flex_col()
-            .gap(sp(20.0))
+            .gap(t.sp(20.0))
             .when(!visible_active.is_empty(), |el| {
                 el.child(
                     div()
@@ -666,7 +676,7 @@ impl AppShell {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(sp(10.0))
+                        .gap(t.sp(10.0))
                         .child(
                             div()
                                 .flex()
@@ -737,13 +747,12 @@ impl AppShell {
         let rose_bg = (t.accent_rose << 8) | if t.is_light { 0x17 } else { 0x1a };
         let rose_hover = (t.accent_rose << 8) | if t.is_light { 0x2b } else { 0x2e };
         let is_protected = addon.flags.protected;
-        let transport_url = addon.transport_url.clone();
-        let url_str = transport_url.to_string();
+        let url_str = addon.transport_url.as_str();
 
         let configurable = addon.manifest.behavior_hints.configurable
             || addon.manifest.behavior_hints.configuration_required;
         let configure_target = if configurable {
-            addon_configure_url(&transport_url).map(|u| u.to_string())
+            addon_configure_url(&addon.transport_url).map(|u| u.to_string())
         } else {
             None
         };
@@ -762,19 +771,12 @@ impl AppShell {
         let can_move_up = is_active && slot_idx > 0;
         let can_move_down = is_active && slot_idx + 1 < total_active;
 
-        let url_for_top = transport_url.clone();
-        let url_for_up = transport_url.clone();
-        let url_for_down = transport_url.clone();
-        let url_for_copy = url_str.clone();
-        let url_for_switch = transport_url.clone();
-        let addon_for_remove = addon.clone();
-        let url_for_muted_remove = transport_url;
-        let addon_name_for_switch = addon.manifest.name.clone();
+        let url_for_copy = url_str.to_owned();
 
         div()
             .id(("studio-addon-row", dom_idx))
-            .px(sp(18.0))
-            .py(sp(14.0))
+            .px(t.sp(18.0))
+            .py(t.sp(14.0))
             .when(dom_idx > 0 && dom_idx != 10_000, |r| {
                 r.border_t_1().border_color(rgba(t.glass_divider))
             })
@@ -787,19 +789,19 @@ impl AppShell {
             .flex()
             .items_center()
             .justify_between()
-            .gap(sp(16.0))
+            .gap(t.sp(16.0))
             .child(
                 div()
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(sp(10.0))
+                    .gap(t.sp(10.0))
                     .child(
                         div()
-                            .w(sp(28.0))
+                            .w(t.sp(28.0))
                             .font(mono_font())
                             .font_weight(FontWeight::BOLD)
-                            .text_size(sp(14.0))
+                            .text_size(t.sp(14.0))
                             .text_color(if !is_active {
                                 rgb(t.text_muted)
                             } else if slot_idx == 0 {
@@ -814,11 +816,15 @@ impl AppShell {
                             }),
                     )
                     .when(is_active && total_active > 1, |el| {
+                        let shared_url = Arc::new(addon.transport_url.clone());
+                        let url_for_top = Arc::clone(&shared_url);
+                        let url_for_up = Arc::clone(&shared_url);
+                        let url_for_down = shared_url;
                         el.child(
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(sp(3.0))
+                                .gap(t.sp(3.0))
                                 .child(render_reorder_icon_btn(
                                     ("addon-pin-top", dom_idx),
                                     IconName::ArrowUpToLine,
@@ -863,17 +869,17 @@ impl AppShell {
                     .min_w(px(0.0))
                     .flex()
                     .flex_col()
-                    .gap(sp(4.0))
+                    .gap(t.sp(4.0))
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
                             .items_center()
-                            .gap(sp(8.0))
+                            .gap(t.sp(8.0))
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(sp(14.5))
+                                    .text_size(t.sp(14.5))
                                     .text_color(if is_active {
                                         rgb(t.text_primary)
                                     } else {
@@ -885,14 +891,14 @@ impl AppShell {
                             .when(!is_active, |el| {
                                 el.child(
                                     div()
-                                        .px(sp(7.0))
-                                        .py(sp(2.0))
+                                        .px(t.sp(7.0))
+                                        .py(t.sp(2.0))
                                         .rounded(px(RADIUS_PILL))
                                         .bg(rgba(t.glass_trough_bg))
                                         .border_1()
                                         .border_color(rgba(t.glass_border))
                                         .font(mono_font())
-                                        .text_size(sp(11.0))
+                                        .text_size(t.sp(11.0))
                                         .text_color(rgb(t.text_muted))
                                         .child("Muted"),
                                 )
@@ -918,7 +924,7 @@ impl AppShell {
                                 el.children(Self::render_telemetry_readout(
                                     dom_idx,
                                     snap,
-                                    &url_str,
+                                    url_str,
                                     &addon.manifest.name,
                                     t,
                                     cx,
@@ -941,14 +947,14 @@ impl AppShell {
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(sp(8.0))
+                    .gap(t.sp(8.0))
                     .when_some(configure_target, |el, cfg_url| {
                         el.child(
                             div()
                                 .id(("addon-configure-btn", dom_idx))
                                 .cursor_pointer()
-                                .h(sp(30.0))
-                                .px(sp(10.0))
+                                .h(t.sp(30.0))
+                                .px(t.sp(10.0))
                                 .rounded(px(RADIUS_CONTROL))
                                 .bg(rgba(t.glass_trough_bg))
                                 .border_1()
@@ -959,7 +965,7 @@ impl AppShell {
                                 })
                                 .flex()
                                 .items_center()
-                                .gap(sp(5.0))
+                                .gap(t.sp(5.0))
                                 .text_xs()
                                 .text_color(rgb(t.text_primary))
                                 .on_mouse_down(
@@ -990,8 +996,8 @@ impl AppShell {
                         div()
                             .id(("addon-copy-url-btn", dom_idx))
                             .cursor_pointer()
-                            .h(sp(30.0))
-                            .px(sp(10.0))
+                            .h(t.sp(30.0))
+                            .px(t.sp(10.0))
                             .rounded(px(RADIUS_CONTROL))
                             .bg(rgba(t.glass_trough_bg))
                             .border_1()
@@ -1002,7 +1008,7 @@ impl AppShell {
                             })
                             .flex()
                             .items_center()
-                            .gap(sp(5.0))
+                            .gap(t.sp(5.0))
                             .text_xs()
                             .text_color(rgb(t.text_secondary))
                             .on_mouse_down(
@@ -1029,8 +1035,8 @@ impl AppShell {
                     )
                     .child(if is_protected {
                         div()
-                            .h(sp(26.0))
-                            .px(sp(9.0))
+                            .h(t.sp(26.0))
+                            .px(t.sp(9.0))
                             .rounded(px(RADIUS_PILL))
                             .bg(rgba(t.glass_trough_bg))
                             .border_1()
@@ -1038,11 +1044,13 @@ impl AppShell {
                             .flex()
                             .items_center()
                             .font(mono_font())
-                            .text_size(sp(11.0))
+                            .text_size(t.sp(11.0))
                             .text_color(rgb(t.text_muted))
                             .child("Core")
                             .into_any_element()
                     } else {
+                        let url_for_switch = addon.transport_url.clone();
+                        let addon_name_for_switch = addon.manifest.name.clone();
                         glass_switch(
                             ("addon-soft-switch", dom_idx),
                             is_active,
@@ -1079,12 +1087,15 @@ impl AppShell {
                         .into_any_element()
                     })
                     .when(!is_protected, |el| {
+                        let remove_active_desc = is_active.then(|| addon.clone());
+                        let remove_muted_url = (!is_active).then(|| addon.transport_url.clone());
+                        let removed_name = addon.manifest.name.clone();
                         el.child(
                             div()
                                 .id(("addon-remove-btn", dom_idx))
                                 .cursor_pointer()
-                                .w(sp(30.0))
-                                .h(sp(30.0))
+                                .w(t.sp(30.0))
+                                .h(t.sp(30.0))
                                 .rounded(px(RADIUS_CONTROL))
                                 .bg(rgba(rose_bg))
                                 .hover(move |s| s.bg(rgba(rose_hover)))
@@ -1094,11 +1105,10 @@ impl AppShell {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
-                                        let removed_name = addon_for_remove.manifest.name.clone();
-                                        if is_active {
-                                            this.core.uninstall_addon(addon_for_remove.clone());
-                                        } else {
-                                            this.core.remove_muted_addon(&url_for_muted_remove);
+                                        if let Some(desc) = remove_active_desc.as_ref() {
+                                            this.core.uninstall_addon(desc.clone());
+                                        } else if let Some(url) = remove_muted_url.as_ref() {
+                                            this.core.remove_muted_addon(url);
                                         }
                                         this.push_toast(
                                             ToastKind::Info,
@@ -1188,7 +1198,7 @@ impl AppShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(sp(8.0))
+                        .gap(t.sp(8.0))
                         .child(meta_divider())
                         .child(
                             div()
@@ -1209,7 +1219,7 @@ impl AppShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(sp(8.0))
+                        .gap(t.sp(8.0))
                         .child(meta_divider())
                         .child(
                             div()
@@ -1230,7 +1240,7 @@ impl AppShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(sp(8.0))
+                        .gap(t.sp(8.0))
                         .child(meta_divider())
                         .child(
                             div()
@@ -1260,7 +1270,7 @@ impl AppShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(sp(8.0))
+                        .gap(t.sp(8.0))
                         .child(meta_divider())
                         .child(
                             div()
@@ -1344,12 +1354,14 @@ impl AppShell {
             return render_empty_state(props);
         }
 
+        let install_index = DirectoryInstallIndex::new(active_addons, muted_addons);
+
         div()
             .grid()
             .grid_cols(2)
-            .gap(sp(16.0))
+            .gap(t.sp(16.0))
             .children(filtered.into_iter().enumerate().map(|(idx, card)| {
-                self.render_directory_card(idx, card, active_addons, muted_addons, t, cx)
+                self.render_directory_card(idx, card, &install_index, t, cx)
             }))
     }
 
@@ -1357,8 +1369,7 @@ impl AppShell {
         &self,
         idx: usize,
         card: &DirectoryAddonCard,
-        active_addons: &[Descriptor],
-        muted_addons: &[MutedAddonEntry],
+        install_index: &DirectoryInstallIndex<'_>,
         t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1370,18 +1381,12 @@ impl AppShell {
             .map(|u| u.to_string())
             .unwrap_or_else(|_| card.manifest_url.clone());
 
-        let active_match = active_addons.iter().find(|a| {
-            a.manifest.id.eq_ignore_ascii_case(&card.id)
-                || a.transport_url.as_str().eq_ignore_ascii_case(&norm_card_url)
-        });
-
-        let muted_match = muted_addons.iter().find(|m| {
-            m.descriptor.manifest.id.eq_ignore_ascii_case(&card.id)
-                || m.descriptor
-                    .transport_url
-                    .as_str()
-                    .eq_ignore_ascii_case(&norm_card_url)
-        });
+        let active_match = install_index.find_active(&card.id, &norm_card_url);
+        let muted_match = if active_match.is_none() {
+            install_index.find_muted(&card.id, &norm_card_url)
+        } else {
+            None
+        };
 
         let is_installing = self.installing_addon_urls.contains(&norm_card_url);
         let cat_label = card
@@ -1402,7 +1407,7 @@ impl AppShell {
 
         div()
             .id(("explore-addon-card", idx))
-            .p(sp(20.0))
+            .p(t.sp(20.0))
             .rounded(px(RADIUS_CARD))
             .bg(rgba(t.glass_card_bg))
             .border_1()
@@ -1411,29 +1416,29 @@ impl AppShell {
             .flex()
             .flex_col()
             .justify_between()
-            .gap(sp(16.0))
+            .gap(t.sp(16.0))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(sp(8.0))
+                    .gap(t.sp(8.0))
                     .child(
                         div()
                             .flex()
                             .items_start()
                             .justify_between()
-                            .gap(sp(12.0))
+                            .gap(t.sp(12.0))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w(px(0.0))
                                     .flex()
                                     .flex_col()
-                                    .gap(sp(2.0))
+                                    .gap(t.sp(2.0))
                                     .child(
                                         div()
                                             .font(ui_sans(FontWeight::SEMIBOLD))
-                                            .text_size(sp(15.5))
+                                            .text_size(t.sp(15.5))
                                             .text_color(rgb(t.text_primary))
                                             .truncate()
                                             .child(card.name.clone()),
@@ -1453,7 +1458,7 @@ impl AppShell {
                     .when_some(card.description.clone(), |el, desc| {
                         el.child(
                             div()
-                                .text_size(sp(13.0))
+                                .text_size(t.sp(13.0))
                                 .text_color(rgb(t.text_secondary))
                                 .line_clamp(2)
                                 .child(desc),
@@ -1462,13 +1467,13 @@ impl AppShell {
             )
             .child(
                 div()
-                    .pt(sp(12.0))
+                    .pt(t.sp(12.0))
                     .border_t_1()
                     .border_color(rgba(t.glass_divider))
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap(sp(12.0))
+                    .gap(t.sp(12.0))
                     .child(
                         div()
                             .flex_1()
@@ -1487,14 +1492,14 @@ impl AppShell {
                         div()
                             .flex()
                             .items_center()
-                            .gap(sp(8.0))
+                            .gap(t.sp(8.0))
                             .when_some(cfg_url_opt, |el, cfg_url| {
                                 el.child(
                                     div()
                                         .id(("explore-cfg-installed", idx))
                                         .cursor_pointer()
-                                        .h(sp(28.0))
-                                        .px(sp(10.0))
+                                        .h(t.sp(28.0))
+                                        .px(t.sp(10.0))
                                         .rounded(px(RADIUS_CONTROL))
                                         .bg(rgba(t.glass_trough_bg))
                                         .border_1()
@@ -1505,7 +1510,7 @@ impl AppShell {
                                         })
                                         .flex()
                                         .items_center()
-                                        .gap(sp(5.0))
+                                        .gap(t.sp(5.0))
                                         .text_xs()
                                         .text_color(rgb(t.text_secondary))
                                         .on_mouse_down(
@@ -1537,8 +1542,8 @@ impl AppShell {
                         div()
                             .id(("explore-reenable-btn", idx))
                             .cursor_pointer()
-                            .h(sp(32.0))
-                            .px(sp(14.0))
+                            .h(t.sp(32.0))
+                            .px(t.sp(14.0))
                             .rounded(px(RADIUS_CONTROL))
                             .bg(rgba(t.accent_soft))
                             .border_1()
@@ -1570,8 +1575,8 @@ impl AppShell {
                         div()
                             .id(("explore-browser-cfg-btn", idx))
                             .cursor_pointer()
-                            .h(sp(32.0))
-                            .px(sp(13.0))
+                            .h(t.sp(32.0))
+                            .px(t.sp(13.0))
                             .rounded(px(RADIUS_CONTROL))
                             .bg(rgba(t.glass_trough_bg))
                             .border_1()
@@ -1582,7 +1587,7 @@ impl AppShell {
                             })
                             .flex()
                             .items_center()
-                            .gap(sp(6.0))
+                            .gap(t.sp(6.0))
                             .font(ui_sans(FontWeight::MEDIUM))
                             .text_xs()
                             .text_color(rgb(t.text_primary))
@@ -1615,14 +1620,14 @@ impl AppShell {
                         div()
                             .id(("explore-install-btn", idx))
                             .cursor_pointer()
-                            .h(sp(32.0))
-                            .px(sp(15.0))
+                            .h(t.sp(32.0))
+                            .px(t.sp(15.0))
                             .rounded(px(RADIUS_CONTROL))
                             .bg(rgb(t.accent))
                             .hover(move |s| s.bg(rgb(t.accent_hover)))
                             .flex()
                             .items_center()
-                            .gap(sp(5.0))
+                            .gap(t.sp(5.0))
                             .font(ui_sans(FontWeight::SEMIBOLD))
                             .text_xs()
                             .text_color(rgb(t.cta_on_accent))
@@ -1696,8 +1701,8 @@ fn render_reorder_icon_btn(
                 .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                 .on_mouse_down(MouseButton::Left, on_click)
         })
-        .w(sp(24.0))
-        .h(sp(24.0))
+        .w(t.sp(24.0))
+        .h(t.sp(24.0))
         .rounded(px(5.0))
         .flex()
         .items_center()
@@ -1727,8 +1732,8 @@ fn render_health_action_pill(
     div()
         .id(id)
         .cursor_pointer()
-        .px(sp(8.0))
-        .py(sp(1.5))
+        .px(t.sp(8.0))
+        .py(t.sp(1.5))
         .rounded(px(RADIUS_PILL))
         .bg(rgba(pill_bg))
         .border_1()
@@ -1736,9 +1741,9 @@ fn render_health_action_pill(
         .hover(move |s| s.bg(rgba(pill_hover)))
         .flex()
         .items_center()
-        .gap(sp(4.0))
+        .gap(t.sp(4.0))
         .font(mono_font())
-        .text_size(sp(11.0))
+        .text_size(t.sp(11.0))
         .text_color(rgb(color_hex))
         .on_mouse_down(MouseButton::Left, on_click)
         .child(svg_icon_weighted(
@@ -1848,12 +1853,105 @@ fn redact_long_manifest_url(url_str: &str) -> String {
     format!("{head}...")
 }
 
-fn build_deduplicated_directory(remote_descriptors: &[Descriptor]) -> Vec<DirectoryAddonCard> {
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut seen_urls: HashSet<String> = HashSet::new();
-    let mut out = Vec::with_capacity(curated_addon_directory().len() + remote_descriptors.len());
+struct DirectoryInstallIndex<'a> {
+    active_by_id: HashMap<String, &'a Descriptor>,
+    active_by_url: HashMap<String, &'a Descriptor>,
+    muted_by_id: HashMap<String, &'a MutedAddonEntry>,
+    muted_by_url: HashMap<String, &'a MutedAddonEntry>,
+}
 
-    for entry in curated_addon_directory() {
+impl<'a> DirectoryInstallIndex<'a> {
+    fn new(active_addons: &'a [Descriptor], muted_addons: &'a [MutedAddonEntry]) -> Self {
+        let mut active_by_id = HashMap::with_capacity(active_addons.len());
+        let mut active_by_url = HashMap::with_capacity(active_addons.len());
+        for addon in active_addons {
+            active_by_id
+                .entry(addon.manifest.id.to_ascii_lowercase())
+                .or_insert(addon);
+            active_by_url
+                .entry(addon.transport_url.as_str().to_ascii_lowercase())
+                .or_insert(addon);
+        }
+
+        let mut muted_by_id = HashMap::with_capacity(muted_addons.len());
+        let mut muted_by_url = HashMap::with_capacity(muted_addons.len());
+        for muted in muted_addons {
+            muted_by_id
+                .entry(muted.descriptor.manifest.id.to_ascii_lowercase())
+                .or_insert(muted);
+            muted_by_url
+                .entry(muted.descriptor.transport_url.as_str().to_ascii_lowercase())
+                .or_insert(muted);
+        }
+
+        Self {
+            active_by_id,
+            active_by_url,
+            muted_by_id,
+            muted_by_url,
+        }
+    }
+
+    fn find_active(&self, id: &str, norm_url: &str) -> Option<&'a Descriptor> {
+        let id_key = id.to_ascii_lowercase();
+        self.active_by_id
+            .get(&id_key)
+            .copied()
+            .or_else(|| {
+                let url_key = norm_url.to_ascii_lowercase();
+                self.active_by_url.get(&url_key).copied()
+            })
+    }
+
+    fn find_muted(&self, id: &str, norm_url: &str) -> Option<&'a MutedAddonEntry> {
+        let id_key = id.to_ascii_lowercase();
+        self.muted_by_id
+            .get(&id_key)
+            .copied()
+            .or_else(|| {
+                let url_key = norm_url.to_ascii_lowercase();
+                self.muted_by_url.get(&url_key).copied()
+            })
+    }
+}
+
+fn count_deduplicated_directory_refs(remote_descriptors: &[&Descriptor]) -> usize {
+    let curated = curated_addon_directory();
+    let mut seen_ids: HashSet<String> = HashSet::with_capacity(curated.len() + remote_descriptors.len());
+    let mut seen_urls: HashSet<String> =
+        HashSet::with_capacity(curated.len() + remote_descriptors.len());
+    let mut count = 0usize;
+
+    for entry in curated {
+        let id_key = entry.id.to_ascii_lowercase();
+        let norm_url = normalize_addon_url(entry.manifest_url)
+            .map(|u| u.to_string().to_ascii_lowercase())
+            .unwrap_or_else(|_| entry.manifest_url.to_ascii_lowercase());
+        seen_ids.insert(id_key);
+        seen_urls.insert(norm_url);
+        count += 1;
+    }
+
+    for desc in remote_descriptors {
+        let id_key = desc.manifest.id.trim().to_ascii_lowercase();
+        let url_key = desc.transport_url.as_str().to_ascii_lowercase();
+        if id_key.is_empty() || !seen_ids.insert(id_key) || !seen_urls.insert(url_key) {
+            continue;
+        }
+        count += 1;
+    }
+
+    count
+}
+
+fn build_deduplicated_directory_refs(remote_descriptors: &[&Descriptor]) -> Vec<DirectoryAddonCard> {
+    let curated = curated_addon_directory();
+    let mut seen_ids: HashSet<String> = HashSet::with_capacity(curated.len() + remote_descriptors.len());
+    let mut seen_urls: HashSet<String> =
+        HashSet::with_capacity(curated.len() + remote_descriptors.len());
+    let mut out = Vec::with_capacity(curated.len() + remote_descriptors.len());
+
+    for entry in curated {
         let id_key = entry.id.to_ascii_lowercase();
         let norm_url = normalize_addon_url(entry.manifest_url)
             .map(|u| u.to_string().to_ascii_lowercase())
@@ -1903,12 +2001,18 @@ fn build_deduplicated_directory(remote_descriptors: &[Descriptor]) -> Vec<Direct
             ready_descriptor: if requires_cfg {
                 None
             } else {
-                Some(desc.clone())
+                Some((*desc).clone())
             },
         });
     }
 
     out
+}
+
+#[cfg(test)]
+fn build_deduplicated_directory(remote_descriptors: &[Descriptor]) -> Vec<DirectoryAddonCard> {
+    let refs: Vec<&Descriptor> = remote_descriptors.iter().collect();
+    build_deduplicated_directory_refs(&refs)
 }
 
 #[cfg(test)]
