@@ -21,7 +21,7 @@ use stremio_core_runtime::{
         runtime::msg::{Action, ActionCatalogWithFilters},
         types::{
             addon::{Descriptor, ResourceRequest},
-            resource::{MetaItemPreview, PosterShape},
+            resource::MetaItemPreview,
         },
     },
     DesktopModelField,
@@ -36,21 +36,21 @@ use crate::{
         LibraryStatusTab, QuickPeekTarget, ToastKind,
     },
     theme::{
-        active_theme, editorial_serif, mono_font, sentence_case_label, sp, tabular_nums, ui_sans,
-        ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        active_theme, mono_font, sentence_case_label, sp, tabular_nums, ui_sans, ThemePalette,
+        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
-    ui_components::{
-        click_handler, glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar,
-        glass_segmented_item, glass_switch, hover_handler, primary_accent_button,
-        render_poster_card, PosterCardProps,
+    ui::{
+        choice_pill, click_handler, compute_app_grid_metrics, dropdown_trigger,
+        full_height_page_container, glass_dropdown_option, glass_dropdown_panel,
+        glass_segmented_bar, glass_segmented_item, glass_switch, hover_handler,
+        infer_grid_poster_aspect, neutral_chip, primary_accent_button, render_empty_state,
+        render_page_header, render_poster_card, search_field, toolbar_bar, DropdownTriggerProps,
+        EmptyStateProps, PageHeader, PageWidth, PosterCardProps, PosterMetrics, SearchFieldProps,
     },
-    virtual_grid::{compute_dynamic_grid_metrics, slice_row_items, PosterAspect},
+    virtual_grid::{slice_row_items, PosterAspect},
 };
 
 const SOURCE_RAIL_WIDTH_PX: f32 = 248.0;
-const DISCOVER_MAX_WIDTH_PX: f32 = 1680.0;
-const DISCOVER_MIN_POSTER_WIDTH_PX: f32 = 204.0;
-const DISCOVER_GRID_GAP_PX: f32 = 22.0;
 const EXPANDED_ADDON_PREFIX: &str = "__exp__:";
 const DROPDOWN_EXTRA_TYPES: &str = "__types__";
 const DROPDOWN_FILTERS: &str = "__filters__";
@@ -639,10 +639,8 @@ impl AppShell {
         box_id: &'static str,
         clear_id: &'static str,
         placeholder: &'static str,
-        theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = *theme;
         let has_raw_cat_query = !self.discover_catalog_search.is_empty();
         let cat_search_focused = self.focused_input == Some(FocusedInput::DiscoverCatalogSearch);
         let cat_search_display = self.format_input_with_caret(
@@ -650,105 +648,30 @@ impl AppShell {
             &self.discover_catalog_search,
         );
 
-        div()
-            .id(box_id)
-            .cursor_pointer()
-            .h(sp(34.0))
-            .px(sp(10.0))
-            .rounded(px(RADIUS_POSTER))
-            .bg(if cat_search_focused {
-                rgba(theme.glass_row_selected_bg)
-            } else {
-                rgba(theme.glass_trough_bg)
-            })
-            .border_1()
-            .border_color(if cat_search_focused {
-                rgba(theme.glass_border_strong)
-            } else {
-                rgba(theme.glass_border)
-            })
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(sp(6.0))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.focused_input = Some(FocusedInput::DiscoverCatalogSearch);
-                    cx.notify();
-                }),
+        search_field(
+            SearchFieldProps::new(
+                box_id,
+                cat_search_display,
+                placeholder,
+                !has_raw_cat_query,
+                cat_search_focused,
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_center()
-                    .gap(sp(6.0))
-                    .child(svg_icon(
-                        IconName::Search,
-                        12.5 * theme.ui_scale,
-                        rgb(if cat_search_focused {
-                            theme.text_primary
-                        } else {
-                            theme.text_muted
-                        }),
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .items_center()
-                            .text_size(sp(12.0))
-                            .text_color(rgb(if has_raw_cat_query {
-                                theme.text_primary
-                            } else {
-                                theme.text_muted
-                            }))
-                            .truncate()
-                            .when(cat_search_focused || has_raw_cat_query, |d| {
-                                d.child(cat_search_display.clone())
-                            })
-                            .when(!has_raw_cat_query, |d| {
-                                d.child(
-                                    div()
-                                        .when(cat_search_focused, |p| p.pl(sp(2.0)))
-                                        .text_color(rgb(theme.text_muted))
-                                        .child(placeholder),
-                                )
-                            }),
-                    ),
-            )
-            .when(has_raw_cat_query, |sb| {
-                sb.child(
-                    div()
-                        .id(clear_id)
-                        .cursor_pointer()
-                        .p(sp(3.0))
-                        .rounded(px(4.0))
-                        .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.discover_catalog_search.clear();
-                                this.input_cursors
-                                    .remove(&FocusedInput::DiscoverCatalogSearch);
-                                this.input_selected_all
-                                    .remove(&FocusedInput::DiscoverCatalogSearch);
-                                cx.notify();
-                            }),
-                        )
-                        .child(svg_icon(
-                            IconName::X,
-                            11.0 * theme.ui_scale,
-                            rgb(theme.text_muted),
-                        )),
-                )
-            })
-            .into_any_element()
+            .clear_id(clear_id)
+            .full_width()
+            .on_focus(cx.listener(|this, _, _, cx| {
+                this.focused_input = Some(FocusedInput::DiscoverCatalogSearch);
+                cx.notify();
+            }))
+            .on_clear(cx.listener(|this, _, _, cx| {
+                this.discover_catalog_search.clear();
+                this.input_cursors
+                    .remove(&FocusedInput::DiscoverCatalogSearch);
+                this.input_selected_all
+                    .remove(&FocusedInput::DiscoverCatalogSearch);
+                cx.notify();
+            })),
+        )
+        .into_any_element()
     }
 
     fn render_discover_source_rail(
@@ -802,7 +725,6 @@ impl AppShell {
             "discover-rail-search-box",
             "discover-rail-search-clear",
             "Filter catalogs...",
-            &theme,
             cx,
         );
 
@@ -1774,8 +1696,6 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = *theme;
-        let available_w = (viewport_w - rail_width_px).max(320.0);
-        let canvas_pad_x = (available_w * 0.03).clamp(28.0, 52.0) * theme.ui_scale;
         let rail_open = self.preferences.discover_source_rail_open;
         let hide_watched = self.preferences.discover_hide_watched;
 
@@ -1824,23 +1744,15 @@ impl AppShell {
             usize::from(hide_watched) + usize::from(has_genre_filter) + non_genre_filtered_count;
         let has_active_filters = active_filter_count > 0;
 
-        let grid_aspect = infer_discover_grid_aspect(&items_arc);
-        let target_poster_w =
-            theme.density.target_poster_width_px().max(DISCOVER_MIN_POSTER_WIDTH_PX) * theme.ui_scale;
-        let gap_px = DISCOVER_GRID_GAP_PX * theme.ui_scale;
-        let metadata_h = 52.0 * theme.ui_scale;
-
-        let metrics = compute_dynamic_grid_metrics(
+        let grid_aspect = infer_grid_poster_aspect(items_arc.iter().map(|i| &i.poster_shape));
+        let poster_metrics = PosterMetrics::from_theme(&theme);
+        let gap_px = poster_metrics.gap_px;
+        let metrics = compute_app_grid_metrics(
             total_items,
-            available_w,
-            0.0,
-            canvas_pad_x * 2.0,
-            Some(DISCOVER_MAX_WIDTH_PX),
-            target_poster_w,
-            gap_px,
-            gap_px,
-            metadata_h,
+            viewport_w,
+            rail_width_px,
             grid_aspect,
+            &theme,
         );
         let columns = metrics.columns;
         let row_count = metrics.layout.row_count;
@@ -1866,6 +1778,34 @@ impl AppShell {
         let is_loading = snap.is_loading;
         let has_next_page = snap.has_next_page;
 
+        let count_badge = (total_items > 0).then(|| {
+            SharedString::from(format!(
+                "{total_items} {}",
+                if total_items == 1 { "title" } else { "titles" }
+            ))
+        });
+        let header_subtitle: Option<SharedString> = if !active_catalog_title.is_empty() {
+            Some(match active_catalog_addon.as_deref() {
+                Some(addon) if !addon.is_empty() => format!("{active_catalog_title} · {addon}").into(),
+                _ => active_catalog_title.clone().into(),
+            })
+        } else {
+            None
+        };
+        let header_right = if is_loading {
+            Some(neutral_chip("Loading…").into_any_element())
+        } else if hide_watched && hidden_watched_count > 0 {
+            Some(neutral_chip(format!("{hidden_watched_count} watched hidden")).into_any_element())
+        } else {
+            None
+        };
+        let page_header = render_page_header(
+            PageHeader::new("Discover")
+                .count_badge(count_badge)
+                .subtitle(header_subtitle)
+                .right_slot(header_right),
+        );
+
         let toolbar = self.render_discover_toolbar(
             snap,
             &active_catalog_title,
@@ -1881,7 +1821,6 @@ impl AppShell {
             &items_arc,
             statuses_arc,
             rail_open,
-            canvas_pad_x,
             &theme,
             cx,
         );
@@ -1893,7 +1832,6 @@ impl AppShell {
                 image_height_px,
                 row_stride_px,
                 gap_px,
-                canvas_pad_x,
                 &theme,
             )
         } else if total_items == 0 {
@@ -1901,8 +1839,6 @@ impl AppShell {
                 has_active_filters,
                 hide_watched && hidden_watched_count > 0,
                 selected_catalog_default_request,
-                canvas_pad_x,
-                &theme,
                 cx,
             )
         } else {
@@ -1925,7 +1861,6 @@ impl AppShell {
                     }
 
                     let kb_focus_index = this.kb_focus_index;
-                    let row_theme = active_theme();
 
                     visible_rows
                         .map(|row_idx| {
@@ -1936,54 +1871,42 @@ impl AppShell {
                                 .id(("discover-row", row_idx))
                                 .w_full()
                                 .h(px(row_stride_px))
+                                .pb(px(gap_px))
                                 .flex()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .max_w(px(DISCOVER_MAX_WIDTH_PX))
-                                        .h_full()
-                                        .px(px(canvas_pad_x))
-                                        .pb(px(gap_px))
-                                        .flex()
-                                        .items_start()
-                                        .gap(px(gap_px))
-                                        .children(range.map(|item_idx| {
-                                            let item = items_arc[item_idx].clone();
-                                            let st = statuses_for_grid.get(&item.id).copied();
-                                            let is_focused = kb_focus_index == Some(item_idx);
-                                            let card_aspect =
-                                                PosterAspect::from_stremio_poster_shape(
-                                                    &item.poster_shape,
-                                                );
-                                            let card_image_h = if card_aspect == grid_aspect {
-                                                image_height_px
-                                            } else {
-                                                (card_width_px * card_aspect.height_over_width())
-                                                    .ceil()
-                                                    .min(image_height_px)
-                                            };
+                                .items_start()
+                                .gap(px(gap_px))
+                                .children(range.map(|item_idx| {
+                                    let item = items_arc[item_idx].clone();
+                                    let st = statuses_for_grid.get(&item.id).copied();
+                                    let is_focused = kb_focus_index == Some(item_idx);
+                                    let card_aspect =
+                                        PosterAspect::from_stremio_poster_shape(&item.poster_shape);
+                                    let card_image_h = if card_aspect == grid_aspect {
+                                        image_height_px
+                                    } else {
+                                        (card_width_px * card_aspect.height_over_width())
+                                            .ceil()
+                                            .min(image_height_px)
+                                    };
 
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .h_full()
-                                                .child(this.render_discover_poster_card(
-                                                    ("discover-card", item_idx),
-                                                    item,
-                                                    st,
-                                                    card_aspect,
-                                                    None,
-                                                    card_image_h,
-                                                    is_focused,
-                                                    &row_theme,
-                                                    cx,
-                                                ))
-                                        }))
-                                        .children(
-                                            (0..empty_slots)
-                                                .map(|_| div().flex_1().min_w(px(0.0))),
-                                        ),
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .h_full()
+                                        .child(this.render_discover_poster_card(
+                                            ("discover-card", item_idx),
+                                            item,
+                                            st,
+                                            card_aspect,
+                                            None,
+                                            card_image_h,
+                                            is_focused,
+                                            cx,
+                                        ))
+                                }))
+                                .children(
+                                    (0..empty_slots)
+                                        .map(|_| div().flex_1().min_w(px(0.0))),
                                 )
                         })
                         .collect()
@@ -1993,7 +1916,6 @@ impl AppShell {
             .flex_1()
             .w_full()
             .min_h(px(0.0))
-            .pt(sp(18.0))
             .into_any_element()
         };
 
@@ -2005,8 +1927,12 @@ impl AppShell {
             .min_h(px(0.0))
             .flex()
             .flex_col()
-            .child(toolbar)
-            .child(grid_body)
+            .child(
+                full_height_page_container(PageWidth::Wide, viewport_w)
+                    .child(page_header)
+                    .child(toolbar)
+                    .child(grid_body),
+            )
             .into_any_element()
     }
 
@@ -2027,12 +1953,11 @@ impl AppShell {
         surprise_items: &Arc<Vec<MetaItemPreview>>,
         surprise_statuses: &Arc<HashMap<String, LibraryStatusTab>>,
         rail_open: bool,
-        canvas_pad_x: f32,
         theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = *theme;
-        let type_cluster = self.render_discover_type_cluster(&snap.types, &theme, cx);
+        let type_cluster = self.render_discover_type_cluster(&snap.types, cx);
         let catalog_dd = self.render_discover_catalog_dropdown(
             snap,
             active_catalog_title,
@@ -2047,7 +1972,6 @@ impl AppShell {
                     g,
                     has_genre_filter,
                     default_catalog_req.clone(),
-                    &theme,
                     cx,
                 )
             });
@@ -2081,16 +2005,7 @@ impl AppShell {
                 )
             })
             .child(catalog_dd)
-            .when_some(genre_dd, |row, gd| row.child(gd))
-            .when(snap.is_loading, |row| {
-                row.child(
-                    div()
-                        .font(mono_font())
-                        .text_size(sp(11.0))
-                        .text_color(rgb(theme.text_muted))
-                        .child("Loading…"),
-                )
-            });
+            .when_some(genre_dd, |row, gd| row.child(gd));
 
         let right_cluster = div()
             .flex_shrink_0()
@@ -2100,35 +2015,15 @@ impl AppShell {
             .child(filters_dd)
             .child(sources_btn);
 
-        div()
-            .flex_shrink_0()
-            .w_full()
-            .bg(rgba(theme.glass_card_bg))
-            .border_t_1()
-            .border_b_1()
-            .border_color(rgba(theme.glass_divider))
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(DISCOVER_MAX_WIDTH_PX))
-                    .mx_auto()
-                    .px(px(canvas_pad_x))
-                    .py(sp(10.0))
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap(sp(12.0))
-                    .child(left_and_center)
-                    .child(right_cluster),
-            )
+        toolbar_bar()
+            .child(left_and_center)
+            .child(right_cluster)
             .into_any_element()
     }
 
     fn render_discover_type_cluster(
         &self,
         types: &[SelectableType],
-        theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let partitioned = partition_discover_types(types);
@@ -2136,7 +2031,6 @@ impl AppShell {
             return None;
         }
 
-        let theme = *theme;
         let dd_types = DiscoverDropdown::Extra(DROPDOWN_EXTRA_TYPES.to_owned());
         let more_open = self.discover_open_dropdown.as_ref() == Some(&dd_types);
 
@@ -2168,76 +2062,28 @@ impl AppShell {
             let more_label = selected_extra
                 .map(|t| format_discover_type_label(&t.r#type))
                 .unwrap_or_else(|| "More".to_owned());
-            let highlighted = more_open || more_is_active;
 
             div()
                 .relative()
-                .child(
-                    div()
-                        .id("discover-dd-more-types")
-                        .cursor_pointer()
-                        .h(sp(36.0))
-                        .px(sp(11.0))
-                        .rounded(px(RADIUS_CONTROL))
-                        .bg(if highlighted {
-                            rgba(theme.glass_row_selected_bg)
-                        } else {
-                            rgba(theme.glass_trough_bg)
-                        })
-                        .border_1()
-                        .border_color(if more_open {
-                            rgba(theme.border_accent)
-                        } else if more_is_active {
-                            rgba(theme.glass_border_strong)
-                        } else {
-                            rgba(theme.glass_border)
-                        })
-                        .hover(move |s| {
-                            s.bg(rgba(theme.glass_row_hover_bg))
-                                .border_color(rgba(theme.glass_border_strong))
-                        })
-                        .flex()
-                        .items_center()
-                        .gap(sp(6.0))
-                        .font(ui_sans(if more_is_active {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::MEDIUM
-                        }))
-                        .text_size(sp(12.5))
-                        .text_color(rgb(if highlighted {
-                            theme.text_primary
-                        } else {
-                            theme.text_secondary
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                if this.discover_open_dropdown.as_ref() == Some(&dd_types) {
-                                    this.discover_open_dropdown = None;
-                                } else {
-                                    this.discover_open_dropdown = Some(dd_types.clone());
-                                    if this.focused_input
-                                        == Some(FocusedInput::DiscoverCatalogSearch)
-                                    {
-                                        this.focused_input = None;
-                                    }
-                                }
-                                cx.notify();
-                            }),
-                        )
-                        .child(more_label)
-                        .child(svg_icon(
-                            IconName::ChevronDown,
-                            11.5 * theme.ui_scale,
-                            rgb(if highlighted {
-                                theme.text_primary
+                .child(dropdown_trigger(
+                    DropdownTriggerProps::new(
+                        "discover-dd-more-types",
+                        more_label,
+                        more_open,
+                        cx.listener(move |this, _, _, cx| {
+                            if this.discover_open_dropdown.as_ref() == Some(&dd_types) {
+                                this.discover_open_dropdown = None;
                             } else {
-                                theme.text_muted
-                            }),
-                        )),
-                )
+                                this.discover_open_dropdown = Some(dd_types.clone());
+                                if this.focused_input == Some(FocusedInput::DiscoverCatalogSearch) {
+                                    this.focused_input = None;
+                                }
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .is_active(more_is_active),
+                ))
                 .when(more_open, |wrap| {
                     wrap.child(
                         deferred(
@@ -2323,7 +2169,6 @@ impl AppShell {
                 "discover-popover-search-box",
                 "discover-popover-search-clear",
                 "Search catalogs...",
-                &theme,
                 cx,
             );
 
@@ -2536,83 +2381,27 @@ impl AppShell {
 
         div()
             .relative()
-            .child(
-                div()
-                    .id("discover-dd-catalog")
-                    .cursor_pointer()
-                    .h(sp(36.0))
-                    .px(sp(12.0))
-                    .max_w(sp(320.0))
-                    .rounded(px(RADIUS_CONTROL))
-                    .bg(if is_open {
-                        rgba(theme.glass_row_selected_bg)
-                    } else {
-                        rgba(theme.glass_trough_bg)
-                    })
-                    .border_1()
-                    .border_color(if is_open {
-                        rgba(theme.border_accent)
-                    } else {
-                        rgba(theme.glass_border)
-                    })
-                    .hover(move |s| {
-                        s.bg(rgba(theme.glass_row_hover_bg))
-                            .border_color(rgba(theme.glass_border_strong))
-                    })
-                    .flex()
-                    .items_center()
-                    .gap(sp(7.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            if this.discover_open_dropdown == Some(DiscoverDropdown::Catalog) {
-                                this.discover_open_dropdown = None;
-                                if this.focused_input == Some(FocusedInput::DiscoverCatalogSearch) {
-                                    this.focused_input = None;
-                                }
-                            } else {
-                                this.discover_open_dropdown = Some(DiscoverDropdown::Catalog);
-                                this.focused_input = Some(FocusedInput::DiscoverCatalogSearch);
+            .child(dropdown_trigger(
+                DropdownTriggerProps::new(
+                    "discover-dd-catalog",
+                    title_owned,
+                    is_open,
+                    cx.listener(|this, _, _, cx| {
+                        if this.discover_open_dropdown == Some(DiscoverDropdown::Catalog) {
+                            this.discover_open_dropdown = None;
+                            if this.focused_input == Some(FocusedInput::DiscoverCatalogSearch) {
+                                this.focused_input = None;
                             }
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex()
-                            .items_center()
-                            .gap(sp(5.0))
-                            .child(
-                                div()
-                                    .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(sp(13.0))
-                                    .text_color(rgb(theme.text_primary))
-                                    .truncate()
-                                    .child(title_owned),
-                            )
-                            .when_some(addon_owned, |row, addon| {
-                                row.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(sp(11.5))
-                                        .text_color(rgb(theme.text_muted))
-                                        .truncate()
-                                        .child(format!("· {addon}")),
-                                )
-                            }),
-                    )
-                    .child(svg_icon(
-                        IconName::ChevronDown,
-                        12.0 * theme.ui_scale,
-                        rgb(if is_open {
-                            theme.text_primary
                         } else {
-                            theme.text_muted
-                        }),
-                    )),
-            )
+                            this.discover_open_dropdown = Some(DiscoverDropdown::Catalog);
+                            this.focused_input = Some(FocusedInput::DiscoverCatalogSearch);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .secondary_label(addon_owned.map(|addon| SharedString::from(format!("· {addon}"))))
+                .max_width_px(Some(320.0)),
+            ))
             .when_some(popover, |wrap, panel| wrap.child(panel))
             .into_any_element()
     }
@@ -2622,10 +2411,8 @@ impl AppShell {
         genre: &SelectableExtra,
         has_genre_filter: bool,
         all_genre_fallback_req: Option<ResourceRequest>,
-        theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = *theme;
         let is_open = self.discover_open_dropdown == Some(DiscoverDropdown::Genre);
 
         let active_genre_value = active_extra_value_label(genre);
@@ -2690,24 +2477,26 @@ impl AppShell {
 
         div()
             .relative()
-            .child(render_discover_dropdown_trigger(
-                "discover-dd-genre",
-                "Genre",
-                active_genre_value,
-                is_open,
-                has_genre_filter,
-                &theme,
-                cx.listener(|this, _, _, cx| {
-                    if this.discover_open_dropdown == Some(DiscoverDropdown::Genre) {
-                        this.discover_open_dropdown = None;
-                    } else {
-                        this.discover_open_dropdown = Some(DiscoverDropdown::Genre);
-                        if this.focused_input == Some(FocusedInput::DiscoverCatalogSearch) {
-                            this.focused_input = None;
+            .child(dropdown_trigger(
+                DropdownTriggerProps::new(
+                    "discover-dd-genre",
+                    active_genre_value,
+                    is_open,
+                    cx.listener(|this, _, _, cx| {
+                        if this.discover_open_dropdown == Some(DiscoverDropdown::Genre) {
+                            this.discover_open_dropdown = None;
+                        } else {
+                            this.discover_open_dropdown = Some(DiscoverDropdown::Genre);
+                            if this.focused_input == Some(FocusedInput::DiscoverCatalogSearch) {
+                                this.focused_input = None;
+                            }
                         }
-                    }
-                    cx.notify();
-                }),
+                        cx.notify();
+                    }),
+                )
+                .prefix_label(Some(SharedString::new_static("Genre")))
+                .is_active(has_genre_filter)
+                .max_width_px(Some(260.0)),
             ))
             .when_some(popover, |wrap, panel| wrap.child(panel))
             .into_any_element()
@@ -2731,7 +2520,6 @@ impl AppShell {
         let dd_filters = DiscoverDropdown::Extra(DROPDOWN_FILTERS.to_owned());
         let is_open = self.discover_open_dropdown.as_ref() == Some(&dd_filters);
         let has_active_filters = active_filter_count > 0;
-        let highlighted = is_open || has_active_filters;
 
         let surprise_items_arc = Arc::clone(surprise_items);
         let surprise_statuses_arc = Arc::clone(surprise_statuses);
@@ -2825,11 +2613,10 @@ impl AppShell {
                         .into_iter()
                         .enumerate()
                         .map(|(o_idx, (label, selected, req))| {
-                            render_discover_filter_chip(
+                            choice_pill(
                                 ("discover-filter-chip", e_idx * 1000 + o_idx),
                                 label,
                                 selected,
-                                &theme,
                                 cx.listener(move |this, _, _, cx| {
                                     this.apply_discover_selection(
                                         Some(CatalogWithFiltersSelected {
@@ -3034,95 +2821,34 @@ impl AppShell {
         });
 
         let dd_for_click = dd_filters;
+        let filters_label: SharedString = if has_active_filters {
+            format!("Filters ({active_filter_count})").into()
+        } else {
+            SharedString::new_static("Filters")
+        };
+
         div()
             .relative()
-            .child(
-                div()
-                    .id("discover-dd-filters")
-                    .cursor_pointer()
-                    .h(sp(36.0))
-                    .px(sp(11.0))
-                    .rounded(px(RADIUS_CONTROL))
-                    .bg(if highlighted {
-                        rgba(theme.glass_row_selected_bg)
-                    } else {
-                        rgba(theme.glass_trough_bg)
-                    })
-                    .border_1()
-                    .border_color(if is_open {
-                        rgba(theme.border_accent)
-                    } else if has_active_filters {
-                        rgba(theme.glass_border_strong)
-                    } else {
-                        rgba(theme.glass_border)
-                    })
-                    .hover(move |s| {
-                        s.bg(rgba(theme.glass_row_hover_bg))
-                            .border_color(rgba(theme.glass_border_strong))
-                    })
-                    .flex()
-                    .items_center()
-                    .gap(sp(7.0))
-                    .font(ui_sans(FontWeight::MEDIUM))
-                    .text_size(sp(12.5))
-                    .text_color(rgb(if highlighted {
-                        theme.text_primary
-                    } else {
-                        theme.text_secondary
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            if this.discover_open_dropdown.as_ref() == Some(&dd_for_click) {
-                                this.discover_open_dropdown = None;
-                            } else {
-                                this.discover_open_dropdown = Some(dd_for_click.clone());
-                                if this.focused_input == Some(FocusedInput::DiscoverCatalogSearch) {
-                                    this.focused_input = None;
-                                }
+            .child(dropdown_trigger(
+                DropdownTriggerProps::new(
+                    "discover-dd-filters",
+                    filters_label,
+                    is_open,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.discover_open_dropdown.as_ref() == Some(&dd_for_click) {
+                            this.discover_open_dropdown = None;
+                        } else {
+                            this.discover_open_dropdown = Some(dd_for_click.clone());
+                            if this.focused_input == Some(FocusedInput::DiscoverCatalogSearch) {
+                                this.focused_input = None;
                             }
-                            cx.notify();
-                        }),
-                    )
-                    .child(svg_icon(
-                        IconName::Sliders,
-                        13.0 * theme.ui_scale,
-                        rgb(if highlighted {
-                            theme.text_primary
-                        } else {
-                            theme.text_muted
-                        }),
-                    ))
-                    .child("Filters")
-                    .when(has_active_filters, |btn| {
-                        btn.child(
-                            div()
-                                .min_w(sp(17.0))
-                                .h(sp(17.0))
-                                .px(sp(5.0))
-                                .rounded_full()
-                                .bg(rgb(theme.accent))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .font(mono_font())
-                                .font_features(tabular_nums())
-                                .text_size(sp(10.0))
-                                .text_color(rgb(theme.cta_on_accent))
-                                .child(format!("{active_filter_count}")),
-                        )
-                    })
-                    .child(svg_icon(
-                        IconName::ChevronDown,
-                        11.5 * theme.ui_scale,
-                        rgb(if highlighted {
-                            theme.text_primary
-                        } else {
-                            theme.text_muted
-                        }),
-                    )),
-            )
+                        }
+                        cx.notify();
+                    }),
+                )
+                .leading_icon(Some(IconName::Sliders))
+                .is_active(has_active_filters),
+            ))
             .when_some(popover, |wrap, panel| wrap.child(panel))
             .into_any_element()
     }
@@ -3254,13 +2980,9 @@ impl AppShell {
         fixed_width_px: Option<f32>,
         image_height_px: f32,
         is_focused: bool,
-        theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = *theme;
         let base_id = Arc::new(id.into());
-        let info_btn_id =
-            ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("info-details"));
 
         let poster_tex = self
             .poster_cache
@@ -3274,9 +2996,6 @@ impl AppShell {
 
         let mid_type = item.r#type.clone();
         let mid_id = item.id.clone();
-
-        let info_type = item.r#type.clone();
-        let info_id = item.id.clone();
 
         let play_type = item.r#type.clone();
         let play_id = item.id.clone();
@@ -3294,32 +3013,6 @@ impl AppShell {
         let ctx_id = item.id.clone();
         let ctx_name = item.name.clone();
 
-        let info_quick_action = div()
-            .id(info_btn_id)
-            .cursor_pointer()
-            .w(px(30.0))
-            .h(px(30.0))
-            .rounded(px(RADIUS_PILL))
-            .bg(rgba(0x0B0D14D9))
-            .border_1()
-            .border_color(rgba(0xFFFFFF33))
-            .hover(move |s| {
-                s.bg(rgb(theme.accent_press))
-                    .border_color(rgb(theme.accent))
-            })
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.open_meta_details(info_type.clone(), info_id.clone(), None, cx);
-                }),
-            )
-            .child(svg_icon(IconName::Info, 13.5, rgb(0xF5F1E8)))
-            .into_any_element();
-
         let card_el = render_poster_card(
             PosterCardProps::new((*base_id).clone(), item.name, item.id)
                 .subtitle(Some(subtitle))
@@ -3331,31 +3024,22 @@ impl AppShell {
                 .imdb_rating(rating)
                 .in_library(in_library)
                 .is_focused(is_focused)
-                .quick_action(info_quick_action)
-                .on_open(click_handler(cx.listener(
-                    move |this, ev: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        if ev.click_count >= 2 {
-                            this.open_meta_details(
-                                details_type.clone(),
-                                details_id.clone(),
-                                None,
-                                cx,
-                            );
-                        } else {
-                            this.open_quick_peek(
-                                QuickPeekTarget {
-                                    type_name: peek_item.r#type.clone(),
-                                    id: peek_item.id.clone(),
-                                    video_id: None,
-                                    title: peek_item.name.clone(),
-                                    preview: Some(peek_item.clone()),
-                                },
-                                cx,
-                            );
-                        }
-                    },
-                )))
+                .on_open(click_handler(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_meta_details(details_type.clone(), details_id.clone(), None, cx);
+                })))
+                .on_quick_peek(click_handler(cx.listener(move |this, _, _, cx| {
+                    this.open_quick_peek(
+                        QuickPeekTarget {
+                            type_name: peek_item.r#type.clone(),
+                            id: peek_item.id.clone(),
+                            video_id: None,
+                            title: peek_item.name.clone(),
+                            preview: Some(peek_item.clone()),
+                        },
+                        cx,
+                    );
+                })))
                 .on_quick_play(click_handler(cx.listener(move |this, _, _, cx| {
                     this.quick_resume_or_open(play_type.clone(), play_id.clone(), None, cx);
                 })))
@@ -3430,77 +3114,6 @@ impl AppShell {
     }
 }
 
-fn render_discover_filter_chip(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    selected: bool,
-    theme: &ThemePalette,
-    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let theme = *theme;
-    let base = div()
-        .id(id.into())
-        .flex_shrink_0()
-        .cursor_pointer()
-        .h(sp(27.0))
-        .px(sp(10.0))
-        .rounded(px(RADIUS_PILL))
-        .whitespace_nowrap()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(sp(11.5))
-        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-            cx.stop_propagation();
-            on_click(ev, window, cx);
-        });
-
-    if selected {
-        base.bg(rgb(theme.segment_active_bg))
-            .font(ui_sans(FontWeight::SEMIBOLD))
-            .text_color(rgb(theme.segment_active_text))
-    } else {
-        base.bg(rgba(theme.glass_trough_bg))
-            .border_1()
-            .border_color(rgba(theme.glass_border))
-            .hover(move |s| {
-                s.bg(rgba(theme.glass_row_hover_bg))
-                    .border_color(rgba(theme.glass_border_strong))
-                    .text_color(rgb(theme.text_primary))
-            })
-            .font(ui_sans(FontWeight::MEDIUM))
-            .text_color(rgb(theme.text_secondary))
-    }
-    .child(label.into())
-}
-
-fn infer_discover_grid_aspect(items: &[MetaItemPreview]) -> PosterAspect {
-    if items.is_empty() {
-        return PosterAspect::Portrait2x3;
-    }
-    let mut has_portrait = false;
-    let mut has_square = false;
-    let mut has_landscape = false;
-    for item in items.iter().take(24) {
-        match item.poster_shape {
-            PosterShape::Poster => has_portrait = true,
-            PosterShape::Square => has_square = true,
-            PosterShape::Landscape => has_landscape = true,
-        }
-    }
-    if has_portrait {
-        PosterAspect::Portrait2x3
-    } else if has_square && !has_landscape {
-        PosterAspect::Square1x1
-    } else if has_landscape && !has_square {
-        PosterAspect::Landscape16x9
-    } else if has_square {
-        PosterAspect::Square1x1
-    } else {
-        PosterAspect::Portrait2x3
-    }
-}
-
 fn format_discover_card_subtitle(item: &MetaItemPreview) -> SharedString {
     let primary = item
         .release_info
@@ -3520,7 +3133,6 @@ fn render_discover_skeleton_grid(
     image_height_px: f32,
     row_stride_px: f32,
     gap_px: f32,
-    pad_x: f32,
     theme: &ThemePalette,
 ) -> AnyElement {
     let theme = *theme;
@@ -3535,71 +3147,63 @@ fn render_discover_skeleton_grid(
         .flex_1()
         .w_full()
         .min_h(px(0.0))
-        .pt(sp(18.0))
         .overflow_hidden()
-        .child(
+        .flex()
+        .flex_col()
+        .children((0..3_usize).map(move |row_idx| {
+            let row_anim = shimmer_anim.clone();
             div()
+                .id(("discover-skel-row", row_idx))
                 .w_full()
-                .max_w(px(DISCOVER_MAX_WIDTH_PX))
-                .mx_auto()
-                .px(px(pad_x))
+                .h(px(row_stride_px))
+                .pb(px(gap_px))
                 .flex()
-                .flex_col()
-                .children((0..3_usize).map(move |row_idx| {
-                    let row_anim = shimmer_anim.clone();
+                .items_start()
+                .gap(px(gap_px))
+                .children((0..cols).map(move |col_idx| {
                     div()
-                        .id(("discover-skel-row", row_idx))
-                        .w_full()
-                        .h(px(row_stride_px))
-                        .pb(px(gap_px))
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
-                        .items_start()
-                        .gap(px(gap_px))
-                        .children((0..cols).map(move |col_idx| {
+                        .flex_col()
+                        .gap(sp(8.0))
+                        .child(
                             div()
-                                .flex_1()
-                                .min_w(px(0.0))
+                                .w_full()
+                                .h(px(image_height_px))
+                                .rounded(px(RADIUS_POSTER))
+                                .bg(rgba(theme.glass_card_bg))
+                                .border_1()
+                                .border_color(rgba(theme.glass_border)),
+                        )
+                        .child(
+                            div()
+                                .w_full()
                                 .flex()
                                 .flex_col()
-                                .gap(sp(8.0))
+                                .gap(sp(6.0))
                                 .child(
                                     div()
-                                        .w_full()
-                                        .h(px(image_height_px))
-                                        .rounded(px(RADIUS_POSTER))
-                                        .bg(rgba(theme.glass_card_bg))
-                                        .border_1()
-                                        .border_color(rgba(theme.glass_border)),
+                                        .h(sp(14.0))
+                                        .w(relative(0.76))
+                                        .rounded(px(4.0))
+                                        .bg(rgba(theme.glass_trough_bg)),
                                 )
                                 .child(
                                     div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(sp(6.0))
-                                        .child(
-                                            div()
-                                                .h(sp(14.0))
-                                                .w(relative(0.76))
-                                                .rounded(px(4.0))
-                                                .bg(rgba(theme.glass_trough_bg)),
-                                        )
-                                        .child(
-                                            div()
-                                                .h(sp(11.0))
-                                                .w(relative(0.46))
-                                                .rounded(px(4.0))
-                                                .bg(rgba(theme.glass_card_bg)),
-                                        ),
-                                )
-                                .with_animation(
-                                    ("discover-skel-pulse", row_idx * 16 + col_idx),
-                                    row_anim.clone(),
-                                    |el, delta| el.opacity(delta),
-                                )
-                        }))
-                })),
-        )
+                                        .h(sp(11.0))
+                                        .w(relative(0.46))
+                                        .rounded(px(4.0))
+                                        .bg(rgba(theme.glass_card_bg)),
+                                ),
+                        )
+                        .with_animation(
+                            ("discover-skel-pulse", row_idx * 16 + col_idx),
+                            row_anim.clone(),
+                            |el, delta| el.opacity(delta),
+                        )
+                }))
+        }))
         .into_any_element()
 }
 
@@ -3607,193 +3211,65 @@ fn render_discover_empty_state(
     has_active_filters: bool,
     all_hidden_by_watched: bool,
     reset_req: Option<ResourceRequest>,
-    pad_x: f32,
-    theme: &ThemePalette,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
-    let theme = *theme;
-    div()
-        .w_full()
-        .max_w(px(DISCOVER_MAX_WIDTH_PX))
-        .mx_auto()
-        .px(px(pad_x))
-        .pt(sp(28.0))
-        .child(
-            div()
-                .py(sp(64.0))
-                .px(sp(24.0))
-                .rounded(px(RADIUS_CARD))
-                .bg(rgba(theme.glass_card_bg))
-                .border_1()
-                .border_color(rgba(theme.glass_border))
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(sp(12.0))
-                .child(
-                    div()
-                        .w(sp(44.0))
-                        .h(sp(44.0))
-                        .rounded(px(RADIUS_PILL))
-                        .bg(rgba(theme.glass_trough_bg))
-                        .border_1()
-                        .border_color(rgba(theme.glass_border))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(svg_icon(
-                            if all_hidden_by_watched {
-                                IconName::EyeOff
-                            } else {
-                                IconName::Compass
-                            },
-                            20.0 * theme.ui_scale,
-                            rgb(theme.text_muted),
-                        )),
-                )
-                .child(
-                    div()
-                        .font(editorial_serif())
-                        .text_size(sp(28.0))
-                        .text_color(rgb(theme.text_primary))
-                        .child(if all_hidden_by_watched {
-                            "You've watched everything here"
-                        } else {
-                            "No titles found"
-                        }),
-                )
-                .child(
-                    div()
-                        .max_w(sp(420.0))
-                        .text_size(sp(13.5))
-                        .text_color(rgb(theme.text_secondary))
-                        .child(if all_hidden_by_watched {
-                            "Every loaded title in this view is already marked as watched. Disable Hide Watched or try another genre."
-                        } else if has_active_filters {
-                            "No catalog entries match the active filters. Reset filters or pick another genre."
-                        } else {
-                            "This catalog did not return any titles. Try switching catalogs or addons."
-                        }),
-                )
-                .when(has_active_filters, |el| {
-                    el.child(div().pt(sp(6.0)).child(primary_accent_button(
-                        "discover-empty-reset",
-                        Some(if all_hidden_by_watched {
-                            IconName::Eye
-                        } else {
-                            IconName::RefreshCw
-                        }),
-                        if all_hidden_by_watched {
-                            "Show watched titles"
-                        } else {
-                            "Reset filters"
-                        },
-                        cx.listener(move |this, _, _, cx| {
-                            if this.preferences.discover_hide_watched {
-                                this.preferences.discover_hide_watched = false;
-                                let _ = this.preferences.save();
-                            }
-                            if all_hidden_by_watched {
-                                cx.notify();
-                            } else {
-                                this.discover_catalog_search.clear();
-                                this.input_cursors
-                                    .remove(&FocusedInput::DiscoverCatalogSearch);
-                                this.input_selected_all
-                                    .remove(&FocusedInput::DiscoverCatalogSearch);
-                                this.apply_discover_selection(
-                                    reset_req
-                                        .clone()
-                                        .map(|request| CatalogWithFiltersSelected { request }),
-                                    cx,
-                                );
-                            }
-                        }),
-                    )))
-                }),
-        )
-        .into_any_element()
-}
+    let icon = if all_hidden_by_watched {
+        IconName::EyeOff
+    } else {
+        IconName::Compass
+    };
+    let title = if all_hidden_by_watched {
+        "You've watched everything here"
+    } else {
+        "No titles found"
+    };
+    let body = if all_hidden_by_watched {
+        "Every loaded title in this view is already marked as watched. Disable Hide Watched or try another genre."
+    } else if has_active_filters {
+        "No catalog entries match the active filters. Reset filters or pick another genre."
+    } else {
+        "This catalog did not return any titles. Try switching catalogs or addons."
+    };
 
-fn render_discover_dropdown_trigger(
-    id: impl Into<ElementId>,
-    prefix_label: impl Into<SharedString>,
-    value_label: impl Into<SharedString>,
-    is_open: bool,
-    is_filtered: bool,
-    theme: &ThemePalette,
-    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let theme = *theme;
-    let highlighted = is_open || is_filtered;
-
-    div()
-        .id(id.into())
-        .cursor_pointer()
-        .h(sp(36.0))
-        .px(sp(11.0))
-        .max_w(sp(260.0))
-        .rounded(px(RADIUS_CONTROL))
-        .bg(if highlighted {
-            rgba(theme.glass_row_selected_bg)
-        } else {
-            rgba(theme.glass_trough_bg)
-        })
-        .border_1()
-        .border_color(if is_open {
-            rgba(theme.border_accent)
-        } else if is_filtered {
-            rgba(theme.glass_border_strong)
-        } else {
-            rgba(theme.glass_border)
-        })
-        .hover(move |s| {
-            s.bg(rgba(theme.glass_row_hover_bg))
-                .border_color(rgba(theme.glass_border_strong))
-        })
-        .flex()
-        .items_center()
-        .gap(sp(6.0))
-        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-            cx.stop_propagation();
-            on_click(ev, window, cx);
-        })
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(sp(12.0))
-                .text_color(rgb(theme.text_muted))
-                .child(prefix_label.into()),
-        )
-        .child(
-            div()
-                .w(px(1.0))
-                .h(sp(12.0))
-                .flex_shrink_0()
-                .bg(rgba(theme.glass_divider)),
-        )
-        .child(
-            div()
-                .min_w(px(0.0))
-                .font(ui_sans(FontWeight::MEDIUM))
-                .text_size(sp(12.5))
-                .text_color(rgb(if highlighted {
-                    theme.text_primary
-                } else {
-                    theme.text_secondary
-                }))
-                .truncate()
-                .child(value_label.into()),
-        )
-        .child(svg_icon(
-            IconName::ChevronDown,
-            11.5 * theme.ui_scale,
-            rgb(if highlighted {
-                theme.text_primary
+    let mut props = EmptyStateProps::new(icon, title, body).fill_available(true);
+    if has_active_filters {
+        props = props.action(primary_accent_button(
+            "discover-empty-reset",
+            Some(if all_hidden_by_watched {
+                IconName::Eye
             } else {
-                theme.text_muted
+                IconName::RefreshCw
             }),
-        ))
+            if all_hidden_by_watched {
+                "Show watched titles"
+            } else {
+                "Reset filters"
+            },
+            cx.listener(move |this, _, _, cx| {
+                if this.preferences.discover_hide_watched {
+                    this.preferences.discover_hide_watched = false;
+                    let _ = this.preferences.save();
+                }
+                if all_hidden_by_watched {
+                    cx.notify();
+                } else {
+                    this.discover_catalog_search.clear();
+                    this.input_cursors
+                        .remove(&FocusedInput::DiscoverCatalogSearch);
+                    this.input_selected_all
+                        .remove(&FocusedInput::DiscoverCatalogSearch);
+                    this.apply_discover_selection(
+                        reset_req
+                            .clone()
+                            .map(|request| CatalogWithFiltersSelected { request }),
+                        cx,
+                    );
+                }
+            }),
+        ));
+    }
+
+    render_empty_state(props).into_any_element()
 }
 
 #[cfg(test)]
@@ -3803,7 +3279,7 @@ mod tests {
         models::catalog_with_filters::{SelectableCatalog, SelectableExtraOption},
         types::{
             addon::{Manifest, ManifestCatalog, ResourcePath},
-            resource::MetaItemBehaviorHints,
+            resource::{MetaItemBehaviorHints, PosterShape},
         },
     };
     use url::Url;

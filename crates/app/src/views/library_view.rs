@@ -1,13 +1,10 @@
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use gpui::{
-    deferred, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb,
-    rgba, AnyElement, Context, FontWeight, MouseButton, MouseDownEvent, ObjectFit, SharedString,
-    Window,
+    deferred, div, img, point, prelude::*, px, relative, rgb, rgba, AnyElement, Context,
+    FontWeight, MouseButton, MouseDownEvent, ObjectFit, SharedString, Window,
 };
-use stremio_core_runtime::stremio_core::types::{
-    library::LibraryItem, resource::PosterShape,
-};
+use stremio_core_runtime::stremio_core::types::library::LibraryItem;
 
 use crate::{
     icons::{svg_icon, svg_icon_weighted, IconName, IconWeight},
@@ -20,17 +17,20 @@ use crate::{
         QuickPeekTarget, SidebarTab, ToastKind,
     },
     theme::{
-        active_theme, editorial_serif, mono_font, placeholder_tint_for_id, poster_card_shadow,
-        poster_hover_glow_shadow, sentence_case_label, sp, tabular_nums, ui_sans,
-        CardDensityChoice, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        active_theme, mono_font, placeholder_tint_for_id, sentence_case_label, sp, tabular_nums,
+        ui_sans, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
-    ui_components::{
-        clamp_progress_fraction, click_handler, format_notification_badge_label,
-        glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar, glass_segmented_item,
-        hover_handler, primary_accent_button, render_poster_card, secondary_glass_button,
-        PosterCardProps,
+    ui::{
+        clamp_progress_fraction, click_handler, compute_app_grid_metrics,
+        compute_app_landscape_grid_metrics, dropdown_trigger, format_notification_badge_label,
+        full_height_page_container, glass_dropdown_option, glass_dropdown_panel,
+        glass_segmented_bar, glass_segmented_item, hover_handler, infer_grid_poster_aspect,
+        primary_accent_button, render_empty_state, render_landscape_card, render_page_header,
+        render_poster_card, render_section_header, search_field, secondary_glass_button,
+        toolbar_bar, ClickHandler, DropdownTriggerProps, EmptyStateProps, LandscapeCardProps,
+        PageHeader, PageWidth, PosterCardProps, PosterMetrics, SearchFieldProps, SectionHeader,
     },
-    virtual_grid::{compute_dynamic_grid_metrics, slice_row_items, PosterAspect},
+    virtual_grid::{slice_row_items, PosterAspect},
 };
 
 const UP_NEXT_SHELF_LIMIT: usize = 12;
@@ -48,11 +48,6 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = active_theme();
-        let accent_ink = if theme.is_light {
-            theme.accent_press
-        } else {
-            theme.accent
-        };
 
         let mut memo = self.get_or_update_memoized_library();
         if self.library_filter_tab == LibraryFilterTab::NewEpisodes && memo.count_new_episodes == 0
@@ -82,35 +77,15 @@ impl AppShell {
         } else {
             self.viewport_size_px.0
         };
-        let h_pad_each = compute_library_horizontal_padding_px(viewport_w);
-        let h_pad_total = h_pad_each * 2.0;
-        let grid_gap = theme.density.grid_gap_px() * theme.ui_scale;
+        let poster_dims = PosterMetrics::from_theme(&theme);
+        let grid_gap = poster_dims.gap_px;
 
-        let poster_aspect = infer_library_grid_aspect(&filtered_arc);
-        let poster_metrics = compute_dynamic_grid_metrics(
-            total_filtered,
-            viewport_w,
-            0.0,
-            h_pad_total,
-            None,
-            theme.density.target_poster_width_px() * theme.ui_scale,
-            grid_gap,
-            grid_gap,
-            54.0 * theme.ui_scale,
-            poster_aspect,
-        );
-        let wide_metrics = compute_dynamic_grid_metrics(
-            total_filtered,
-            viewport_w,
-            0.0,
-            h_pad_total,
-            None,
-            wide_card_min_width_px(theme.density, theme.ui_scale),
-            grid_gap,
-            grid_gap,
-            56.0 * theme.ui_scale,
-            PosterAspect::Landscape16x9,
-        );
+        let poster_aspect =
+            infer_grid_poster_aspect(filtered_arc.iter().map(|(li, _)| &li.poster_shape));
+        let poster_metrics =
+            compute_app_grid_metrics(total_filtered, viewport_w, 0.0, poster_aspect, &theme);
+        let wide_metrics =
+            compute_app_landscape_grid_metrics(total_filtered, viewport_w, 0.0, &theme);
 
         let kb_columns = match active_view_mode {
             LibraryViewMode::PosterGrid => poster_metrics.columns,
@@ -366,64 +341,22 @@ impl AppShell {
                 }),
             )
             .child(
-                div()
-                    .w_full()
-                    .px(px(h_pad_each))
-                    .pt(sp(12.0))
-                    .pb(sp(12.0))
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .gap(sp(14.0))
-                    // 1. Compact Cinematic Header with frosted glass stat pills.
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_between()
-                            .gap(sp(14.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_baseline()
-                                    .gap(sp(12.0))
-                                    .child(
-                                        div()
-                                            .font(editorial_serif())
-                                            .text_size(sp(34.0))
-                                            .line_height(sp(38.0))
-                                            .text_color(rgb(theme.text_primary))
-                                            .child("Library"),
-                                    )
-                                    .when(memo.count_all > 0, |row| {
-                                        row.child(
-                                            div()
-                                                .px(sp(9.0))
-                                                .py(sp(3.0))
-                                                .rounded(px(RADIUS_PILL))
-                                                .bg(rgba(theme.glass_trough_bg))
-                                                .border_1()
-                                                .border_color(rgba(theme.glass_border))
-                                                .font(mono_font())
-                                                .font_features(tabular_nums())
-                                                .text_size(sp(11.5))
-                                                .text_color(rgb(theme.text_muted))
-                                                .child(format!(
-                                                    "{} {}",
-                                                    memo.count_all,
-                                                    if memo.count_all == 1 {
-                                                        "title"
-                                                    } else {
-                                                        "titles"
-                                                    }
-                                                )),
-                                        )
-                                    }),
-                            )
-                            .child(
+                full_height_page_container(PageWidth::Wide, viewport_w)
+                    // 1. Canonical Page Header with frosted glass stat pills.
+                    .child(render_page_header(
+                        PageHeader::new("Library")
+                            .count_badge((memo.count_all > 0).then(|| {
+                                SharedString::from(format!(
+                                    "{} {}",
+                                    memo.count_all,
+                                    if memo.count_all == 1 {
+                                        "title"
+                                    } else {
+                                        "titles"
+                                    }
+                                ))
+                            }))
+                            .right_slot(Some(
                                 div()
                                     .flex()
                                     .flex_wrap()
@@ -487,9 +420,10 @@ impl AppShell {
                                         "Hours",
                                         false,
                                         None,
-                                    )),
-                            ),
-                    )
+                                    ))
+                                    .into_any_element(),
+                            )),
+                    ))
                     // 2. "New Episodes & Up Next" Highlight Shelf.
                     .when(show_up_next_shelf, |col| {
                         col.child(self.render_library_up_next_shelf(
@@ -499,21 +433,9 @@ impl AppShell {
                             cx,
                         ))
                     })
-                    // 3. Unified Sticky Frosted Glass Toolbar.
+                    // 3. Unified Floating Frosted Glass Toolbar.
                     .child(
-                        div()
-                            .flex_shrink_0()
-                            .px(sp(12.0))
-                            .py(sp(9.0))
-                            .rounded(px(RADIUS_CARD))
-                            .bg(rgba(theme.glass_card_bg))
-                            .border_1()
-                            .border_color(rgba(theme.glass_border))
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_between()
-                            .gap(sp(10.0))
+                        toolbar_bar()
                             .child(
                                 glass_segmented_bar("lib-filter-bar").children(
                                     visible_filter_tabs.into_iter().enumerate().map(
@@ -548,120 +470,25 @@ impl AppShell {
                                     .items_center()
                                     .gap(sp(8.0))
                                     // Inline instant filter input.
-                                    .child(
-                                        div()
-                                            .id("lib-search-box")
-                                            .cursor_pointer()
-                                            .w(sp(216.0))
-                                            .h(sp(36.0))
-                                            .px(sp(11.0))
-                                            .rounded(px(RADIUS_CONTROL))
-                                            .bg(if search_focused {
-                                                rgba(theme.glass_row_selected_bg)
-                                            } else {
-                                                rgba(theme.glass_trough_bg)
-                                            })
-                                            .border_1()
-                                            .border_color(if search_focused {
-                                                rgba(theme.border_accent)
-                                            } else {
-                                                rgba(theme.glass_border)
-                                            })
-                                            .hover(move |s| {
-                                                s.border_color(if search_focused {
-                                                    rgba(theme.border_accent)
-                                                } else {
-                                                    rgba(theme.glass_border_strong)
-                                                })
-                                            })
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(sp(8.0))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.library_sort_dropdown_open = false;
-                                                    this.focused_input =
-                                                        Some(FocusedInput::LibrarySearch);
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(0.0))
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(sp(7.0))
-                                                    .child(svg_icon(
-                                                        IconName::Search,
-                                                        13.5 * theme.ui_scale,
-                                                        if search_focused {
-                                                            rgb(accent_ink)
-                                                        } else {
-                                                            rgb(theme.text_muted)
-                                                        },
-                                                    ))
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w(px(0.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .font(ui_sans(FontWeight::NORMAL))
-                                                            .text_size(sp(12.5))
-                                                            .text_color(if has_search_query {
-                                                                rgb(theme.text_primary)
-                                                            } else {
-                                                                rgb(theme.text_muted)
-                                                            })
-                                                            .truncate()
-                                                            .when(
-                                                                search_focused || has_search_query,
-                                                                |d| d.child(search_display.clone()),
-                                                            )
-                                                            .when(!has_search_query, |d| {
-                                                                d.child(
-                                                                    div()
-                                                                        .when(
-                                                                            search_focused,
-                                                                            |p| p.pl(px(3.0)),
-                                                                        )
-                                                                        .text_color(rgb(
-                                                                            theme.text_muted,
-                                                                        ))
-                                                                        .child("Filter library..."),
-                                                                )
-                                                            }),
-                                                    ),
-                                            )
-                                            .when(has_search_query, |sb| {
-                                                sb.child(
-                                                    div()
-                                                        .id("lib-search-clear")
-                                                        .cursor_pointer()
-                                                        .p(px(3.0))
-                                                        .rounded(px(4.0))
-                                                        .hover(move |s| {
-                                                            s.bg(rgba(theme.glass_row_hover_bg))
-                                                        })
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _, _, cx| {
-                                                                cx.stop_propagation();
-                                                                this.clear_library_search(cx);
-                                                            }),
-                                                        )
-                                                        .child(svg_icon(
-                                                            IconName::X,
-                                                            11.5 * theme.ui_scale,
-                                                            rgb(theme.text_muted),
-                                                        )),
-                                                )
-                                            }),
-                                    )
+                                    .child(search_field(
+                                        SearchFieldProps::new(
+                                            "lib-search-box",
+                                            search_display.clone(),
+                                            "Filter library...",
+                                            !has_search_query,
+                                            search_focused,
+                                        )
+                                        .clear_id("lib-search-clear")
+                                        .width_px(Some(216.0))
+                                        .on_focus(cx.listener(|this, _, _, cx| {
+                                            this.library_sort_dropdown_open = false;
+                                            this.focused_input = Some(FocusedInput::LibrarySearch);
+                                            cx.notify();
+                                        }))
+                                        .on_clear(cx.listener(|this, _, _, cx| {
+                                            this.clear_library_search(cx);
+                                        })),
+                                    ))
                                     // Type filter pills (All | Movies | Series).
                                     .child(
                                         glass_segmented_bar("lib-type-bar").children(
@@ -693,80 +520,24 @@ impl AppShell {
                                     .child(
                                         div()
                                             .relative()
-                                            .child(
-                                                div()
-                                                    .id("lib-sort-pill")
-                                                    .cursor_pointer()
-                                                    .h(sp(36.0))
-                                                    .px(sp(11.0))
-                                                    .rounded(px(RADIUS_CONTROL))
-                                                    .bg(if sort_open {
-                                                        rgba(theme.glass_row_selected_bg)
-                                                    } else {
-                                                        rgba(theme.glass_trough_bg)
-                                                    })
-                                                    .border_1()
-                                                    .border_color(if sort_open {
-                                                        rgba(theme.border_accent)
-                                                    } else {
-                                                        rgba(theme.glass_border)
-                                                    })
-                                                    .hover(move |s| {
-                                                        s.bg(if sort_open {
-                                                            rgba(theme.glass_row_selected_bg)
-                                                        } else {
-                                                            rgba(theme.glass_row_hover_bg)
-                                                        })
-                                                        .border_color(if sort_open {
-                                                            rgb(theme.accent)
-                                                        } else {
-                                                            rgba(theme.glass_border_strong)
-                                                        })
-                                                    })
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(sp(7.0))
-                                                    .font(ui_sans(FontWeight::MEDIUM))
-                                                    .text_size(sp(12.5))
-                                                    .text_color(if sort_open {
-                                                        rgb(accent_ink)
-                                                    } else {
-                                                        rgb(theme.text_primary)
-                                                    })
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.library_sort_dropdown_open =
-                                                                !this.library_sort_dropdown_open;
-                                                            if this.focused_input
-                                                                == Some(FocusedInput::LibrarySearch)
-                                                            {
-                                                                this.focused_input = None;
-                                                            }
-                                                            cx.notify();
-                                                        }),
-                                                    )
-                                                    .child(svg_icon(
-                                                        IconName::Sliders,
-                                                        13.0 * theme.ui_scale,
-                                                        if sort_open {
-                                                            rgb(accent_ink)
-                                                        } else {
-                                                            rgb(theme.text_muted)
-                                                        },
-                                                    ))
-                                                    .child(active_sort.label())
-                                                    .child(svg_icon(
-                                                        IconName::ChevronDown,
-                                                        12.0 * theme.ui_scale,
-                                                        if sort_open {
-                                                            rgb(accent_ink)
-                                                        } else {
-                                                            rgb(theme.text_muted)
-                                                        },
-                                                    )),
-                                            )
+                                            .child(dropdown_trigger(
+                                                DropdownTriggerProps::new(
+                                                    "lib-sort-pill",
+                                                    active_sort.label(),
+                                                    sort_open,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.library_sort_dropdown_open =
+                                                            !this.library_sort_dropdown_open;
+                                                        if this.focused_input
+                                                            == Some(FocusedInput::LibrarySearch)
+                                                        {
+                                                            this.focused_input = None;
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .leading_icon(Some(IconName::Sliders)),
+                                            ))
                                             .when(sort_open, |wrap| {
                                                 wrap.child(
                                                     deferred(
@@ -1012,111 +783,63 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = active_theme();
-        let accent_ink = if theme.is_light {
-            theme.accent_press
-        } else {
-            theme.accent
-        };
         let heading = if new_episodes_count > 0 {
             "New Episodes & Up Next"
         } else {
             "Up Next"
         };
-        let heading_icon = if new_episodes_count > 0 {
-            IconName::Sparkles
-        } else {
-            IconName::Play
-        };
+
+        let right_action = (new_episodes_count > 0 && active_tab != LibraryFilterTab::NewEpisodes)
+            .then(|| {
+                div()
+                    .id("lib-up-next-view-new")
+                    .cursor_pointer()
+                    .px(sp(9.0))
+                    .py(sp(3.0))
+                    .rounded(px(RADIUS_PILL))
+                    .bg(rgba(theme.glass_trough_bg))
+                    .border_1()
+                    .border_color(rgba(theme.glass_border))
+                    .hover(move |s| {
+                        s.bg(rgba(theme.glass_row_hover_bg))
+                            .border_color(rgba(theme.glass_border_strong))
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(sp(4.0))
+                    .font(ui_sans(FontWeight::MEDIUM))
+                    .text_size(sp(11.5))
+                    .text_color(rgb(theme.text_secondary))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.select_library_filter_tab(LibraryFilterTab::NewEpisodes, cx);
+                        }),
+                    )
+                    .child("Filter new episodes")
+                    .child(svg_icon(
+                        IconName::ChevronRight,
+                        11.0 * theme.ui_scale,
+                        rgb(theme.text_muted),
+                    ))
+                    .into_any_element()
+            });
 
         div()
             .id("library-up-next-shelf")
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap(sp(8.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(sp(12.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(sp(8.0))
-                            .child(svg_icon(
-                                heading_icon,
-                                13.5 * theme.ui_scale,
-                                rgb(accent_ink),
-                            ))
-                            .child(
-                                div()
-                                    .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(sp(13.0))
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(heading),
-                            )
-                            .when(new_episodes_count > 0, |row| {
-                                row.child(
-                                    div()
-                                        .px(sp(7.0))
-                                        .py(sp(2.0))
-                                        .rounded(px(RADIUS_PILL))
-                                        .bg(rgba(theme.accent_soft))
-                                        .border_1()
-                                        .border_color(rgba(theme.border_accent))
-                                        .font(mono_font())
-                                        .font_features(tabular_nums())
-                                        .text_size(sp(10.5))
-                                        .text_color(rgb(accent_ink))
-                                        .child(format!("{new_episodes_count} new")),
-                                )
-                            }),
+            .gap(sp(12.0))
+            .child(render_section_header(
+                SectionHeader::new(heading)
+                    .count_badge(
+                        (new_episodes_count > 0)
+                            .then(|| SharedString::from(format!("{new_episodes_count} new"))),
                     )
-                    .when(
-                        new_episodes_count > 0 && active_tab != LibraryFilterTab::NewEpisodes,
-                        |row| {
-                            row.child(
-                                div()
-                                    .id("lib-up-next-view-new")
-                                    .cursor_pointer()
-                                    .px(sp(9.0))
-                                    .py(sp(3.0))
-                                    .rounded(px(RADIUS_PILL))
-                                    .bg(rgba(theme.glass_trough_bg))
-                                    .border_1()
-                                    .border_color(rgba(theme.glass_border))
-                                    .hover(move |s| {
-                                        s.bg(rgba(theme.glass_row_hover_bg))
-                                            .border_color(rgba(theme.glass_border_strong))
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .gap(sp(4.0))
-                                    .font(ui_sans(FontWeight::MEDIUM))
-                                    .text_size(sp(11.5))
-                                    .text_color(rgb(theme.text_secondary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.select_library_filter_tab(
-                                                LibraryFilterTab::NewEpisodes,
-                                                cx,
-                                            );
-                                        }),
-                                    )
-                                    .child("Filter new episodes")
-                                    .child(svg_icon(
-                                        IconName::ChevronRight,
-                                        11.0 * theme.ui_scale,
-                                        rgb(theme.text_muted),
-                                    )),
-                            )
-                        },
-                    ),
-            )
+                    .right_slot(right_action),
+            ))
             .child(
                 div()
                     .id("library-up-next-strip")
@@ -1139,7 +862,6 @@ impl AppShell {
         entry: &UpNextHighlightEntry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = active_theme();
         let li = &entry.item;
         let notif_count = entry.notification_count;
         let wide_url = self.resolve_library_widescreen_url(li);
@@ -1148,25 +870,14 @@ impl AppShell {
             li.poster.as_ref().map(|u| u.as_str()),
         );
         let progress = clamp_progress_fraction(library_item_progress_fraction(li, entry.status));
-        let notif_label = format_notification_badge_label(notif_count);
         let ep_code = format_movietracker_episode_code(li.state.video_id.as_deref());
         let remaining = format_library_remaining_time(li);
-        let detail_line: SharedString = match (ep_code.as_deref(), remaining.as_deref()) {
-            (Some(ep), Some(rem)) => format!("{ep} · {rem}").into(),
-            (Some(ep), None) if notif_count > 0 => format!("{ep} · New episode").into(),
-            (Some(ep), None) => ep.to_owned().into(),
-            (None, Some(rem)) => rem.to_owned().into(),
-            (None, None) if notif_count > 0 => "New episode available".into(),
-            (None, None) => sentence_case_label(&li.r#type).into(),
-        };
-
-        let grp: SharedString = format!("lib-up-next-grp-{idx}").into();
-        let hover_glow = poster_hover_glow_shadow(&theme);
-        let scrim_top_transparent = theme.scrim_bottom & 0xFFFFFF00;
-        let top_hairline_rgba = if theme.is_light {
-            0xFFFFFF80
-        } else {
-            0xFFFFFF24
+        let subtitle: Option<SharedString> = match (ep_code.is_some(), remaining) {
+            (_, Some(rem)) => Some(rem.into()),
+            (true, None) if notif_count > 0 => Some("New episode".into()),
+            (true, None) => None,
+            (false, None) if notif_count > 0 => Some("New episode available".into()),
+            (false, None) => Some(sentence_case_label(&li.r#type).into()),
         };
 
         let open_type = li.r#type.clone();
@@ -1196,27 +907,14 @@ impl AppShell {
         let hover_id = li.id.clone();
         let hover_bg = wide_url;
 
-        div()
-            .id(("lib-up-next-card", idx))
-            .group(grp.clone())
-            .flex_shrink_0()
-            .w(sp(268.0))
-            .h(sp(150.0))
-            .rounded(px(RADIUS_CARD))
-            .overflow_hidden()
-            .relative()
-            .cursor_pointer()
-            .bg(rgb(placeholder_tint_for_id(&li.id)))
-            .border_1()
-            .border_color(rgba(theme.glass_border))
-            .shadow(poster_card_shadow())
-            .group_hover(grp.clone(), move |s| {
-                s.border_color(rgba(theme.border_poster_hover))
-                    .shadow(hover_glow)
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
+        let mut props =
+            LandscapeCardProps::new(("lib-up-next-card", idx), li.name.clone(), li.id.clone())
+                .image(wide_tex)
+                .subtitle(subtitle)
+                .notification_count(notif_count)
+                .progress_fraction(progress)
+                .play_label(Some(SharedString::new_static("Resume")))
+                .on_open(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.open_meta_details(
                         open_type.clone(),
@@ -1224,12 +922,19 @@ impl AppShell {
                         open_vid.clone(),
                         cx,
                     );
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
+                }))
+                .on_quick_play(cx.listener(move |this, _, _, cx| {
+                    this.quick_resume_or_open(
+                        play_type.clone(),
+                        play_id.clone(),
+                        play_vid.clone(),
+                        cx,
+                    );
+                }))
+                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    this.open_quick_peek(peek_target.clone(), cx);
+                }))
+                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     let menu = BrowsingContextMenu::new(
                         ev.position,
                         ctx_type.clone(),
@@ -1241,196 +946,22 @@ impl AppShell {
                     .is_watched(ctx_watched)
                     .can_rewind_cw(ctx_can_rewind);
                     this.open_browsing_context_menu(menu, cx);
-                }),
-            )
-            .on_hover(cx.listener(move |this, hovered, _, cx| {
-                this.on_card_hover_prefetch(
-                    &hover_type,
-                    &hover_id,
-                    hover_bg.as_deref(),
-                    *hovered,
-                    cx,
-                );
-            }))
-            // Widescreen backdrop artwork.
-            .child(if let Some(tex) = wide_tex {
-                img(tex)
-                    .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    .into_any_element()
-            } else {
-                div()
-                    .size_full()
-                    .bg(rgb(theme.bg_surface))
-                    .into_any_element()
-            })
-            // Luminous top glass hairline.
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(1.0))
-                    .bg(rgba(top_hairline_rgba)),
-            )
-            // Bottom cinema scrim for always-legible metadata & controls.
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .bg(linear_gradient(
-                        180.0,
-                        linear_color_stop(rgba(scrim_top_transparent), 0.18),
-                        linear_color_stop(rgba(theme.scrim_bottom), 1.0),
-                    )),
-            )
-            // Top-left New Episodes badge.
-            .when_some(notif_label, |el, label| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top(sp(8.0))
-                        .left(sp(8.0))
-                        .h(sp(20.0))
-                        .px(sp(7.0))
-                        .rounded(px(RADIUS_PILL))
-                        .bg(rgb(theme.accent))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .font(mono_font())
-                        .font_weight(FontWeight::BOLD)
-                        .text_size(sp(10.0))
-                        .text_color(rgb(theme.cta_on_accent))
-                        .child(label),
-                )
-            })
-            // Top-right Quick Peek button.
-            .child(
-                div()
-                    .id(("lib-up-next-peek", idx))
-                    .cursor_pointer()
-                    .absolute()
-                    .top(sp(8.0))
-                    .right(sp(8.0))
-                    .w(sp(28.0))
-                    .h(sp(28.0))
-                    .rounded(px(RADIUS_PILL))
-                    .bg(rgba(0x0B0D14CC))
-                    .border_1()
-                    .border_color(rgba(0xFFFFFF2E))
-                    .opacity(0.85)
-                    .hover(move |s| {
-                        s.opacity(1.0)
-                            .bg(rgb(theme.accent_press))
-                            .border_color(rgb(theme.accent))
-                    })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.open_quick_peek(peek_target.clone(), cx);
-                        }),
-                    )
-                    .child(svg_icon(
-                        IconName::Eye,
-                        13.0 * theme.ui_scale,
-                        rgb(0xF5F1E8),
-                    )),
-            )
-            // Bottom overlay: Title + Episode/Remaining + 1-click Resume CTA.
-            .child(
-                div()
-                    .absolute()
-                    .bottom(sp(10.0))
-                    .left(sp(10.0))
-                    .right(sp(10.0))
-                    .flex()
-                    .items_end()
-                    .justify_between()
-                    .gap(sp(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap(sp(2.0))
-                            .child(
-                                div()
-                                    .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(sp(13.0))
-                                    .line_height(sp(16.0))
-                                    .text_color(rgb(0xF5F1E8))
-                                    .truncate()
-                                    .child(li.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .font(ui_sans(FontWeight::MEDIUM))
-                                    .font_features(tabular_nums())
-                                    .text_size(sp(11.5))
-                                    .line_height(sp(14.0))
-                                    .text_color(rgb(0xC8C8D2))
-                                    .truncate()
-                                    .child(detail_line),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("lib-up-next-resume", idx))
-                            .cursor_pointer()
-                            .flex_shrink_0()
-                            .h(sp(30.0))
-                            .px(sp(10.0))
-                            .rounded(px(RADIUS_PILL))
-                            .bg(rgb(theme.accent))
-                            .hover(move |s| s.bg(rgb(theme.accent_hover)))
-                            .flex()
-                            .items_center()
-                            .gap(sp(5.0))
-                            .font(ui_sans(FontWeight::SEMIBOLD))
-                            .text_size(sp(11.5))
-                            .text_color(rgb(theme.cta_on_accent))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.quick_resume_or_open(
-                                        play_type.clone(),
-                                        play_id.clone(),
-                                        play_vid.clone(),
-                                        cx,
-                                    );
-                                }),
-                            )
-                            .child(svg_icon_weighted(
-                                IconName::Play,
-                                IconWeight::Fill,
-                                11.0 * theme.ui_scale,
-                                rgb(theme.cta_on_accent),
-                            ))
-                            .child("Resume"),
-                    ),
-            )
-            // Bottom edge progress bar.
-            .when_some(progress, |el, frac| {
-                el.child(
-                    div()
-                        .absolute()
-                        .bottom_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(3.0))
-                        .bg(rgba(0xFFFFFF33))
-                        .child(div().h_full().w(relative(frac)).bg(rgb(theme.accent))),
-                )
-            })
-            .into_any_element()
+                }))
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    this.on_card_hover_prefetch(
+                        &hover_type,
+                        &hover_id,
+                        hover_bg.as_deref(),
+                        *hovered,
+                        cx,
+                    );
+                }));
+
+        if let Some(code) = ep_code {
+            props = props.episode_badge(code, false);
+        }
+
+        render_landscape_card(props)
     }
 
     fn get_or_update_memoized_library(&self) -> MemoizedLibraryView {
@@ -1671,8 +1202,8 @@ impl AppShell {
         div()
             .id((id_prefix, idx))
             .cursor_pointer()
-            .w(px(30.0))
-            .h(px(30.0))
+            .w(sp(30.0))
+            .h(sp(30.0))
             .rounded(px(RADIUS_PILL))
             .bg(if is_watched {
                 rgb(theme.status_watched)
@@ -1714,7 +1245,7 @@ impl AppShell {
             )
             .child(svg_icon(
                 IconName::Check,
-                13.0,
+                13.0 * theme.ui_scale,
                 if is_watched {
                     rgb(badge_fg)
                 } else {
@@ -2402,29 +1933,6 @@ impl AppShell {
     }
 }
 
-/// Computes fluid horizontal padding matching CSS `clamp(24px, 3vw, 56px)`.
-pub fn compute_library_horizontal_padding_px(viewport_w: f32) -> f32 {
-    if !viewport_w.is_finite() || viewport_w <= 0.0 {
-        return 32.0;
-    }
-    (viewport_w * 0.03).clamp(24.0, 56.0)
-}
-
-/// Minimum 16:9 widescreen card width scaled by the active `CardDensityChoice` and UI scale.
-pub fn wide_card_min_width_px(density: CardDensityChoice, ui_scale: f32) -> f32 {
-    let base = match density {
-        CardDensityChoice::Compact => 264.0,
-        CardDensityChoice::Comfortable => 312.0,
-        CardDensityChoice::Cinema => 368.0,
-    };
-    let scale = if ui_scale.is_finite() && ui_scale > 0.0 {
-        ui_scale
-    } else {
-        1.0
-    };
-    base * scale
-}
-
 fn library_item_progress_fraction(li: &LibraryItem, status: LibraryStatusTab) -> Option<f32> {
     if status != LibraryStatusTab::Watching || li.state.time_offset == 0 {
         return None;
@@ -2509,33 +2017,6 @@ fn format_wide_card_subtitle(
     }
 }
 
-fn infer_library_grid_aspect(items: &[(LibraryItem, LibraryStatusTab)]) -> PosterAspect {
-    if items.is_empty() {
-        return PosterAspect::Portrait2x3;
-    }
-    let mut has_portrait = false;
-    let mut has_square = false;
-    let mut has_landscape = false;
-    for (li, _) in items.iter().take(24) {
-        match li.poster_shape {
-            PosterShape::Poster => has_portrait = true,
-            PosterShape::Square => has_square = true,
-            PosterShape::Landscape => has_landscape = true,
-        }
-    }
-    if has_portrait {
-        PosterAspect::Portrait2x3
-    } else if has_square && !has_landscape {
-        PosterAspect::Square1x1
-    } else if has_landscape && !has_square {
-        PosterAspect::Landscape16x9
-    } else if has_square {
-        PosterAspect::Square1x1
-    } else {
-        PosterAspect::Portrait2x3
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn render_library_stat_pill(
     id: &'static str,
@@ -2545,7 +2026,7 @@ fn render_library_stat_pill(
     value: String,
     label: &'static str,
     active: bool,
-    on_click: Option<crate::ui_components::ClickHandler>,
+    on_click: Option<ClickHandler>,
 ) -> AnyElement {
     let theme = active_theme();
     let clickable = on_click.is_some();
@@ -2620,7 +2101,6 @@ fn render_library_empty_state(
     trimmed_query: &str,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
-    let theme = active_theme();
     let has_type_filter = active_type != LibraryTypeFilter::All;
 
     let (empty_title, empty_sub): (SharedString, SharedString) = if has_search_query {
@@ -2668,148 +2148,76 @@ fn render_library_empty_state(
         }
     };
 
-    let mut actions = div()
-        .pt(sp(6.0))
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .justify_center()
-        .gap(sp(10.0));
-
+    let mut actions: Vec<AnyElement> = Vec::new();
     if has_search_query || has_type_filter {
-        actions = actions.child(primary_accent_button(
-            "lib-empty-clear-filters",
-            Some(IconName::X),
-            if has_search_query {
-                "Clear search"
-            } else {
-                "Reset type filter"
-            },
-            cx.listener(|this, _, _, cx| {
-                this.library_search_query.clear();
-                this.input_cursors.remove(&FocusedInput::LibrarySearch);
-                this.input_selected_all.remove(&FocusedInput::LibrarySearch);
-                this.library_type_filter = LibraryTypeFilter::All;
-                this.kb_focus_index = None;
-                this.reset_library_scroll();
-                cx.notify();
-            }),
-        ));
+        actions.push(
+            primary_accent_button(
+                "lib-empty-clear-filters",
+                Some(IconName::X),
+                if has_search_query {
+                    "Clear search"
+                } else {
+                    "Reset type filter"
+                },
+                cx.listener(|this, _, _, cx| {
+                    this.library_search_query.clear();
+                    this.input_cursors.remove(&FocusedInput::LibrarySearch);
+                    this.input_selected_all.remove(&FocusedInput::LibrarySearch);
+                    this.library_type_filter = LibraryTypeFilter::All;
+                    this.kb_focus_index = None;
+                    this.reset_library_scroll();
+                    cx.notify();
+                }),
+            )
+            .into_any_element(),
+        );
     } else {
         if active_tab != LibraryFilterTab::All && total_library_count > 0 {
-            actions = actions.child(secondary_glass_button(
-                "lib-empty-show-all",
-                Some(IconName::Bookmark),
-                "View all titles",
-                false,
-                cx.listener(|this, _, _, cx| {
-                    this.select_library_filter_tab(LibraryFilterTab::All, cx);
-                }),
-            ));
+            actions.push(
+                secondary_glass_button(
+                    "lib-empty-show-all",
+                    Some(IconName::Bookmark),
+                    "View all titles",
+                    false,
+                    cx.listener(|this, _, _, cx| {
+                        this.select_library_filter_tab(LibraryFilterTab::All, cx);
+                    }),
+                )
+                .into_any_element(),
+            );
         }
-        actions = actions.child(primary_accent_button(
-            "lib-empty-discover",
-            Some(IconName::Compass),
-            "Browse Discover",
-            cx.listener(|this, _, _, cx| {
-                this.navigate_tab(SidebarTab::Discover, cx);
-            }),
-        ));
+        actions.push(
+            primary_accent_button(
+                "lib-empty-discover",
+                Some(IconName::Compass),
+                "Browse Discover",
+                cx.listener(|this, _, _, cx| {
+                    this.navigate_tab(SidebarTab::Discover, cx);
+                }),
+            )
+            .into_any_element(),
+        );
     }
 
-    div()
-        .flex_1()
-        .min_h(px(0.0))
-        .w_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            div()
-                .w_full()
-                .max_w(sp(560.0))
-                .py(sp(56.0))
-                .px(sp(28.0))
-                .rounded(px(RADIUS_CARD))
-                .border_1()
-                .border_color(rgba(theme.glass_border))
-                .bg(rgba(theme.glass_card_bg))
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(sp(12.0))
-                .child(
-                    div()
-                        .w(sp(44.0))
-                        .h(sp(44.0))
-                        .rounded(px(RADIUS_PILL))
-                        .bg(rgba(theme.glass_trough_bg))
-                        .border_1()
-                        .border_color(rgba(theme.glass_border))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(svg_icon(
-                            if has_search_query {
-                                IconName::Search
-                            } else {
-                                IconName::Bookmark
-                            },
-                            19.0 * theme.ui_scale,
-                            rgb(theme.text_muted),
-                        )),
-                )
-                .child(
-                    div()
-                        .font(editorial_serif())
-                        .text_size(sp(28.0))
-                        .text_color(rgb(theme.text_primary))
-                        .child(empty_title),
-                )
-                .child(
-                    div()
-                        .max_w(sp(420.0))
-                        .text_size(sp(13.5))
-                        .text_color(rgb(theme.text_secondary))
-                        .child(empty_sub),
-                )
-                .child(actions),
+    render_empty_state(
+        EmptyStateProps::new(
+            if has_search_query {
+                IconName::Search
+            } else {
+                IconName::Bookmark
+            },
+            empty_title,
+            empty_sub,
         )
-        .into_any_element()
+        .fill_available(true)
+        .actions(actions),
+    )
+    .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn library_horizontal_padding_clamps_between_24_and_56() {
-        assert_eq!(compute_library_horizontal_padding_px(600.0), 24.0);
-        assert_eq!(compute_library_horizontal_padding_px(800.0), 24.0);
-        assert!((compute_library_horizontal_padding_px(1200.0) - 36.0).abs() < f32::EPSILON);
-        assert!((compute_library_horizontal_padding_px(1600.0) - 48.0).abs() < f32::EPSILON);
-        assert_eq!(compute_library_horizontal_padding_px(2560.0), 56.0);
-        assert_eq!(compute_library_horizontal_padding_px(3840.0), 56.0);
-        assert_eq!(compute_library_horizontal_padding_px(0.0), 32.0);
-        assert_eq!(compute_library_horizontal_padding_px(f32::NAN), 32.0);
-    }
-
-    #[test]
-    fn wide_card_widths_order_by_density_and_scale() {
-        let compact = wide_card_min_width_px(CardDensityChoice::Compact, 1.0);
-        let comfortable = wide_card_min_width_px(CardDensityChoice::Comfortable, 1.0);
-        let cinema = wide_card_min_width_px(CardDensityChoice::Cinema, 1.0);
-        assert!(compact < comfortable && comfortable < cinema);
-        assert!(
-            (wide_card_min_width_px(CardDensityChoice::Comfortable, 1.25) - comfortable * 1.25)
-                .abs()
-                < f32::EPSILON
-        );
-        assert_eq!(
-            wide_card_min_width_px(CardDensityChoice::Comfortable, f32::NAN),
-            comfortable
-        );
-    }
 
     #[test]
     fn remaining_duration_formats_minutes_and_hours_cleanly() {

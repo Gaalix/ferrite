@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use chrono::{Datelike, Local, Months, NaiveDate};
 use gpui::{
-    div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, AnyElement, Context,
-    FontWeight, MouseButton, MouseDownEvent, ObjectFit, SharedString,
+    div, prelude::*, px, rgb, rgba, AnyElement, Context, FontWeight, MouseButton, MouseDownEvent,
+    SharedString,
 };
 use stremio_core_runtime::stremio_core::{
     models::{calendar::YearMonthDate, common::Loadable},
@@ -19,12 +19,14 @@ use crate::{
         SidebarTab,
     },
     theme::{
-        active_theme, editorial_serif, mono_font, placeholder_tint_for_id, sp, tabular_nums,
-        ui_sans, ThemePalette, RADIUS_CARD, RADIUS_PILL, RADIUS_POSTER, RADIUS_SHEET,
+        active_theme, mono_font, sp, tabular_nums, ui_sans, ThemePalette, RADIUS_CARD, RADIUS_PILL,
     },
-    ui_components::{
+    ui::{
         format_notification_badge_label, glass_back_button, glass_segmented_bar,
-        glass_segmented_item, primary_accent_button, secondary_glass_button,
+        glass_segmented_item, page_container, primary_accent_button, render_empty_state,
+        render_landscape_card, render_page_header, render_section_header, secondary_glass_button,
+        EmptyStateProps, LandscapeCardBadge, LandscapeCardProps, PageHeader, PageWidth,
+        SectionHeader,
     },
 };
 
@@ -251,12 +253,6 @@ impl AppShell {
         });
 
         let t = active_theme();
-        let side_pad = if self.viewport_size_px.0.is_finite() && self.viewport_size_px.0 > 0.0 {
-            (self.viewport_size_px.0 * 0.03).clamp(24.0, 56.0)
-        } else {
-            32.0
-        };
-
         let is_current_month =
             selected.year == local_today.year() && selected.month == local_today.month();
         let has_any_episodes = total_episodes > 0;
@@ -279,13 +275,13 @@ impl AppShell {
             None
         } else {
             Some(
-                self.render_up_next_strip(&up_next_entries, local_today, &mut kb_cards, t, cx)
+                self.render_up_next_strip(&up_next_entries, local_today, &mut kb_cards, cx)
                     .into_any_element(),
             )
         };
 
         let body_el = if !has_any_episodes && !is_loading {
-            self.render_calendar_empty_state(t, cx).into_any_element()
+            self.render_calendar_empty_state(cx).into_any_element()
         } else {
             self.render_monthly_release_grid(
                 &grid_cells,
@@ -300,162 +296,120 @@ impl AppShell {
 
         self.set_kb_focus_items(kb_cards);
 
+        let subtitle_text = if is_loading {
+            "Updating episode release dates from your library...".to_owned()
+        } else if has_any_episodes {
+            let ep_word = if total_episodes == 1 {
+                "episode"
+            } else {
+                "episodes"
+            };
+            let day_word = if active_days_count == 1 {
+                "day"
+            } else {
+                "days"
+            };
+            format!(
+                "{} {} · {total_episodes} {ep_word} across {active_days_count} {day_word}",
+                month_name(selected.month),
+                selected.year
+            )
+        } else {
+            format!(
+                "{} {} · No tracked episode air dates",
+                month_name(selected.month),
+                selected.year
+            )
+        };
+
+        let month_controls = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(sp(10.0))
+            .child(glass_back_button(
+                "cal-prev-month",
+                format!("{} {}", month_short_name(prev_ym.month), prev_ym.year),
+                cx.listener(move |this, _, _, cx| {
+                    this.core.load_calendar(Some(prev_for_click.clone()));
+                    cx.notify();
+                }),
+            ))
+            .child(
+                glass_segmented_bar("cal-month-bar")
+                    .child(
+                        div()
+                            .px(sp(14.0))
+                            .font(ui_sans(FontWeight::SEMIBOLD))
+                            .font_features(tabular_nums())
+                            .text_size(sp(13.0))
+                            .text_color(rgb(t.text_primary))
+                            .whitespace_nowrap()
+                            .child(format!("{} {}", month_name(selected.month), selected.year)),
+                    )
+                    .child(glass_segmented_item(
+                        "cal-today-btn",
+                        "Today",
+                        is_current_month,
+                        cx.listener(|this, _, _, cx| {
+                            this.core.load_calendar(None);
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .id("cal-next-month")
+                    .cursor_pointer()
+                    .h(sp(34.0))
+                    .px(sp(12.0))
+                    .rounded(px(RADIUS_PILL))
+                    .bg(rgba(t.glass_trough_bg))
+                    .border_1()
+                    .border_color(rgba(t.glass_border))
+                    .hover(move |s| {
+                        s.bg(rgba(t.glass_row_hover_bg))
+                            .border_color(rgba(t.glass_border_strong))
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(sp(6.0))
+                    .font(ui_sans(FontWeight::MEDIUM))
+                    .text_size(sp(13.0))
+                    .text_color(rgb(t.text_secondary))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.core.load_calendar(Some(next_for_click.clone()));
+                            cx.notify();
+                        }),
+                    )
+                    .child(format!(
+                        "{} {}",
+                        month_short_name(next_ym.month),
+                        next_ym.year
+                    ))
+                    .child(svg_icon_weighted(
+                        IconName::ChevronRight,
+                        IconWeight::Regular,
+                        14.0 * t.ui_scale,
+                        rgb(t.text_secondary),
+                    )),
+            );
+
         div()
             .id("calendar-view-scroll")
             .track_scroll(&self.calendar_scroll_handle)
             .size_full()
             .overflow_y_scroll()
             .child(
-                div()
-                    .w_full()
-                    .px(px(side_pad))
-                    .pt(sp(16.0))
-                    .pb(sp(72.0))
-                    .flex()
-                    .flex_col()
-                    .gap(sp(24.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_end()
-                            .justify_between()
-                            .gap(sp(16.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(sp(4.0))
-                                    .child(
-                                        div()
-                                            .font(editorial_serif())
-                                            .text_size(sp(38.0))
-                                            .line_height(gpui::relative(1.06))
-                                            .text_color(rgb(t.text_primary))
-                                            .child("Release Calendar"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(sp(10.0))
-                                            .text_size(sp(13.5))
-                                            .text_color(rgb(t.text_secondary))
-                                            .child(if is_loading {
-                                                "Updating episode release dates from your library..."
-                                                    .to_owned()
-                                            } else if has_any_episodes {
-                                                let ep_word = if total_episodes == 1 {
-                                                    "episode"
-                                                } else {
-                                                    "episodes"
-                                                };
-                                                let day_word = if active_days_count == 1 {
-                                                    "day"
-                                                } else {
-                                                    "days"
-                                                };
-                                                format!(
-                                                    "{} {} · {total_episodes} {ep_word} across {active_days_count} {day_word}",
-                                                    month_name(selected.month),
-                                                    selected.year
-                                                )
-                                            } else {
-                                                format!(
-                                                    "{} {} · No tracked episode air dates",
-                                                    month_name(selected.month),
-                                                    selected.year
-                                                )
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(sp(10.0))
-                                    .child(glass_back_button(
-                                        "cal-prev-month",
-                                        format!(
-                                            "{} {}",
-                                            month_short_name(prev_ym.month),
-                                            prev_ym.year
-                                        ),
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.core.load_calendar(Some(prev_for_click.clone()));
-                                            cx.notify();
-                                        }),
-                                    ))
-                                    .child(
-                                        glass_segmented_bar("cal-month-bar")
-                                            .child(
-                                                div()
-                                                    .px(sp(14.0))
-                                                    .font(ui_sans(FontWeight::SEMIBOLD))
-                                                    .font_features(tabular_nums())
-                                                    .text_size(sp(13.0))
-                                                    .text_color(rgb(t.text_primary))
-                                                    .whitespace_nowrap()
-                                                    .child(format!(
-                                                        "{} {}",
-                                                        month_name(selected.month),
-                                                        selected.year
-                                                    )),
-                                            )
-                                            .child(glass_segmented_item(
-                                                "cal-today-btn",
-                                                "Today",
-                                                is_current_month,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.core.load_calendar(None);
-                                                    cx.notify();
-                                                }),
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("cal-next-month")
-                                            .cursor_pointer()
-                                            .h(sp(34.0))
-                                            .px(sp(12.0))
-                                            .rounded(px(RADIUS_PILL))
-                                            .bg(rgba(t.glass_trough_bg))
-                                            .border_1()
-                                            .border_color(rgba(t.glass_border))
-                                            .hover(move |s| {
-                                                s.bg(rgba(t.glass_row_hover_bg))
-                                                    .border_color(rgba(t.glass_border_strong))
-                                            })
-                                            .flex()
-                                            .items_center()
-                                            .gap(sp(6.0))
-                                            .font(ui_sans(FontWeight::MEDIUM))
-                                            .text_size(sp(13.0))
-                                            .text_color(rgb(t.text_secondary))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.core
-                                                        .load_calendar(Some(next_for_click.clone()));
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child(format!(
-                                                "{} {}",
-                                                month_short_name(next_ym.month),
-                                                next_ym.year
-                                            ))
-                                            .child(svg_icon_weighted(
-                                                IconName::ChevronRight,
-                                                IconWeight::Regular,
-                                                14.0 * t.ui_scale,
-                                                rgb(t.text_secondary),
-                                            )),
-                                    ),
-                            ),
-                    )
+                page_container(PageWidth::Wide, self.viewport_size_px.0)
+                    .child(render_page_header(
+                        PageHeader::new("Release Calendar")
+                            .subtitle(Some(subtitle_text.into()))
+                            .right_slot(Some(month_controls.into_any_element())),
+                    ))
                     .when_some(cw_alerts_el, |root, el| root.child(el))
                     .when_some(up_next_el, |root, el| root.child(el))
                     .child(body_el),
@@ -590,7 +544,6 @@ impl AppShell {
         entries: &[CalendarEpisodeEntry],
         local_today: NaiveDate,
         kb_cards: &mut Vec<KbFocusableCard>,
-        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut cards: Vec<AnyElement> = Vec::with_capacity(entries.len());
@@ -639,235 +592,75 @@ impl AppShell {
             let hover_id = entry.meta_id.clone();
             let hover_bg = entry.backdrop_url.clone();
 
-            cards.push(
-                div()
-                    .id(("cal-upnext-card", idx))
-                    .cursor_pointer()
-                    .w(sp(276.0))
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_col()
-                    .gap(sp(8.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.open_meta_details(
-                                open_type.clone(),
-                                open_id.clone(),
-                                Some(open_vid.clone()),
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.open_browsing_context_menu(
-                                BrowsingContextMenu::new(
-                                    ev.position,
-                                    ctx_type.clone(),
-                                    ctx_id.clone(),
-                                    ctx_title.clone(),
-                                )
-                                .video_id(Some(ctx_vid.clone()))
-                                .preview(Some(ctx_preview.clone()))
-                                .is_in_library(ctx_in_lib)
-                                .is_watched(ctx_watched),
-                                cx,
-                            );
-                        }),
-                    )
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        this.on_card_hover_prefetch(
-                            &hover_type,
-                            &hover_id,
-                            hover_bg.as_deref(),
-                            *hovered,
-                            cx,
-                        );
-                    }))
-                    .child(
-                        div()
-                            .w_full()
-                            .h(sp(155.0))
-                            .rounded(px(RADIUS_POSTER))
-                            .overflow_hidden()
-                            .relative()
-                            .bg(rgb(placeholder_tint_for_id(&entry.meta_id)))
-                            .border_1()
-                            .border_color(if is_focused {
-                                rgb(t.accent)
-                            } else if is_today_pill {
-                                rgba(t.border_accent)
-                            } else {
-                                rgba(t.glass_border)
-                            })
-                            .hover(move |s| s.border_color(rgba(t.border_poster_hover)))
-                            .child(if let Some(tex) = card_tex {
-                                img(tex)
-                                    .size_full()
-                                    .object_fit(ObjectFit::Cover)
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .size_full()
-                                    .p(sp(14.0))
-                                    .bg(rgb(t.bg_surface))
-                                    .flex()
-                                    .items_end()
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .font(editorial_serif())
-                                            .text_size(sp(20.0))
-                                            .text_color(rgb(t.text_secondary))
-                                            .truncate()
-                                            .child(entry.series_name.clone()),
-                                    )
-                                    .into_any_element()
-                            })
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .bg(linear_gradient(
-                                        180.0,
-                                        linear_color_stop(rgba(0x0B0D1414), 0.2),
-                                        linear_color_stop(rgba(0x0B0D14E0), 1.0),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(8.0))
-                                    .left(px(8.0))
-                                    .h(sp(22.0))
-                                    .px(sp(8.0))
-                                    .rounded(px(RADIUS_PILL))
-                                    .bg(if is_today_pill {
-                                        rgb(t.accent)
-                                    } else {
-                                        rgba(0x0B0D14D9)
-                                    })
-                                    .border_1()
-                                    .border_color(if is_today_pill {
-                                        rgb(t.accent)
-                                    } else {
-                                        rgba(0xFFFFFF26)
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .font(mono_font())
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_size(sp(10.0))
-                                    .text_color(if is_today_pill {
-                                        rgb(t.cta_on_accent)
-                                    } else {
-                                        rgb(0xF5F1E8)
-                                    })
-                                    .child(date_label),
-                            )
-                            .when_some(notif_badge, |art, badge| {
-                                art.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(8.0))
-                                        .right(px(8.0))
-                                        .h(sp(20.0))
-                                        .px(sp(7.0))
-                                        .rounded(px(RADIUS_PILL))
-                                        .bg(rgb(t.accent))
-                                        .flex()
-                                        .items_center()
-                                        .font(mono_font())
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_size(sp(10.0))
-                                        .text_color(rgb(t.cta_on_accent))
-                                        .child(badge),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .absolute()
-                                    .bottom(px(8.0))
-                                    .left(px(8.0))
-                                    .px(sp(7.0))
-                                    .py(sp(2.5))
-                                    .rounded(px(6.0))
-                                    .bg(rgba(0x0B0D14D9))
-                                    .border_1()
-                                    .border_color(rgba(0xFFFFFF26))
-                                    .font(mono_font())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_size(sp(10.5))
-                                    .text_color(if entry.is_episode_watched {
-                                        rgb(0x4ADE80)
-                                    } else {
-                                        rgb(t.accent)
-                                    })
-                                    .child(entry.episode_badge_spaced.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap(sp(2.0))
-                            .child(
-                                div()
-                                    .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(sp(13.5))
-                                    .text_color(rgb(t.text_primary))
-                                    .truncate()
-                                    .child(entry.series_name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .font(ui_sans(FontWeight::NORMAL))
-                                    .text_size(sp(12.0))
-                                    .text_color(rgb(t.text_secondary))
-                                    .truncate()
-                                    .child(entry.episode_title.clone()),
-                            ),
-                    )
-                    .into_any_element(),
-            );
+            let air_badge = if is_today_pill {
+                LandscapeCardBadge::accent(date_label)
+            } else {
+                LandscapeCardBadge::neutral(date_label)
+            };
+
+            cards.push(render_landscape_card(
+                LandscapeCardProps::new(
+                    ("cal-upnext-card", idx),
+                    entry.series_name.clone(),
+                    entry.meta_id.clone(),
+                )
+                .image(card_tex)
+                .subtitle(Some(entry.episode_title.clone().into()))
+                .episode_badge(entry.episode_badge_spaced.clone(), entry.is_episode_watched)
+                .top_left_badge(Some(air_badge))
+                .top_right_badge(notif_badge.map(LandscapeCardBadge::accent))
+                .is_active(is_today_pill)
+                .is_focused(is_focused)
+                .on_open(cx.listener(move |this, _, _, cx| {
+                    this.open_meta_details(
+                        open_type.clone(),
+                        open_id.clone(),
+                        Some(open_vid.clone()),
+                        cx,
+                    );
+                }))
+                .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    this.open_browsing_context_menu(
+                        BrowsingContextMenu::new(
+                            ev.position,
+                            ctx_type.clone(),
+                            ctx_id.clone(),
+                            ctx_title.clone(),
+                        )
+                        .video_id(Some(ctx_vid.clone()))
+                        .preview(Some(ctx_preview.clone()))
+                        .is_in_library(ctx_in_lib)
+                        .is_watched(ctx_watched),
+                        cx,
+                    );
+                }))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.on_card_hover_prefetch(
+                        &hover_type,
+                        &hover_id,
+                        hover_bg.as_deref(),
+                        *hovered,
+                        cx,
+                    );
+                })),
+            ));
         }
 
         div()
             .flex()
             .flex_col()
             .gap(sp(14.0))
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .gap(sp(12.0))
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(sp(26.0))
-                            .text_color(rgb(t.text_primary))
-                            .child("Airing This Week & Up Next"),
-                    )
-                    .child(
-                        div()
-                            .font(mono_font())
-                            .text_xs()
-                            .text_color(rgb(t.text_muted))
-                            .child(format!("{} upcoming", entries.len())),
-                    ),
-            )
+            .child(render_section_header(
+                SectionHeader::new("Airing This Week & Up Next")
+                    .count_badge(Some(format!("{} upcoming", entries.len()).into())),
+            ))
             .child(
                 div()
                     .id("cal-upnext-strip")
                     .w_full()
                     .overflow_x_scroll()
-                    .child(div().flex().items_start().gap(sp(16.0)).children(cards)),
+                    .pb(sp(2.0))
+                    .child(div().flex().items_start().gap(sp(14.0)).children(cards)),
             )
     }
 
@@ -1156,78 +949,31 @@ impl AppShell {
             .children(week_rows)
     }
 
-    fn render_calendar_empty_state(&self, t: ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
-        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
-        div()
-            .w_full()
-            .p(sp(36.0))
-            .rounded(px(RADIUS_SHEET))
-            .bg(rgba(t.glass_card_bg))
-            .border_1()
-            .border_color(rgba(t.glass_border))
-            .flex()
-            .flex_col()
-            .items_start()
-            .gap(sp(12.0))
-            .child(
-                div()
-                    .w(sp(42.0))
-                    .h(sp(42.0))
-                    .rounded(px(RADIUS_CARD))
-                    .bg(rgba(t.accent_soft))
-                    .border_1()
-                    .border_color(rgba(t.border_accent))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(svg_icon_weighted(
-                        IconName::Calendar,
-                        IconWeight::Fill,
-                        20.0 * t.ui_scale,
-                        rgb(accent_ink),
-                    )),
+    fn render_calendar_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        render_empty_state(
+            EmptyStateProps::new(
+                IconName::Calendar,
+                "No releases scheduled this month",
+                "Add ongoing series to your library to track upcoming episode air dates here.",
             )
-            .child(
-                div()
-                    .font(editorial_serif())
-                    .text_size(sp(30.0))
-                    .text_color(rgb(t.text_primary))
-                    .child("No releases scheduled this month"),
-            )
-            .child(
-                div()
-                    .max_w(px(540.0))
-                    .text_size(sp(14.0))
-                    .text_color(rgb(t.text_secondary))
-                    .child(
-                        "Add ongoing series to your library to track upcoming episode air dates here.",
-                    ),
-            )
-            .child(
-                div()
-                    .mt(sp(6.0))
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(sp(10.0))
-                    .child(primary_accent_button(
-                        "cal-empty-discover",
-                        Some(IconName::Compass),
-                        "Browse Discover",
-                        cx.listener(|this, _, _, cx| {
-                            this.navigate_tab(SidebarTab::Discover, cx);
-                        }),
-                    ))
-                    .child(secondary_glass_button(
-                        "cal-empty-library",
-                        Some(IconName::Bookmark),
-                        "Open Library",
-                        false,
-                        cx.listener(|this, _, _, cx| {
-                            this.navigate_tab(SidebarTab::Library, cx);
-                        }),
-                    )),
-            )
+            .action(primary_accent_button(
+                "cal-empty-discover",
+                Some(IconName::Compass),
+                "Browse Discover",
+                cx.listener(|this, _, _, cx| {
+                    this.navigate_tab(SidebarTab::Discover, cx);
+                }),
+            ))
+            .action(secondary_glass_button(
+                "cal-empty-library",
+                Some(IconName::Bookmark),
+                "Open Library",
+                false,
+                cx.listener(|this, _, _, cx| {
+                    this.navigate_tab(SidebarTab::Library, cx);
+                }),
+            )),
+        )
     }
 }
 
