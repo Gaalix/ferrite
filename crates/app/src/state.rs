@@ -47,7 +47,11 @@ use stremio_stream_engine::{
 };
 use url::Url;
 
-use crate::{icons::IconName, poster_cache::PosterCache, theme::sentence_case_label};
+use crate::{
+    icons::IconName,
+    poster_cache::PosterCache,
+    theme::{sentence_case_label, AccentChoice, CardDensityChoice, ThemePreset, UiScaleChoice},
+};
 
 pub const STREAM_PAGE_SIZE: usize = 30;
 
@@ -271,6 +275,16 @@ impl BrowsingContextMenu {
     }
 }
 
+/// Payload for the universal slide-over quick-peek preview drawer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuickPeekTarget {
+    pub type_name: String,
+    pub id: String,
+    pub video_id: Option<String>,
+    pub title: String,
+    pub preview: Option<MetaItemPreview>,
+}
+
 /// 2D grid-coordinated focusable card registered by views for arrow/Enter keyboard navigation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KbFocusableCard {
@@ -370,11 +384,14 @@ pub enum StorageModeChoice {
 
 impl Default for StorageModeChoice {
     fn default() -> Self {
-        Self::DiskLru { budget_gb: 20 }
+        Self::DiskLru { budget_gb: 5 }
     }
 }
 
 impl StorageModeChoice {
+    pub const ALL_DISK_GB: [u64; 4] = [2, 5, 10, 20];
+    pub const ALL_RAM_GB: [u64; 2] = [1, 2];
+
     pub fn budget_bytes(self) -> u64 {
         match self {
             Self::DiskLru { budget_gb } | Self::RamOnly { budget_gb } => {
@@ -454,8 +471,8 @@ impl ToneMappingChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpscaleChoice {
-    #[default]
     Bilinear,
+    #[default]
     Spline36,
     Lanczos,
     EwaLanczos,
@@ -595,91 +612,77 @@ impl DebridAccessMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SettingsCategory {
     #[default]
-    GeneralAndAppearance,
-    PlaybackAndVideo,
-    AudioAndSubtitles,
-    DebridAndStreaming,
-    IntegrationsAndKeys,
-    StorageAndCache,
-    Shortcuts,
-    UpdatesAndAbout,
+    Appearance,
+    Playback,
+    SubtitlesAndAudio,
+    StreamingAndDebrid,
+    IntegrationsAndAddons,
+    SystemAndStorage,
 }
 
 impl SettingsCategory {
-    pub const ALL: [Self; 8] = [
-        Self::GeneralAndAppearance,
-        Self::PlaybackAndVideo,
-        Self::AudioAndSubtitles,
-        Self::DebridAndStreaming,
-        Self::IntegrationsAndKeys,
-        Self::StorageAndCache,
-        Self::Shortcuts,
-        Self::UpdatesAndAbout,
+    pub const ALL: [Self; 6] = [
+        Self::Appearance,
+        Self::Playback,
+        Self::SubtitlesAndAudio,
+        Self::StreamingAndDebrid,
+        Self::IntegrationsAndAddons,
+        Self::SystemAndStorage,
     ];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::GeneralAndAppearance => "General & Appearance",
-            Self::PlaybackAndVideo => "Playback & Video",
-            Self::AudioAndSubtitles => "Audio & Subtitles",
-            Self::DebridAndStreaming => "Debrid & Streaming",
-            Self::IntegrationsAndKeys => "Integrations & Keys",
-            Self::StorageAndCache => "Storage & Cache",
-            Self::Shortcuts => "Shortcuts",
-            Self::UpdatesAndAbout => "Updates & About",
+            Self::Appearance => "Appearance",
+            Self::Playback => "Playback",
+            Self::SubtitlesAndAudio => "Subtitles & Audio",
+            Self::StreamingAndDebrid => "Streaming & Debrid",
+            Self::IntegrationsAndAddons => "Integrations & Addons",
+            Self::SystemAndStorage => "System & Storage",
         }
     }
 
     pub const fn subtitle(self) -> &'static str {
         match self {
-            Self::GeneralAndAppearance => {
-                "Startup update checks, clipboard link detection, and player overlay timing."
+            Self::Appearance => {
+                "Theme presets, accent palette, ambient glow, UI scale, and card density."
             }
-            Self::PlaybackAndVideo => {
-                "Zero-copy hardware pipeline, HDR tone mapping, GPU shaders, and OS controls."
+            Self::Playback => {
+                "Zero-copy hardware pipeline, HDR tone mapping, upscaling, GPU shaders, and OS controls."
             }
-            Self::AudioAndSubtitles => {
-                "Default audio and subtitle languages, auto-selection, and delay offset."
+            Self::SubtitlesAndAudio => {
+                "Default languages, auto-selection, subtitle appearance studio, and timing offset."
             }
-            Self::DebridAndStreaming => {
+            Self::StreamingAndDebrid => {
                 "Local Rust Debrid resolver, Prowlarr outage fallback, and BitTorrent resilience."
             }
-            Self::IntegrationsAndKeys => {
-                "Local-only 0600 credentials for Debrid services, Prowlarr, and Addons Studio."
+            Self::IntegrationsAndAddons => {
+                "Local-only 0600 credentials for Debrid, Prowlarr, TMDB, OpenSubtitles, and Addons Studio."
             }
-            Self::StorageAndCache => {
-                "Piece cache budget, live engine telemetry, and metadata cleanup."
-            }
-            Self::Shortcuts => "Global navigation and libmpv player keyboard shortcuts.",
-            Self::UpdatesAndAbout => {
-                "Signed SHA-256 releases, version details, and local-first privacy architecture."
+            Self::SystemAndStorage => {
+                "Piece cache budget, cache telemetry, updates, keyboard shortcuts, and diagnostics."
             }
         }
     }
 
     pub const fn id(self) -> &'static str {
         match self {
-            Self::GeneralAndAppearance => "general",
-            Self::PlaybackAndVideo => "playback-video",
-            Self::AudioAndSubtitles => "audio-subtitles",
-            Self::DebridAndStreaming => "debrid-streaming",
-            Self::IntegrationsAndKeys => "integrations-keys",
-            Self::StorageAndCache => "storage-cache",
-            Self::Shortcuts => "shortcuts",
-            Self::UpdatesAndAbout => "updates-about",
+            Self::Appearance => "appearance",
+            Self::Playback => "playback",
+            Self::SubtitlesAndAudio => "subtitles-audio",
+            Self::StreamingAndDebrid => "streaming-debrid",
+            Self::IntegrationsAndAddons => "integrations-addons",
+            Self::SystemAndStorage => "system-storage",
         }
     }
 
     pub const fn icon_name(self) -> IconName {
         match self {
-            Self::GeneralAndAppearance => IconName::Sliders,
-            Self::PlaybackAndVideo => IconName::Film,
-            Self::AudioAndSubtitles => IconName::Subtitles,
-            Self::DebridAndStreaming => IconName::Zap,
-            Self::IntegrationsAndKeys => IconName::ShieldCheck,
-            Self::StorageAndCache => IconName::HardDrive,
-            Self::Shortcuts => IconName::Compass,
-            Self::UpdatesAndAbout => IconName::Info,
+            Self::Appearance => IconName::Palette,
+            Self::Playback => IconName::Film,
+            Self::SubtitlesAndAudio => IconName::Subtitles,
+            Self::StreamingAndDebrid => IconName::Zap,
+            Self::IntegrationsAndAddons => IconName::Layers,
+            Self::SystemAndStorage => IconName::HardDrive,
         }
     }
 }
@@ -799,6 +802,30 @@ pub struct AppPreferences {
     pub pinned_board_shelves: Vec<String>,
     #[serde(default)]
     pub hidden_board_shelves: Vec<String>,
+    #[serde(default)]
+    pub theme_preset: ThemePreset,
+    #[serde(default)]
+    pub accent_color: AccentChoice,
+    #[serde(default = "default_true")]
+    pub ambient_bleed_enabled: bool,
+    #[serde(default)]
+    pub ui_scale: UiScaleChoice,
+    #[serde(default)]
+    pub card_density: CardDensityChoice,
+    #[serde(default)]
+    pub discover_view_mode: DiscoverViewMode,
+    #[serde(default)]
+    pub discover_source_rail_open: bool,
+    #[serde(default)]
+    pub discover_hide_watched: bool,
+    #[serde(default)]
+    pub pinned_discover_catalogs: Vec<String>,
+    #[serde(default)]
+    pub collapsed_discover_addons: Vec<String>,
+    #[serde(default)]
+    pub hidden_discover_catalogs: Vec<String>,
+    #[serde(default)]
+    pub library_view_mode: LibraryViewMode,
 }
 
 impl Default for AppPreferences {
@@ -811,7 +838,7 @@ impl Default for AppPreferences {
             debrid_access_mode: DebridAccessMode::AutoDetect,
             sidebar_collapsed: false,
             tone_mapping: ToneMappingChoice::Auto,
-            upscale_mode: UpscaleChoice::Bilinear,
+            upscale_mode: UpscaleChoice::Spline36,
             experimental_video: ExperimentalVideoPrefs::default(),
             prevent_display_sleep: true,
             enable_os_media_controls: true,
@@ -833,11 +860,32 @@ impl Default for AppPreferences {
             show_home_spotlight: true,
             pinned_board_shelves: Vec::new(),
             hidden_board_shelves: Vec::new(),
+            theme_preset: ThemePreset::default(),
+            accent_color: AccentChoice::default(),
+            ambient_bleed_enabled: true,
+            ui_scale: UiScaleChoice::default(),
+            card_density: CardDensityChoice::default(),
+            discover_view_mode: DiscoverViewMode::default(),
+            discover_source_rail_open: false,
+            discover_hide_watched: false,
+            pinned_discover_catalogs: Vec::new(),
+            collapsed_discover_addons: Vec::new(),
+            hidden_discover_catalogs: Vec::new(),
+            library_view_mode: LibraryViewMode::default(),
         }
     }
 }
 
 impl AppPreferences {
+    pub fn apply_theme(&self) {
+        crate::theme::set_active_theme(
+            self.theme_preset,
+            self.accent_color,
+            self.ambient_bleed_enabled,
+            self.ui_scale.factor(),
+            self.card_density,
+        );
+    }
     pub fn effective_subtitle_background(&self) -> SubtitleBackgroundChoice {
         self.subtitle_background.unwrap_or(if self.subtitle_background_pill {
             SubtitleBackgroundChoice::Box
@@ -893,20 +941,30 @@ impl AppPreferences {
         std::env::temp_dir().join(app_dir).join("preferences.json")
     }
 
+    fn normalize_on_load(&mut self) {
+        if self.discover_view_mode == DiscoverViewMode::BrowseHubs {
+            self.discover_view_mode = DiscoverViewMode::CatalogGrid;
+        }
+        // Always start with the Discover Sources drawer collapsed on launch.
+        self.discover_source_rail_open = false;
+    }
+
     pub fn load_or_default() -> Self {
         let primary = Self::default_path();
-        if let Some(loaded) = std::fs::read_to_string(&primary)
+        if let Some(mut loaded) = std::fs::read_to_string(&primary)
             .ok()
             .and_then(|raw| serde_json::from_str::<Self>(&raw).ok())
         {
+            loaded.normalize_on_load();
             return loaded;
         }
 
         let legacy = Self::legacy_default_path();
-        if let Some(migrated) = std::fs::read_to_string(&legacy)
+        if let Some(mut migrated) = std::fs::read_to_string(&legacy)
             .ok()
             .and_then(|raw| serde_json::from_str::<Self>(&raw).ok())
         {
+            migrated.normalize_on_load();
             let _ = migrated.save_to(&primary);
             return migrated;
         }
@@ -974,8 +1032,8 @@ pub fn build_engine_config_from_prefs(prefs: &AppPreferences) -> StreamEngineCon
         ..StreamEngineConfig::default()
     };
     if prefs.dead_swarm_failover {
-        let failover_secs = prefs.dead_swarm_timeout_secs.max(12);
-        cfg.metadata_timeout = Duration::from_secs(prefs.dead_swarm_timeout_secs.max(15));
+        let failover_secs = prefs.dead_swarm_timeout_secs.max(20);
+        cfg.metadata_timeout = Duration::from_secs(prefs.dead_swarm_timeout_secs.max(20));
         cfg.first_byte_timeout = Duration::from_secs(failover_secs);
     }
     cfg
@@ -1020,6 +1078,14 @@ impl DeferredStreamEngine {
             .read()
             .as_ref()
             .and_then(|h| h.torrent_stats(info_hash, file_idx))
+    }
+
+    /// Returns `(fetched_bytes, live_peers, download_speed_bps)` for a specific torrent if managed.
+    pub fn torrent_progress_snapshot(&self, info_hash: &[u8; 20]) -> Option<(u64, u32, f64)> {
+        self.0
+            .read()
+            .as_ref()
+            .and_then(|h| h.torrent_progress_snapshot(info_hash))
     }
 
     pub fn release_playback_sessions_bg(&self) {
@@ -1274,6 +1340,47 @@ pub fn compute_scrub_preview_left(cursor_x: f32, track_width: f32, card_width: f
     (cursor_x - card_width * 0.5).clamp(0.0, (track_width - card_width).max(0.0))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoverViewMode {
+    #[serde(alias = "BrowseHubs")]
+    BrowseHubs,
+    #[default]
+    CatalogGrid,
+}
+
+impl DiscoverViewMode {
+    pub const ALL: [Self; 2] = [Self::BrowseHubs, Self::CatalogGrid];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BrowseHubs => "Browse Hubs",
+            Self::CatalogGrid => "Catalog Grid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryViewMode {
+    #[default]
+    PosterGrid,
+    WideBackdrops,
+    CompactList,
+}
+
+impl LibraryViewMode {
+    pub const ALL: [Self; 3] = [Self::PosterGrid, Self::WideBackdrops, Self::CompactList];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PosterGrid => "Poster Grid",
+            Self::WideBackdrops => "Wide Backdrops",
+            Self::CompactList => "Compact List",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LibraryStatusTab {
     #[default]
@@ -1290,6 +1397,47 @@ impl LibraryStatusTab {
             Self::Watching => "Watching",
             Self::Watchlist => "Watchlist",
             Self::Watched => "Watched",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryFilterTab {
+    #[default]
+    All,
+    Watching,
+    NewEpisodes,
+    Watchlist,
+    Watched,
+}
+
+impl LibraryFilterTab {
+    pub const ALL: [Self; 5] = [
+        Self::All,
+        Self::Watching,
+        Self::NewEpisodes,
+        Self::Watchlist,
+        Self::Watched,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Watching => "Watching",
+            Self::NewEpisodes => "New Episodes",
+            Self::Watchlist => "Watchlist",
+            Self::Watched => "Watched",
+        }
+    }
+
+    pub const fn matches(self, status: LibraryStatusTab, notification_count: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Watching => matches!(status, LibraryStatusTab::Watching),
+            Self::NewEpisodes => notification_count > 0,
+            Self::Watchlist => matches!(status, LibraryStatusTab::Watchlist),
+            Self::Watched => matches!(status, LibraryStatusTab::Watched),
         }
     }
 }
@@ -1380,13 +1528,17 @@ impl LibrarySortCriterion {
 #[derive(Clone, Debug)]
 pub struct MemoizedLibraryView {
     pub library_rev: u64,
-    pub status_tab: LibraryStatusTab,
+    pub notification_rev: u64,
+    pub filter_tab: LibraryFilterTab,
     pub type_filter: LibraryTypeFilter,
     pub sort_criterion: LibrarySortCriterion,
     pub search_query: String,
+    pub count_all: usize,
     pub count_watching: usize,
+    pub count_new_episodes: usize,
     pub count_watchlist: usize,
     pub count_watched: usize,
+    pub has_notifications: bool,
     pub films_count: usize,
     pub shows_count: usize,
     pub episodes_logged: u64,
@@ -1642,18 +1794,57 @@ impl PlaybackCandidate {
     }
 }
 
+fn is_uncached_p2p_torrent(cand: &PlaybackCandidate) -> bool {
+    matches!(cand.stream.source, StreamSource::Torrent { .. }) && !cand.parsed.is_cached
+}
+
+fn p2p_playability_tier(seeders: Option<u32>, size_bytes: Option<u64>) -> u8 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let seeds = seeders.unwrap_or(0);
+    if seeds >= 20 && (size_bytes.is_none_or(|b| b <= 25 * GIB) || seeds >= 80) {
+        3
+    } else if seeds >= 5 && (size_bytes.is_none_or(|b| b <= 35 * GIB) || seeds >= 20) {
+        2
+    } else if seeds >= 1 {
+        1
+    } else {
+        0
+    }
+}
+
 pub fn sort_stream_candidates(candidates: &mut [PlaybackCandidate]) {
     candidates.sort_by(|ca, cb| {
-        let a = &ca.parsed;
-        let b = &cb.parsed;
-        b.is_cached
-            .cmp(&a.is_cached)
-            .then_with(|| b.resolution.cmp(&a.resolution))
-            .then_with(|| b.quality.cmp(&a.quality))
-            .then_with(|| b.hdr.cmp(&a.hdr))
-            .then_with(|| b.audio.cmp(&a.audio))
-            .then_with(|| b.seeders.unwrap_or(0).cmp(&a.seeders.unwrap_or(0)))
-            .then_with(|| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
+        let a_p2p = is_uncached_p2p_torrent(ca);
+        let b_p2p = is_uncached_p2p_torrent(cb);
+        // Priority Group 1 (Cached Debrid & Direct HTTP) always ranks above Priority Group 2 (Uncached P2P).
+        a_p2p.cmp(&b_p2p).then_with(|| {
+            let a = &ca.parsed;
+            let b = &cb.parsed;
+            if !a_p2p {
+                b.is_cached
+                    .cmp(&a.is_cached)
+                    .then_with(|| b.resolution.cmp(&a.resolution))
+                    .then_with(|| b.quality.cmp(&a.quality))
+                    .then_with(|| b.hdr.cmp(&a.hdr))
+                    .then_with(|| b.audio.cmp(&a.audio))
+                    .then_with(|| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
+            } else {
+                let tier_a = p2p_playability_tier(a.seeders, a.size_bytes);
+                let tier_b = p2p_playability_tier(b.seeders, b.size_bytes);
+                tier_b
+                    .cmp(&tier_a)
+                    .then_with(|| b.resolution.cmp(&a.resolution))
+                    .then_with(|| b.seeders.unwrap_or(0).cmp(&a.seeders.unwrap_or(0)))
+                    .then_with(|| b.quality.cmp(&a.quality))
+                    .then_with(|| b.hdr.cmp(&a.hdr))
+                    .then_with(|| b.audio.cmp(&a.audio))
+                    .then_with(|| {
+                        a.size_bytes
+                            .unwrap_or(u64::MAX)
+                            .cmp(&b.size_bytes.unwrap_or(u64::MAX))
+                    })
+            }
+        })
     });
 }
 
@@ -3916,21 +4107,32 @@ mod tests {
     }
 
     #[test]
-    fn settings_categories_all_eight_labels_match_exact_order() {
+    fn settings_categories_all_six_labels_match_exact_order() {
         let labels: Vec<&str> = SettingsCategory::ALL.iter().map(|c| c.label()).collect();
         assert_eq!(
             labels,
             vec![
-                "General & Appearance",
-                "Playback & Video",
-                "Audio & Subtitles",
-                "Debrid & Streaming",
-                "Integrations & Keys",
-                "Storage & Cache",
-                "Shortcuts",
-                "Updates & About",
+                "Appearance",
+                "Playback",
+                "Subtitles & Audio",
+                "Streaming & Debrid",
+                "Integrations & Addons",
+                "System & Storage",
             ]
         );
+        let ids: Vec<&str> = SettingsCategory::ALL.iter().map(|c| c.id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "appearance",
+                "playback",
+                "subtitles-audio",
+                "streaming-debrid",
+                "integrations-addons",
+                "system-storage",
+            ]
+        );
+        assert_eq!(SettingsCategory::default(), SettingsCategory::Appearance);
         for cat in SettingsCategory::ALL {
             assert!(!cat.id().is_empty());
             assert!(!cat.subtitle().is_empty());
@@ -4473,6 +4675,7 @@ mod tests {
         assert!(deferred
             .torrent_stats("0123456789abcdef0123456789abcdef01234567", None)
             .is_none());
+        assert!(deferred.torrent_progress_snapshot(&[0x11_u8; 20]).is_none());
         deferred.set_enable_upnp(false);
         deferred.set_first_byte_timeout(Duration::from_secs(15));
         deferred.release_playback_sessions_bg();
@@ -4709,5 +4912,277 @@ mod tests {
         let legacy_prefs: AppPreferences = serde_json::from_str("{}").unwrap();
         assert!(legacy_prefs.pinned_board_shelves.is_empty());
         assert!(legacy_prefs.hidden_board_shelves.is_empty());
+    }
+
+    #[test]
+    fn ethereal_preferences_storage_defaults_and_view_enums_work() {
+        assert_eq!(
+            StorageModeChoice::default(),
+            StorageModeChoice::DiskLru { budget_gb: 5 }
+        );
+        assert_eq!(StorageModeChoice::ALL_DISK_GB, [2, 5, 10, 20]);
+        assert_eq!(StorageModeChoice::ALL_RAM_GB, [1, 2]);
+        assert_eq!(UpscaleChoice::default(), UpscaleChoice::Spline36);
+
+        let def = AppPreferences::default();
+        assert_eq!(def.storage_mode, StorageModeChoice::DiskLru { budget_gb: 5 });
+        assert_eq!(def.upscale_mode, UpscaleChoice::Spline36);
+        assert_eq!(def.theme_preset, ThemePreset::EtherealDark);
+        assert_eq!(def.accent_color, AccentChoice::EmberCoral);
+        assert!(def.ambient_bleed_enabled);
+        assert_eq!(def.ui_scale, UiScaleChoice::S100);
+        assert_eq!(def.card_density, CardDensityChoice::Comfortable);
+        assert_eq!(def.discover_view_mode, DiscoverViewMode::CatalogGrid);
+        assert!(!def.discover_source_rail_open);
+        assert!(!def.discover_hide_watched);
+        assert!(def.pinned_discover_catalogs.is_empty());
+        assert!(def.collapsed_discover_addons.is_empty());
+        assert!(def.hidden_discover_catalogs.is_empty());
+        assert_eq!(def.library_view_mode, LibraryViewMode::PosterGrid);
+
+        let legacy: AppPreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy, def);
+
+        let mut legacy_hubs: AppPreferences = serde_json::from_str(
+            r#"{"discover_view_mode":"browse_hubs","discover_source_rail_open":true}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_hubs.discover_view_mode, DiscoverViewMode::BrowseHubs);
+        assert!(legacy_hubs.discover_source_rail_open);
+        legacy_hubs.normalize_on_load();
+        assert_eq!(legacy_hubs.discover_view_mode, DiscoverViewMode::CatalogGrid);
+        assert!(!legacy_hubs.discover_source_rail_open);
+
+        let custom = AppPreferences {
+            theme_preset: ThemePreset::AuroraIndigo,
+            accent_color: AccentChoice::AuroraCyan,
+            ambient_bleed_enabled: false,
+            ui_scale: UiScaleChoice::S110,
+            card_density: CardDensityChoice::Cinema,
+            discover_view_mode: DiscoverViewMode::CatalogGrid,
+            discover_source_rail_open: true,
+            discover_hide_watched: true,
+            pinned_discover_catalogs: vec!["cinemeta:movie:top".to_owned()],
+            collapsed_discover_addons: vec!["tmdb".to_owned()],
+            hidden_discover_catalogs: vec!["https://cinemeta.example/m.json::movie::featured".to_owned()],
+            library_view_mode: LibraryViewMode::WideBackdrops,
+            ..AppPreferences::default()
+        };
+        let json = serde_json::to_string(&custom).unwrap();
+        let roundtrip: AppPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, custom);
+
+        assert_eq!(LibraryFilterTab::default(), LibraryFilterTab::All);
+        assert_eq!(LibraryFilterTab::ALL.len(), 5);
+        assert!(LibraryFilterTab::All.matches(LibraryStatusTab::Watchlist, 0));
+        assert!(LibraryFilterTab::NewEpisodes.matches(LibraryStatusTab::Watching, 2));
+        assert!(!LibraryFilterTab::NewEpisodes.matches(LibraryStatusTab::Watching, 0));
+        assert!(LibraryFilterTab::Watched.matches(LibraryStatusTab::Watched, 0));
+
+        let peek = QuickPeekTarget {
+            type_name: "movie".to_owned(),
+            id: "tt15239678".to_owned(),
+            video_id: None,
+            title: "Dune: Part Two".to_owned(),
+            preview: None,
+        };
+        assert_eq!(peek.id, "tt15239678");
+    }
+
+    fn make_test_p2p_candidate(seed_byte: u8, name: &str, desc: &str) -> PlaybackCandidate {
+        let stream = Stream {
+            source: StreamSource::Torrent {
+                info_hash: [seed_byte; 20],
+                file_idx: Some(0),
+                announce: Vec::new(),
+                file_must_include: Vec::new(),
+            },
+            name: Some(name.to_owned()),
+            description: Some(desc.to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+        PlaybackCandidate::from_stream_and_request(stream, None, &[])
+    }
+
+    fn make_test_url_candidate(url: &str, name: &str, desc: &str) -> PlaybackCandidate {
+        let stream = Stream {
+            source: StreamSource::Url {
+                url: Url::parse(url).expect("valid test url"),
+            },
+            name: Some(name.to_owned()),
+            description: Some(desc.to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+        PlaybackCandidate::from_stream_and_request(stream, None, &[])
+    }
+
+    #[test]
+    fn p2p_playability_tier_boundaries_match_swarm_health_rules() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(p2p_playability_tier(Some(20), Some(25 * GIB)), 3);
+        assert_eq!(p2p_playability_tier(Some(20), None), 3);
+        assert_eq!(p2p_playability_tier(Some(20), Some(26 * GIB)), 2);
+        assert_eq!(p2p_playability_tier(Some(80), Some(95 * GIB)), 3);
+        assert_eq!(p2p_playability_tier(Some(5), Some(35 * GIB)), 2);
+        assert_eq!(p2p_playability_tier(Some(5), None), 2);
+        assert_eq!(p2p_playability_tier(Some(5), Some(36 * GIB)), 1);
+        assert_eq!(p2p_playability_tier(Some(1), Some(95 * GIB)), 1);
+        assert_eq!(p2p_playability_tier(Some(0), Some(4 * GIB)), 0);
+        assert_eq!(p2p_playability_tier(None, Some(4 * GIB)), 0);
+    }
+
+    #[test]
+    fn sort_stream_candidates_ranks_healthy_p2p_above_dead_or_slow_remux() {
+        let slow_4k_remux = make_test_p2p_candidate(
+            0x01,
+            "Torrentio 4k",
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.TrueHD.Atmos.HEVC\n👤 1 · 💾 95.0 GB",
+        );
+        let dead_4k_remux = make_test_p2p_candidate(
+            0x02,
+            "Torrentio 4k",
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.TrueHD.Atmos.HEVC\n👤 0 · 💾 90.0 GB",
+        );
+        let playable_1080p = make_test_p2p_candidate(
+            0x03,
+            "Torrentio 1080p",
+            "Movie.2024.1080p.BluRay.x264\n👤 15 · 💾 6.0 GB",
+        );
+        let fast_1080p = make_test_p2p_candidate(
+            0x04,
+            "Torrentio 1080p",
+            "Movie.2024.1080p.WEB-DL.DDP5.1.H.264\n👤 120 · 💾 4.0 GB",
+        );
+        let fast_4k_webdl = make_test_p2p_candidate(
+            0x05,
+            "Torrentio 4k",
+            "Movie.2024.2160p.WEB-DL.HDR10.DDP5.1.HEVC\n👤 120 · 💾 15.0 GB",
+        );
+
+        let mut list = vec![
+            dead_4k_remux.clone(),
+            slow_4k_remux.clone(),
+            playable_1080p.clone(),
+            fast_1080p.clone(),
+            fast_4k_webdl,
+        ];
+        sort_stream_candidates(&mut list);
+
+        let hashes: Vec<Option<String>> = list.iter().map(|c| c.info_hash_hex()).collect();
+        assert_eq!(
+            hashes,
+            vec![
+                Some(hex::encode([0x05; 20])), // Tier 3, 4K, 120 seeds
+                Some(hex::encode([0x04; 20])), // Tier 3, 1080p, 120 seeds
+                Some(hex::encode([0x03; 20])), // Tier 2, 1080p, 15 seeds
+                Some(hex::encode([0x01; 20])), // Tier 1, 4K, 1 seed
+                Some(hex::encode([0x02; 20])), // Tier 0, 4K, 0 seeds
+            ]
+        );
+
+        // Smaller healthy encode wins tie on tier, resolution, seeders, quality, hdr, and audio.
+        let bigger_1080 = make_test_p2p_candidate(
+            0x06,
+            "Torrentio 1080p",
+            "Movie.2024.1080p.WEB-DL.H.264\n👤 50 · 💾 12.0 GB",
+        );
+        let smaller_1080 = make_test_p2p_candidate(
+            0x07,
+            "Torrentio 1080p",
+            "Movie.2024.1080p.WEB-DL.H.264\n👤 50 · 💾 3.5 GB",
+        );
+        let mut tie_list = vec![bigger_1080, smaller_1080];
+        sort_stream_candidates(&mut tie_list);
+        assert_eq!(tie_list[0].info_hash_hex(), Some(hex::encode([0x07; 20])));
+        assert_eq!(tie_list[1].info_hash_hex(), Some(hex::encode([0x06; 20])));
+
+        // Explicit check: 120-seeder 1080p WEB-DL beats 1-seeder 95 GB 4K Remux,
+        // and 15-seeder 1080p beats 0-seeder 4K Remux.
+        let mut pair_1 = vec![slow_4k_remux, fast_1080p];
+        sort_stream_candidates(&mut pair_1);
+        assert_eq!(pair_1[0].info_hash_hex(), Some(hex::encode([0x04; 20])));
+
+        let mut pair_2 = vec![dead_4k_remux, playable_1080p];
+        sort_stream_candidates(&mut pair_2);
+        assert_eq!(pair_2[0].info_hash_hex(), Some(hex::encode([0x03; 20])));
+    }
+
+    #[test]
+    fn sort_stream_candidates_keeps_cached_debrid_and_direct_http_above_p2p() {
+        let cached_4k_remux = make_test_url_candidate(
+            "https://rd.example/remux.mkv",
+            "[RD+] Torrentio 4k",
+            "Movie.2024.2160p.UHD.BluRay.REMUX.DV.TrueHD.Atmos.HEVC\n👤 2 · 💾 80.0 GB",
+        );
+        let cached_1080p = make_test_url_candidate(
+            "https://rd.example/1080p.mkv",
+            "[RD+] Torrentio 1080p",
+            "Movie.2024.1080p.WEB-DL.DDP5.1.H.264\n👤 200 · 💾 4.0 GB",
+        );
+        let direct_http = make_test_url_candidate(
+            "https://cdn.example/movie-1080p.mkv",
+            "WebStreamr 1080p",
+            "Movie.2024.1080p.WEB-DL.H.264\n💾 3.0 GB",
+        );
+        let mut locally_cached_torrent = make_test_p2p_candidate(
+            0x0a,
+            "Torrentio 4k",
+            "Movie.2024.2160p.BluRay.HDR10.HEVC\n👤 5 · 💾 22.0 GB",
+        );
+        locally_cached_torrent.parsed.is_cached = true;
+        locally_cached_torrent.parsed.debrid_provider = Some("RD+".to_owned());
+
+        let fast_uncached_p2p = make_test_p2p_candidate(
+            0x0b,
+            "Torrentio 4k",
+            "Movie.2024.2160p.WEB-DL.DV.Atmos.HEVC\n👤 250 · 💾 14.0 GB",
+        );
+
+        let mut list = vec![
+            fast_uncached_p2p,
+            direct_http,
+            cached_1080p,
+            locally_cached_torrent,
+            cached_4k_remux,
+        ];
+        sort_stream_candidates(&mut list);
+
+        assert_eq!(list[0].parsed.resolution, Resolution::Uhd4k);
+        assert_eq!(
+            list[0].parsed.quality,
+            stremio_core_runtime::StreamQuality::Remux
+        );
+        assert!(list[0].parsed.is_cached);
+
+        assert_eq!(list[1].info_hash_hex(), Some(hex::encode([0x0a; 20])));
+        assert!(list[1].parsed.is_cached);
+
+        assert_eq!(list[2].parsed.resolution, Resolution::Fhd1080p);
+        assert!(list[2].parsed.is_cached);
+
+        assert!(matches!(list[3].stream.source, StreamSource::Url { .. }));
+        assert!(!list[3].parsed.is_cached);
+
+        assert_eq!(list[4].info_hash_hex(), Some(hex::encode([0x0b; 20])));
+        assert!(!list[4].parsed.is_cached);
+
+        // Within Group 1 (Cached Debrid), larger bitrate/size still ranks first on ties.
+        let cached_smaller = make_test_url_candidate(
+            "https://rd.example/4k-small.mkv",
+            "[RD+] Torrentio 4k",
+            "Movie.2024.2160p.WEB-DL.HDR10.HEVC\n👤 200 · 💾 12.0 GB",
+        );
+        let cached_larger = make_test_url_candidate(
+            "https://rd.example/4k-large.mkv",
+            "[RD+] Torrentio 4k",
+            "Movie.2024.2160p.WEB-DL.HDR10.HEVC\n👤 5 · 💾 22.0 GB",
+        );
+        let mut cached_tie = vec![cached_smaller, cached_larger];
+        sort_stream_candidates(&mut cached_tie);
+        assert!(cached_tie[0].parsed.size_bytes > cached_tie[1].parsed.size_bytes);
     }
 }

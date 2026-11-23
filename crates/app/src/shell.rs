@@ -7,18 +7,21 @@ use std::{
 };
 
 use gpui::{
-    div, point, prelude::*, px, rgb, rgba, AnimationExt, AsyncApp, ClipboardItem, Context,
-    CursorStyle, Decorations, FocusHandle, Focusable, FontWeight, KeyDownEvent, KeyUpEvent,
-    MouseButton, NavigationDirection, PathPromptOptions, Render, RenderImage, ResizeEdge,
-    ScrollDelta, ScrollHandle, SharedString, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowControlArea,
+    div, img, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, AnimationExt,
+    AsyncApp, ClipboardItem, Context, CursorStyle, Decorations, FocusHandle, Focusable, FontWeight,
+    KeyDownEvent, KeyUpEvent, MouseButton, NavigationDirection, ObjectFit, PathPromptOptions,
+    Render, RenderImage, ResizeEdge, ScrollDelta, ScrollHandle, SharedString, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowControlArea,
 };
 use gpui_mpv::{
-    extract_audio_pcm_s16le_8khz, MpvThumbnailer, PlayerEvent, PlayerSnapshot, TrackType,
+    extract_audio_pcm_s16le_8khz, extract_embedded_text_subtitle_window, MpvThumbnailer,
+    PlayerEvent, PlayerSnapshot, SecondaryForcedMode, TrackType,
 };
 use stremio_core_runtime::{
-    detect_clipboard_addon_url, has_full_embedded_subtitle_for_lang, human_language_name,
-    is_native_playable_stream, normalize_addon_url, select_preferred_tracks,
+    assess_embedded_subtitles, detect_clipboard_addon_url, has_full_embedded_subtitle_for_lang,
+    human_language_name, is_image_subtitle_codec, is_native_playable_stream, normalize_addon_url,
+    select_alternative_embedded_full_track, select_embedded_forced_track,
+    select_embedded_image_track_for_inline_forced, select_preferred_tracks,
     stremio_core::{
         constants::CINEMETA_URL,
         models::{
@@ -35,11 +38,11 @@ use stremio_core_runtime::{
     },
     build_unified_editorial_search, subtitle_lang_matches, AudioSpeechFingerprint,
     AudioSpeechWindow, CoreController, DebridCacheStatus, DesktopModelField, EditorialMediaHit,
-    EditorialPersonHit, EnrichedCollection, FetchedNativeSubtitle, LocalDebridProvider,
-    NativeSubtitleQuery, PersonFilmography, PrivateIntegrationsConfig, ProwlarrFallbackMode,
-    ResolvedNextEpisode, SecretApiKey, SeriesTrackPreference, SubtitleAlignmentResult,
-    SubtitleMatchTier, SubtitleSyncAligner, TrackCandidate, UnifiedEditorialSearch,
-    INITIAL_BOARD_SHELVES,
+    EditorialPersonHit, EmbeddedSubtitleQuality, EnrichedCollection, FetchedNativeSubtitle,
+    ForeignTranslationStatus, LocalDebridProvider, NativeSubtitleQuery, PersonFilmography,
+    PrivateIntegrationsConfig, ProwlarrFallbackMode, ResolvedNextEpisode, SecretApiKey,
+    SeriesTrackPreference, SubtitleAlignmentResult, SubtitleMatchTier, SubtitleSearchMode,
+    SubtitleSyncAligner, TrackCandidate, UnifiedEditorialSearch, INITIAL_BOARD_SHELVES,
 };
 use stremio_stream_engine::{opensubhash::compute_opensubhash_http, StreamEngineHandle};
 use url::Url;
@@ -54,34 +57,28 @@ use crate::{
     state::{
         apply_key_to_text_buffer_with_cursor, build_subtitles_resource_path,
         classify_library_item_status, default_library_selected, detect_addon_url_candidate,
-        format_core_error_message, format_text_with_caret, is_loopback_p2p_torrent_url,
-        is_scrub_thumbnail_stale, merge_and_enrich_stream_candidates,
+        find_cached_preview_in_model, format_core_error_message, format_text_with_caret,
+        is_loopback_p2p_torrent_url, is_scrub_thumbnail_stale, merge_and_enrich_stream_candidates,
         parse_season_episode_from_video_id, pick_default_series_episode_id,
         quantize_scrub_bucket_ms, resolve_ready_meta_item, rewrite_loopback_engine_url,
         route_affected_by_fields, step_kb_focus_2d, switch_engine_storage_mode_on_tokio,
         sync_memoized_meta_streams, trim_process_heap, AddonCategoryFilter, AddonSubTab,
         AppPreferences, AppRoute, BootServices, BrowsingContextMenu, DebridAccessMode,
-        DeferredStreamEngine, DiscoverDropdown, DiscoverViewSnapshot, FocusedInput,
-        KbFocusableCard, LibrarySortCriterion, LibrarySortOrder, LibraryStatusTab,
-        LibraryTypeFilter, MemoizedEnrichedStreams, MemoizedLibraryView, MemoizedMetaStreams,
-        NativeSubtitleMatchState, NativeSubtitleMatchStatus, NavHistoryEntry, PersonDeptFilter,
-        PlaybackCandidate, PlaybackSession, PlayerPopover, SettingsCategory, SettingsDropdown,
+        DeferredStreamEngine, DiscoverDropdown, DiscoverViewMode, DiscoverViewSnapshot,
+        FocusedInput, KbFocusableCard, LibraryFilterTab, LibrarySortCriterion, LibrarySortOrder,
+        LibraryStatusTab, LibraryTypeFilter, LibraryViewMode, MemoizedEnrichedStreams,
+        MemoizedLibraryView, MemoizedMetaStreams, NativeSubtitleMatchState,
+        NativeSubtitleMatchStatus, NavHistoryEntry, PersonDeptFilter, PlaybackCandidate,
+        PlaybackSession, PlayerPopover, QuickPeekTarget, SettingsCategory, SettingsDropdown,
         SidebarTab, StorageModeChoice, StreamFilterState, SubtitleBackgroundChoice, ToastKind,
         ToastMessage, ToneMappingChoice, UpscaleChoice, LIBRARY_PAGE_SIZE,
         MAX_AUTO_FAILOVER_ATTEMPTS, STREAM_PAGE_SIZE,
     },
     theme::{
-        editorial_serif, glass_capsule_shadow, keycap, movietracker_mark, obsidian_fade_in,
-        transparent_cutout, ui_sans, ACCENT, ACCENT_AMBER, ACCENT_ROSE, ACCENT_SOFT, BG_ELEVATED,
-        BG_OBSIDIAN, BG_TOPNAV, BORDER_ACCENT, BORDER_SUBTLE, CTA_ON_ACCENT, GLASS_BORDER,
-        GLASS_BORDER_STRONG, GLASS_DIVIDER, GLASS_POPOVER_BG, GLASS_ROW_HOVER_BG,
-        GLASS_ROW_SELECTED_BG, GLASS_TROUGH_BG, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
-        STATUS_WATCHED, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+        active_theme, glass_capsule_shadow, obsidian_fade_in, sp, transparent_cutout, ui_sans,
+        AccentChoice, CardDensityChoice, ThemePreset, UiScaleChoice, RADIUS_CONTROL, RADIUS_PILL,
     },
-    ui_components::{
-        click_handler, glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar,
-        glass_segmented_item, ClickHandler,
-    },
+    ui_components::{click_handler, glass_dropdown_panel, ClickHandler},
     updater::{self, AppliedUpdateOutcome, UpdateStatus},
 };
 
@@ -119,9 +116,13 @@ pub struct AppShell {
     pub viewport_size_px: (f32, f32),
     pub exit_fullscreen_on_next_render: bool,
     pub window_blur_active: bool,
+    pub last_window_bg_appearance: WindowBackgroundAppearance,
     pub command_palette_open: bool,
     pub avatar_menu_open: bool,
     pub context_menu: Option<BrowsingContextMenu>,
+    pub quick_peek: Option<QuickPeekTarget>,
+    pub quick_peek_scroll_handle: ScrollHandle,
+    pub ambient_hero_backdrop_url: Option<String>,
     pub palette_query: String,
     pub palette_selected_idx: usize,
     pub palette_scroll_handle: ScrollHandle,
@@ -147,6 +148,7 @@ pub struct AppShell {
     pub memoized_discover_catalog: parking_lot::Mutex<Option<(u64, DiscoverViewSnapshot)>>,
     pub discover_last_next_page_len: Cell<Option<usize>>,
     pub memoized_library_items: parking_lot::Mutex<Option<MemoizedLibraryView>>,
+    pub memoized_board_cache: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
 
     pub auth_email_input: String,
     pub auth_password_input: String,
@@ -160,7 +162,11 @@ pub struct AppShell {
     pub link_poll_active: bool,
 
     pub board_hero_index: usize,
+    pub board_hero_mode_featured: bool,
+    pub board_hover_debounce_seq: u64,
+    pub board_active_cw_idx: usize,
     pub discover_loaded_once: bool,
+    pub discover_hubs_scroll_handle: ScrollHandle,
     pub selected_season: Option<u32>,
     pub auto_selected_episode_for_meta: Option<(String, String)>,
     pub stream_filter: StreamFilterState,
@@ -189,6 +195,7 @@ pub struct AppShell {
     pub discover_catalog_search: String,
     pub expanded_stream_rows: HashSet<usize>,
     pub library_status_tab: LibraryStatusTab,
+    pub library_filter_tab: LibraryFilterTab,
     pub library_type_filter: LibraryTypeFilter,
     pub library_sort_order: LibrarySortOrder,
     pub library_search_query: String,
@@ -222,6 +229,8 @@ pub struct AppShell {
     pub native_sub_match: NativeSubtitleMatchState,
     pub pending_auto_select_sub_title: Option<String>,
     pub user_picked_subtitle: bool,
+    pub secondary_forced_available: Option<(i64, bool)>,
+    pub live_untranslated_upgrade_triggered: bool,
     pub pending_quick_resume: Option<(String, String, Option<String>)>,
 
     pub toasts: Vec<ToastMessage>,
@@ -229,6 +238,7 @@ pub struct AppShell {
     pub update_status: UpdateStatus,
 
     pub active_settings_category: SettingsCategory,
+    pub settings_advanced_open: HashSet<SettingsCategory>,
     pub settings_search_query: String,
     pub settings_open_dropdown: Option<SettingsDropdown>,
     pub settings_scroll_handle: ScrollHandle,
@@ -297,6 +307,7 @@ impl Focusable for AppShell {
 
 impl AppShell {
     pub fn new(services: BootServices, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        services.preferences.apply_theme();
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
@@ -331,7 +342,7 @@ impl AppShell {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             while poster_rx.recv().await.is_ok() {
                 cx.background_executor()
-                    .timer(Duration::from_millis(16))
+                    .timer(Duration::from_millis(33))
                     .await;
                 while poster_rx.try_recv().is_ok() {}
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
@@ -416,9 +427,13 @@ impl AppShell {
             viewport_size_px,
             exit_fullscreen_on_next_render: false,
             window_blur_active: true,
+            last_window_bg_appearance: WindowBackgroundAppearance::Blurred,
             command_palette_open: false,
             avatar_menu_open: false,
             context_menu: None,
+            quick_peek: None,
+            quick_peek_scroll_handle: ScrollHandle::new(),
+            ambient_hero_backdrop_url: None,
             palette_query: String::new(),
             palette_selected_idx: 0,
             palette_scroll_handle: ScrollHandle::new(),
@@ -442,6 +457,7 @@ impl AppShell {
             memoized_discover_catalog: parking_lot::Mutex::new(None),
             discover_last_next_page_len: Cell::new(None),
             memoized_library_items: parking_lot::Mutex::new(None),
+            memoized_board_cache: parking_lot::Mutex::new(None),
             auth_email_input: String::new(),
             auth_password_input: String::new(),
             addon_url_input: cli_addon_url.clone().unwrap_or_default(),
@@ -453,7 +469,11 @@ impl AppShell {
             installing_addon_urls: HashSet::new(),
             link_poll_active: false,
             board_hero_index: 0,
+            board_hero_mode_featured: false,
+            board_hover_debounce_seq: 0,
+            board_active_cw_idx: 0,
             discover_loaded_once: false,
+            discover_hubs_scroll_handle: ScrollHandle::new(),
             selected_season: None,
             auto_selected_episode_for_meta: None,
             stream_filter: StreamFilterState::default(),
@@ -482,6 +502,7 @@ impl AppShell {
             discover_catalog_search: String::new(),
             expanded_stream_rows: HashSet::new(),
             library_status_tab: LibraryStatusTab::Watching,
+            library_filter_tab: LibraryFilterTab::All,
             library_type_filter: LibraryTypeFilter::All,
             library_sort_order: LibrarySortOrder::Recent,
             library_search_query: String::new(),
@@ -514,11 +535,14 @@ impl AppShell {
             native_sub_match: NativeSubtitleMatchState::default(),
             pending_auto_select_sub_title: None,
             user_picked_subtitle: false,
+            secondary_forced_available: None,
+            live_untranslated_upgrade_triggered: false,
             pending_quick_resume: None,
             toasts: Vec::new(),
             next_toast_id: 1,
             update_status: UpdateStatus::Idle,
             active_settings_category: SettingsCategory::default(),
+            settings_advanced_open: HashSet::new(),
             settings_search_query: String::new(),
             settings_open_dropdown: None,
             settings_scroll_handle: ScrollHandle::new(),
@@ -593,7 +617,7 @@ impl AppShell {
                 let url = handle.base_url();
                 handle.set_enable_upnp(self.preferences.enable_upnp);
                 handle.set_first_byte_timeout(Duration::from_secs(
-                    self.preferences.dead_swarm_timeout_secs.max(12),
+                    self.preferences.dead_swarm_timeout_secs.max(20),
                 ));
                 let desired_mode = self.preferences.storage_mode.to_engine_mode();
                 let needs_mode_sync = handle.storage_mode() != desired_mode;
@@ -636,6 +660,203 @@ impl AppShell {
         }
         self.last_heap_trim_at = Some(Instant::now());
         drop(self.tokio_handle.spawn_blocking(trim_process_heap));
+    }
+
+    pub(crate) fn on_major_route_transition(&mut self, entering_player: bool) {
+        self.poster_cache.trim_for_route_transition();
+        if entering_player {
+            self.poster_cache.trim_for_playback();
+        }
+        self.last_heap_trim_at = Some(Instant::now());
+        drop(self.tokio_handle.spawn_blocking(trim_process_heap));
+    }
+
+    fn resolve_backdrop_url_for_id(
+        &self,
+        id: &str,
+        preview: Option<&stremio_core_runtime::stremio_core::types::resource::MetaItemPreview>,
+    ) -> Option<String> {
+        let from_preview = preview
+            .and_then(|p| p.background.as_ref())
+            .map(|u| u.to_string())
+            .filter(|s| !s.trim().is_empty());
+        if from_preview.is_some() {
+            return from_preview;
+        }
+        let enriched = self.core.cached_enriched_meta(id);
+        if let Some(url) = enriched
+            .as_ref()
+            .and_then(|e| e.backdrop_url.as_ref())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(url);
+        }
+        let from_model = self.core.with_model(|m| {
+            find_cached_preview_in_model(m, id)
+                .and_then(|p| p.background.map(|u| u.to_string()))
+                .filter(|s| !s.trim().is_empty())
+        });
+        if from_model.is_some() {
+            return from_model;
+        }
+        let imdb_id = if id.starts_with("tt") {
+            Some(id.to_owned())
+        } else {
+            enriched
+                .and_then(|e| e.imdb_id)
+                .filter(|s| s.starts_with("tt"))
+        };
+        imdb_id.map(|tt| format!("https://images.metahub.space/background/medium/{tt}/img"))
+    }
+
+    fn sync_ambient_backdrop_for_render(&mut self) {
+        if let Some(peek) = self.quick_peek.as_ref() {
+            if let Some(bg) = self.resolve_backdrop_url_for_id(&peek.id, peek.preview.as_ref()) {
+                self.ambient_hero_backdrop_url = Some(bg);
+            }
+            return;
+        }
+
+        match &self.route {
+            AppRoute::MetaDetails { id, .. } => {
+                let meta_bg = self.core.with_model(|m| {
+                    resolve_ready_meta_item(&m.meta_details.meta_items)
+                        .filter(|(item, _)| item.preview.id == *id)
+                        .and_then(|(item, _)| item.preview.background.as_ref().map(|u| u.to_string()))
+                });
+                let resolved = meta_bg.or_else(|| self.resolve_backdrop_url_for_id(id, None));
+                if resolved.is_some() {
+                    self.ambient_hero_backdrop_url = resolved;
+                }
+            }
+            AppRoute::Tab(SidebarTab::Home) if self.ambient_hero_backdrop_url.is_none() => {
+                let spotlight_id = self.core.with_model(|m| {
+                    m.continue_watching_preview
+                        .items
+                        .first()
+                        .map(|cw| cw.library_item.id.clone())
+                        .or_else(|| {
+                            m.board.catalogs.iter().find_map(|cat| {
+                                cat.first().and_then(|p| match &p.content {
+                                    Some(Loadable::Ready(items)) => {
+                                        items.first().map(|i| i.id.clone())
+                                    }
+                                    _ => None,
+                                })
+                            })
+                        })
+                });
+                if let Some(id) = spotlight_id {
+                    if let Some(bg) = self.resolve_backdrop_url_for_id(&id, None) {
+                        self.ambient_hero_backdrop_url = Some(bg);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn open_quick_peek(&mut self, target: QuickPeekTarget, cx: &mut Context<Self>) {
+        self.avatar_menu_open = false;
+        self.context_menu = None;
+        self.command_palette_open = false;
+        self.discover_open_dropdown = None;
+        self.meta_addon_dropdown_open = false;
+        self.library_sort_dropdown_open = false;
+        self.board_hidden_drawer_open = false;
+        self.settings_open_dropdown = None;
+        self.quick_peek_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+
+        if let Some(bg) = self.resolve_backdrop_url_for_id(&target.id, target.preview.as_ref()) {
+            self.ambient_hero_backdrop_url = Some(bg);
+        }
+
+        let target_type = target.type_name.clone();
+        let target_id = target.id.clone();
+        let target_vid = target.video_id.clone();
+        self.quick_peek = Some(target);
+
+        self.request_background_enrichment_if_needed(&target_type, &target_id, cx);
+
+        let on_other_meta_details = matches!(
+            &self.route,
+            AppRoute::MetaDetails { id, .. } if id != &target_id
+        );
+        if !on_other_meta_details {
+            if target_id.starts_with("tmdb:") {
+                let core = self.core.clone();
+                let req_type = target_type.clone();
+                let req_id = target_id.clone();
+                let req_vid = target_vid.clone();
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    if let Some(imdb_id) = core
+                        .resolve_canonical_imdb_id(req_type.clone(), req_id.clone())
+                        .await
+                    {
+                        let _ = this.update(cx, |shell, cx| {
+                            if shell
+                                .quick_peek
+                                .as_ref()
+                                .is_some_and(|p| p.id == req_id)
+                            {
+                                shell.request_background_enrichment_if_needed(
+                                    &req_type,
+                                    &imdb_id,
+                                    cx,
+                                );
+                                if !matches!(shell.route, AppRoute::MetaDetails { .. }) {
+                                    shell.core.load_meta_details(
+                                        &req_type,
+                                        &imdb_id,
+                                        req_vid.as_deref(),
+                                    );
+                                }
+                                cx.notify();
+                            }
+                        });
+                        return;
+                    }
+                    if let Some(synthetic) = core
+                        .fetch_synthetic_tmdb_meta(req_type, req_id.clone())
+                        .await
+                    {
+                        let _ = this.update(cx, |shell, cx| {
+                            if shell
+                                .quick_peek
+                                .as_ref()
+                                .is_some_and(|p| p.id == req_id)
+                            {
+                                shell.synthetic_tmdb_meta = Some((req_id, synthetic));
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .detach();
+            } else {
+                let already_ready = self.core.with_model(|m| {
+                    resolve_ready_meta_item(&m.meta_details.meta_items)
+                        .is_some_and(|(item, _)| item.preview.id == target_id)
+                });
+                if !already_ready {
+                    self.core
+                        .load_meta_details(&target_type, &target_id, target_vid.as_deref());
+                }
+            }
+        }
+
+        cx.notify();
+    }
+
+    pub fn close_quick_peek(&mut self, cx: &mut Context<Self>) {
+        if self.quick_peek.take().is_some() {
+            if !matches!(self.route, AppRoute::MetaDetails { .. } | AppRoute::Player) {
+                self.core.unload_meta_details();
+            }
+            cx.notify();
+        }
     }
 
     pub fn cached_library_statuses(&self) -> Arc<HashMap<String, LibraryStatusTab>> {
@@ -1089,38 +1310,96 @@ impl AppShell {
         }
         let gen_id = s.generation;
         let cand_idx = s.active_index;
-        let is_p2p_torrent = s
-            .active_candidate()
-            .is_some_and(|c| matches!(c.stream.source, StreamSource::Torrent { .. }))
-            && !s.debrid_resolving;
-        let timeout_secs = if is_p2p_torrent {
-            self.preferences.dead_swarm_timeout_secs.max(18)
-        } else {
-            self.preferences.dead_swarm_timeout_secs.max(6)
-        };
+        let torrent_info_hash = s.active_candidate().and_then(|c| match c.stream.source {
+            StreamSource::Torrent { info_hash, .. } if !s.debrid_resolving => Some(info_hash),
+            _ => None,
+        });
 
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            cx.background_executor()
-                .timer(Duration::from_secs(timeout_secs))
-                .await;
-            let _ = this.update(cx, |shell, cx| {
-                let stalled = shell.route.is_player()
-                    && shell.preferences.dead_swarm_failover
-                    && shell.playback_session.as_ref().is_some_and(|cur| {
-                        cur.generation == gen_id
-                            && cur.active_index == cand_idx
-                            && !cur.first_media_ready
-                            && cur.candidates.len() > cur.active_index + 1
+        if let Some(ih) = torrent_info_hash {
+            let initial_wait = self.preferences.dead_swarm_timeout_secs.max(18);
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut elapsed_secs = initial_wait;
+                let mut wait_secs = initial_wait;
+                let mut prev_fetched = 0_u64;
+                let mut stalled_ticks = 0_u8;
+
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(wait_secs))
+                        .await;
+
+                    let mut sleep_next: Option<u64> = None;
+                    let update_res = this.update(cx, |shell, cx| {
+                        let still_waiting = shell.route.is_player()
+                            && shell.preferences.dead_swarm_failover
+                            && shell.playback_session.as_ref().is_some_and(|cur| {
+                                cur.generation == gen_id
+                                    && cur.active_index == cand_idx
+                                    && !cur.first_media_ready
+                                    && cur.candidates.len() > cur.active_index + 1
+                            });
+                        if !still_waiting {
+                            return;
+                        }
+
+                        let snapshot = shell.engine.torrent_progress_snapshot(&ih);
+                        match evaluate_p2p_watchdog_tick(
+                            snapshot,
+                            elapsed_secs,
+                            prev_fetched,
+                            stalled_ticks,
+                        ) {
+                            P2pWatchdogDecision::Continue {
+                                next_prev_fetched,
+                                next_stalled_ticks,
+                                sleep_secs,
+                            } => {
+                                prev_fetched = next_prev_fetched;
+                                stalled_ticks = next_stalled_ticks;
+                                elapsed_secs = elapsed_secs.saturating_add(sleep_secs);
+                                sleep_next = Some(sleep_secs);
+                            }
+                            P2pWatchdogDecision::Failover { reason } => {
+                                shell.trigger_dead_swarm_failover(&reason, cx);
+                            }
+                        }
                     });
-                if stalled {
-                    shell.trigger_dead_swarm_failover(
-                        &format!("No video frames within {timeout_secs}s"),
-                        cx,
-                    );
+
+                    if update_res.is_err() {
+                        break;
+                    }
+                    match sleep_next {
+                        Some(secs) => wait_secs = secs,
+                        None => break,
+                    }
                 }
-            });
-        })
-        .detach();
+            })
+            .detach();
+        } else {
+            let timeout_secs = self.preferences.dead_swarm_timeout_secs.max(6);
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                cx.background_executor()
+                    .timer(Duration::from_secs(timeout_secs))
+                    .await;
+                let _ = this.update(cx, |shell, cx| {
+                    let stalled = shell.route.is_player()
+                        && shell.preferences.dead_swarm_failover
+                        && shell.playback_session.as_ref().is_some_and(|cur| {
+                            cur.generation == gen_id
+                                && cur.active_index == cand_idx
+                                && !cur.first_media_ready
+                                && cur.candidates.len() > cur.active_index + 1
+                        });
+                    if stalled {
+                        shell.trigger_dead_swarm_failover(
+                            &format!("No video frames within {timeout_secs}s"),
+                            cx,
+                        );
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     fn bump_state_revisions(&mut self, fields: &[DesktopModelField]) {
@@ -1213,12 +1492,23 @@ impl AppShell {
 
                 let player_osd_or_stats =
                     self.is_player_osd_visible() || self.player_stats_for_nerds;
-                if !route_affected_by_fields(
-                    &self.route,
-                    self.command_palette_open,
-                    player_osd_or_stats,
-                    fields,
-                ) {
+                let quick_peek_affected = self.quick_peek.is_some()
+                    && fields.iter().any(|f| {
+                        matches!(
+                            f,
+                            DesktopModelField::MetaDetails
+                                | DesktopModelField::Library
+                                | DesktopModelField::Ctx
+                        )
+                    });
+                if !quick_peek_affected
+                    && !route_affected_by_fields(
+                        &self.route,
+                        self.command_palette_open,
+                        player_osd_or_stats,
+                        fields,
+                    )
+                {
                     return;
                 }
 
@@ -1461,6 +1751,14 @@ impl AppShell {
             self.apply_saved_series_track_prefs(&snap);
         }
 
+        if !snap.tracks.is_empty() {
+            let pref_lang = self.active_preferred_sub_lang();
+            let cands = Self::build_track_candidates(&snap.tracks);
+            self.secondary_forced_available = select_embedded_forced_track(&cands, &pref_lang);
+        } else {
+            self.secondary_forced_available = None;
+        }
+
         if let Some(pending_title) = self.pending_auto_select_sub_title.as_deref() {
             if let Some(track) = snap
                 .tracks
@@ -1468,6 +1766,7 @@ impl AppShell {
                 .find(|t| t.track_type == TrackType::Sub && t.title.as_deref() == Some(pending_title))
             {
                 if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_sub_forced_events_only(false);
                     let _ = mpv.select_subtitle_track(Some(track.id));
                 }
                 self.pending_auto_select_sub_title = None;
@@ -1609,6 +1908,9 @@ impl AppShell {
                     self.spawn_automatic_audio_subtitle_sync(false, cx);
                 }
             }
+            PlayerEvent::UntranslatedForeignSubtitleDetected(_) => {
+                self.handle_untranslated_foreign_subtitle_detected(cx);
+            }
             PlayerEvent::EndFile {
                 error: Some(err_msg),
                 ..
@@ -1653,6 +1955,7 @@ impl AppShell {
                         TrackCandidate::sub(t.id, t.lang.as_deref(), t.title.as_deref())
                             .with_external(t.external)
                             .with_forced(t.forced)
+                            .with_hearing_impaired(t.hearing_impaired)
                             .with_default(t.default);
                     if let Some(codec) = &t.codec {
                         cand = cand.with_codec(codec.clone());
@@ -1699,6 +2002,7 @@ impl AppShell {
             let _ = mpv.select_audio_track(aid);
         }
         if let Some(sub_choice) = matched.sub_id {
+            let _ = mpv.set_sub_forced_events_only(false);
             let _ = mpv.select_subtitle_track(sub_choice);
         }
         if pref.sub_delay_secs.abs() > 0.005 {
@@ -1756,32 +2060,52 @@ impl AppShell {
         self.core.save_series_track_pref(pref);
     }
 
-    fn current_route_scroll_y(&self) -> f32 {
+    pub(crate) fn current_route_scroll_y(&self) -> f32 {
         match &self.route {
             AppRoute::Tab(SidebarTab::Home) => {
                 (-self.board_scroll_handle.offset().y / px(1.0)).max(0.0)
             }
-            AppRoute::Tab(SidebarTab::Discover) => (-self
-                .discover_grid_scroll_handle
-                .0
-                .borrow()
-                .base_handle
-                .offset()
-                .y
-                / px(1.0))
-            .max(0.0),
+            AppRoute::Tab(SidebarTab::Discover) => match self.preferences.discover_view_mode {
+                DiscoverViewMode::BrowseHubs => {
+                    (-self.discover_hubs_scroll_handle.offset().y / px(1.0)).max(0.0)
+                }
+                DiscoverViewMode::CatalogGrid => (-self
+                    .discover_grid_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .offset()
+                    .y
+                    / px(1.0))
+                .max(0.0),
+            },
             AppRoute::Tab(SidebarTab::Calendar) => {
                 (-self.calendar_scroll_handle.offset().y / px(1.0)).max(0.0)
             }
-            AppRoute::Tab(SidebarTab::Library) => (-self
-                .library_grid_scroll_handle
-                .0
-                .borrow()
-                .base_handle
-                .offset()
-                .y
-                / px(1.0))
-            .max(0.0),
+            AppRoute::Tab(SidebarTab::Library) => match self.preferences.library_view_mode {
+                LibraryViewMode::PosterGrid => (-self
+                    .library_grid_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .offset()
+                    .y
+                    / px(1.0))
+                .max(0.0),
+                LibraryViewMode::WideBackdrops | LibraryViewMode::CompactList => {
+                    let grid_y = (-self
+                        .library_grid_scroll_handle
+                        .0
+                        .borrow()
+                        .base_handle
+                        .offset()
+                        .y
+                        / px(1.0))
+                    .max(0.0);
+                    let list_y = (-self.library_scroll_handle.offset().y / px(1.0)).max(0.0);
+                    grid_y.max(list_y)
+                }
+            },
             AppRoute::Tab(SidebarTab::Settings) => {
                 (-self.settings_scroll_handle.offset().y / px(1.0)).max(0.0)
             }
@@ -1798,19 +2122,24 @@ impl AppShell {
         let off = point(px(0.0), px(-scroll_y.max(0.0)));
         match route {
             AppRoute::Tab(SidebarTab::Home) => self.board_scroll_handle.set_offset(off),
-            AppRoute::Tab(SidebarTab::Discover) => self
-                .discover_grid_scroll_handle
-                .0
-                .borrow()
-                .base_handle
-                .set_offset(off),
+            AppRoute::Tab(SidebarTab::Discover) => match self.preferences.discover_view_mode {
+                DiscoverViewMode::BrowseHubs => self.discover_hubs_scroll_handle.set_offset(off),
+                DiscoverViewMode::CatalogGrid => self
+                    .discover_grid_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(off),
+            },
             AppRoute::Tab(SidebarTab::Calendar) => self.calendar_scroll_handle.set_offset(off),
-            AppRoute::Tab(SidebarTab::Library) => self
-                .library_grid_scroll_handle
-                .0
-                .borrow()
-                .base_handle
-                .set_offset(off),
+            AppRoute::Tab(SidebarTab::Library) => {
+                self.library_scroll_handle.set_offset(off);
+                self.library_grid_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(off);
+            }
             AppRoute::Tab(SidebarTab::Settings) => self.settings_scroll_handle.set_offset(off),
             AppRoute::MetaDetails { .. } => self.meta_scroll_handle.set_offset(off),
             AppRoute::Search { .. } => self.search_scroll_handle.set_offset(off),
@@ -1848,6 +2177,7 @@ impl AppShell {
         self.command_palette_open = false;
         self.avatar_menu_open = false;
         self.context_menu = None;
+        self.quick_peek = None;
         self.discover_open_dropdown = None;
         self.meta_addon_dropdown_open = false;
         self.library_sort_dropdown_open = false;
@@ -1859,12 +2189,16 @@ impl AppShell {
     }
 
     fn apply_nav_entry(&mut self, entry: NavHistoryEntry, cx: &mut Context<Self>) {
+        let route_changed = self.route != entry.route;
         let keep_meta = matches!(
             entry.route,
             AppRoute::MetaDetails { .. } | AppRoute::Player
         );
         self.unload_meta_details_if_leaving(keep_meta);
         self.clear_transient_browsing_state();
+        if route_changed {
+            self.on_major_route_transition(entry.route.is_player());
+        }
 
         self.route = entry.route.clone();
         self.selected_season = entry.selected_season;
@@ -1959,9 +2293,10 @@ impl AppShell {
     }
 
     pub fn navigate_tab(&mut self, tab: SidebarTab, cx: &mut Context<Self>) {
+        let route_changed = self.route != AppRoute::Tab(tab);
         if self.route.is_player() {
             self.teardown_active_playback();
-        } else if self.route != AppRoute::Tab(tab) {
+        } else if route_changed {
             let entry = self.capture_nav_entry();
             self.push_nav_history_entry(entry);
             self.nav_forward.clear();
@@ -1972,6 +2307,9 @@ impl AppShell {
         }
         self.unload_meta_details_if_leaving(false);
         self.clear_transient_browsing_state();
+        if route_changed {
+            self.on_major_route_transition(false);
+        }
 
         match tab {
             SidebarTab::Home => {
@@ -2027,8 +2365,11 @@ impl AppShell {
         }
         self.unload_meta_details_if_leaving(false);
         self.clear_transient_browsing_state();
+        self.on_major_route_transition(false);
         self.discover_loaded_once = true;
         self.discover_last_next_page_len.set(None);
+        self.discover_hubs_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
         self.discover_grid_scroll_handle
             .0
             .borrow()
@@ -2175,6 +2516,7 @@ impl AppShell {
             });
 
         self.clear_transient_browsing_state();
+        self.on_major_route_transition(false);
         self.selected_season = None;
         self.auto_selected_episode_for_meta = resolved_video_id
             .as_ref()
@@ -2202,14 +2544,18 @@ impl AppShell {
     }
 
     pub fn open_full_search(&mut self, query: String, cx: &mut Context<Self>) {
+        let entering_search = !matches!(self.route, AppRoute::Search { .. });
         if self.route.is_player() {
             self.teardown_active_playback();
-        } else if !matches!(self.route, AppRoute::Search { .. }) {
+        } else if entering_search {
             let entry = self.capture_nav_entry();
             self.push_nav_history_entry(entry);
             self.nav_forward.clear();
         }
         self.clear_transient_browsing_state();
+        if entering_search {
+            self.on_major_route_transition(false);
+        }
 
         let trimmed = query.trim().to_owned();
         self.full_search_query = trimmed.clone();
@@ -2359,6 +2705,7 @@ impl AppShell {
             self.nav_forward.clear();
         }
         self.clear_transient_browsing_state();
+        self.on_major_route_transition(false);
 
         self.person_request_seq = self.person_request_seq.wrapping_add(1);
         let seq = self.person_request_seq;
@@ -2803,17 +3150,27 @@ impl AppShell {
             AppRoute::Tab(SidebarTab::Home) => {
                 Self::scroll_handle_for_page_key(&self.board_scroll_handle, key, vh)
             }
-            AppRoute::Tab(SidebarTab::Discover) => {
-                let guard = self.discover_grid_scroll_handle.0.borrow();
-                Self::scroll_handle_for_page_key(&guard.base_handle, key, vh)
-            }
+            AppRoute::Tab(SidebarTab::Discover) => match self.preferences.discover_view_mode {
+                DiscoverViewMode::BrowseHubs => {
+                    Self::scroll_handle_for_page_key(&self.discover_hubs_scroll_handle, key, vh)
+                }
+                DiscoverViewMode::CatalogGrid => {
+                    let guard = self.discover_grid_scroll_handle.0.borrow();
+                    Self::scroll_handle_for_page_key(&guard.base_handle, key, vh)
+                }
+            },
             AppRoute::Tab(SidebarTab::Calendar) => {
                 Self::scroll_handle_for_page_key(&self.calendar_scroll_handle, key, vh)
             }
-            AppRoute::Tab(SidebarTab::Library) => {
-                let guard = self.library_grid_scroll_handle.0.borrow();
-                Self::scroll_handle_for_page_key(&guard.base_handle, key, vh)
-            }
+            AppRoute::Tab(SidebarTab::Library) => match self.preferences.library_view_mode {
+                LibraryViewMode::PosterGrid => {
+                    let guard = self.library_grid_scroll_handle.0.borrow();
+                    Self::scroll_handle_for_page_key(&guard.base_handle, key, vh)
+                }
+                LibraryViewMode::WideBackdrops | LibraryViewMode::CompactList => {
+                    Self::scroll_handle_for_page_key(&self.library_scroll_handle, key, vh)
+                }
+            },
             AppRoute::Tab(SidebarTab::Settings) => {
                 Self::scroll_handle_for_page_key(&self.settings_scroll_handle, key, vh)
             }
@@ -2887,7 +3244,7 @@ impl AppShell {
             self.nav_forward.clear();
         }
 
-        self.poster_cache.trim_for_playback();
+        self.on_major_route_transition(true);
         self.ensure_mpv_initialized(cx);
 
         self.playback_generation_seq = self.playback_generation_seq.wrapping_add(1);
@@ -2930,6 +3287,7 @@ impl AppShell {
         self.discover_open_dropdown = None;
         self.avatar_menu_open = false;
         self.context_menu = None;
+        self.quick_peek = None;
         self.command_palette_open = false;
         self.kb_focus_index = None;
         self.kb_focus_items.clear();
@@ -2941,6 +3299,8 @@ impl AppShell {
         self.native_sub_match.reset();
         self.pending_auto_select_sub_title = None;
         self.user_picked_subtitle = false;
+        self.secondary_forced_available = None;
+        self.live_untranslated_upgrade_triggered = false;
         self.is_scrubbing = false;
         self.is_dragging_volume = false;
         self.scrub_hover_fraction = None;
@@ -3015,6 +3375,8 @@ impl AppShell {
 
         self.native_sub_match.reset();
         self.pending_auto_select_sub_title = None;
+        self.secondary_forced_available = None;
+        self.live_untranslated_upgrade_triggered = false;
 
         self.schedule_dead_swarm_watchdog(cx);
         self.ensure_player_telemetry_pulse(cx);
@@ -3421,6 +3783,7 @@ impl AppShell {
                     .or_else(|| next_stream.name.clone())
                     .or_else(|| next_stream.description.clone()),
                 preferred_langs: vec![pref_lang],
+                search_mode: SubtitleSearchMode::Full,
             };
             let core_subs = self.core.clone();
             self.tokio_handle.spawn(async move {
@@ -3469,6 +3832,8 @@ impl AppShell {
         self.prewarmed_next_direct_url = None;
         self.native_sub_match.reset();
         self.pending_auto_select_sub_title = None;
+        self.secondary_forced_available = None;
+        self.live_untranslated_upgrade_triggered = false;
         self.user_picked_subtitle = false;
         self.sync_os_integrations();
         self.schedule_debounced_heap_trim();
@@ -3748,6 +4113,8 @@ impl AppShell {
         self.user_picked_subtitle = true;
         self.pending_auto_select_sub_title = None;
         if let Some(mpv) = &self.mpv {
+            let _ = mpv.set_sub_forced_events_only(false);
+            let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
             let _ = mpv.select_subtitle_track(track_id);
         }
         self.persist_series_track_selection(None, Some(track_id), None);
@@ -3917,7 +4284,7 @@ impl AppShell {
     pub fn set_dead_swarm_timeout_secs(&mut self, secs: u64, cx: &mut Context<Self>) {
         self.preferences.dead_swarm_timeout_secs = secs;
         self.engine
-            .set_first_byte_timeout(Duration::from_secs(secs.max(12)));
+            .set_first_byte_timeout(Duration::from_secs(secs.max(20)));
         let _ = self.preferences.save();
         cx.notify();
     }
@@ -3979,6 +4346,41 @@ impl AppShell {
 
     pub fn toggle_show_home_spotlight(&mut self, cx: &mut Context<Self>) {
         self.preferences.show_home_spotlight = !self.preferences.show_home_spotlight;
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn set_theme_preset(&mut self, preset: ThemePreset, cx: &mut Context<Self>) {
+        self.preferences.theme_preset = preset;
+        self.preferences.apply_theme();
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn set_accent_color(&mut self, accent: AccentChoice, cx: &mut Context<Self>) {
+        self.preferences.accent_color = accent;
+        self.preferences.apply_theme();
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn toggle_ambient_bleed(&mut self, cx: &mut Context<Self>) {
+        self.preferences.ambient_bleed_enabled = !self.preferences.ambient_bleed_enabled;
+        self.preferences.apply_theme();
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn set_ui_scale(&mut self, scale: UiScaleChoice, cx: &mut Context<Self>) {
+        self.preferences.ui_scale = scale;
+        self.preferences.apply_theme();
+        let _ = self.preferences.save();
+        cx.notify();
+    }
+
+    pub fn set_card_density(&mut self, density: CardDensityChoice, cx: &mut Context<Self>) {
+        self.preferences.card_density = density;
+        self.preferences.apply_theme();
         let _ = self.preferences.save();
         cx.notify();
     }
@@ -4155,12 +4557,15 @@ impl AppShell {
         }
     }
 
-    fn has_usable_embedded_preferred_subtitle(&self, tracks: &[gpui_mpv::MediaTrack]) -> bool {
-        let preferred = self
-            .active_series_id()
+    fn active_preferred_sub_lang(&self) -> String {
+        self.active_series_id()
             .and_then(|series_id| self.core.get_series_track_pref(&series_id))
             .and_then(|pref| pref.sub_lang)
-            .unwrap_or_else(|| self.normalized_preferred_sub_lang());
+            .unwrap_or_else(|| self.normalized_preferred_sub_lang())
+    }
+
+    fn has_usable_embedded_preferred_subtitle(&self, tracks: &[gpui_mpv::MediaTrack]) -> bool {
+        let preferred = self.active_preferred_sub_lang();
         let candidates = Self::build_track_candidates(tracks);
         has_full_embedded_subtitle_for_lang(&candidates, &preferred)
     }
@@ -4181,41 +4586,232 @@ impl AppShell {
                     && !raw_pref.eq_ignore_ascii_case("off")
                     && !raw_pref.eq_ignore_ascii_case("none")
             });
-        if !subtitles_wanted {
-            return;
-        }
+        let preferred = self.active_preferred_sub_lang();
+        let candidates = Self::build_track_candidates(&self.player_snapshot.tracks);
+        let forced_cand = select_embedded_forced_track(&candidates, &preferred);
+        self.secondary_forced_available = forced_cand;
 
-        if self.has_usable_embedded_preferred_subtitle(&self.player_snapshot.tracks) {
-            if !matches!(
-                self.native_sub_match.status,
-                NativeSubtitleMatchStatus::LocalFile { .. }
-                    | NativeSubtitleMatchStatus::Searching
-                    | NativeSubtitleMatchStatus::AudioSyncing
-                    | NativeSubtitleMatchStatus::AudioSynced { .. }
-            ) {
-                self.native_sub_match.status = NativeSubtitleMatchStatus::EmbeddedReady;
+        if !subtitles_wanted || series_pref.as_ref().is_some_and(|p| p.prefer_forced_only) {
+            if let Some((forced_id, _)) = forced_cand {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                    let _ = mpv.set_sub_forced_events_only(false);
+                    let _ = mpv.select_subtitle_track(Some(forced_id));
+                }
+                if !matches!(
+                    self.native_sub_match.status,
+                    NativeSubtitleMatchStatus::LocalFile { .. }
+                        | NativeSubtitleMatchStatus::Searching
+                        | NativeSubtitleMatchStatus::AudioSyncing
+                        | NativeSubtitleMatchStatus::AudioSynced { .. }
+                ) {
+                    self.native_sub_match.status = NativeSubtitleMatchStatus::EmbeddedReady;
+                }
+                cx.notify();
+            } else if let Some(pgs_id) =
+                select_embedded_image_track_for_inline_forced(&candidates, &preferred)
+            {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                    let _ = mpv.set_sub_forced_events_only(true);
+                    let _ = mpv.select_subtitle_track(Some(pgs_id));
+                }
+                if !matches!(
+                    self.native_sub_match.status,
+                    NativeSubtitleMatchStatus::LocalFile { .. }
+                        | NativeSubtitleMatchStatus::Searching
+                        | NativeSubtitleMatchStatus::AudioSyncing
+                        | NativeSubtitleMatchStatus::AudioSynced { .. }
+                ) {
+                    self.native_sub_match.status = NativeSubtitleMatchStatus::EmbeddedReady;
+                }
+                cx.notify();
+            } else if self.preferences.auto_match_native_subtitles
+                && matches!(self.native_sub_match.status, NativeSubtitleMatchStatus::Idle)
+            {
+                self.trigger_native_subtitle_search(
+                    SubtitleSearchMode::ForcedOnly,
+                    false,
+                    false,
+                    cx,
+                );
             }
-            cx.notify();
             return;
         }
 
-        if self.preferences.auto_match_native_subtitles
-            && matches!(self.native_sub_match.status, NativeSubtitleMatchStatus::Idle)
-        {
-            self.trigger_native_subtitle_auto_match(false, cx);
-        } else {
-            self.attach_fallback_addon_subtitles_if_needed(cx);
+        if let Some(mpv) = &self.mpv {
+            let _ = mpv.set_sub_forced_events_only(false);
+        }
+
+        let quality = assess_embedded_subtitles(&candidates, &preferred);
+        match quality {
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id,
+                full_is_text,
+                forced_id,
+                forced_is_text,
+                ..
+            } => {
+                if let Some(mpv) = &self.mpv {
+                    if !self.user_picked_subtitle {
+                        let currently_full = self
+                            .player_snapshot
+                            .tracks
+                            .iter()
+                            .any(|t| t.track_type == TrackType::Sub && t.id == full_id && t.selected);
+                        if !currently_full {
+                            let _ = mpv.select_subtitle_track(Some(full_id));
+                        }
+                    }
+                    if full_is_text && forced_is_text {
+                        if let Some(fid) = forced_id {
+                            let _ = mpv.set_secondary_subtitle_track(
+                                Some(fid),
+                                SecondaryForcedMode::SmartFallback,
+                            );
+                        } else {
+                            let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                        }
+                    } else {
+                        let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                    }
+                }
+                if !matches!(
+                    self.native_sub_match.status,
+                    NativeSubtitleMatchStatus::LocalFile { .. }
+                        | NativeSubtitleMatchStatus::Searching
+                        | NativeSubtitleMatchStatus::AudioSyncing
+                        | NativeSubtitleMatchStatus::AudioSynced { .. }
+                ) {
+                    self.native_sub_match.status = NativeSubtitleMatchStatus::EmbeddedReady;
+                }
+                cx.notify();
+            }
+            EmbeddedSubtitleQuality::ForcedOnly { .. } | EmbeddedSubtitleQuality::None => {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                }
+                if self.preferences.auto_match_native_subtitles
+                    && matches!(self.native_sub_match.status, NativeSubtitleMatchStatus::Idle)
+                {
+                    self.trigger_native_subtitle_search(SubtitleSearchMode::Full, false, false, cx);
+                } else {
+                    self.attach_fallback_addon_subtitles_if_needed(cx);
+                }
+            }
         }
     }
 
-    fn format_native_sub_label(sub: &FetchedNativeSubtitle, aligned: Option<&SubtitleAlignmentResult>) -> String {
+    fn handle_untranslated_foreign_subtitle_detected(&mut self, cx: &mut Context<Self>) {
+        if !self.route.is_player()
+            || self.user_picked_subtitle
+            || self.live_untranslated_upgrade_triggered
+        {
+            return;
+        }
+        self.live_untranslated_upgrade_triggered = true;
+
+        let active_embedded_sub = self
+            .player_snapshot
+            .tracks
+            .iter()
+            .find(|t| t.track_type == TrackType::Sub && t.selected && !t.external)
+            .map(|t| (t.id, !is_image_subtitle_codec(t.codec.as_deref())));
+
+        if let Some((active_id, true)) = active_embedded_sub {
+            if let Some((forced_id, true)) = self.secondary_forced_available {
+                if forced_id != active_id {
+                    if let Some(mpv) = &self.mpv {
+                        let _ = mpv.set_secondary_subtitle_track(
+                            Some(forced_id),
+                            SecondaryForcedMode::SmartFallback,
+                        );
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        if let Some((active_id, _)) = active_embedded_sub {
+            let preferred = self.active_preferred_sub_lang();
+            let candidates = Self::build_track_candidates(&self.player_snapshot.tracks);
+            if let Some(alt_id) =
+                select_alternative_embedded_full_track(&candidates, &preferred, active_id)
+            {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                    let _ = mpv.set_sub_forced_events_only(false);
+                    let _ = mpv.select_subtitle_track(Some(alt_id));
+                }
+                cx.notify();
+                return;
+            }
+        } else if let Some(best_translated) = self
+            .native_sub_match
+            .fetched_subs
+            .iter()
+            .find(|s| {
+                s.match_tier.is_trusted_sync()
+                    && s.content_profile.foreign_status == ForeignTranslationStatus::Translated
+                    && s.content_profile.foreign_placeholder_count == 0
+            })
+            .cloned()
+        {
+            let label = Self::format_native_sub_label(&best_translated, None);
+            if let Some(track) = self
+                .player_snapshot
+                .tracks
+                .iter()
+                .find(|t| t.track_type == TrackType::Sub && t.title.as_deref() == Some(&label))
+                .map(|t| t.id)
+            {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                    let _ = mpv.set_sub_forced_events_only(false);
+                    let _ = mpv.select_subtitle_track(Some(track));
+                }
+                self.push_toast(
+                    ToastKind::Info,
+                    "Upgraded subtitles",
+                    Some("Foreign dialogue translated".to_owned()),
+                    cx,
+                );
+                cx.notify();
+                return;
+            }
+        }
+
+        if self.preferences.auto_match_native_subtitles
+            && !matches!(
+                self.native_sub_match.status,
+                NativeSubtitleMatchStatus::Searching
+            )
+        {
+            self.trigger_native_subtitle_search(SubtitleSearchMode::Full, false, true, cx);
+        }
+    }
+
+    fn format_native_sub_label(
+        sub: &FetchedNativeSubtitle,
+        aligned: Option<&SubtitleAlignmentResult>,
+    ) -> String {
         let base = Self::native_sub_base_label(sub);
+        let mut extras: Vec<String> = Vec::new();
+        match sub.content_profile.foreign_status {
+            ForeignTranslationStatus::Translated => extras.push("Foreign translated".to_owned()),
+            ForeignTranslationStatus::MissingForeign => extras.push("Missing foreign".to_owned()),
+            ForeignTranslationStatus::Unknown => {}
+        }
         if let Some(align) = aligned {
-            format!("{base} · {}", Self::format_alignment_badge(align))
+            extras.push(Self::format_alignment_badge(align));
         } else if sub.match_tier == SubtitleMatchTier::ExactHash {
-            format!("{base} · hash match")
-        } else {
+            extras.push("hash match".to_owned());
+        }
+        if extras.is_empty() {
             base
+        } else {
+            format!("{base} — {}", extras.join(" · "))
         }
     }
 
@@ -4232,18 +4828,30 @@ impl AppShell {
 
     fn native_sub_base_label(sub: &FetchedNativeSubtitle) -> String {
         let base_lang = human_language_name(&sub.lang);
-        let is_sdh = sub.title.to_ascii_uppercase().contains("SDH")
+        let is_sdh = sub.hearing_impaired
+            || sub.title.to_ascii_uppercase().contains("SDH")
             || sub.release_name.to_ascii_uppercase().contains("SDH");
-        let lang_title = if is_sdh {
-            format!("{base_lang} SDH")
-        } else {
-            base_lang
-        };
+        let mut lang_title = base_lang;
+        if sub.forced {
+            lang_title.push_str(" Forced");
+        } else if is_sdh {
+            lang_title.push_str(" SDH");
+        }
         let provider = Self::clean_subtitle_provider_name(&sub.provider);
         format!("{lang_title} — {provider}")
     }
 
     pub fn trigger_native_subtitle_auto_match(&mut self, force_rematch: bool, cx: &mut Context<Self>) {
+        self.trigger_native_subtitle_search(SubtitleSearchMode::Full, force_rematch, false, cx);
+    }
+
+    pub fn trigger_native_subtitle_search(
+        &mut self,
+        search_mode: SubtitleSearchMode,
+        force_rematch: bool,
+        is_live_placeholder_rescue: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !force_rematch && !self.preferences.auto_match_native_subtitles {
             return;
         }
@@ -4291,7 +4899,7 @@ impl AppShell {
                     })
                 })
             });
-        let preferred_lang = self.normalized_preferred_sub_lang();
+        let preferred_lang = self.active_preferred_sub_lang();
         let local_target_to_align = if force_rematch
             && matches!(
                 self.native_sub_match.status,
@@ -4303,7 +4911,12 @@ impl AppShell {
         };
         let align_local_mode = local_target_to_align.is_some();
 
-        self.native_sub_match.status = NativeSubtitleMatchStatus::Searching;
+        let previous_status = self.native_sub_match.status.clone();
+        let keep_embedded_label_quiet =
+            !force_rematch && matches!(previous_status, NativeSubtitleMatchStatus::EmbeddedReady);
+        if !keep_embedded_label_quiet {
+            self.native_sub_match.status = NativeSubtitleMatchStatus::Searching;
+        }
         if force_rematch {
             self.native_sub_match.last_alignment_badge = None;
         }
@@ -4311,7 +4924,23 @@ impl AppShell {
 
         let core = self.core.clone();
         let tokio_handle = self.tokio_handle.clone();
-        let max_fetch = if force_rematch { 3 } else { 2 };
+        let playhead = self.player_snapshot.time_pos.max(0.0);
+        let active_embedded_text_sub_ordinal = if is_live_placeholder_rescue {
+            self.player_snapshot
+                .tracks
+                .iter()
+                .filter(|t| t.track_type == TrackType::Sub && !t.external)
+                .enumerate()
+                .find_map(|(ordinal, t)| {
+                    (t.selected && !is_image_subtitle_codec(t.codec.as_deref())).then_some(ordinal)
+                })
+        } else {
+            None
+        };
+        let max_fetch = match search_mode {
+            SubtitleSearchMode::Full => 4,
+            SubtitleSearchMode::ForcedOnly => 2,
+        };
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let outcome = tokio_handle
                 .spawn(async move {
@@ -4352,14 +4981,15 @@ impl AppShell {
                         video_byte_size: hash_res.as_ref().map(|r| r.size).or(video_byte_size),
                         video_filename,
                         preferred_langs: vec![preferred_lang],
+                        search_mode,
                     };
-                    let fetched = core.search_and_fetch_native_subtitles(query, max_fetch).await;
+                    let mut fetched = core.search_and_fetch_native_subtitles(query, max_fetch).await;
                     let exact_ref = fetched
                         .iter()
                         .find(|s| s.match_tier == SubtitleMatchTier::ExactHash)
                         .cloned();
 
-                    let auto_aligned = if let (Some(top), Some(ref_sub)) =
+                    let mut auto_aligned = if let (Some(top), Some(ref_sub)) =
                         (fetched.first(), exact_ref.as_ref())
                     {
                         if let Some(local_path) = local_target_to_align.as_ref() {
@@ -4377,6 +5007,101 @@ impl AppShell {
                         None
                     };
 
+                    if is_live_placeholder_rescue
+                        && auto_aligned.is_none()
+                        && fetched
+                            .first()
+                            .is_some_and(|top| top.match_tier != SubtitleMatchTier::ExactHash)
+                    {
+                        if let (Some(sub_ordinal), Some(stream_url)) = (
+                            active_embedded_text_sub_ordinal,
+                            resolved_url
+                                .as_deref()
+                                .filter(|u| {
+                                    !is_loopback_p2p_torrent_url(u)
+                                        && Url::parse(u).ok().is_some_and(|p| {
+                                            p.scheme() == "http" || p.scheme() == "https"
+                                        })
+                                })
+                                .map(str::to_owned),
+                        ) {
+                            let mut align_candidates: Vec<(usize, PathBuf)> = Vec::new();
+                            for (idx, sub) in fetched.iter().enumerate() {
+                                if !sub.forced
+                                    && sub.content_profile.foreign_placeholder_count == 0
+                                    && sub.content_profile.foreign_status
+                                        == ForeignTranslationStatus::Translated
+                                {
+                                    align_candidates.push((idx, sub.local_path.clone()));
+                                }
+                            }
+                            for (idx, sub) in fetched.iter().enumerate() {
+                                if !sub.forced
+                                    && sub.content_profile.foreign_placeholder_count == 0
+                                    && sub.content_profile.foreign_status
+                                        != ForeignTranslationStatus::MissingForeign
+                                    && !align_candidates.iter().any(|(i, _)| *i == idx)
+                                {
+                                    align_candidates.push((idx, sub.local_path.clone()));
+                                }
+                            }
+                            if !align_candidates.is_empty() {
+                                let window_start = (playhead - 45.0).max(0.0);
+                                let embedded_aligned = tokio::task::spawn_blocking(move || {
+                                    let ref_srt = extract_embedded_text_subtitle_window(
+                                        &stream_url,
+                                        sub_ordinal,
+                                        window_start,
+                                        120.0,
+                                    )
+                                    .ok()?;
+                                    if ref_srt.trim().is_empty() {
+                                        return None;
+                                    }
+                                    for (cand_idx, cand_path) in align_candidates {
+                                        let ext = cand_path
+                                            .extension()
+                                            .and_then(|e| e.to_str())
+                                            .unwrap_or("srt");
+                                        let stem = cand_path
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("sub");
+                                        let out_path = cand_path
+                                            .parent()
+                                            .unwrap_or_else(|| std::path::Path::new("."))
+                                            .join(format!("{stem}_embref_aligned.{ext}"));
+                                        if let Ok(alignment) =
+                                            SubtitleSyncAligner::align_subtitle_file_to_reference_text(
+                                                &cand_path,
+                                                &ref_srt,
+                                                &out_path,
+                                            )
+                                        {
+                                            if alignment.matched_onsets >= 10
+                                                && alignment.confidence >= 0.40
+                                            {
+                                                return Some((cand_idx, out_path, alignment));
+                                            }
+                                        }
+                                    }
+                                    None
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+
+                                if let Some((cand_idx, out_path, alignment)) = embedded_aligned {
+                                    if cand_idx > 0 && cand_idx < fetched.len() {
+                                        let chosen = fetched.remove(cand_idx);
+                                        fetched.insert(0, chosen);
+                                    }
+                                    auto_aligned = Some((out_path, alignment));
+                                }
+                            }
+                        }
+                    }
+
                     (fetched, exact_ref.map(|r| r.local_path), auto_aligned)
                 })
                 .await;
@@ -4392,8 +5117,11 @@ impl AppShell {
                 }
 
                 let Ok((fetched, exact_ref_path, auto_aligned)) = outcome else {
-                    shell.native_sub_match.status =
-                        NativeSubtitleMatchStatus::Failed("Subtitle search task failed".to_owned());
+                    if !keep_embedded_label_quiet {
+                        shell.native_sub_match.status = NativeSubtitleMatchStatus::Failed(
+                            "Subtitle search task failed".to_owned(),
+                        );
+                    }
                     cx.notify();
                     return;
                 };
@@ -4402,12 +5130,20 @@ impl AppShell {
                 shell.native_sub_match.fetched_subs = fetched.clone();
 
                 if fetched.is_empty() {
-                    if !matches!(
+                    if keep_embedded_label_quiet {
+                        shell.native_sub_match.status = NativeSubtitleMatchStatus::EmbeddedReady;
+                    } else if !matches!(
                         shell.native_sub_match.status,
                         NativeSubtitleMatchStatus::LocalFile { .. }
                     ) {
-                        shell.native_sub_match.status = NativeSubtitleMatchStatus::NoMatches;
-                        shell.attach_fallback_addon_subtitles_if_needed(cx);
+                        shell.native_sub_match.status = if search_mode == SubtitleSearchMode::ForcedOnly {
+                            NativeSubtitleMatchStatus::Idle
+                        } else {
+                            NativeSubtitleMatchStatus::NoMatches
+                        };
+                        if search_mode == SubtitleSearchMode::Full {
+                            shell.attach_fallback_addon_subtitles_if_needed(cx);
+                        }
                     } else if shell.native_sub_match.file_loaded_ready
                         && shell.should_auto_audio_sync_now()
                     {
@@ -4425,18 +5161,37 @@ impl AppShell {
                     return;
                 }
 
-                let has_embedded_preferred =
-                    shell.has_usable_embedded_preferred_subtitle(&shell.player_snapshot.tracks);
+                let preferred = shell.active_preferred_sub_lang();
+                let track_cands = Self::build_track_candidates(&shell.player_snapshot.tracks);
+                let embedded_quality = assess_embedded_subtitles(&track_cands, &preferred);
                 let top_sub = &fetched[0];
-                let should_select_top = (force_rematch
-                    || (!shell.user_picked_subtitle && !has_embedded_preferred))
-                    && shell.preferences.auto_select_subtitles;
+                let aligned_to_reference = auto_aligned.is_some();
+                let should_select_top = should_hot_swap_to_online(
+                    embedded_quality,
+                    top_sub,
+                    search_mode,
+                    force_rematch,
+                    shell.user_picked_subtitle,
+                    is_live_placeholder_rescue,
+                    aligned_to_reference,
+                ) && (search_mode == SubtitleSearchMode::ForcedOnly
+                    || shell.preferences.auto_select_subtitles
+                    || force_rematch);
+                let had_embedded_before = !matches!(
+                    embedded_quality,
+                    EmbeddedSubtitleQuality::None | EmbeddedSubtitleQuality::ForcedOnly { .. }
+                );
                 let mut chosen_title: Option<String> = None;
 
                 if let Some((aligned_path, alignment)) = auto_aligned {
                     let badge = Self::format_alignment_badge(&alignment);
                     let label = Self::format_native_sub_label(top_sub, Some(&alignment));
                     if let Some(mpv) = &shell.mpv {
+                        if should_select_top {
+                            let _ = mpv.set_sub_forced_events_only(false);
+                            let _ =
+                                mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                        }
                         let _ = mpv.add_local_subtitle_file_selected(
                             &aligned_path,
                             Some(&label),
@@ -4447,14 +5202,16 @@ impl AppShell {
                             let _ = mpv.set_subtitle_delay(0.0);
                         }
                     }
-                    shell.native_sub_match.active_local_sub_path = Some(aligned_path);
-                    shell.native_sub_match.synced_track_title = Some(label.clone());
-                    shell.native_sub_match.last_alignment_badge = Some(badge.clone());
-                    if !align_local_mode {
-                        shell.native_sub_match.status = NativeSubtitleMatchStatus::Matched {
-                            tier: top_sub.match_tier,
-                            elapsed_ms: top_sub.lookup_elapsed_ms,
-                        };
+                    if should_select_top {
+                        shell.native_sub_match.active_local_sub_path = Some(aligned_path);
+                        shell.native_sub_match.synced_track_title = Some(label.clone());
+                        shell.native_sub_match.last_alignment_badge = Some(badge.clone());
+                        if !align_local_mode {
+                            shell.native_sub_match.status = NativeSubtitleMatchStatus::Matched {
+                                tier: top_sub.match_tier,
+                                elapsed_ms: top_sub.lookup_elapsed_ms,
+                            };
+                        }
                     }
                     chosen_title = Some(label);
                     if force_rematch {
@@ -4469,6 +5226,11 @@ impl AppShell {
                     }
                     let select_this = should_select_top && idx == 0;
                     if let Some(mpv) = &shell.mpv {
+                        if select_this {
+                            let _ = mpv.set_sub_forced_events_only(false);
+                            let _ =
+                                mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
+                        }
                         let _ = mpv.add_local_subtitle_file_selected(
                             &sub.local_path,
                             Some(&label),
@@ -4480,11 +5242,14 @@ impl AppShell {
                         }
                     }
                     if idx == 0 && chosen_title.is_none() {
-                        shell.native_sub_match.active_local_sub_path = Some(sub.local_path.clone());
-                        shell.native_sub_match.status = NativeSubtitleMatchStatus::Matched {
-                            tier: sub.match_tier,
-                            elapsed_ms: sub.lookup_elapsed_ms,
-                        };
+                        if should_select_top {
+                            shell.native_sub_match.active_local_sub_path =
+                                Some(sub.local_path.clone());
+                            shell.native_sub_match.status = NativeSubtitleMatchStatus::Matched {
+                                tier: sub.match_tier,
+                                elapsed_ms: sub.lookup_elapsed_ms,
+                            };
+                        }
                         chosen_title = Some(label);
                     }
                 }
@@ -4492,6 +5257,10 @@ impl AppShell {
                 if should_select_top {
                     if !align_local_mode {
                         shell.native_sub_match.local_source_sub_path = None;
+                    }
+                    if let Some(mpv) = &shell.mpv {
+                        let _ = mpv.set_sub_forced_events_only(false);
+                        let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
                     }
                     if let Some(title) = chosen_title {
                         if let Some(track) = shell.player_snapshot.tracks.iter().find(|t| {
@@ -4505,7 +5274,25 @@ impl AppShell {
                             shell.pending_auto_select_sub_title = Some(title);
                         }
                     }
+                    if !force_rematch && had_embedded_before && search_mode == SubtitleSearchMode::Full {
+                        let reason = if top_sub.content_profile.foreign_status
+                            == ForeignTranslationStatus::Translated
+                        {
+                            "Foreign dialogue translated"
+                        } else {
+                            "Synced clean replacement"
+                        };
+                        shell.push_toast(
+                            ToastKind::Info,
+                            "Upgraded subtitles",
+                            Some(reason.to_owned()),
+                            cx,
+                        );
+                    }
+                } else if keep_embedded_label_quiet {
+                    shell.native_sub_match.status = NativeSubtitleMatchStatus::EmbeddedReady;
                 }
+
                 if force_rematch && !align_local_mode {
                     shell.push_toast(
                         ToastKind::Success,
@@ -4515,7 +5302,9 @@ impl AppShell {
                     );
                 }
 
-                if shell.native_sub_match.reference_sub_path.is_none()
+                if should_select_top
+                    && !aligned_to_reference
+                    && shell.native_sub_match.reference_sub_path.is_none()
                     && shell.native_sub_match.file_loaded_ready
                     && shell.should_auto_audio_sync_now()
                 {
@@ -4530,10 +5319,12 @@ impl AppShell {
     fn should_auto_audio_sync_now(&self) -> bool {
         if !self.preferences.auto_match_native_subtitles
             || self.native_sub_match.audio_sync_in_flight
+            || self.native_sub_match.last_alignment_badge.is_some()
             || matches!(
                 self.native_sub_match.status,
                 NativeSubtitleMatchStatus::AudioSynced { .. }
                     | NativeSubtitleMatchStatus::Searching
+                    | NativeSubtitleMatchStatus::EmbeddedReady
             )
         {
             return false;
@@ -4547,7 +5338,7 @@ impl AppShell {
         }
         if self.native_sub_match.reference_sub_path.is_some()
             || self.native_sub_match.fetched_subs.is_empty()
-            || self.has_usable_embedded_preferred_subtitle(&self.player_snapshot.tracks)
+            || self.native_sub_match.active_local_sub_path.is_none()
         {
             return false;
         }
@@ -4556,7 +5347,7 @@ impl AppShell {
             .tracks
             .iter()
             .any(|t| t.track_type == TrackType::Sub && !t.external && t.selected);
-        !has_selected_embedded
+        !(has_selected_embedded && self.pending_auto_select_sub_title.is_none())
     }
 
     fn spawn_automatic_audio_subtitle_sync(
@@ -4785,6 +5576,13 @@ impl AppShell {
                                     let _ = mpv.remove_subtitle_track(tr.id);
                                 }
                             }
+                            if should_select {
+                                let _ = mpv.set_sub_forced_events_only(false);
+                                let _ = mpv.set_secondary_subtitle_track(
+                                    None,
+                                    SecondaryForcedMode::Off,
+                                );
+                            }
                             let _ = mpv.add_local_subtitle_file_selected(
                                 &aligned_path,
                                 Some(&synced_label),
@@ -4903,6 +5701,8 @@ impl AppShell {
                                 }
                             }
                         }
+                        let _ = mpv.set_sub_forced_events_only(false);
+                        let _ = mpv.set_secondary_subtitle_track(None, SecondaryForcedMode::Off);
                         if let Err(err) = mpv.add_local_subtitle_file_selected(
                             &canonical,
                             Some(&label),
@@ -5289,17 +6089,7 @@ impl AppShell {
         self.loading_collection_id = None;
         self.poster_cache.clear_failures();
         self.poster_cache.trim_for_playback();
-        let cache_root = self.poster_cache.cache_root().to_path_buf();
-        if let Ok(entries) = std::fs::read_dir(&cache_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let _ = std::fs::remove_file(path);
-                } else if path.is_dir() {
-                    let _ = std::fs::remove_dir_all(path);
-                }
-            }
-        }
+        self.poster_cache.clear_disk_cache();
         self.schedule_debounced_heap_trim();
         self.push_toast(
             ToastKind::Success,
@@ -5317,6 +6107,7 @@ impl AppShell {
         }
         self.avatar_menu_open = false;
         self.context_menu = None;
+        self.quick_peek = None;
         self.discover_open_dropdown = None;
         self.meta_addon_dropdown_open = false;
         self.library_sort_dropdown_open = false;
@@ -6091,6 +6882,8 @@ impl AppShell {
             } else if self.avatar_menu_open {
                 self.avatar_menu_open = false;
                 cx.notify();
+            } else if self.quick_peek.is_some() {
+                self.close_quick_peek(cx);
             } else if self.discover_open_dropdown.is_some() {
                 self.discover_open_dropdown = None;
                 cx.notify();
@@ -6148,6 +6941,7 @@ impl AppShell {
 
         if self.context_menu.is_none()
             && !self.avatar_menu_open
+            && self.quick_peek.is_none()
             && !ks.modifiers.alt
             && !ctrl_or_cmd
         {
@@ -6218,6 +7012,39 @@ impl AppShell {
             return None;
         }
 
+        let theme = active_theme();
+        let is_player_chrome = id_prefix == "player";
+        let fg_idle = if is_player_chrome {
+            0xA0A0A8
+        } else {
+            theme.text_secondary
+        };
+        let fg_hover = if is_player_chrome {
+            0xF5F1E8
+        } else {
+            theme.text_primary
+        };
+        let hover_bg = if is_player_chrome {
+            0xFFFFFF18
+        } else {
+            theme.glass_row_hover_bg
+        };
+        let capsule_bg = if is_player_chrome {
+            0x141417DB
+        } else {
+            theme.bg_topnav_float
+        };
+        let capsule_border = if is_player_chrome {
+            0xFFFFFF1E
+        } else {
+            theme.glass_border
+        };
+        let close_hover_fg = if is_player_chrome {
+            0xf87171
+        } else {
+            theme.accent_rose
+        };
+
         let use_native_nc_chrome = uses_native_windows_nc_chrome(is_windows);
         let controls = window.window_controls();
         let is_maximized = window.is_maximized();
@@ -6238,12 +7065,12 @@ impl AppShell {
             .items_center()
             .gap(px(2.0))
             .when(in_glass_capsule, |el| {
-                el.h(px(36.0))
-                    .px(px(4.0))
-                    .rounded(px(999.0))
-                    .bg(rgba(crate::theme::BG_OSD_GLASS))
+                el.h(sp(36.0))
+                    .px(sp(4.0))
+                    .rounded(px(RADIUS_PILL))
+                    .bg(rgba(capsule_bg))
                     .border_1()
-                    .border_color(rgba(BORDER_SUBTLE))
+                    .border_color(rgba(capsule_border))
             });
 
         Some(
@@ -6255,10 +7082,10 @@ impl AppShell {
                         .occlude()
                         .window_control_area(WindowControlArea::Min)
                         .cursor_pointer()
-                        .w(px(32.0))
-                        .h(px(32.0))
-                        .rounded(px(6.0))
-                        .hover(|s| s.bg(rgb(BG_ELEVATED)))
+                        .w(sp(30.0))
+                        .h(sp(30.0))
+                        .rounded(px(RADIUS_PILL))
+                        .hover(move |s| s.bg(rgba(hover_bg)))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -6269,8 +7096,8 @@ impl AppShell {
                             })
                         })
                         .child(
-                            svg_icon(IconName::Minus, 14.0, rgb(TEXT_SECONDARY))
-                                .group_hover(min_grp, |s| s.text_color(rgb(TEXT_PRIMARY))),
+                            svg_icon(IconName::Minus, 13.5 * theme.ui_scale, rgb(fg_idle))
+                                .group_hover(min_grp, move |s| s.text_color(rgb(fg_hover))),
                         ),
                 )
             })
@@ -6282,10 +7109,10 @@ impl AppShell {
                         .occlude()
                         .window_control_area(WindowControlArea::Max)
                         .cursor_pointer()
-                        .w(px(32.0))
-                        .h(px(32.0))
-                        .rounded(px(6.0))
-                        .hover(|s| s.bg(rgb(BG_ELEVATED)))
+                        .w(sp(30.0))
+                        .h(sp(30.0))
+                        .rounded(px(RADIUS_PILL))
+                        .hover(move |s| s.bg(rgba(hover_bg)))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -6302,10 +7129,10 @@ impl AppShell {
                                 } else {
                                     IconName::MaximizeWindow
                                 },
-                                13.5,
-                                rgb(TEXT_SECONDARY),
+                                13.0 * theme.ui_scale,
+                                rgb(fg_idle),
                             )
-                            .group_hover(max_grp, |s| s.text_color(rgb(TEXT_PRIMARY))),
+                            .group_hover(max_grp, move |s| s.text_color(rgb(fg_hover))),
                         ),
                 )
             })
@@ -6316,9 +7143,9 @@ impl AppShell {
                     .occlude()
                     .window_control_area(WindowControlArea::Close)
                     .cursor_pointer()
-                    .w(px(32.0))
-                    .h(px(32.0))
-                    .rounded(px(6.0))
+                    .w(sp(30.0))
+                    .h(sp(30.0))
+                    .rounded(px(RADIUS_PILL))
                     .hover(|s| s.bg(rgba(0xf8717124)))
                     .flex()
                     .items_center()
@@ -6330,8 +7157,8 @@ impl AppShell {
                         })
                     })
                     .child(
-                        svg_icon(IconName::X, 14.5, rgb(TEXT_SECONDARY))
-                            .group_hover(close_grp, |s| s.text_color(rgb(ACCENT_ROSE))),
+                        svg_icon(IconName::X, 14.0 * theme.ui_scale, rgb(fg_idle))
+                            .group_hover(close_grp, move |s| s.text_color(rgb(close_hover_fg))),
                     ),
             ),
         )
@@ -6489,580 +7316,19 @@ impl AppShell {
         )
     }
 
-    fn render_topnav_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_tab = self.route.active_sidebar_tab();
-        let is_fullscreen = window.is_fullscreen();
-        let csd_controls = Self::render_csd_window_controls(window, "topnav", false);
-        let (signed_in_email, avatar_initial) = self.core.with_model(|m| {
-            let email = m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone());
-            let init = email
-                .as_deref()
-                .and_then(|e| e.chars().next())
-                .map(|c| c.to_ascii_uppercase().to_string());
-            (email, init)
-        });
-
-        let can_back = !self.nav_history.is_empty();
-        let can_forward = !self.nav_forward.is_empty();
-        let on_user_tab = matches!(
-            active_tab,
-            Some(SidebarTab::Addons | SidebarTab::Settings | SidebarTab::Account)
-        );
-
-        let query_empty = self.palette_query.is_empty();
-        let search_text: SharedString = if self.command_palette_open {
-            if query_empty {
-                "Search movies, shows, commands...|".into()
-            } else {
-                self.format_input_with_caret(FocusedInput::CommandPalette, &self.palette_query)
-                    .into()
-            }
-        } else if query_empty {
-            "Search movies, shows...".into()
-        } else {
-            self.palette_query.clone().into()
-        };
-
-        let use_native_nc_chrome = uses_native_windows_nc_chrome(cfg!(target_os = "windows"));
-
-        div()
-            .id("topnav-titlebar")
-            .when(!is_fullscreen, |el| {
-                el.window_control_area(WindowControlArea::Drag)
-            })
-            .w_full()
-            .h(px(64.0))
-            .flex_shrink_0()
-            .pl(px(32.0))
-            .pr(if csd_controls.is_some() {
-                px(16.0)
-            } else {
-                px(32.0)
-            })
-            .bg(rgba(BG_TOPNAV))
-            .border_b_1()
-            .border_color(rgba(GLASS_DIVIDER))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(16.0))
-            .when(!use_native_nc_chrome, |el| {
-                el.on_mouse_down(MouseButton::Left, |event, window, _cx| {
-                    if event.click_count >= 2 {
-                        window.zoom_window();
-                    } else {
-                        window.start_window_move();
-                    }
-                })
-                .on_mouse_down(MouseButton::Right, |event, window, cx| {
-                    cx.stop_propagation();
-                    window.show_window_menu(event.position);
-                })
-            })
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(18.0))
-                    .child(
-                        div()
-                            .id("topnav-brand")
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.navigate_tab(SidebarTab::Home, cx);
-                                }),
-                            )
-                            .child(movietracker_mark(28.0))
-                            .child(
-                                div()
-                                    .font(editorial_serif())
-                                    .text_size(px(22.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .child("Ferrite"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h(px(32.0))
-                            .px(px(3.0))
-                            .rounded(px(RADIUS_CONTROL))
-                            .bg(rgba(GLASS_TROUGH_BG))
-                            .border_1()
-                            .border_color(rgba(GLASS_BORDER))
-                            .flex()
-                            .items_center()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .id("topnav-nav-back")
-                                    .w(px(26.0))
-                                    .h(px(26.0))
-                                    .rounded(px(RADIUS_POSTER))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(can_back, |el| {
-                                        el.cursor_pointer()
-                                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.navigate_back(cx);
-                                                }),
-                                            )
-                                    })
-                                    .child(svg_icon(
-                                        IconName::ChevronLeft,
-                                        14.0,
-                                        if can_back {
-                                            rgb(TEXT_PRIMARY)
-                                        } else {
-                                            rgb(TEXT_MUTED)
-                                        },
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("topnav-nav-forward")
-                                    .w(px(26.0))
-                                    .h(px(26.0))
-                                    .rounded(px(RADIUS_POSTER))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(can_forward, |el| {
-                                        el.cursor_pointer()
-                                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.navigate_forward(cx);
-                                                }),
-                                            )
-                                    })
-                                    .child(svg_icon(
-                                        IconName::ChevronRight,
-                                        14.0,
-                                        if can_forward {
-                                            rgb(TEXT_PRIMARY)
-                                        } else {
-                                            rgb(TEXT_MUTED)
-                                        },
-                                    )),
-                            ),
-                    )
-                    .child(
-                        glass_segmented_bar("topnav-tabs-bar").children(
-                            SidebarTab::TITLEBAR_TABS.into_iter().enumerate().map(|(idx, tab)| {
-                                let is_active = active_tab == Some(tab);
-                                glass_segmented_item(
-                                    ("topnav-link", idx),
-                                    tab.label(),
-                                    is_active,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.navigate_tab(tab, cx);
-                                    }),
-                                )
-                            }),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(12.0))
-                    .child(
-                        div()
-                            .id("topnav-search-box")
-                            .cursor_pointer()
-                            .min_w(px(180.0))
-                            .max_w(px(340.0))
-                            .flex_1()
-                            .h(px(36.0))
-                            .px(px(12.0))
-                            .rounded(px(RADIUS_CONTROL))
-                            .bg(if self.command_palette_open {
-                                rgba(GLASS_ROW_SELECTED_BG)
-                            } else {
-                                rgba(GLASS_TROUGH_BG)
-                            })
-                            .border_1()
-                            .border_color(if self.command_palette_open {
-                                rgba(BORDER_ACCENT)
-                            } else {
-                                rgba(GLASS_BORDER)
-                            })
-                            .hover(|s| {
-                                s.border_color(if self.command_palette_open {
-                                    rgba(BORDER_ACCENT)
-                                } else {
-                                    rgba(GLASS_BORDER_STRONG)
-                                })
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.open_command_palette(cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(9.0))
-                                    .child(svg_icon(
-                                        IconName::Search,
-                                        14.5,
-                                        if self.command_palette_open {
-                                            rgb(ACCENT)
-                                        } else {
-                                            rgb(TEXT_MUTED)
-                                        },
-                                    ))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .font(ui_sans(FontWeight::NORMAL))
-                                            .text_size(px(13.5))
-                                            .text_color(if query_empty {
-                                                rgb(TEXT_MUTED)
-                                            } else {
-                                                rgb(TEXT_PRIMARY)
-                                            })
-                                            .truncate()
-                                            .child(search_text),
-                                    ),
-                            )
-                            .child(if !query_empty {
-                                div()
-                                    .id("topnav-search-clear")
-                                    .cursor_pointer()
-                                    .p(px(3.0))
-                                    .rounded(px(4.0))
-                                    .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.clear_palette_query(cx);
-                                        }),
-                                    )
-                                    .child(svg_icon(IconName::X, 12.0, rgb(TEXT_MUTED)))
-                                    .into_any_element()
-                            } else {
-                                keycap("Ctrl K").into_any_element()
-                            }),
-                    )
-                    .when_some(
-                        self.update_status
-                            .available_version()
-                            .map(|v| (v.to_owned(), self.update_status.is_ready_to_restart())),
-                        |row, (ver, ready_restart)| {
-                            row.child(
-                                div()
-                                    .id("topnav-update-badge")
-                                    .flex_shrink_0()
-                                    .cursor_pointer()
-                                    .h(px(30.0))
-                                    .px(px(11.0))
-                                    .rounded(px(RADIUS_PILL))
-                                    .bg(rgba(ACCENT_SOFT))
-                                    .border_1()
-                                    .border_color(rgb(ACCENT))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(ACCENT))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            if ready_restart {
-                                                this.restart_into_updated_binary(cx);
-                                            } else {
-                                                this.navigate_tab(SidebarTab::Settings, cx);
-                                            }
-                                        }),
-                                    )
-                                    .child(svg_icon(IconName::RefreshCw, 12.0, rgb(ACCENT)))
-                                    .child(if ready_restart {
-                                        format!("Restart v{ver}")
-                                    } else {
-                                        format!("Update v{ver}")
-                                    }),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .id("topnav-avatar-btn")
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .w(px(34.0))
-                            .h(px(34.0))
-                            .rounded(px(RADIUS_PILL))
-                            .bg(if signed_in_email.is_some() {
-                                rgb(ACCENT)
-                            } else if on_user_tab || self.avatar_menu_open {
-                                rgba(ACCENT_SOFT)
-                            } else {
-                                rgba(GLASS_TROUGH_BG)
-                            })
-                            .border_1()
-                            .border_color(if on_user_tab || self.avatar_menu_open {
-                                rgb(ACCENT)
-                            } else {
-                                rgba(GLASS_BORDER)
-                            })
-                            .hover(|s| s.border_color(rgba(GLASS_BORDER_STRONG)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.command_palette_open = false;
-                                    this.context_menu = None;
-                                    this.avatar_menu_open = !this.avatar_menu_open;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(if let Some(ch) = avatar_initial {
-                                div()
-                                    .font(ui_sans(FontWeight::BOLD))
-                                    .text_size(px(13.0))
-                                    .text_color(rgb(CTA_ON_ACCENT))
-                                    .child(ch)
-                                    .into_any_element()
-                            } else {
-                                svg_icon(
-                                    IconName::User,
-                                    15.0,
-                                    if on_user_tab || self.avatar_menu_open {
-                                        rgb(ACCENT)
-                                    } else {
-                                        rgb(TEXT_SECONDARY)
-                                    },
-                                )
-                                .into_any_element()
-                            }),
-                    )
-                    .when(is_fullscreen, |row| {
-                        row.child(
-                            div()
-                                .id("topnav-btn-exit-fullscreen")
-                                .flex_shrink_0()
-                                .cursor_pointer()
-                                .h(px(34.0))
-                                .px(px(12.0))
-                                .rounded(px(RADIUS_PILL))
-                                .bg(rgba(GLASS_TROUGH_BG))
-                                .border_1()
-                                .border_color(rgba(GLASS_BORDER))
-                                .hover(|s| s.border_color(rgba(GLASS_BORDER_STRONG)))
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .font(ui_sans(FontWeight::MEDIUM))
-                                .text_size(px(12.5))
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                    cx.stop_propagation();
-                                    window.toggle_fullscreen();
-                                })
-                                .child(svg_icon(IconName::Minimize, 13.0, rgb(ACCENT)))
-                                .child("Exit fullscreen"),
-                        )
-                    })
-                    .when_some(csd_controls, |row, controls_el| {
-                        row.child(
-                            div()
-                                .w(px(1.0))
-                                .h(px(18.0))
-                                .flex_shrink_0()
-                                .bg(rgba(GLASS_DIVIDER)),
-                        )
-                        .child(controls_el)
-                    }),
-            )
-    }
-
-    fn render_avatar_menu(&self, is_csd: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let email_opt = self.core.with_model(|m| {
-            m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone())
-        });
-        let active_tab = self.route.active_sidebar_tab();
-
-        div()
-            .id("avatar-menu-backdrop")
-            .absolute()
-            .inset_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.avatar_menu_open = false;
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .id("avatar-menu-popover")
-                    .occlude()
-                    .absolute()
-                    .top(px(60.0))
-                    .right(if is_csd { px(136.0) } else { px(32.0) })
-                    .w(px(244.0))
-                    .p(px(6.0))
-                    .rounded(px(14.0))
-                    .bg(rgba(GLASS_POPOVER_BG))
-                    .border_1()
-                    .border_color(rgba(GLASS_BORDER))
-                    .shadow(glass_capsule_shadow())
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .border_b_1()
-                            .border_color(rgba(GLASS_DIVIDER))
-                            .mb(px(4.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_size(px(13.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .truncate()
-                                    .child(if email_opt.is_some() {
-                                        "Stremio Account"
-                                    } else {
-                                        "Guest Session"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .truncate()
-                                    .child(
-                                        email_opt
-                                            .clone()
-                                            .unwrap_or_else(|| "Sign in to sync library".to_owned()),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        glass_dropdown_option(
-                            "avatar-menu-account",
-                            if email_opt.is_some() {
-                                "Account & sync"
-                            } else {
-                                "Sign in"
-                            },
-                            None,
-                            active_tab == Some(SidebarTab::Account),
-                            cx.listener(|this, _, _, cx| {
-                                this.navigate_tab(SidebarTab::Account, cx);
-                            }),
-                        ),
-                    )
-                    .child(
-                        glass_dropdown_option(
-                            "avatar-menu-addons",
-                            "Addons",
-                            None,
-                            active_tab == Some(SidebarTab::Addons),
-                            cx.listener(|this, _, _, cx| {
-                                this.navigate_tab(SidebarTab::Addons, cx);
-                            }),
-                        ),
-                    )
-                    .child(
-                        glass_dropdown_option(
-                            "avatar-menu-settings",
-                            "Settings",
-                            None,
-                            active_tab == Some(SidebarTab::Settings),
-                            cx.listener(|this, _, _, cx| {
-                                this.navigate_tab(SidebarTab::Settings, cx);
-                            }),
-                        ),
-                    )
-                    .when(email_opt.is_some(), |el| {
-                        el.child(
-                            div()
-                                .id("avatar-menu-logout")
-                                .cursor_pointer()
-                                .mt(px(4.0))
-                                .px(px(12.0))
-                                .py(px(8.0))
-                                .rounded(px(RADIUS_CONTROL))
-                                .hover(|s| s.bg(rgba(0xf871711a)))
-                                .flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .text_size(px(13.0))
-                                .font(ui_sans(FontWeight::MEDIUM))
-                                .text_color(rgb(ACCENT_ROSE))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.avatar_menu_open = false;
-                                        this.core.logout();
-                                        this.push_toast(
-                                            ToastKind::Info,
-                                            "Signed out of Stremio",
-                                            None,
-                                            cx,
-                                        );
-                                    }),
-                                )
-                                .child(svg_icon(IconName::X, 14.0, rgb(ACCENT_ROSE)))
-                                .child("Sign out"),
-                        )
-                    })
-                    .with_animation("avatar-menu-fade", obsidian_fade_in(), |el, delta| {
-                        el.opacity(delta)
-                    }),
-            )
-    }
-
     fn render_browsing_context_menu(
         &self,
         menu: &BrowsingContextMenu,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = active_theme();
+        let accent_ink = if theme.is_light {
+            theme.accent_press
+        } else {
+            theme.accent
+        };
         let menu_w = 248.0_f32;
-        let est_h = 264.0_f32;
+        let est_h = 296.0_f32;
         let x = f32::from(menu.position.x)
             .clamp(12.0, (self.viewport_size_px.0 - menu_w - 12.0).max(12.0));
         let y = f32::from(menu.position.y)
@@ -7075,6 +7341,14 @@ impl AppShell {
             "Resume"
         } else {
             "Play"
+        };
+
+        let peek_target = QuickPeekTarget {
+            type_name: menu.type_name.clone(),
+            id: menu.id.clone(),
+            video_id: menu.video_id.clone(),
+            title: menu.title.to_string(),
+            preview: menu.preview.clone(),
         };
 
         let details_type = menu.type_name.clone();
@@ -7094,6 +7368,8 @@ impl AppShell {
         let rewind_id = menu.id.clone();
         let can_rewind = menu.can_rewind_cw;
 
+        let hover_bg = theme.glass_row_hover_bg;
+        let ui_scale = theme.ui_scale;
         let menu_row = |id: &'static str,
                         icon: IconName,
                         label: &'static str,
@@ -7103,21 +7379,21 @@ impl AppShell {
                 .id(id)
                 .w_full()
                 .cursor_pointer()
-                .px(px(10.0))
-                .py(px(8.0))
+                .px(sp(10.0))
+                .py(sp(8.0))
                 .rounded(px(RADIUS_CONTROL))
-                .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                .hover(move |s| s.bg(rgba(hover_bg)))
                 .flex()
                 .items_center()
-                .gap(px(10.0))
+                .gap(sp(10.0))
                 .font(ui_sans(FontWeight::MEDIUM))
-                .text_size(px(13.0))
+                .text_size(sp(13.0))
                 .text_color(rgb(col))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
                     on_click(ev, window, cx);
                 })
-                .child(svg_icon(icon, 14.0, rgb(col)))
+                .child(svg_icon(icon, 14.0 * ui_scale, rgb(col)))
                 .child(label)
         };
 
@@ -7144,14 +7420,14 @@ impl AppShell {
                     .top(px(y))
                     .child(
                         div()
-                            .px(px(10.0))
-                            .py(px(6.0))
+                            .px(sp(10.0))
+                            .py(sp(6.0))
                             .border_b_1()
-                            .border_color(rgba(GLASS_DIVIDER))
-                            .mb(px(2.0))
+                            .border_color(rgba(theme.glass_divider))
+                            .mb(sp(2.0))
                             .font(ui_sans(FontWeight::SEMIBOLD))
-                            .text_size(px(12.5))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(12.5))
+                            .text_color(rgb(theme.text_primary))
                             .truncate()
                             .child(menu.title.clone()),
                     )
@@ -7159,7 +7435,7 @@ impl AppShell {
                         "ctx-menu-play",
                         IconName::Play,
                         play_label,
-                        ACCENT,
+                        accent_ink,
                         click_handler(cx.listener(move |this, _, _, cx| {
                             this.dismiss_context_menu(cx);
                             this.quick_resume_or_open(
@@ -7171,10 +7447,20 @@ impl AppShell {
                         })),
                     ))
                     .child(menu_row(
+                        "ctx-menu-quick-peek",
+                        IconName::Eye,
+                        "Quick Peek",
+                        theme.text_primary,
+                        click_handler(cx.listener(move |this, _, _, cx| {
+                            this.dismiss_context_menu(cx);
+                            this.open_quick_peek(peek_target.clone(), cx);
+                        })),
+                    ))
+                    .child(menu_row(
                         "ctx-menu-details",
                         IconName::Info,
                         "Open details",
-                        TEXT_PRIMARY,
+                        theme.text_primary,
                         click_handler(cx.listener(move |this, _, _, cx| {
                             this.dismiss_context_menu(cx);
                             this.open_meta_details(
@@ -7194,7 +7480,7 @@ impl AppShell {
                             } else {
                                 "Add to library"
                             },
-                            TEXT_PRIMARY,
+                            theme.text_primary,
                             click_handler(cx.listener(move |this, _, _, cx| {
                                 this.dismiss_context_menu(cx);
                                 if lib_in {
@@ -7235,7 +7521,7 @@ impl AppShell {
                                 "ctx-menu-watched",
                                 IconName::Check,
                                 label,
-                                TEXT_PRIMARY,
+                                theme.text_primary,
                                 click_handler(cx.listener(move |this, _, _, cx| {
                                     this.dismiss_context_menu(cx);
                                     if let Some((video, vid_watched)) = watch_video.clone() {
@@ -7263,7 +7549,7 @@ impl AppShell {
                             "ctx-menu-rewind",
                             IconName::X,
                             "Remove from Continue Watching",
-                            TEXT_SECONDARY,
+                            theme.text_secondary,
                             click_handler(cx.listener(move |this, _, _, cx| {
                                 this.dismiss_context_menu(cx);
                                 this.core.rewind_library_item(rewind_id.clone());
@@ -7283,6 +7569,12 @@ impl AppShell {
     }
 
     fn render_toast_stack(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active_theme();
+        let accent_ink = if theme.is_light {
+            theme.accent_press
+        } else {
+            theme.accent
+        };
         div()
             .absolute()
             .bottom(if self.route.is_player() {
@@ -7295,39 +7587,39 @@ impl AppShell {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(8.0))
+            .gap(sp(8.0))
             .children(self.toasts.iter().map(|toast| {
                 let toast_id = toast.id;
                 let (icon_col, icon) = match toast.kind {
-                    ToastKind::Info => (ACCENT, IconName::Info),
-                    ToastKind::Success => (STATUS_WATCHED, IconName::Check),
-                    ToastKind::Warning => (ACCENT_AMBER, IconName::RefreshCw),
-                    ToastKind::Error => (ACCENT_ROSE, IconName::X),
+                    ToastKind::Info => (accent_ink, IconName::Info),
+                    ToastKind::Success => (theme.status_watched, IconName::Check),
+                    ToastKind::Warning => (theme.accent_amber, IconName::RefreshCw),
+                    ToastKind::Error => (theme.accent_rose, IconName::X),
                 };
                 div()
-                    .px(px(14.0))
-                    .py(px(9.0))
+                    .px(sp(14.0))
+                    .py(sp(9.0))
                     .rounded(px(RADIUS_PILL))
-                    .bg(rgba(GLASS_POPOVER_BG))
+                    .bg(rgba(theme.glass_popover_bg))
                     .border_1()
-                    .border_color(rgba(GLASS_BORDER))
+                    .border_color(rgba(theme.glass_border))
                     .shadow(glass_capsule_shadow())
                     .flex()
                     .items_center()
-                    .gap(px(10.0))
-                    .child(svg_icon(icon, 14.0, rgb(icon_col)))
+                    .gap(sp(10.0))
+                    .child(svg_icon(icon, 14.0 * theme.ui_scale, rgb(icon_col)))
                     .child(
                         div()
                             .font(ui_sans(FontWeight::MEDIUM))
-                            .text_size(px(13.0))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(13.0))
+                            .text_color(rgb(theme.text_primary))
                             .child(toast.title.clone()),
                     )
                     .when_some(toast.detail.clone(), |el, d| {
                         el.child(
                             div()
-                                .text_size(px(12.5))
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_size(sp(12.5))
+                                .text_color(rgb(theme.text_secondary))
                                 .child(d),
                         )
                     })
@@ -7335,10 +7627,10 @@ impl AppShell {
                         div()
                             .id(("toast-dismiss", toast_id as usize))
                             .cursor_pointer()
-                            .w(px(22.0))
-                            .h(px(22.0))
+                            .w(sp(22.0))
+                            .h(sp(22.0))
                             .rounded(px(RADIUS_PILL))
-                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                            .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -7349,7 +7641,11 @@ impl AppShell {
                                     this.dismiss_toast(toast_id, cx);
                                 }),
                             )
-                            .child(svg_icon(IconName::X, 12.0, rgb(TEXT_MUTED))),
+                            .child(svg_icon(
+                                IconName::X,
+                                12.0 * theme.ui_scale,
+                                rgb(theme.text_muted),
+                            )),
                     )
                     .with_animation(
                         ("toast-fade", toast_id as usize),
@@ -7386,33 +7682,38 @@ impl Render for AppShell {
             }
         }
 
+        let theme = active_theme();
         let is_player = self.route.is_player();
+        let is_hero_route = matches!(
+            self.route,
+            AppRoute::Tab(SidebarTab::Home) | AppRoute::MetaDetails { .. }
+        );
         let has_custom_window_controls = should_render_custom_window_controls(
             cfg!(target_os = "windows"),
             window.window_decorations(),
             window.is_fullscreen(),
         );
 
-        if is_player && self.window_blur_active {
-            window.set_background_appearance(WindowBackgroundAppearance::Transparent);
-            self.window_blur_active = false;
-        } else if !is_player && !self.window_blur_active {
-            window.set_background_appearance(WindowBackgroundAppearance::Blurred);
-            self.window_blur_active = true;
+        let target_appearance = if is_player {
+            WindowBackgroundAppearance::Transparent
+        } else if theme.is_light || theme.preset == ThemePreset::PureOled {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            WindowBackgroundAppearance::Blurred
+        };
+        if self.last_window_bg_appearance != target_appearance {
+            window.set_background_appearance(target_appearance);
+            self.last_window_bg_appearance = target_appearance;
+            self.window_blur_active = target_appearance == WindowBackgroundAppearance::Blurred;
         }
 
         let root_bg = if is_player {
             transparent_cutout()
         } else {
-            rgb(BG_OBSIDIAN)
+            rgb(theme.bg_canvas)
         };
 
         let transition_key = SharedString::from(self.route.transition_id());
-        let topnav_el = if !is_player {
-            Some(self.render_topnav_bar(window, cx))
-        } else {
-            None
-        };
         let resize_handles_el = Self::render_csd_resize_handles(window);
 
         let active_content = match self.route.clone() {
@@ -7443,6 +7744,49 @@ impl Render for AppShell {
                 .into_any_element(),
         };
 
+        let ambient_layer = if !is_player && theme.ambient_bleed {
+            self.sync_ambient_backdrop_for_render();
+            self.ambient_hero_backdrop_url
+                .as_deref()
+                .and_then(|u| self.poster_cache.resolve_ambient_bleed(u))
+                .map(|tex| {
+                    let bleed_opacity = if theme.is_light { 0.16 } else { 0.21 };
+                    let top_fade = (theme.bg_canvas << 8) | 0x26;
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(460.0))
+                        .overflow_hidden()
+                        .child(
+                            img(tex)
+                                .size_full()
+                                .absolute()
+                                .inset_0()
+                                .object_fit(ObjectFit::Cover)
+                                .opacity(bleed_opacity),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .bg(linear_gradient(
+                                    180.0,
+                                    linear_color_stop(rgba(top_fade), 0.0),
+                                    linear_color_stop(rgb(theme.bg_canvas), 1.0),
+                                )),
+                        )
+                })
+        } else {
+            None
+        };
+
+        let topnav_el = (!is_player).then(|| self.render_floating_topnav(window, cx));
+        let quick_peek_el = (!is_player)
+            .then(|| self.render_quick_peek_drawer(cx))
+            .flatten();
+
         div()
             .id("ferrite-root")
             .track_focus(&self.focus_handle)
@@ -7465,11 +7809,11 @@ impl Render for AppShell {
             .size_full()
             .bg(root_bg)
             .font(ui_sans(FontWeight::NORMAL))
-            .text_color(rgb(TEXT_PRIMARY))
+            .text_color(rgb(theme.text_primary))
             .relative()
             .flex()
             .flex_col()
-            .when_some(topnav_el, |el, bar| el.child(bar))
+            .when_some(ambient_layer, |el, bleed| el.child(bleed))
             .child(
                 div()
                     .flex_1()
@@ -7485,13 +7829,24 @@ impl Render for AppShell {
                             .flex()
                             .flex_col()
                             .min_h(px(0.0))
-                            .child(active_content)
+                            .when(!is_hero_route, |el| el.pt(sp(76.0)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .w_full()
+                                    .min_h(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .child(active_content),
+                            )
                             .with_animation(transition_key, obsidian_fade_in(), |el, delta| {
                                 el.opacity(delta)
                             })
                             .into_any_element()
                     }),
             )
+            .when_some(topnav_el, |el, bar| el.child(bar))
+            .when_some(quick_peek_el, |el, drawer| el.child(drawer))
             .when(self.command_palette_open, |el| {
                 el.child(self.render_command_palette(cx))
             })
@@ -7947,8 +8302,177 @@ fn should_render_custom_window_controls(
 /// and cannot restore a maximized window, whereas `gpui_windows`'s `WM_NCLBUTTONUP` handler
 /// for `HTMAXBUTTON` properly toggles `SW_NORMAL`/`SW_MAXIMIZE` and `WM_NCHITTEST` returning
 /// `HTMAXBUTTON` enables Windows 11 Snap Layouts.
-fn uses_native_windows_nc_chrome(is_windows: bool) -> bool {
+pub(crate) fn uses_native_windows_nc_chrome(is_windows: bool) -> bool {
     is_windows
+}
+
+const P2P_WATCHDOG_POLL_SECS: u64 = 15;
+const P2P_WATCHDOG_HARD_CAP_SECS: u64 = 75;
+const P2P_WATCHDOG_ACTIVE_SPEED_BPS: f64 = 1024.0;
+
+#[derive(Debug, PartialEq, Eq)]
+enum P2pWatchdogDecision {
+    Continue {
+        next_prev_fetched: u64,
+        next_stalled_ticks: u8,
+        sleep_secs: u64,
+    },
+    Failover {
+        reason: String,
+    },
+}
+
+fn evaluate_p2p_watchdog_tick(
+    snapshot: Option<(u64, u32, f64)>,
+    elapsed_secs: u64,
+    prev_fetched: u64,
+    stalled_ticks: u8,
+) -> P2pWatchdogDecision {
+    let Some((fetched_bytes, live_peers, speed_bps)) = snapshot else {
+        return P2pWatchdogDecision::Failover {
+            reason: format!("No video frames within {elapsed_secs}s"),
+        };
+    };
+
+    if live_peers == 0 && fetched_bytes == 0 {
+        return P2pWatchdogDecision::Failover {
+            reason: format!("Dead swarm: 0 peers after {elapsed_secs}s"),
+        };
+    }
+
+    if elapsed_secs >= P2P_WATCHDOG_HARD_CAP_SECS {
+        return P2pWatchdogDecision::Failover {
+            reason: format!("No video frames within {elapsed_secs}s"),
+        };
+    }
+
+    if fetched_bytes > prev_fetched || speed_bps >= P2P_WATCHDOG_ACTIVE_SPEED_BPS {
+        return P2pWatchdogDecision::Continue {
+            next_prev_fetched: fetched_bytes,
+            next_stalled_ticks: 0,
+            sleep_secs: P2P_WATCHDOG_POLL_SECS,
+        };
+    }
+
+    if live_peers > 0 && stalled_ticks == 0 {
+        return P2pWatchdogDecision::Continue {
+            next_prev_fetched: fetched_bytes,
+            next_stalled_ticks: 1,
+            sleep_secs: P2P_WATCHDOG_POLL_SECS,
+        };
+    }
+
+    if live_peers == 0 {
+        P2pWatchdogDecision::Failover {
+            reason: format!("Dead swarm: 0 peers after {elapsed_secs}s"),
+        }
+    } else {
+        P2pWatchdogDecision::Failover {
+            reason: format!(
+                "Swarm stalled ({live_peers} peers, no new bytes) after {elapsed_secs}s"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod p2p_watchdog_tests {
+    use super::{evaluate_p2p_watchdog_tick, P2pWatchdogDecision};
+
+    #[test]
+    fn dead_swarm_zero_peers_zero_bytes_fails_over_immediately() {
+        assert_eq!(
+            evaluate_p2p_watchdog_tick(Some((0, 0, 0.0)), 18, 0, 0),
+            P2pWatchdogDecision::Failover {
+                reason: "Dead swarm: 0 peers after 18s".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn active_swarm_extends_with_15s_polls_until_hard_cap() {
+        assert_eq!(
+            evaluate_p2p_watchdog_tick(Some((1_048_576, 12, 256_000.0)), 18, 0, 0),
+            P2pWatchdogDecision::Continue {
+                next_prev_fetched: 1_048_576,
+                next_stalled_ticks: 0,
+                sleep_secs: 15,
+            }
+        );
+        assert_eq!(
+            evaluate_p2p_watchdog_tick(Some((1_048_576, 12, 2_048.0)), 33, 1_048_576, 1),
+            P2pWatchdogDecision::Continue {
+                next_prev_fetched: 1_048_576,
+                next_stalled_ticks: 0,
+                sleep_secs: 15,
+            }
+        );
+        assert_eq!(
+            evaluate_p2p_watchdog_tick(Some((8_388_608, 12, 512_000.0)), 78, 4_194_304, 0),
+            P2pWatchdogDecision::Failover {
+                reason: "No video frames within 78s".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn unchoking_peers_get_one_grace_tick_then_failover_on_second_stall() {
+        assert_eq!(
+            evaluate_p2p_watchdog_tick(Some((0, 6, 0.0)), 18, 0, 0),
+            P2pWatchdogDecision::Continue {
+                next_prev_fetched: 0,
+                next_stalled_ticks: 1,
+                sleep_secs: 15,
+            }
+        );
+        assert_eq!(
+            evaluate_p2p_watchdog_tick(Some((0, 6, 0.0)), 33, 0, 1),
+            P2pWatchdogDecision::Failover {
+                reason: "Swarm stalled (6 peers, no new bytes) after 33s".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_snapshot_fails_over_at_elapsed_time() {
+        assert_eq!(
+            evaluate_p2p_watchdog_tick(None, 18, 0, 0),
+            P2pWatchdogDecision::Failover {
+                reason: "No video frames within 18s".to_owned(),
+            }
+        );
+    }
+}
+
+pub fn should_hot_swap_to_online(
+    embedded_quality: EmbeddedSubtitleQuality,
+    top_online: &FetchedNativeSubtitle,
+    search_mode: SubtitleSearchMode,
+    force_rematch: bool,
+    user_picked_subtitle: bool,
+    is_live_placeholder_rescue: bool,
+    aligned_to_reference: bool,
+) -> bool {
+    if user_picked_subtitle && !force_rematch {
+        return false;
+    }
+    if force_rematch {
+        return true;
+    }
+    if search_mode == SubtitleSearchMode::ForcedOnly {
+        return top_online.forced
+            && (top_online.match_tier.is_compatible_sync() || aligned_to_reference);
+    }
+    match embedded_quality {
+        EmbeddedSubtitleQuality::None | EmbeddedSubtitleQuality::ForcedOnly { .. } => true,
+        EmbeddedSubtitleQuality::UsableFull { .. } => {
+            is_live_placeholder_rescue
+                && (top_online.match_tier.is_trusted_sync() || aligned_to_reference)
+                && top_online.content_profile.foreign_placeholder_count == 0
+                && top_online.content_profile.foreign_status
+                    != ForeignTranslationStatus::MissingForeign
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8011,5 +8535,364 @@ mod window_chrome_tests {
     fn native_windows_nc_chrome_is_windows_only() {
         assert!(uses_native_windows_nc_chrome(true));
         assert!(!uses_native_windows_nc_chrome(false));
+    }
+}
+
+#[cfg(test)]
+mod subtitle_upgrade_tests {
+    use std::path::PathBuf;
+
+    use stremio_core_runtime::{
+        EmbeddedSubtitleQuality, FetchedNativeSubtitle, ForeignTranslationStatus,
+        SubtitleContentProfile, SubtitleMatchTier, SubtitleSearchMode,
+    };
+
+    use super::should_hot_swap_to_online;
+
+    fn online_sub(
+        tier: SubtitleMatchTier,
+        hi: bool,
+        forced: bool,
+        foreign_status: ForeignTranslationStatus,
+        placeholder_count: usize,
+    ) -> FetchedNativeSubtitle {
+        FetchedNativeSubtitle {
+            provider: "OpenSubtitles".to_owned(),
+            lang: "eng".to_owned(),
+            title: "Sub".to_owned(),
+            release_name: "Show.S01E01.BluRay".to_owned(),
+            match_tier: tier,
+            score: 4_000_000,
+            local_path: PathBuf::from("/tmp/sub.srt"),
+            lookup_elapsed_ms: 120,
+            hearing_impaired: hi,
+            forced,
+            content_profile: SubtitleContentProfile {
+                cue_count: 500,
+                span_ms: 3_000_000,
+                foreign_placeholder_count: placeholder_count,
+                sdh_cue_count: 0,
+                sdh_ratio_pct: if hi { 30 } else { 0 },
+                foreign_status,
+            },
+        }
+    }
+
+    #[test]
+    fn respects_user_manual_pick_unless_force_rematch() {
+        let translated = online_sub(
+            SubtitleMatchTier::ExactHash,
+            false,
+            false,
+            ForeignTranslationStatus::Translated,
+            0,
+        );
+        assert!(!should_hot_swap_to_online(
+            EmbeddedSubtitleQuality::None,
+            &translated,
+            SubtitleSearchMode::Full,
+            false,
+            true,
+            false,
+            false,
+        ));
+        assert!(should_hot_swap_to_online(
+            EmbeddedSubtitleQuality::None,
+            &translated,
+            SubtitleSearchMode::Full,
+            true,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn usable_embedded_never_replaced_on_normal_load() {
+        let exact_translated = online_sub(
+            SubtitleMatchTier::ExactHash,
+            false,
+            false,
+            ForeignTranslationStatus::Translated,
+            0,
+        );
+        let fallback_translated = online_sub(
+            SubtitleMatchTier::Fallback,
+            false,
+            false,
+            ForeignTranslationStatus::Translated,
+            0,
+        );
+
+        let embedded_variants = [
+            // Clean SRT/ASS embedded track
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 1,
+                full_is_text: true,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: false,
+            },
+            // Blu-ray PGS embedded track
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 2,
+                full_is_text: false,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: false,
+            },
+            // Embedded SDH text track
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 3,
+                full_is_text: true,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: true,
+            },
+            // Embedded SDH Blu-ray PGS track
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 4,
+                full_is_text: false,
+                forced_id: Some(5),
+                forced_is_text: false,
+                is_sdh: true,
+            },
+        ];
+
+        for quality in embedded_variants {
+            assert!(!should_hot_swap_to_online(
+                quality,
+                &exact_translated,
+                SubtitleSearchMode::Full,
+                false,
+                false,
+                false,
+                true,
+            ));
+            assert!(!should_hot_swap_to_online(
+                quality,
+                &fallback_translated,
+                SubtitleSearchMode::Full,
+                false,
+                false,
+                false,
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn live_placeholder_rescue_enforces_strict_sync_and_clean_content() {
+        let usable = EmbeddedSubtitleQuality::UsableFull {
+            full_id: 1,
+            full_is_text: true,
+            forced_id: None,
+            forced_is_text: false,
+            is_sdh: false,
+        };
+
+        // Unaligned off-sync or merely cut-compatible tiers are REJECTED
+        for tier in [
+            SubtitleMatchTier::Fallback,
+            SubtitleMatchTier::Conflicting,
+            SubtitleMatchTier::CompatibleCut,
+            SubtitleMatchTier::SameServiceAndCut,
+        ] {
+            let sub = online_sub(tier, false, false, ForeignTranslationStatus::Translated, 0);
+            assert!(
+                !should_hot_swap_to_online(
+                    usable,
+                    &sub,
+                    SubtitleSearchMode::Full,
+                    false,
+                    false,
+                    true,
+                    false,
+                ),
+                "unaligned {tier:?} should be rejected during live rescue"
+            );
+        }
+
+        // ExactHash, ExactRelease, or reference-aligned clean tracks are ACCEPTED
+        for (tier, aligned) in [
+            (SubtitleMatchTier::ExactHash, false),
+            (SubtitleMatchTier::ExactRelease, false),
+            (SubtitleMatchTier::CompatibleCut, true),
+            (SubtitleMatchTier::Fallback, true),
+        ] {
+            let clean_translated =
+                online_sub(tier, false, false, ForeignTranslationStatus::Translated, 0);
+            assert!(
+                should_hot_swap_to_online(
+                    usable,
+                    &clean_translated,
+                    SubtitleSearchMode::Full,
+                    false,
+                    false,
+                    true,
+                    aligned,
+                ),
+                "{tier:?} (aligned={aligned}) clean track should be accepted during live rescue"
+            );
+        }
+
+        // Tracks with MissingForeign or placeholder_count > 0 are REJECTED even if ExactHash/aligned
+        let missing_foreign = online_sub(
+            SubtitleMatchTier::ExactHash,
+            false,
+            false,
+            ForeignTranslationStatus::MissingForeign,
+            1,
+        );
+        assert!(!should_hot_swap_to_online(
+            usable,
+            &missing_foreign,
+            SubtitleSearchMode::Full,
+            false,
+            false,
+            true,
+            true,
+        ));
+
+        let with_placeholders = online_sub(
+            SubtitleMatchTier::ExactHash,
+            false,
+            false,
+            ForeignTranslationStatus::Unknown,
+            2,
+        );
+        assert!(!should_hot_swap_to_online(
+            usable,
+            &with_placeholders,
+            SubtitleSearchMode::Full,
+            false,
+            false,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn forced_only_mode_requires_forced_flag_and_compatible_or_aligned_sync() {
+        let non_forced = online_sub(
+            SubtitleMatchTier::ExactHash,
+            false,
+            false,
+            ForeignTranslationStatus::Unknown,
+            0,
+        );
+        let forced_compatible = online_sub(
+            SubtitleMatchTier::CompatibleCut,
+            false,
+            true,
+            ForeignTranslationStatus::Unknown,
+            0,
+        );
+        let forced_fallback = online_sub(
+            SubtitleMatchTier::Fallback,
+            false,
+            true,
+            ForeignTranslationStatus::Unknown,
+            0,
+        );
+        let forced_conflicting = online_sub(
+            SubtitleMatchTier::Conflicting,
+            false,
+            true,
+            ForeignTranslationStatus::Unknown,
+            0,
+        );
+
+        assert!(!should_hot_swap_to_online(
+            EmbeddedSubtitleQuality::None,
+            &non_forced,
+            SubtitleSearchMode::ForcedOnly,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(should_hot_swap_to_online(
+            EmbeddedSubtitleQuality::None,
+            &forced_compatible,
+            SubtitleSearchMode::ForcedOnly,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!should_hot_swap_to_online(
+            EmbeddedSubtitleQuality::None,
+            &forced_fallback,
+            SubtitleSearchMode::ForcedOnly,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!should_hot_swap_to_online(
+            EmbeddedSubtitleQuality::None,
+            &forced_conflicting,
+            SubtitleSearchMode::ForcedOnly,
+            false,
+            false,
+            false,
+            false,
+        ));
+        // Aligned forced track is accepted even from Fallback tier
+        assert!(should_hot_swap_to_online(
+            EmbeddedSubtitleQuality::None,
+            &forced_fallback,
+            SubtitleSearchMode::ForcedOnly,
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn none_or_forced_only_embedded_selects_online_full_track() {
+        let fallback_full = online_sub(
+            SubtitleMatchTier::Fallback,
+            false,
+            false,
+            ForeignTranslationStatus::Unknown,
+            0,
+        );
+        let conflicting_full = online_sub(
+            SubtitleMatchTier::Conflicting,
+            false,
+            false,
+            ForeignTranslationStatus::Unknown,
+            0,
+        );
+
+        for quality in [
+            EmbeddedSubtitleQuality::None,
+            EmbeddedSubtitleQuality::ForcedOnly {
+                forced_id: 1,
+                forced_is_text: true,
+            },
+        ] {
+            assert!(should_hot_swap_to_online(
+                quality,
+                &fallback_full,
+                SubtitleSearchMode::Full,
+                false,
+                false,
+                false,
+                false,
+            ));
+            assert!(should_hot_swap_to_online(
+                quality,
+                &conflicting_full,
+                SubtitleSearchMode::Full,
+                false,
+                false,
+                false,
+                false,
+            ));
+        }
     }
 }

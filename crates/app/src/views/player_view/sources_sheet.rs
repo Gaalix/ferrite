@@ -3,23 +3,20 @@ use std::sync::Arc;
 use gpui::{div, prelude::*, px, rgb, rgba, Context, FontWeight, MouseButton};
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{PlayerPopover, StreamResolutionChoice, STREAM_PAGE_SIZE},
     theme::{
         compact_audio_badge, compact_codec_badge, compact_hdr_badge, estimate_bitrate_mbps,
-        mono_font, summarize_stream_for_humans, tabular_nums, ui_sans, ACCENT, TEXT_MUTED,
-        TEXT_PRIMARY, TEXT_SECONDARY,
+        mono_font, summarize_stream_for_humans, tabular_nums, ui_sans,
     },
 };
 
-use super::components::{
-    player_sheet_card, segmented_item, segmented_trough, ROW_HOVER_BG, ROW_SELECTED_BG,
-    SHEET_DIVIDER, TROUGH_BG,
-};
+use super::components::{player_hud_palette, player_sheet_card, segmented_item, segmented_trough};
 
 impl AppShell {
     pub(super) fn render_switch_stream_drawer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = player_hud_palette();
         let Some((active_idx, list_arc)) = self
             .playback_session
             .as_ref()
@@ -51,7 +48,7 @@ impl AppShell {
                     .px(px(20.0))
                     .py(px(15.0))
                     .border_b_1()
-                    .border_color(rgba(SHEET_DIVIDER))
+                    .border_color(rgba(t.glass_divider))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -71,7 +68,7 @@ impl AppShell {
                                         div()
                                             .font(ui_sans(FontWeight::SEMIBOLD))
                                             .text_size(px(15.0))
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .text_color(rgb(t.text_primary))
                                             .child("Sources"),
                                     )
                                     .child(
@@ -79,7 +76,7 @@ impl AppShell {
                                             .font(ui_sans(FontWeight::NORMAL))
                                             .font_features(tabular_nums())
                                             .text_size(px(15.0))
-                                            .text_color(rgb(TEXT_MUTED))
+                                            .text_color(rgb(t.text_muted))
                                             .child(format!("{}", list_arc.len())),
                                     ),
                             )
@@ -87,7 +84,7 @@ impl AppShell {
                                 div()
                                     .font(ui_sans(FontWeight::NORMAL))
                                     .text_size(px(12.0))
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(rgb(t.text_muted))
                                     .child("Switching keeps your place"),
                             ),
                     )
@@ -102,7 +99,7 @@ impl AppShell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+                            .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -110,7 +107,12 @@ impl AppShell {
                                     this.toggle_player_popover(PlayerPopover::SwitchStream, cx);
                                 }),
                             )
-                            .child(svg_icon(IconName::X, 15.0, rgb(TEXT_SECONDARY))),
+                            .child(svg_icon_weighted(
+                                IconName::X,
+                                IconWeight::Regular,
+                                15.0,
+                                rgb(t.text_secondary),
+                            )),
                     ),
             )
             .child(
@@ -188,7 +190,7 @@ impl AppShell {
                                         .py(px(16.0))
                                         .font(ui_sans(FontWeight::NORMAL))
                                         .text_size(px(12.5))
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(t.text_muted))
                                         .child("No sources available"),
                                 )
                             })
@@ -230,18 +232,18 @@ impl AppShell {
                                     .py(px(11.0))
                                     .rounded(px(12.0))
                                     .bg(if is_current {
-                                        rgba(ROW_SELECTED_BG)
+                                        rgba(t.accent_soft)
                                     } else {
                                         rgba(0x00000000)
                                     })
                                     .border_1()
                                     .border_color(if is_current {
-                                        rgba(0xFFFFFF12)
+                                        rgba(t.border_accent)
                                     } else {
                                         rgba(0x00000000)
                                     })
                                     .when(!is_current, |row| {
-                                        row.hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+                                        row.hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                                     })
                                     .flex()
                                     .items_center()
@@ -265,7 +267,7 @@ impl AppShell {
                                                 div()
                                                     .font(ui_sans(FontWeight::SEMIBOLD))
                                                     .text_size(px(13.5))
-                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .text_color(rgb(t.text_primary))
                                                     .truncate()
                                                     .child(line1),
                                             )
@@ -274,7 +276,7 @@ impl AppShell {
                                                     .font(ui_sans(FontWeight::NORMAL))
                                                     .font_features(tabular_nums())
                                                     .text_size(px(12.0))
-                                                    .text_color(rgb(TEXT_SECONDARY))
+                                                    .text_color(rgb(t.text_secondary))
                                                     .truncate()
                                                     .child(line2),
                                             )
@@ -283,22 +285,19 @@ impl AppShell {
                                                     div()
                                                         .font(mono_font())
                                                         .text_size(px(11.5))
-                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .text_color(rgb(t.text_muted))
                                                         .truncate()
                                                         .child(release_title),
                                                 )
                                             }),
                                     )
                                     .when(is_current, |row| {
-                                        row.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .child(svg_icon(
-                                                    IconName::Check,
-                                                    15.0,
-                                                    rgb(ACCENT),
-                                                )),
-                                        )
+                                        row.child(div().flex_shrink_0().child(svg_icon_weighted(
+                                            IconName::Check,
+                                            IconWeight::Fill,
+                                            15.0,
+                                            rgb(t.accent),
+                                        )))
                                     })
                             }))
                             .when(remaining > 0, |drawer| {
@@ -312,16 +311,16 @@ impl AppShell {
                                         .h(px(36.0))
                                         .px(px(14.0))
                                         .rounded(px(10.0))
-                                        .bg(rgba(TROUGH_BG))
+                                        .bg(rgba(t.glass_trough_bg))
                                         .border_1()
-                                        .border_color(rgba(0xFFFFFF12))
-                                        .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+                                        .border_color(rgba(t.glass_border))
+                                        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                                         .flex()
                                         .items_center()
                                         .justify_between()
                                         .font(ui_sans(FontWeight::MEDIUM))
                                         .text_size(px(12.5))
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_color(rgb(t.text_primary))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -340,7 +339,7 @@ impl AppShell {
                                                 .font(ui_sans(FontWeight::NORMAL))
                                                 .font_features(tabular_nums())
                                                 .text_size(px(12.0))
-                                                .text_color(rgb(TEXT_MUTED))
+                                                .text_color(rgb(t.text_muted))
                                                 .child(format!("{remaining} remaining")),
                                         ),
                                 )

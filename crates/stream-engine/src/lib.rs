@@ -668,6 +668,52 @@ impl EngineInner {
         info_hash: [u8; 20],
         extra_trackers: Vec<String>,
     ) -> Result<Arc<ManagedTorrent>, routes::ApiHttpError> {
+        self.ensure_torrent_resolved_with_file_idx(info_hash, extra_trackers, None)
+            .await
+    }
+
+    async fn add_torrent_with_only_files_fallback(
+        &self,
+        info_hash: &[u8; 20],
+        out_folder: &Path,
+        trackers: &[String],
+        paused: bool,
+        initial_file_idx: Option<usize>,
+        make_add: impl Fn() -> AddTorrent<'static>,
+    ) -> Result<librqbit::AddTorrentResponse, String> {
+        let initial_only_files = initial_file_idx.map(|i| vec![i]);
+        let opts = make_resolve_add_opts(
+            out_folder,
+            trackers.to_vec(),
+            paused,
+            initial_only_files.clone(),
+        );
+        match self.session.add_torrent(make_add(), Some(opts)).await {
+            Ok(resp) => Ok(resp),
+            Err(err) if initial_only_files.is_some() => {
+                warn!(
+                    info_hash = %hex::encode(info_hash),
+                    ?initial_file_idx,
+                    error = %format!("{err:#}"),
+                    "add_torrent with initial only_files failed; retrying without only_files"
+                );
+                let fallback_opts =
+                    make_resolve_add_opts(out_folder, trackers.to_vec(), paused, None);
+                self.session
+                    .add_torrent(make_add(), Some(fallback_opts))
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            }
+            Err(err) => Err(format!("{err:#}")),
+        }
+    }
+
+    pub async fn ensure_torrent_resolved_with_file_idx(
+        &self,
+        info_hash: [u8; 20],
+        extra_trackers: Vec<String>,
+        initial_file_idx: Option<usize>,
+    ) -> Result<Arc<ManagedTorrent>, routes::ApiHttpError> {
         let entry = self.get_or_insert_magnet_entry(info_hash, extra_trackers);
         if let Some(existing) = self.get_managed_torrent(&info_hash) {
             return self.wait_handle_initialized(info_hash, existing).await;
@@ -702,31 +748,31 @@ impl EngineInner {
                 if let Ok(raw_bytes) = tokio::fs::read(&backup_torrent_path).await {
                     if !raw_bytes.is_empty() {
                         self.restore_torrent_bitv_if_needed(&info_hash).await;
-                        let warm_opts = AddTorrentOptions {
-                            paused: true,
-                            overwrite: true,
-                            output_folder: Some(out_folder.to_string_lossy().into_owned()),
-                            trackers: Some(trackers.clone()),
-                            peer_opts: Some(default_peer_connection_opts()),
-                            force_tracker_interval: Some(DEFAULT_TRACKER_REANNOUNCE_INTERVAL),
-                            peer_limit: Some(DEFAULT_PEER_LIMIT),
-                            ..Default::default()
-                        };
+                        let raw_bytes = bytes::Bytes::from(raw_bytes);
                         if let Ok(resp) = self
-                            .session
-                            .add_torrent(AddTorrent::from_bytes(raw_bytes), Some(warm_opts))
+                            .add_torrent_with_only_files_fallback(
+                                &info_hash,
+                                &out_folder,
+                                &trackers,
+                                true,
+                                initial_file_idx,
+                                || AddTorrent::from_bytes(raw_bytes.clone()),
+                            )
                             .await
                         {
                             if let Some(handle) = resp.into_handle() {
                                 let _ = handle.wait_until_initialized().await;
                                 let stats = handle.stats();
+                                let tracked_idx = self.scheduler.selected_file(&info_hash).or_else(
+                                    || handle.only_files().and_then(|of| of.first().copied()),
+                                );
                                 self.cache_tracker.record_or_touch(
                                     info_hash,
                                     loc,
                                     out_folder,
                                     handle.name(),
                                     stats.progress_bytes,
-                                    self.scheduler.selected_file(&info_hash),
+                                    tracked_idx,
                                 );
                                 self.cache_tracker.persist_disk_lru_index().await;
                                 debug!(
@@ -741,19 +787,15 @@ impl EngineInner {
             }
 
             let magnet_uri = build_magnet_with_trackers(&info_hash, &trackers);
-            let opts = AddTorrentOptions {
-                overwrite: true,
-                output_folder: Some(out_folder.to_string_lossy().into_owned()),
-                trackers: Some(trackers),
-                peer_opts: Some(default_peer_connection_opts()),
-                force_tracker_interval: Some(DEFAULT_TRACKER_REANNOUNCE_INTERVAL),
-                peer_limit: Some(DEFAULT_PEER_LIMIT),
-                ..Default::default()
-            };
-
             let response = self
-                .session
-                .add_torrent(AddTorrent::from_url(magnet_uri), Some(opts))
+                .add_torrent_with_only_files_fallback(
+                    &info_hash,
+                    &out_folder,
+                    &trackers,
+                    false,
+                    initial_file_idx,
+                    || AddTorrent::from_url(magnet_uri.clone()),
+                )
                 .await
                 .map_err(|e| {
                     routes::ApiHttpError::bad_gateway(format!(
@@ -772,13 +814,14 @@ impl EngineInner {
                 .map_err(|e| map_torrent_init_err(&info_hash, e))?;
 
             let stats = handle.stats();
+            let tracked_idx = handle.only_files().and_then(|of| of.first().copied());
             self.cache_tracker.record_or_touch(
                 info_hash,
                 loc,
                 out_folder,
                 handle.name(),
                 stats.progress_bytes,
-                None,
+                tracked_idx,
             );
             self.persist_torrent_metadata_backup(&info_hash, &handle)
                 .await;
@@ -1385,6 +1428,21 @@ impl EngineInner {
         }
     }
 
+    /// Returns `(fetched_bytes, live_peers, download_speed_bps)` for a specific torrent if managed.
+    pub fn torrent_progress_snapshot(&self, info_hash: &[u8; 20]) -> Option<(u64, u32, f64)> {
+        let handle = self.get_managed_torrent(info_hash)?;
+        let stats = handle.stats();
+        if let Some(ref live) = stats.live {
+            Some((
+                live.snapshot.fetched_bytes,
+                live.snapshot.peer_stats.live,
+                live.download_speed.mbps * 1024.0 * 1024.0,
+            ))
+        } else {
+            Some((stats.progress_bytes, 0, 0.0))
+        }
+    }
+
     pub fn build_statistics(
         &self,
         info_hash: &[u8; 20],
@@ -1605,6 +1663,25 @@ impl EngineInner {
             swarm_paused: paused,
             swarm_size,
         })
+    }
+}
+
+fn make_resolve_add_opts(
+    out_folder: &Path,
+    trackers: Vec<String>,
+    paused: bool,
+    only_files: Option<Vec<usize>>,
+) -> AddTorrentOptions {
+    AddTorrentOptions {
+        paused,
+        overwrite: true,
+        output_folder: Some(out_folder.to_string_lossy().into_owned()),
+        trackers: Some(trackers),
+        peer_opts: Some(default_peer_connection_opts()),
+        force_tracker_interval: Some(DEFAULT_TRACKER_REANNOUNCE_INTERVAL),
+        peer_limit: Some(DEFAULT_PEER_LIMIT),
+        only_files,
+        ..Default::default()
     }
 }
 
@@ -2048,7 +2125,7 @@ impl StreamEngineHandle {
         let normalized_trackers = routes::extract_trackers_from_sources(&trackers);
         let handle = self
             .inner
-            .ensure_torrent_resolved(info_hash, normalized_trackers)
+            .ensure_torrent_resolved_with_file_idx(info_hash, normalized_trackers, file_idx)
             .await
             .map_err(|e| {
                 if e.status == axum::http::StatusCode::GATEWAY_TIMEOUT {
@@ -2146,6 +2223,11 @@ impl StreamEngineHandle {
     pub fn torrent_stats(&self, info_hash: &str, file_idx: Option<usize>) -> Option<Statistics> {
         let parsed = validate_info_hash_str(info_hash).ok()?;
         self.inner.build_statistics(&parsed, file_idx)
+    }
+
+    /// Returns `(fetched_bytes, live_peers, download_speed_bps)` for a specific torrent if managed.
+    pub fn torrent_progress_snapshot(&self, info_hash: &[u8; 20]) -> Option<(u64, u32, f64)> {
+        self.inner.torrent_progress_snapshot(info_hash)
     }
 
     pub fn active_torrents(&self) -> Vec<Statistics> {
@@ -2397,5 +2479,125 @@ mod tests {
             ram_opts.dht.expect("DHT enabled").persistence.is_none(),
             "RamOnly mode must not persist DHT state to disk"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_torrent_resolved_with_file_idx_and_progress_snapshot() {
+        use librqbit::CreateTorrentOptions;
+        use tempfile::TempDir;
+
+        let seed_dir = TempDir::new().unwrap();
+        let pack_dir = seed_dir.path().join("PackTwoFiles");
+        tokio::fs::create_dir_all(&pack_dir).await.unwrap();
+        tokio::fs::write(pack_dir.join("01_ep1.mkv"), vec![0x11u8; 64 * 1024])
+            .await
+            .unwrap();
+        tokio::fs::write(pack_dir.join("02_ep2.mkv"), vec![0x22u8; 64 * 1024])
+            .await
+            .unwrap();
+
+        let seeder = Session::new_with_opts(
+            seed_dir.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(ListenerOptions {
+                    mode: ListenerMode::TcpOnly,
+                    listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                    enable_upnp_port_forwarding: false,
+                    ipv4_only: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let seeder_addr = seeder.listen_addr().unwrap();
+        let (created_meta, _seed_handle) = seeder
+            .create_and_serve_torrent(
+                &pack_dir,
+                CreateTorrentOptions {
+                    name: Some("PackTwoFiles"),
+                    piece_length: Some(32 * 1024),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let torrent_bytes = created_meta.as_bytes().unwrap().to_vec();
+
+        let cache_dir = TempDir::new().unwrap();
+        let mut cfg = StreamEngineConfig::for_testing(cache_dir.path().to_path_buf());
+        cfg.storage_mode = StorageMode::disk_lru(50 * 1024 * 1024);
+        cfg.extra_trackers = Vec::new();
+        let engine = StreamEngine::start(cfg).await.unwrap();
+
+        let ih = engine
+            .add_torrent_bytes(torrent_bytes, vec![], Some(vec![seeder_addr]))
+            .await
+            .unwrap()
+            .as_array();
+        let handle = engine.inner.get_managed_torrent(&ih).unwrap();
+        engine
+            .inner
+            .activate_and_touch_episode(&handle, ih, 1)
+            .await
+            .unwrap();
+
+        // Wait briefly for the local seeder to transfer ep2 pieces before hibernating.
+        for _ in 0..100 {
+            if engine
+                .torrent_progress_snapshot(&ih)
+                .is_some_and(|(fetched, _, _)| fetched >= 64 * 1024)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (fetched_live, _, speed_live) = engine
+            .torrent_progress_snapshot(&ih)
+            .expect("live torrent snapshot");
+        assert!(fetched_live > 0);
+        assert!(speed_live >= 0.0);
+
+        engine.release_playback_sessions().await;
+        seeder.cancellation_token().cancel();
+        assert_eq!(engine.torrent_progress_snapshot(&ih), None);
+
+        // Valid initial_file_idx (1) isolates only_files from second 0.
+        let h_isolated = engine
+            .inner
+            .ensure_torrent_resolved_with_file_idx(ih, vec![], Some(1))
+            .await
+            .unwrap_or_else(|e| panic!("resolved failed: {}", e.message));
+        assert_eq!(h_isolated.only_files(), Some(vec![1]));
+        let (prog_paused, peers_paused, speed_paused) = engine
+            .torrent_progress_snapshot(&ih)
+            .expect("warm-restored torrent snapshot");
+        assert!(prog_paused > 0);
+        assert_eq!(peers_paused, 0);
+        assert_eq!(speed_paused, 0.0);
+
+        // Out-of-range initial_file_idx (99) falls back safely without only_files.
+        engine.release_playback_sessions().await;
+        let h_fallback = engine
+            .inner
+            .ensure_torrent_resolved_with_file_idx(ih, vec![], Some(99))
+            .await
+            .unwrap_or_else(|e| panic!("fallback resolve failed: {}", e.message));
+        assert_eq!(h_fallback.only_files(), None);
+
+        // 2-arg wrapper delegates initial_file_idx = None.
+        engine.release_playback_sessions().await;
+        let h_default = engine
+            .inner
+            .ensure_torrent_resolved(ih, vec![])
+            .await
+            .unwrap_or_else(|e| panic!("default resolve failed: {}", e.message));
+        assert_eq!(h_default.only_files(), None);
+
+        engine.shutdown().await;
     }
 }

@@ -25,7 +25,7 @@ use stremio_core_runtime::{
 use url::Url;
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{
         build_default_meta_request, build_subtitles_resource_path, classify_library_item_status,
@@ -34,19 +34,15 @@ use crate::{
         pick_default_series_episode_id, resolve_ready_meta_item, resume_offset_for_library_item,
         sync_memoized_enriched_streams, sync_memoized_meta_streams, AddonStreamCounts,
         BrowsingContextMenu, CachedTitlePreview, LibraryStatusTab, PlaybackCandidate,
-        StreamResolutionChoice, ToastKind, STREAM_PAGE_SIZE,
+        QuickPeekTarget, StreamResolutionChoice, ToastKind, STREAM_PAGE_SIZE,
     },
     theme::{
-        compact_audio_badge, compact_codec_badge, compact_hdr_badge, editorial_serif,
+        active_theme, compact_audio_badge, compact_codec_badge, compact_hdr_badge, editorial_serif,
         estimate_bitrate_mbps, format_bitrate_mbps, format_episode_air_date,
-        format_timestamp_secs, glass_capsule_shadow, meta_divider, mono_font,
-        parse_runtime_minutes, placeholder_tint_for_id, poster_card_shadow, semantic_status_pill,
-        sentence_case_label, summarize_stream_for_humans, tabular_nums, ui_sans, ACCENT,
-        ACCENT_AMBER, ACCENT_SOFT, BG_SURFACE, BORDER_ACCENT, BORDER_SOFT, CTA_ON_ACCENT,
-        GLASS_BORDER, GLASS_BORDER_STRONG, GLASS_CARD_BG, GLASS_ROW_HOVER_BG, GLASS_TROUGH_BG,
-        RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER, SEGMENT_ACTIVE_BG,
-        SEGMENT_ACTIVE_TEXT, STATUS_WATCHED, STATUS_WATCHING, STATUS_WATCHLIST, TEXT_MUTED,
-        TEXT_PRIMARY, TEXT_SECONDARY,
+        format_timestamp_secs, glass_capsule_shadow, mono_font, parse_runtime_minutes,
+        placeholder_tint_for_id, poster_card_shadow, semantic_status_pill, sentence_case_label, sp,
+        summarize_stream_for_humans, tabular_nums, ui_sans, ThemePalette, RADIUS_CARD,
+        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
     ui_components::{
         glass_back_button, glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar,
@@ -61,6 +57,24 @@ const EPISODE_ROW_CARD_HEIGHT_PX: f32 = 116.0;
 const EPISODE_ROW_STRIDE_PX: f32 = 124.0;
 const EPISODE_LIST_MAX_HEIGHT_PX: f32 = 560.0;
 const SIDE_BY_SIDE_MIN_WIDTH_PX: f32 = 1320.0;
+
+// Dedicated dark-cinema hero ink & glass tokens so hero typography, back button, chips,
+// and secondary actions remain crisp over the dark backdrop scrim even in `LightMist`.
+const HERO_INK_PRIMARY: u32 = 0xF5F1E8;
+const HERO_INK_SECONDARY: u32 = 0xC8C8D2;
+const HERO_GLASS_BG: u32 = 0xFFFFFF14;
+const HERO_GLASS_HOVER_BG: u32 = 0xFFFFFF24;
+const HERO_GLASS_BORDER: u32 = 0xFFFFFF26;
+const HERO_GLASS_BORDER_STRONG: u32 = 0xFFFFFF42;
+const HERO_DIVIDER: u32 = 0xFFFFFF24;
+
+#[inline]
+fn meta_side_padding_px(viewport_w: f32) -> f32 {
+    if !viewport_w.is_finite() || viewport_w <= 0.0 {
+        return 32.0;
+    }
+    (viewport_w * 0.03).clamp(24.0, 56.0)
+}
 
 struct MetaDetailsSnapshot {
     meta: MetaItem,
@@ -110,6 +124,7 @@ struct ResolvedMetaHeroImages {
     hero_backdrop: Option<Arc<RenderImage>>,
     title_logo_tex: Option<Arc<RenderImage>>,
     poster_tex: Option<Arc<RenderImage>>,
+    resolved_backdrop_url: Option<String>,
 }
 
 struct StreamPickerPanelArgs<'a> {
@@ -391,11 +406,15 @@ impl AppShell {
             })
             .collect();
 
+        let t = active_theme();
+        let side_pad = meta_side_padding_px(self.viewport_size_px.0);
+
         let ResolvedMetaHeroImages {
             preblurred_backdrop,
             hero_backdrop,
             title_logo_tex,
             poster_tex,
+            resolved_backdrop_url,
         } = self.resolve_meta_hero_images(
             &meta.preview.id,
             enriched.as_ref().and_then(|e| e.backdrop_url.as_deref()),
@@ -405,6 +424,9 @@ impl AppShell {
             enriched.as_ref().and_then(|e| e.poster_url.as_deref()),
             meta.preview.poster.as_ref(),
         );
+        if resolved_backdrop_url.is_some() {
+            self.ambient_hero_backdrop_url = resolved_backdrop_url;
+        }
 
         let (mut credit_directors, mut credit_cast) = enriched
             .as_ref()
@@ -494,8 +516,8 @@ impl AppShell {
 
         let side_by_side = self.viewport_size_px.0 >= SIDE_BY_SIDE_MIN_WIDTH_PX;
         let seasons_panel_width = side_by_side.then(|| {
-            let avail = (self.viewport_size_px.0 - 64.0).min(1440.0);
-            (avail * 0.43).clamp(480.0, 560.0)
+            let avail = (self.viewport_size_px.0 - side_pad * 2.0).max(960.0);
+            (avail * 0.42).clamp(480.0, 620.0)
         });
 
         let has_seasons = !seasons.is_empty();
@@ -529,6 +551,7 @@ impl AppShell {
                     best_play_for_selected,
                     panel_width_px: seasons_panel_width,
                 },
+                t,
                 cx,
             )
         });
@@ -546,36 +569,41 @@ impl AppShell {
             .min_w(px(0.0))
             .flex()
             .flex_col()
-            .gap(px(12.0))
+            .gap(sp(12.0))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(10.0))
-                    .text_size(px(13.0))
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .gap(sp(10.0))
+                    .text_size(sp(13.0))
+                    .text_color(rgb(HERO_INK_SECONDARY))
                     .child(sentence_case_label(&meta.preview.r#type))
                     .when_some(certification, |el, cert| {
                         el.child(render_certification_pill(&cert))
                     })
                     .when_some(release_year, |el, yr| {
-                        el.child(meta_divider())
+                        el.child(hero_meta_divider())
                             .child(div().font(mono_font()).child(yr))
                     })
                     .when_some(runtime_display, |el, rt| {
-                        el.child(meta_divider())
+                        el.child(hero_meta_divider())
                             .child(div().font(mono_font()).child(rt))
                     })
                     .when_some(imdb, |el, r| {
-                        el.child(meta_divider()).child(
+                        el.child(hero_meta_divider()).child(
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(px(4.5))
+                                .gap(sp(4.5))
                                 .font(mono_font())
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .child(svg_icon(IconName::Star, 12.5, rgb(ACCENT_AMBER)))
+                                .text_color(rgb(HERO_INK_PRIMARY))
+                                .child(svg_icon_weighted(
+                                    IconName::Star,
+                                    IconWeight::Fill,
+                                    12.5 * t.ui_scale,
+                                    rgb(0xFBBF24),
+                                ))
                                 .child(r),
                         )
                     })
@@ -584,23 +612,23 @@ impl AppShell {
                             LibraryStatusTab::Watched => semantic_status_pill(
                                 IconName::Check,
                                 "Watched",
-                                STATUS_WATCHED,
-                                0x4ade804d,
-                                0x4ade801c,
+                                0x4ADE80,
+                                0x4ADE804D,
+                                0x4ADE801C,
                             ),
                             LibraryStatusTab::Watching => semantic_status_pill(
                                 IconName::Play,
                                 "Watching",
-                                STATUS_WATCHING,
-                                0x60a5fa4d,
-                                0x60a5fa1c,
+                                0x60A5FA,
+                                0x60A5FA4D,
+                                0x60A5FA1C,
                             ),
                             LibraryStatusTab::Watchlist => semantic_status_pill(
                                 IconName::Bookmark,
                                 "In library",
-                                STATUS_WATCHLIST,
-                                0xc084fc4d,
-                                0xc084fc1c,
+                                0xC084FC,
+                                0xC084FC4D,
+                                0xC084FC1C,
                             ),
                         };
                         el.child(pill)
@@ -608,16 +636,16 @@ impl AppShell {
             )
             .child(if let Some(logo_img) = title_logo_tex {
                 img(logo_img)
-                    .h(px(84.0))
-                    .max_w(px(420.0))
+                    .h(sp(84.0))
+                    .max_w(sp(420.0))
                     .object_fit(gpui::ObjectFit::Contain)
                     .into_any_element()
             } else {
                 div()
                     .font(editorial_serif())
-                    .text_size(px(58.0))
+                    .text_size(sp(56.0))
                     .line_height(gpui::relative(1.06))
-                    .text_color(rgb(TEXT_PRIMARY))
+                    .text_color(rgb(HERO_INK_PRIMARY))
                     .child(meta.preview.name.clone())
                     .into_any_element()
             })
@@ -627,8 +655,8 @@ impl AppShell {
                         .max_w(px(640.0))
                         .font(ui_sans(FontWeight::NORMAL))
                         .italic()
-                        .text_size(px(15.0))
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_size(sp(15.0))
+                        .text_color(rgb(HERO_INK_SECONDARY))
                         .child(line),
                 )
             })
@@ -636,10 +664,10 @@ impl AppShell {
                 el.child(
                     div()
                         .max_w(px(660.0))
-                        .text_size(px(14.5))
+                        .text_size(sp(14.5))
                         .line_height(gpui::relative(1.45))
-                        .text_color(rgb(TEXT_PRIMARY))
-                        .opacity(0.88)
+                        .text_color(rgb(HERO_INK_PRIMARY))
+                        .opacity(0.90)
                         .child(desc),
                 )
             })
@@ -649,13 +677,14 @@ impl AppShell {
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(6.0))
+                        .gap(sp(6.0))
                         .children(genres.into_iter().enumerate().map(|(idx, genre)| {
                             let g_type = meta_type_for_genre.clone();
                             let g_val = genre.clone();
                             render_genre_chip(
                                 idx,
                                 genre,
+                                t,
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.open_discover_genre(&g_type, &g_val, cx);
@@ -666,11 +695,11 @@ impl AppShell {
             })
             .child(
                 div()
-                    .mt(px(8.0))
+                    .mt(sp(8.0))
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(10.0))
+                    .gap(sp(10.0))
                     .when_some(filtered_indices.first().copied(), |el, best_play_idx| {
                         let top_cands = Arc::clone(&all_playable_arc);
                         let p_type = meta.preview.r#type.clone();
@@ -706,11 +735,13 @@ impl AppShell {
                         let t_type = meta.preview.r#type.clone();
                         let t_id = meta.preview.id.clone();
                         let t_title = meta.preview.name.clone();
-                        el.child(secondary_glass_button(
+                        el.child(render_hero_glass_button(
                             "meta-btn-trailer",
-                            Some(IconName::Clapperboard),
+                            IconName::Clapperboard,
+                            IconWeight::Regular,
                             "Trailer",
                             false,
+                            t,
                             cx.listener(move |this, _, _, cx| match &target {
                                 TrailerTarget::DirectStream(stream) => {
                                     let cand = PlaybackCandidate::from_stream_and_request(
@@ -738,37 +769,45 @@ impl AppShell {
                             }),
                         ))
                     })
-                    .child(secondary_glass_button(
+                    .child(render_hero_glass_button(
                         "meta-btn-toggle-lib",
-                        Some(if in_library {
-                            IconName::Check
+                        IconName::Bookmark,
+                        if in_library {
+                            IconWeight::Fill
                         } else {
-                            IconName::Bookmark
-                        }),
+                            IconWeight::Regular
+                        },
                         if in_library {
                             "In Library"
                         } else {
                             "Add to Library"
                         },
                         in_library,
+                        t,
                         cx.listener(move |this, _, _, cx| {
                             this.core.toggle_library_item(preview_for_toggle.clone());
                             cx.notify();
                         }),
                     ))
-                    .child(secondary_glass_button(
+                    .child(render_hero_glass_button(
                         "meta-btn-mark-watched",
-                        Some(if is_watched {
+                        if is_watched {
                             IconName::Check
                         } else {
                             IconName::Eye
-                        }),
+                        },
+                        if is_watched {
+                            IconWeight::Fill
+                        } else {
+                            IconWeight::Regular
+                        },
                         if is_watched {
                             "Watched"
                         } else {
                             "Mark watched"
                         },
                         is_watched,
+                        t,
                         cx.listener(move |this, _, _, cx| {
                             this.core.mark_meta_watched(!is_watched);
                             cx.notify();
@@ -793,13 +832,11 @@ impl AppShell {
         let main_sections = div()
             .w_full()
             .flex_shrink_0()
-            .max_w(px(1440.0))
-            .mx_auto()
-            .px(px(32.0))
+            .px(px(side_pad))
             .flex()
             .when(side_by_side, |d| d.items_start())
             .when(!side_by_side, |d| d.flex_col())
-            .gap(px(32.0))
+            .gap(sp(32.0))
             .when_some(seasons_panel, |el, panel| el.child(panel))
             .child(
                 div()
@@ -825,6 +862,7 @@ impl AppShell {
                             has_stream_request,
                             has_stream_addons,
                         },
+                        t,
                         cx,
                     )),
             );
@@ -836,6 +874,8 @@ impl AppShell {
                 is_loading,
                 &meta.preview.id,
                 &library_statuses,
+                side_pad,
+                t,
                 cx,
             )
         });
@@ -849,6 +889,8 @@ impl AppShell {
                 &recommendations,
                 None,
                 &library_statuses,
+                side_pad,
+                t,
                 cx,
             )
         });
@@ -870,10 +912,10 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .pb(px(72.0))
+                    .pb(sp(72.0))
                     .flex()
                     .flex_col()
-                    .gap(px(36.0))
+                    .gap(sp(36.0))
                     .child(Self::render_hero_backdrop_shell(
                         &meta.preview.id,
                         preblurred_backdrop,
@@ -881,10 +923,12 @@ impl AppShell {
                         poster_tex,
                         "btn-details-back",
                         hero_right_col,
+                        side_pad,
+                        t,
                         cx,
                     ))
                     .when(!combined_credits.is_empty(), |el| {
-                        el.child(self.render_cast_rail(combined_credits, cx))
+                        el.child(self.render_cast_rail(combined_credits, side_pad, t, cx))
                     })
                     .child(main_sections)
                     .when_some(collection_section, |el, section| el.child(section))
@@ -909,6 +953,17 @@ impl AppShell {
             .then(|| format!("https://images.metahub.space/background/medium/{meta_id}/img"));
         let metahub_logo =
             is_imdb.then(|| format!("https://images.metahub.space/logo/medium/{meta_id}/img"));
+
+        let resolved_backdrop_url = enriched_backdrop
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                preview_backdrop
+                    .map(|u| u.as_str().trim().to_owned())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| metahub_bg.clone());
 
         let mut ambient_urls: Vec<&str> = Vec::with_capacity(4);
         if let Some(u) = enriched_backdrop {
@@ -961,9 +1016,11 @@ impl AppShell {
             hero_backdrop,
             title_logo_tex,
             poster_tex,
+            resolved_backdrop_url,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_hero_backdrop_shell(
         placeholder_id: &str,
         preblurred_backdrop: Option<Arc<RenderImage>>,
@@ -971,16 +1028,34 @@ impl AppShell {
         poster_tex: Option<Arc<RenderImage>>,
         back_btn_id: &'static str,
         right_col: AnyElement,
+        side_pad: f32,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> Div {
+        let hero_base_bg = if t.is_light {
+            0x0B0D14
+        } else {
+            placeholder_tint_for_id(placeholder_id)
+        };
+        let scrim_top = if t.is_light {
+            0x0B0D1466
+        } else {
+            (t.bg_canvas << 8) | 0x4D
+        };
+        let scrim_bottom = if t.is_light {
+            rgba(0x0B0D14EB)
+        } else {
+            rgb(t.bg_canvas)
+        };
+
         div()
             .w_full()
             .flex_shrink_0()
             .relative()
             .overflow_hidden()
-            .bg(rgb(placeholder_tint_for_id(placeholder_id)))
+            .bg(rgb(hero_base_bg))
             .border_b_1()
-            .border_color(rgba(BORDER_SOFT))
+            .border_color(rgba(t.glass_divider))
             .when_some(preblurred_backdrop, |el, bleed| {
                 el.child(
                     img(bleed)
@@ -998,7 +1073,7 @@ impl AppShell {
                         .absolute()
                         .inset_0()
                         .object_fit(gpui::ObjectFit::Cover)
-                        .opacity(0.24),
+                        .opacity(0.28),
                 )
             })
             .child(
@@ -1006,44 +1081,41 @@ impl AppShell {
                     .w_full()
                     .bg(linear_gradient(
                         180.0,
-                        linear_color_stop(rgba(0x0b0b0d45), 0.0),
-                        linear_color_stop(rgba(0x0b0b0dfa), 1.0),
+                        linear_color_stop(rgba(scrim_top), 0.0),
+                        linear_color_stop(scrim_bottom, 1.0),
                     ))
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(1440.0))
-                            .mx_auto()
-                            .px(px(32.0))
-                            .pt(px(22.0))
-                            .pb(px(36.0))
+                            .px(px(side_pad))
+                            .pt(sp(84.0))
+                            .pb(sp(40.0))
                             .flex()
                             .flex_col()
-                            .gap(px(24.0))
-                            .child(
-                                div().flex().child(glass_back_button(
-                                    back_btn_id,
-                                    "Back",
-                                    cx.listener(|this, _, _, cx| {
-                                        this.navigate_back(cx);
-                                    }),
-                                )),
-                            )
+                            .gap(sp(24.0))
+                            .child(div().flex().child(render_hero_back_button(
+                                back_btn_id,
+                                "Back",
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    this.navigate_back(cx);
+                                }),
+                            )))
                             .child(
                                 div()
                                     .flex()
                                     .items_end()
-                                    .gap(px(36.0))
+                                    .gap(sp(34.0))
                                     .child(
                                         div()
-                                            .w(px(236.0))
-                                            .h(px(354.0))
+                                            .w(sp(230.0))
+                                            .h(sp(345.0))
                                             .flex_shrink_0()
                                             .rounded(px(RADIUS_POSTER))
                                             .overflow_hidden()
-                                            .bg(rgb(BG_SURFACE))
+                                            .bg(rgb(0x141417))
                                             .border_1()
-                                            .border_color(rgba(GLASS_BORDER))
+                                            .border_color(rgba(HERO_GLASS_BORDER))
                                             .shadow(poster_card_shadow())
                                             .when_some(poster_tex, |el, tex| {
                                                 el.child(
@@ -1062,17 +1134,18 @@ impl AppShell {
     fn render_cast_rail(
         &self,
         combined_credits: Vec<PersonCreditChip>,
+        side_pad: f32,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> Div {
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         div()
             .w_full()
             .flex_shrink_0()
-            .max_w(px(1440.0))
-            .mx_auto()
-            .px(px(32.0))
+            .px(px(side_pad))
             .flex()
             .flex_col()
-            .gap(px(14.0))
+            .gap(sp(14.0))
             .child(
                 div()
                     .flex()
@@ -1081,14 +1154,14 @@ impl AppShell {
                     .child(
                         div()
                             .font(editorial_serif())
-                            .text_size(px(26.0))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(26.0))
+                            .text_color(rgb(t.text_primary))
                             .child("Cast & Crew"),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(rgb(t.text_muted))
                             .child("Click any person for filmography"),
                     ),
             )
@@ -1097,10 +1170,10 @@ impl AppShell {
                     .id("meta-cast-rail")
                     .w_full()
                     .overflow_x_scroll()
-                    .pb(px(6.0))
+                    .pb(sp(6.0))
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
+                    .gap(sp(12.0))
                     .children(combined_credits.into_iter().enumerate().map(|(idx, chip)| {
                         let pk = chip.person_key.clone();
                         let pname = chip.name.clone();
@@ -1120,20 +1193,20 @@ impl AppShell {
                         div()
                             .id(("meta-cast-card", idx))
                             .flex_shrink_0()
-                            .w(px(216.0))
+                            .w(sp(216.0))
                             .cursor_pointer()
-                            .p(px(10.0))
+                            .p(sp(10.0))
                             .rounded(px(RADIUS_CARD))
-                            .bg(rgba(GLASS_CARD_BG))
+                            .bg(rgba(t.glass_card_bg))
                             .border_1()
-                            .border_color(rgba(GLASS_BORDER))
-                            .hover(|s| {
-                                s.bg(rgba(GLASS_ROW_HOVER_BG))
-                                    .border_color(rgba(GLASS_BORDER_STRONG))
+                            .border_color(rgba(t.glass_border))
+                            .hover(move |s| {
+                                s.bg(rgba(t.glass_row_hover_bg))
+                                    .border_color(rgba(t.glass_border_strong))
                             })
                             .flex()
                             .items_center()
-                            .gap(px(12.0))
+                            .gap(sp(12.0))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
@@ -1142,14 +1215,14 @@ impl AppShell {
                             )
                             .child(
                                 div()
-                                    .w(px(46.0))
-                                    .h(px(46.0))
+                                    .w(sp(46.0))
+                                    .h(sp(46.0))
                                     .flex_shrink_0()
                                     .rounded_full()
                                     .overflow_hidden()
-                                    .bg(rgba(GLASS_TROUGH_BG))
+                                    .bg(rgba(t.glass_trough_bg))
                                     .border_1()
-                                    .border_color(rgba(GLASS_BORDER))
+                                    .border_color(rgba(t.glass_border))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -1161,8 +1234,8 @@ impl AppShell {
                                     } else {
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(px(16.0))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_size(sp(16.0))
+                                            .text_color(rgb(t.text_secondary))
                                             .child(initials)
                                             .into_any_element()
                                     }),
@@ -1173,23 +1246,23 @@ impl AppShell {
                                     .min_w(px(0.0))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(2.0))
+                                    .gap(sp(2.0))
                                     .child(
                                         div()
                                             .font(ui_sans(FontWeight::SEMIBOLD))
-                                            .text_size(px(13.5))
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .text_size(sp(13.5))
+                                            .text_color(rgb(t.text_primary))
                                             .truncate()
                                             .child(chip.name),
                                     )
                                     .child(
                                         div()
                                             .font(ui_sans(FontWeight::NORMAL))
-                                            .text_size(px(12.0))
+                                            .text_size(sp(12.0))
                                             .text_color(if chip.is_director {
-                                                rgb(ACCENT)
+                                                rgb(accent_ink)
                                             } else {
-                                                rgb(TEXT_MUTED)
+                                                rgb(t.text_muted)
                                             })
                                             .truncate()
                                             .child(role_label),
@@ -1199,6 +1272,7 @@ impl AppShell {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_collection_section(
         &self,
         stub_col: &EnrichedCollection,
@@ -1206,6 +1280,8 @@ impl AppShell {
         is_loading: bool,
         current_meta_id: &str,
         library_statuses: &HashMap<String, LibraryStatusTab>,
+        side_pad: f32,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let col = loaded_col.unwrap_or(stub_col);
@@ -1218,12 +1294,10 @@ impl AppShell {
                 div()
                     .w_full()
                     .flex_shrink_0()
-                    .max_w(px(1440.0))
-                    .mx_auto()
-                    .px(px(32.0))
+                    .px(px(side_pad))
                     .flex()
                     .flex_col()
-                    .gap(px(12.0))
+                    .gap(sp(12.0))
                     .child(
                         div()
                             .flex()
@@ -1232,15 +1306,15 @@ impl AppShell {
                             .child(
                                 div()
                                     .font(editorial_serif())
-                                    .text_size(px(26.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(26.0))
+                                    .text_color(rgb(t.text_primary))
                                     .child(heading),
                             )
                             .child(
                                 div()
                                     .font(mono_font())
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(rgb(t.text_muted))
                                     .child("Loading collection..."),
                             ),
                     )
@@ -1258,6 +1332,8 @@ impl AppShell {
                 &col.parts,
                 Some(current_meta_id),
                 library_statuses,
+                side_pad,
+                t,
                 cx,
             )
             .into_any_element(),
@@ -1274,29 +1350,33 @@ impl AppShell {
         hits: &[EditorialMediaHit],
         current_meta_id: Option<&str>,
         library_statuses: &HashMap<String, LibraryStatusTab>,
+        side_pad: f32,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let card_w = (t.density.target_poster_width_px() * 0.94 * t.ui_scale).clamp(136.0, 224.0);
+        let card_h = card_w * 1.5;
+        let rail_gap = t.density.grid_gap_px() * t.ui_scale;
+
         div()
             .id(section_id)
             .w_full()
             .flex_shrink_0()
-            .max_w(px(1440.0))
-            .mx_auto()
-            .px(px(32.0))
+            .px(px(side_pad))
             .flex()
             .flex_col()
-            .gap(px(14.0))
+            .gap(sp(14.0))
             .child(
                 div()
                     .flex()
                     .items_baseline()
                     .justify_between()
-                    .gap(px(12.0))
+                    .gap(sp(12.0))
                     .child(
                         div()
                             .font(editorial_serif())
-                            .text_size(px(26.0))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(26.0))
+                            .text_color(rgb(t.text_primary))
                             .child(heading),
                     )
                     .when_some(right_badge, |el, badge| {
@@ -1304,7 +1384,7 @@ impl AppShell {
                             div()
                                 .font(mono_font())
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(t.text_muted))
                                 .child(badge),
                         )
                     }),
@@ -1314,10 +1394,10 @@ impl AppShell {
                     .id(rail_id)
                     .w_full()
                     .overflow_x_scroll()
-                    .pb(px(8.0))
+                    .pb(sp(8.0))
                     .flex()
                     .items_start()
-                    .gap(px(16.0))
+                    .gap(px(rail_gap))
                     .children(hits.iter().enumerate().map(|(idx, hit)| {
                         let hit_id = hit
                             .imdb_id
@@ -1344,9 +1424,9 @@ impl AppShell {
                                 hit.year.as_deref().filter(|s| !s.trim().is_empty()),
                                 type_label,
                             ) {
-                                (Some(y), Some(t)) => Some(SharedString::from(format!("{y} · {t}"))),
+                                (Some(y), Some(ty)) => Some(SharedString::from(format!("{y} · {ty}"))),
                                 (Some(y), None) => Some(SharedString::from(y.to_owned())),
-                                (None, Some(t)) => Some(SharedString::from(t)),
+                                (None, Some(ty)) => Some(SharedString::from(ty)),
                                 (None, None) => None,
                             }
                         };
@@ -1361,7 +1441,11 @@ impl AppShell {
                         let ctx_type = hit.media_type.clone();
                         let ctx_id = hit_id.clone();
                         let ctx_title = hit.title.clone();
+                        let peek_type = hit.media_type.clone();
+                        let peek_id = hit_id.clone();
+                        let peek_title = hit.title.clone();
                         let preview_for_toggle = editorial_hit_to_preview(hit, &hit_id);
+                        let preview_for_peek = preview_for_toggle.clone();
                         let preview_for_ctx = preview_for_toggle.clone();
 
                         render_poster_card(
@@ -1369,8 +1453,8 @@ impl AppShell {
                                 .subtitle(subtitle)
                                 .image(tex)
                                 .aspect(PosterAspect::Portrait2x3)
-                                .fixed_width_px(Some(164.0))
-                                .image_height_px(Some(246.0))
+                                .fixed_width_px(Some(card_w))
+                                .image_height_px(Some(card_h))
                                 .status_tab(status_tab)
                                 .in_library(in_lib)
                                 .imdb_rating(hit.imdb_rating.clone().map(SharedString::from))
@@ -1393,6 +1477,18 @@ impl AppShell {
                                 .on_toggle_library(cx.listener(move |this, _, _, cx| {
                                     this.core.toggle_library_item(preview_for_toggle.clone());
                                     cx.notify();
+                                }))
+                                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                                    this.open_quick_peek(
+                                        QuickPeekTarget {
+                                            type_name: peek_type.clone(),
+                                            id: peek_id.clone(),
+                                            video_id: None,
+                                            title: peek_title.clone(),
+                                            preview: Some(preview_for_peek.clone()),
+                                        },
+                                        cx,
+                                    );
                                 }))
                                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                     this.on_card_hover_prefetch(
@@ -1423,13 +1519,15 @@ impl AppShell {
     }
 
     fn render_loading_meta_details_view(
-        &self,
+        &mut self,
         route_type: &str,
         route_id: &str,
         is_meta_loading: bool,
         cached_preview: Option<CachedTitlePreview>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = active_theme();
+        let side_pad = meta_side_padding_px(self.viewport_size_px.0);
         let status_text = if is_meta_loading {
             format!("Loading details and streams for {route_type}...")
         } else {
@@ -1444,12 +1542,12 @@ impl AppShell {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(1440.0))
-                        .mx_auto()
-                        .p(px(32.0))
+                        .px(px(side_pad))
+                        .pt(sp(84.0))
+                        .pb(sp(32.0))
                         .flex()
                         .flex_col()
-                        .gap(px(20.0))
+                        .gap(sp(20.0))
                         .child(div().flex().child(glass_back_button(
                             "btn-details-back",
                             "Back",
@@ -1459,14 +1557,14 @@ impl AppShell {
                         )))
                         .child(
                             div()
-                                .p(px(32.0))
+                                .p(sp(32.0))
                                 .rounded(px(RADIUS_CARD))
-                                .bg(rgba(GLASS_CARD_BG))
+                                .bg(rgba(t.glass_card_bg))
                                 .border_1()
-                                .border_color(rgba(GLASS_BORDER))
+                                .border_color(rgba(t.glass_border))
                                 .font(editorial_serif())
-                                .text_size(px(28.0))
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_size(sp(28.0))
+                                .text_color(rgb(t.text_secondary))
                                 .child(status_text),
                         ),
                 )
@@ -1478,6 +1576,7 @@ impl AppShell {
             hero_backdrop,
             title_logo_tex,
             poster_tex,
+            resolved_backdrop_url,
         } = self.resolve_meta_hero_images(
             &preview.id,
             None,
@@ -1487,6 +1586,9 @@ impl AppShell {
             None,
             preview.poster.as_ref(),
         );
+        if resolved_backdrop_url.is_some() {
+            self.ambient_hero_backdrop_url = resolved_backdrop_url;
+        }
 
         let loading_type = preview.r#type.clone();
         let loading_genres = preview.genres.clone();
@@ -1495,48 +1597,53 @@ impl AppShell {
             .min_w(px(0.0))
             .flex()
             .flex_col()
-            .gap(px(12.0))
+            .gap(sp(12.0))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(10.0))
-                    .text_size(px(13.0))
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .gap(sp(10.0))
+                    .text_size(sp(13.0))
+                    .text_color(rgb(HERO_INK_SECONDARY))
                     .child(sentence_case_label(&preview.r#type))
                     .when_some(
                         preview.release_info.filter(|s| !s.trim().is_empty()),
                         |el, yr| {
-                            el.child(meta_divider())
+                            el.child(hero_meta_divider())
                                 .child(div().font(mono_font()).child(yr))
                         },
                     )
                     .when_some(preview.imdb_rating, |el, r| {
-                        el.child(meta_divider()).child(
+                        el.child(hero_meta_divider()).child(
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(px(4.5))
+                                .gap(sp(4.5))
                                 .font(mono_font())
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .child(svg_icon(IconName::Star, 12.5, rgb(ACCENT_AMBER)))
+                                .text_color(rgb(HERO_INK_PRIMARY))
+                                .child(svg_icon_weighted(
+                                    IconName::Star,
+                                    IconWeight::Fill,
+                                    12.5 * t.ui_scale,
+                                    rgb(0xFBBF24),
+                                ))
                                 .child(r),
                         )
                     }),
             )
             .child(if let Some(logo_img) = title_logo_tex {
                 img(logo_img)
-                    .h(px(84.0))
-                    .max_w(px(420.0))
+                    .h(sp(84.0))
+                    .max_w(sp(420.0))
                     .object_fit(gpui::ObjectFit::Contain)
                     .into_any_element()
             } else {
                 div()
                     .font(editorial_serif())
-                    .text_size(px(58.0))
+                    .text_size(sp(56.0))
                     .line_height(gpui::relative(1.06))
-                    .text_color(rgb(TEXT_PRIMARY))
+                    .text_color(rgb(HERO_INK_PRIMARY))
                     .child(preview.name)
                     .into_any_element()
             })
@@ -1544,9 +1651,9 @@ impl AppShell {
                 el.child(
                     div()
                         .max_w(px(640.0))
-                        .text_size(px(14.5))
-                        .text_color(rgb(TEXT_PRIMARY))
-                        .opacity(0.88)
+                        .text_size(sp(14.5))
+                        .text_color(rgb(HERO_INK_PRIMARY))
+                        .opacity(0.90)
                         .child(desc),
                 )
             })
@@ -1556,13 +1663,14 @@ impl AppShell {
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(6.0))
+                        .gap(sp(6.0))
                         .children(loading_genres.into_iter().enumerate().map(|(idx, genre)| {
                             let g_type = loading_type.clone();
                             let g_val = genre.clone();
                             render_genre_chip(
                                 idx,
                                 genre,
+                                t,
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.open_discover_genre(&g_type, &g_val, cx);
@@ -1580,10 +1688,10 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .pb(px(72.0))
+                    .pb(sp(72.0))
                     .flex()
                     .flex_col()
-                    .gap(px(36.0))
+                    .gap(sp(36.0))
                     .child(Self::render_hero_backdrop_shell(
                         &preview.id,
                         preblurred_backdrop,
@@ -1591,25 +1699,25 @@ impl AppShell {
                         poster_tex,
                         "btn-details-back",
                         right_col,
+                        side_pad,
+                        t,
                         cx,
                     ))
                     .child(
                         div()
                             .w_full()
                             .flex_shrink_0()
-                            .max_w(px(1440.0))
-                            .mx_auto()
-                            .px(px(32.0))
+                            .px(px(side_pad))
                             .child(
                                 div()
-                                    .p(px(32.0))
+                                    .p(sp(32.0))
                                     .rounded(px(RADIUS_CARD))
-                                    .bg(rgba(GLASS_CARD_BG))
+                                    .bg(rgba(t.glass_card_bg))
                                     .border_1()
-                                    .border_color(rgba(GLASS_BORDER))
+                                    .border_color(rgba(t.glass_border))
                                     .font(editorial_serif())
-                                    .text_size(px(24.0))
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_size(sp(24.0))
+                                    .text_color(rgb(t.text_secondary))
                                     .child(status_text),
                             ),
                     ),
@@ -1620,8 +1728,13 @@ impl AppShell {
     fn render_series_seasons_panel(
         &mut self,
         args: SeasonsPanelArgs<'_>,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> Div {
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
+        let watched_bg = (t.status_watched << 8) | if t.is_light { 0x1f } else { 0x1c };
+        let watched_border = (t.status_watched << 8) | if t.is_light { 0x59 } else { 0x4d };
+
         let SeasonsPanelArgs {
             type_name,
             meta_id,
@@ -1684,7 +1797,7 @@ impl AppShell {
             (ep_count as f32 * EPISODE_ROW_STRIDE_PX).min(EPISODE_LIST_MAX_HEIGHT_PX)
         };
 
-        let mut panel = div().flex().flex_col().gap(px(14.0));
+        let mut panel = div().flex().flex_col().gap(sp(14.0));
         if let Some(w_px) = panel_width_px {
             panel = panel.w(px(w_px)).flex_shrink_0();
         } else {
@@ -1698,24 +1811,24 @@ impl AppShell {
                     .flex_wrap()
                     .items_center()
                     .justify_between()
-                    .gap(px(12.0))
+                    .gap(sp(12.0))
                     .child(
                         div()
                             .flex()
                             .items_baseline()
-                            .gap(px(10.0))
+                            .gap(sp(10.0))
                             .child(
                                 div()
                                     .font(editorial_serif())
-                                    .text_size(px(30.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(30.0))
+                                    .text_color(rgb(t.text_primary))
                                     .child(season_heading),
                             )
                             .child(
                                 div()
                                     .font(mono_font())
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(rgb(t.text_muted))
                                     .child(format!("{ep_count} episodes")),
                             ),
                     )
@@ -1746,7 +1859,7 @@ impl AppShell {
                     .id("season-pills-scroll")
                     .w_full()
                     .overflow_x_scroll()
-                    .pb(px(2.0))
+                    .pb(sp(2.0))
                     .child(
                         div().flex().child(
                             glass_segmented_bar("meta-season-tabs-bar").children(
@@ -1781,25 +1894,25 @@ impl AppShell {
                     .w_full()
                     .h(px(list_height_px))
                     .rounded(px(RADIUS_CARD))
-                    .bg(rgba(GLASS_CARD_BG))
+                    .bg(rgba(t.glass_card_bg))
                     .border_1()
-                    .border_color(rgba(GLASS_BORDER))
+                    .border_color(rgba(t.glass_border))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
+                    .text_color(rgb(t.text_muted))
                     .child("No episodes listed for this season.")
                     .into_any_element()
             } else {
                 div()
                     .id("meta-season-episodes-frame")
                     .w_full()
-                    .p(px(8.0))
+                    .p(sp(8.0))
                     .rounded(px(RADIUS_CARD))
-                    .bg(rgba(GLASS_CARD_BG))
+                    .bg(rgba(t.glass_card_bg))
                     .border_1()
-                    .border_color(rgba(GLASS_BORDER))
+                    .border_color(rgba(t.glass_border))
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                         let dy = f32::from(event.delta.pixel_delta(window.line_height()).y);
                         if dy.abs() <= 0.1 {
@@ -1872,32 +1985,32 @@ impl AppShell {
                                                     .cursor_pointer()
                                                     .w_full()
                                                     .h(px(EPISODE_ROW_CARD_HEIGHT_PX))
-                                                    .p(px(10.0))
+                                                    .p(sp(10.0))
                                                     .rounded(px(RADIUS_CONTROL))
                                                     .bg(if ep.is_selected {
-                                                        rgba(ACCENT_SOFT)
+                                                        rgba(t.accent_soft)
                                                     } else {
-                                                        rgba(GLASS_TROUGH_BG)
+                                                        rgba(t.glass_trough_bg)
                                                     })
                                                     .border_1()
                                                     .border_color(if ep.is_selected {
-                                                        rgba(BORDER_ACCENT)
+                                                        rgba(t.border_accent)
                                                     } else {
-                                                        rgba(GLASS_BORDER)
+                                                        rgba(t.glass_border)
                                                     })
-                                                    .hover(|s| {
+                                                    .hover(move |s| {
                                                         if ep.is_selected {
-                                                            s.bg(rgba(ACCENT_SOFT))
+                                                            s.bg(rgba(t.accent_soft))
                                                         } else {
-                                                            s.bg(rgba(GLASS_ROW_HOVER_BG))
+                                                            s.bg(rgba(t.glass_row_hover_bg))
                                                                 .border_color(rgba(
-                                                                    GLASS_BORDER_STRONG,
+                                                                    t.glass_border_strong,
                                                                 ))
                                                         }
                                                     })
                                                     .flex()
                                                     .items_center()
-                                                    .gap(px(12.0))
+                                                    .gap(sp(12.0))
                                                     .on_mouse_down(
                                                         MouseButton::Left,
                                                         cx.listener(move |this, _, _, cx| {
@@ -1956,7 +2069,7 @@ impl AppShell {
                                                                 &ep.video_id,
                                                             )))
                                                             .border_1()
-                                                            .border_color(rgba(GLASS_BORDER))
+                                                            .border_color(rgba(t.glass_border))
                                                             .child(if let Some(tex) = thumb_tex {
                                                                 img(tex)
                                                                     .size_full()
@@ -1972,7 +2085,7 @@ impl AppShell {
                                                                     .justify_center()
                                                                     .font(mono_font())
                                                                     .text_xs()
-                                                                    .text_color(rgb(TEXT_MUTED))
+                                                                    .text_color(rgb(t.text_muted))
                                                                     .child(ep.ep_code.clone())
                                                                     .into_any_element()
                                                             })
@@ -1985,7 +2098,7 @@ impl AppShell {
                                                                     .items_center()
                                                                     .justify_center()
                                                                     .bg(if ep.is_selected {
-                                                                        rgba(0x0b0b0d55)
+                                                                        rgba(0x0B0D1455)
                                                                     } else {
                                                                         rgba(0x00000000)
                                                                     })
@@ -1996,7 +2109,7 @@ impl AppShell {
                                                                     })
                                                                     .group_hover(grp, |s| {
                                                                         s.opacity(1.0)
-                                                                            .bg(rgba(0x0b0b0d66))
+                                                                            .bg(rgba(0x0B0D1466))
                                                                     })
                                                                     .on_mouse_down(
                                                                         MouseButton::Left,
@@ -2045,32 +2158,33 @@ impl AppShell {
                                                                     )
                                                                     .child(
                                                                         div()
-                                                                            .w(px(32.0))
-                                                                            .h(px(32.0))
+                                                                            .w(sp(32.0))
+                                                                            .h(sp(32.0))
                                                                             .rounded_full()
                                                                             .bg(if ep.is_selected {
-                                                                                rgb(ACCENT)
+                                                                                rgb(t.accent)
                                                                             } else {
-                                                                                rgba(0x141417eb)
+                                                                                rgba(0x0B0D14EB)
                                                                             })
                                                                             .border_1()
                                                                             .border_color(
                                                                                 if ep.is_selected {
-                                                                                    rgb(ACCENT)
+                                                                                    rgb(t.accent)
                                                                                 } else {
-                                                                                    rgba(GLASS_BORDER_STRONG)
+                                                                                    rgba(HERO_GLASS_BORDER_STRONG)
                                                                                 },
                                                                             )
                                                                             .flex()
                                                                             .items_center()
                                                                             .justify_center()
-                                                                            .child(svg_icon(
+                                                                            .child(svg_icon_weighted(
                                                                                 IconName::Play,
-                                                                                13.0,
+                                                                                IconWeight::Fill,
+                                                                                13.0 * t.ui_scale,
                                                                                 if ep.is_selected {
-                                                                                    rgb(CTA_ON_ACCENT)
+                                                                                    rgb(t.cta_on_accent)
                                                                                 } else {
-                                                                                    rgb(TEXT_PRIMARY)
+                                                                                    rgb(HERO_INK_PRIMARY)
                                                                                 },
                                                                             )),
                                                                     ),
@@ -2080,9 +2194,9 @@ impl AppShell {
                                                                 |el, frac| {
                                                                     let bar_color =
                                                                         if ep.is_watched {
-                                                                            rgb(STATUS_WATCHED)
+                                                                            rgb(t.status_watched)
                                                                         } else {
-                                                                            rgb(ACCENT)
+                                                                            rgb(t.accent)
                                                                         };
                                                                     el.child(
                                                                         div()
@@ -2091,7 +2205,7 @@ impl AppShell {
                                                                             .left_0()
                                                                             .right_0()
                                                                             .h(px(2.5))
-                                                                            .bg(rgba(0xffffff2e))
+                                                                            .bg(rgba(0xFFFFFF2E))
                                                                             .child(
                                                                                 div()
                                                                                     .h_full()
@@ -2112,35 +2226,35 @@ impl AppShell {
                                                             .flex()
                                                             .flex_col()
                                                             .justify_between()
-                                                            .gap(px(3.0))
+                                                            .gap(sp(3.0))
                                                             .child(
                                                                 div()
                                                                     .w_full()
                                                                     .min_w(px(0.0))
                                                                     .flex()
                                                                     .items_center()
-                                                                    .gap(px(8.0))
+                                                                    .gap(sp(8.0))
                                                                     .child(
                                                                         div()
                                                                             .flex_shrink_0()
-                                                                            .px(px(6.0))
-                                                                            .py(px(1.5))
+                                                                            .px(sp(6.0))
+                                                                            .py(sp(1.5))
                                                                             .rounded(px(4.0))
                                                                             .bg(if ep.is_selected {
-                                                                                rgba(ACCENT_SOFT)
+                                                                                rgba(t.accent_soft)
                                                                             } else {
-                                                                                rgba(GLASS_TROUGH_BG)
+                                                                                rgba(t.glass_trough_bg)
                                                                             })
                                                                             .font(mono_font())
                                                                             .font_weight(
                                                                                 FontWeight::SEMIBOLD,
                                                                             )
-                                                                            .text_size(px(11.0))
+                                                                            .text_size(sp(11.0))
                                                                             .text_color(
                                                                                 if ep.is_selected {
-                                                                                    rgb(ACCENT)
+                                                                                    rgb(accent_ink)
                                                                                 } else {
-                                                                                    rgb(TEXT_SECONDARY)
+                                                                                    rgb(t.text_secondary)
                                                                                 },
                                                                             )
                                                                             .child(
@@ -2154,9 +2268,9 @@ impl AppShell {
                                                                             .font(ui_sans(
                                                                                 FontWeight::SEMIBOLD,
                                                                             ))
-                                                                            .text_size(px(13.5))
+                                                                            .text_size(sp(13.5))
                                                                             .text_color(rgb(
-                                                                                TEXT_PRIMARY,
+                                                                                t.text_primary,
                                                                             ))
                                                                             .truncate()
                                                                             .child(
@@ -2171,8 +2285,8 @@ impl AppShell {
                                                                             ))
                                                                             .flex_shrink_0()
                                                                             .cursor_pointer()
-                                                                            .h(px(24.0))
-                                                                            .px(px(if ep.is_watched {
+                                                                            .h(sp(24.0))
+                                                                            .px(sp(if ep.is_watched {
                                                                                 8.0
                                                                             } else {
                                                                                 6.0
@@ -2181,36 +2295,36 @@ impl AppShell {
                                                                                 RADIUS_PILL,
                                                                             ))
                                                                             .bg(if ep.is_watched {
-                                                                                rgba(0x4ade801c)
+                                                                                rgba(watched_bg)
                                                                             } else {
-                                                                                rgba(GLASS_TROUGH_BG)
+                                                                                rgba(t.glass_trough_bg)
                                                                             })
                                                                             .border_1()
                                                                             .border_color(
                                                                                 if ep.is_watched {
-                                                                                    rgba(0x4ade804d)
+                                                                                    rgba(watched_border)
                                                                                 } else {
-                                                                                    rgba(GLASS_BORDER)
+                                                                                    rgba(t.glass_border)
                                                                                 },
                                                                             )
-                                                                            .hover(|s| {
+                                                                            .hover(move |s| {
                                                                                 s.border_color(rgba(
-                                                                                    GLASS_BORDER_STRONG,
+                                                                                    t.glass_border_strong,
                                                                                 ))
                                                                             })
                                                                             .flex()
                                                                             .items_center()
                                                                             .justify_center()
-                                                                            .gap(px(4.0))
-                                                                            .text_size(px(10.5))
+                                                                            .gap(sp(4.0))
+                                                                            .text_size(sp(10.5))
                                                                             .font_weight(
                                                                                 FontWeight::MEDIUM,
                                                                             )
                                                                             .text_color(
                                                                                 if ep.is_watched {
-                                                                                    rgb(STATUS_WATCHED)
+                                                                                    rgb(t.status_watched)
                                                                                 } else {
-                                                                                    rgb(TEXT_MUTED)
+                                                                                    rgb(t.text_muted)
                                                                                 },
                                                                             )
                                                                             .on_mouse_down(
@@ -2229,17 +2343,22 @@ impl AppShell {
                                                                                     },
                                                                                 ),
                                                                             )
-                                                                            .child(svg_icon(
+                                                                            .child(svg_icon_weighted(
                                                                                 if ep.is_watched {
                                                                                     IconName::Check
                                                                                 } else {
                                                                                     IconName::Eye
                                                                                 },
-                                                                                11.0,
                                                                                 if ep.is_watched {
-                                                                                    rgb(STATUS_WATCHED)
+                                                                                    IconWeight::Fill
                                                                                 } else {
-                                                                                    rgb(TEXT_MUTED)
+                                                                                    IconWeight::Regular
+                                                                                },
+                                                                                11.0 * t.ui_scale,
+                                                                                if ep.is_watched {
+                                                                                    rgb(t.status_watched)
+                                                                                } else {
+                                                                                    rgb(t.text_muted)
                                                                                 },
                                                                             ))
                                                                             .when(
@@ -2258,17 +2377,17 @@ impl AppShell {
                                                                     .min_w(px(0.0))
                                                                     .flex()
                                                                     .items_center()
-                                                                    .gap(px(8.0))
+                                                                    .gap(sp(8.0))
                                                                     .text_xs()
                                                                     .font_features(tabular_nums())
-                                                                    .text_color(rgb(TEXT_MUTED))
+                                                                    .text_color(rgb(t.text_muted))
                                                                     .when_some(
                                                                         ep.air_date.clone(),
                                                                         |row, date| {
                                                                             row.child(
                                                                                 div()
                                                                                     .font(mono_font())
-                                                                                    .text_size(px(
+                                                                                    .text_size(sp(
                                                                                         11.0,
                                                                                     ))
                                                                                     .child(date),
@@ -2280,22 +2399,22 @@ impl AppShell {
                                                                         |row, rt| {
                                                                             row.child(
                                                                                 div()
-                                                                                    .px(px(6.0))
-                                                                                    .py(px(1.0))
+                                                                                    .px(sp(6.0))
+                                                                                    .py(sp(1.0))
                                                                                     .rounded(px(
                                                                                         4.0,
                                                                                     ))
                                                                                     .bg(rgba(
-                                                                                        GLASS_TROUGH_BG,
+                                                                                        t.glass_trough_bg,
                                                                                     ))
                                                                                     .font(
                                                                                         mono_font(),
                                                                                     )
-                                                                                    .text_size(px(
+                                                                                    .text_size(sp(
                                                                                         10.5,
                                                                                     ))
                                                                                     .text_color(rgb(
-                                                                                        TEXT_SECONDARY,
+                                                                                        t.text_secondary,
                                                                                     ))
                                                                                     .child(rt),
                                                                             )
@@ -2306,14 +2425,14 @@ impl AppShell {
                                                                 div()
                                                                     .w_full()
                                                                     .min_w(px(0.0))
-                                                                    .text_size(px(12.0))
-                                                                    .line_height(px(16.5))
+                                                                    .text_size(sp(12.0))
+                                                                    .line_height(sp(16.5))
                                                                     .line_clamp(2)
                                                                     .text_color(
                                                                         if ep.synopsis.is_some() {
-                                                                            rgb(TEXT_SECONDARY)
+                                                                            rgb(t.text_secondary)
                                                                         } else {
-                                                                            rgb(TEXT_MUTED)
+                                                                            rgb(t.text_muted)
                                                                         },
                                                                     )
                                                                     .child(
@@ -2342,8 +2461,10 @@ impl AppShell {
     fn render_stream_picker_panel(
         &self,
         args: StreamPickerPanelArgs<'_>,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> Div {
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         let StreamPickerPanelArgs {
             type_name,
             meta_id,
@@ -2384,25 +2505,25 @@ impl AppShell {
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(16.0))
+            .gap(sp(16.0))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .justify_between()
-                    .gap(px(12.0))
+                    .gap(sp(12.0))
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
                             .items_baseline()
-                            .gap(px(10.0))
+                            .gap(sp(10.0))
                             .child(
                                 div()
                                     .font(editorial_serif())
-                                    .text_size(px(30.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(30.0))
+                                    .text_color(rgb(t.text_primary))
                                     .child("Sources"),
                             )
                             .when_some(episode_label.clone(), |el, ep| {
@@ -2410,7 +2531,7 @@ impl AppShell {
                                     div()
                                         .font(mono_font())
                                         .text_xs()
-                                        .text_color(rgb(ACCENT))
+                                        .text_color(rgb(accent_ink))
                                         .child(ep),
                                 )
                             })
@@ -2419,7 +2540,7 @@ impl AppShell {
                                     .font(mono_font())
                                     .font_features(tabular_nums())
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(rgb(t.text_muted))
                                     .child(format!(
                                         "{filtered_total} of {total_unfiltered} ({addons_ready}/{addons_total} addons)"
                                     )),
@@ -2430,7 +2551,7 @@ impl AppShell {
                             .flex()
                             .flex_wrap()
                             .items_center()
-                            .gap(px(8.0))
+                            .gap(sp(8.0))
                             .child(
                                 glass_segmented_bar("meta-stream-filter-bar")
                                     .child(glass_segmented_item(
@@ -2498,8 +2619,16 @@ impl AppShell {
                                 bar.child(render_compact_glass_toggle(
                                     "stream-filter-cached",
                                     "Cached",
-                                    Some(IconName::Zap),
+                                    Some((
+                                        IconName::Zap,
+                                        if self.stream_filter.cached_only {
+                                            IconWeight::Fill
+                                        } else {
+                                            IconWeight::Regular
+                                        },
+                                    )),
                                     self.stream_filter.cached_only,
+                                    t,
                                     cx.listener(|this, _, _, cx| {
                                         this.stream_filter.cached_only =
                                             !this.stream_filter.cached_only;
@@ -2511,6 +2640,7 @@ impl AppShell {
                             })
                             .when(!available_addons_arc.is_empty(), |bar| {
                                 let addons_for_menu = Arc::clone(&available_addons_arc);
+                                let dropdown_active = addon_filter_active || addon_dropdown_open;
                                 bar.child(
                                     div()
                                         .relative()
@@ -2518,45 +2648,39 @@ impl AppShell {
                                             div()
                                                 .id("stream-addon-dropdown-btn")
                                                 .cursor_pointer()
-                                                .h(px(38.0))
-                                                .px(px(12.0))
+                                                .h(sp(38.0))
+                                                .px(sp(12.0))
                                                 .rounded(px(RADIUS_CONTROL))
-                                                .bg(if addon_filter_active || addon_dropdown_open {
-                                                    rgba(ACCENT_SOFT)
+                                                .bg(if dropdown_active {
+                                                    rgba(t.accent_soft)
                                                 } else {
-                                                    rgba(GLASS_TROUGH_BG)
+                                                    rgba(t.glass_trough_bg)
                                                 })
                                                 .border_1()
-                                                .border_color(
-                                                    if addon_filter_active || addon_dropdown_open {
-                                                        rgba(BORDER_ACCENT)
-                                                    } else {
-                                                        rgba(GLASS_BORDER)
-                                                    },
-                                                )
-                                                .hover(|s| {
-                                                    s.bg(rgba(GLASS_ROW_HOVER_BG)).border_color(
-                                                        if addon_filter_active
-                                                            || addon_dropdown_open
-                                                        {
-                                                            rgb(ACCENT)
+                                                .border_color(if dropdown_active {
+                                                    rgba(t.border_accent)
+                                                } else {
+                                                    rgba(t.glass_border)
+                                                })
+                                                .hover(move |s| {
+                                                    s.bg(rgba(t.glass_row_hover_bg)).border_color(
+                                                        if dropdown_active {
+                                                            rgb(t.accent)
                                                         } else {
-                                                            rgba(GLASS_BORDER_STRONG)
+                                                            rgba(t.glass_border_strong)
                                                         },
                                                     )
                                                 })
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(6.0))
+                                                .gap(sp(6.0))
                                                 .font(ui_sans(FontWeight::MEDIUM))
-                                                .text_size(px(12.5))
-                                                .text_color(
-                                                    if addon_filter_active || addon_dropdown_open {
-                                                        rgb(ACCENT)
-                                                    } else {
-                                                        rgb(TEXT_SECONDARY)
-                                                    },
-                                                )
+                                                .text_size(sp(12.5))
+                                                .text_color(if dropdown_active {
+                                                    rgb(accent_ink)
+                                                } else {
+                                                    rgb(t.text_secondary)
+                                                })
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(|this, _, _, cx| {
@@ -2566,23 +2690,25 @@ impl AppShell {
                                                         cx.notify();
                                                     }),
                                                 )
-                                                .child(svg_icon(
+                                                .child(svg_icon_weighted(
                                                     IconName::Layers,
-                                                    12.0,
-                                                    if addon_filter_active || addon_dropdown_open {
-                                                        rgb(ACCENT)
+                                                    IconWeight::Regular,
+                                                    12.0 * t.ui_scale,
+                                                    if dropdown_active {
+                                                        rgb(accent_ink)
                                                     } else {
-                                                        rgb(TEXT_SECONDARY)
+                                                        rgb(t.text_secondary)
                                                     },
                                                 ))
                                                 .child(addon_label)
-                                                .child(svg_icon(
+                                                .child(svg_icon_weighted(
                                                     IconName::ChevronDown,
-                                                    12.0,
-                                                    if addon_filter_active || addon_dropdown_open {
-                                                        rgb(ACCENT)
+                                                    IconWeight::Regular,
+                                                    12.0 * t.ui_scale,
+                                                    if dropdown_active {
+                                                        rgb(accent_ink)
                                                     } else {
-                                                        rgb(TEXT_MUTED)
+                                                        rgb(t.text_muted)
                                                     },
                                                 )),
                                         )
@@ -2594,18 +2720,18 @@ impl AppShell {
                                                         292.0,
                                                     )
                                                     .absolute()
-                                                    .top(px(44.0))
+                                                    .top(sp(44.0))
                                                     .right_0()
                                                     .shadow(glass_capsule_shadow())
                                                     .child(
                                                         div()
                                                             .id("stream-addon-dropdown-scroll")
                                                             .w_full()
-                                                            .max_h(px(320.0))
+                                                            .max_h(sp(320.0))
                                                             .overflow_y_scroll()
                                                             .flex()
                                                             .flex_col()
-                                                            .gap(px(2.0))
+                                                            .gap(sp(2.0))
                                                             .child(glass_dropdown_option(
                                                                 "stream-addon-opt-all",
                                                                 "All addons",
@@ -2670,8 +2796,9 @@ impl AppShell {
                                 bar.child(render_compact_glass_toggle(
                                     "stream-filter-reset",
                                     "Reset",
-                                    Some(IconName::X),
+                                    Some((IconName::X, IconWeight::Regular)),
                                     false,
+                                    t,
                                     cx.listener(|this, _, _, cx| {
                                         this.stream_filter.reset();
                                         this.meta_addon_dropdown_open = false;
@@ -2710,31 +2837,31 @@ impl AppShell {
                 };
 
                 div()
-                    .p(px(36.0))
+                    .p(sp(36.0))
                     .rounded(px(RADIUS_CARD))
-                    .bg(rgba(GLASS_CARD_BG))
+                    .bg(rgba(t.glass_card_bg))
                     .border_1()
-                    .border_color(rgba(GLASS_BORDER))
+                    .border_color(rgba(t.glass_border))
                     .flex()
                     .flex_col()
                     .items_start()
-                    .gap(px(8.0))
+                    .gap(sp(8.0))
                     .child(
                         div()
                             .font(editorial_serif())
-                            .text_size(px(24.0))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(24.0))
+                            .text_color(rgb(t.text_primary))
                             .child(empty_heading),
                     )
                     .child(
                         div()
-                            .text_size(px(13.5))
-                            .text_color(rgb(TEXT_SECONDARY))
+                            .text_size(sp(13.5))
+                            .text_color(rgb(t.text_secondary))
                             .child(empty_sub),
                     )
                     .when(!is_querying && total_unfiltered > 0 && !is_unfiltered, |el| {
                         el.child(
-                            div().pt(px(6.0)).child(secondary_glass_button(
+                            div().pt(sp(6.0)).child(secondary_glass_button(
                                 "btn-streams-empty-reset",
                                 Some(IconName::RotateCcw),
                                 "Reset filters",
@@ -2756,7 +2883,7 @@ impl AppShell {
                     .w_full()
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
+                    .gap(sp(8.0))
                     .children(page_slice.iter().copied().map(|orig_idx| {
                         let cand = &all_playable_arc[orig_idx];
                         let summary = summarize_stream_for_humans(&cand.parsed);
@@ -2896,6 +3023,7 @@ impl AppShell {
                             page_start,
                             page_end,
                             filtered_total,
+                            t,
                             cx,
                         ))
                     })
@@ -2903,6 +3031,7 @@ impl AppShell {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_stream_pagination_bar(
         &self,
         cur_page: usize,
@@ -2910,30 +3039,31 @@ impl AppShell {
         page_start: usize,
         page_end: usize,
         filtered_total: usize,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> Div {
         let has_prev = cur_page > 0;
         let has_next = cur_page + 1 < total_pages;
 
         div()
-            .mt(px(4.0))
-            .px(px(16.0))
-            .py(px(10.0))
+            .mt(sp(4.0))
+            .px(sp(16.0))
+            .py(sp(10.0))
             .rounded(px(RADIUS_CARD))
-            .bg(rgba(GLASS_CARD_BG))
+            .bg(rgba(t.glass_card_bg))
             .border_1()
-            .border_color(rgba(GLASS_BORDER))
+            .border_color(rgba(t.glass_border))
             .flex()
             .flex_wrap()
             .items_center()
             .justify_between()
-            .gap(px(12.0))
+            .gap(sp(12.0))
             .child(
                 div()
                     .font(mono_font())
                     .font_features(tabular_nums())
                     .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
+                    .text_color(rgb(t.text_muted))
                     .child(format!(
                         "Showing {}–{} of {filtered_total} streams",
                         page_start + 1,
@@ -2944,13 +3074,14 @@ impl AppShell {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(sp(6.0))
                     .child(render_pager_step_button(
                         "btn-streams-prev-page",
                         IconName::ChevronLeft,
                         "Prev",
                         has_prev,
                         false,
+                        t,
                         cx.listener(move |this, _, _, cx| {
                             if cur_page > 0 {
                                 this.visible_stream_limit = cur_page * STREAM_PAGE_SIZE;
@@ -2965,26 +3096,26 @@ impl AppShell {
                             div()
                                 .id(("btn-streams-page", p_idx))
                                 .cursor_pointer()
-                                .w(px(30.0))
-                                .h(px(30.0))
+                                .w(sp(30.0))
+                                .h(sp(30.0))
                                 .rounded(px(RADIUS_POSTER))
                                 .bg(if active {
-                                    rgb(SEGMENT_ACTIVE_BG)
+                                    rgb(t.segment_active_bg)
                                 } else {
-                                    rgba(GLASS_TROUGH_BG)
+                                    rgba(t.glass_trough_bg)
                                 })
                                 .border_1()
                                 .border_color(if active {
-                                    rgb(SEGMENT_ACTIVE_BG)
+                                    rgb(t.segment_active_bg)
                                 } else {
-                                    rgba(GLASS_BORDER)
+                                    rgba(t.glass_border)
                                 })
-                                .hover(|s| {
+                                .hover(move |s| {
                                     if active {
                                         s
                                     } else {
-                                        s.bg(rgba(GLASS_ROW_HOVER_BG))
-                                            .border_color(rgba(GLASS_BORDER_STRONG))
+                                        s.bg(rgba(t.glass_row_hover_bg))
+                                            .border_color(rgba(t.glass_border_strong))
                                     }
                                 })
                                 .flex()
@@ -2994,9 +3125,9 @@ impl AppShell {
                                 .font_features(tabular_nums())
                                 .text_xs()
                                 .text_color(rgb(if active {
-                                    SEGMENT_ACTIVE_TEXT
+                                    t.segment_active_text
                                 } else {
-                                    TEXT_SECONDARY
+                                    t.text_secondary
                                 }))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -3012,11 +3143,11 @@ impl AppShell {
                     .when(total_pages > 7, |row| {
                         row.child(
                             div()
-                                .px(px(10.0))
+                                .px(sp(10.0))
                                 .font(mono_font())
                                 .font_features(tabular_nums())
                                 .text_xs()
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_color(rgb(t.text_secondary))
                                 .child(format!("Page {} of {total_pages}", cur_page + 1)),
                         )
                     })
@@ -3026,6 +3157,7 @@ impl AppShell {
                         "Next",
                         has_next,
                         true,
+                        t,
                         cx.listener(move |this, _, _, cx| {
                             if cur_page + 1 < total_pages {
                                 this.visible_stream_limit = (cur_page + 2) * STREAM_PAGE_SIZE;
@@ -3263,44 +3395,149 @@ fn collection_heading(name: &str) -> String {
     }
 }
 
+fn hero_meta_divider() -> Div {
+    div()
+        .w(px(1.0))
+        .h(px(11.0))
+        .flex_shrink_0()
+        .bg(rgba(HERO_DIVIDER))
+}
+
+fn render_hero_back_button(
+    id: &'static str,
+    label: &'static str,
+    t: ThemePalette,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .h(sp(34.0))
+        .px(sp(12.0))
+        .rounded(px(RADIUS_PILL))
+        .bg(rgba(HERO_GLASS_BG))
+        .border_1()
+        .border_color(rgba(HERO_GLASS_BORDER))
+        .hover(|s| {
+            s.bg(rgba(HERO_GLASS_HOVER_BG))
+                .border_color(rgba(HERO_GLASS_BORDER_STRONG))
+        })
+        .flex()
+        .items_center()
+        .gap(sp(6.0))
+        .font(ui_sans(FontWeight::MEDIUM))
+        .text_size(sp(13.0))
+        .text_color(rgb(HERO_INK_PRIMARY))
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
+        .child(svg_icon_weighted(
+            IconName::ChevronLeft,
+            IconWeight::Regular,
+            14.0 * t.ui_scale,
+            rgb(HERO_INK_PRIMARY),
+        ))
+        .child(label)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_hero_glass_button(
+    id: impl Into<gpui::ElementId>,
+    icon: IconName,
+    weight: IconWeight,
+    label: impl Into<SharedString>,
+    active: bool,
+    t: ThemePalette,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
+    let fg = if active { t.accent } else { HERO_INK_PRIMARY };
+    let active_bg = (t.accent << 8) | 0x29;
+    let active_border = (t.accent << 8) | 0x73;
+    div()
+        .id(id.into())
+        .cursor_pointer()
+        .h(sp(40.0))
+        .px(sp(16.0))
+        .rounded(px(RADIUS_CONTROL))
+        .bg(if active {
+            rgba(active_bg)
+        } else {
+            rgba(HERO_GLASS_BG)
+        })
+        .border_1()
+        .border_color(if active {
+            rgba(active_border)
+        } else {
+            rgba(HERO_GLASS_BORDER)
+        })
+        .hover(move |s| {
+            s.bg(if active {
+                rgba(active_bg)
+            } else {
+                rgba(HERO_GLASS_HOVER_BG)
+            })
+            .border_color(if active {
+                rgb(t.accent)
+            } else {
+                rgba(HERO_GLASS_BORDER_STRONG)
+            })
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(sp(8.0))
+        .font(ui_sans(FontWeight::MEDIUM))
+        .text_size(sp(13.5))
+        .text_color(rgb(fg))
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
+        .child(svg_icon_weighted(icon, weight, 14.5 * t.ui_scale, rgb(fg)))
+        .child(label.into())
+}
+
 fn render_certification_pill(cert: &str) -> Div {
     div()
-        .px(px(7.0))
-        .py(px(1.5))
+        .px(sp(7.0))
+        .py(sp(1.5))
         .rounded(px(4.0))
-        .bg(rgba(GLASS_TROUGH_BG))
+        .bg(rgba(HERO_GLASS_BG))
         .border_1()
-        .border_color(rgba(GLASS_BORDER_STRONG))
+        .border_color(rgba(HERO_GLASS_BORDER_STRONG))
         .font(mono_font())
-        .text_size(px(11.0))
-        .text_color(rgb(TEXT_PRIMARY))
+        .text_size(sp(11.0))
+        .text_color(rgb(HERO_INK_PRIMARY))
         .child(cert.to_owned())
 }
 
 fn render_genre_chip(
     idx: usize,
     label: String,
+    t: ThemePalette,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
+    let accent_border = (t.accent << 8) | 0x73;
     div()
         .id(("meta-genre-chip", idx))
         .cursor_pointer()
-        .h(px(26.0))
-        .px(px(10.0))
+        .h(sp(26.0))
+        .px(sp(10.0))
         .rounded(px(RADIUS_PILL))
-        .bg(rgba(GLASS_TROUGH_BG))
+        .bg(rgba(HERO_GLASS_BG))
         .border_1()
-        .border_color(rgba(GLASS_BORDER))
-        .hover(|s| {
-            s.bg(rgba(GLASS_ROW_HOVER_BG))
-                .border_color(rgba(BORDER_ACCENT))
-                .text_color(rgb(TEXT_PRIMARY))
+        .border_color(rgba(HERO_GLASS_BORDER))
+        .hover(move |s| {
+            s.bg(rgba(HERO_GLASS_HOVER_BG))
+                .border_color(rgba(accent_border))
+                .text_color(rgb(HERO_INK_PRIMARY))
         })
         .flex()
         .items_center()
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(px(12.0))
-        .text_color(rgb(TEXT_SECONDARY))
+        .text_size(sp(12.0))
+        .text_color(rgb(HERO_INK_SECONDARY))
         .on_mouse_down(MouseButton::Left, on_click)
         .child(label)
 }
@@ -3308,74 +3545,80 @@ fn render_genre_chip(
 fn render_compact_glass_toggle(
     id: impl Into<gpui::ElementId>,
     label: impl Into<SharedString>,
-    icon: Option<IconName>,
+    icon: Option<(IconName, IconWeight)>,
     active: bool,
+    t: ThemePalette,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
-    let fg = if active { ACCENT } else { TEXT_SECONDARY };
+    let accent_ink = if t.is_light { t.accent_press } else { t.accent };
+    let fg = if active { accent_ink } else { t.text_secondary };
     div()
         .id(id.into())
         .cursor_pointer()
-        .h(px(38.0))
-        .px(px(12.0))
+        .h(sp(38.0))
+        .px(sp(12.0))
         .rounded(px(RADIUS_CONTROL))
         .bg(if active {
-            rgba(ACCENT_SOFT)
+            rgba(t.accent_soft)
         } else {
-            rgba(GLASS_TROUGH_BG)
+            rgba(t.glass_trough_bg)
         })
         .border_1()
         .border_color(if active {
-            rgba(BORDER_ACCENT)
+            rgba(t.border_accent)
         } else {
-            rgba(GLASS_BORDER)
+            rgba(t.glass_border)
         })
-        .hover(|s| {
+        .hover(move |s| {
             s.bg(if active {
-                rgba(ACCENT_SOFT)
+                rgba(t.accent_soft)
             } else {
-                rgba(GLASS_ROW_HOVER_BG)
+                rgba(t.glass_row_hover_bg)
             })
             .border_color(if active {
-                rgb(ACCENT)
+                rgb(t.accent)
             } else {
-                rgba(GLASS_BORDER_STRONG)
+                rgba(t.glass_border_strong)
             })
         })
         .flex()
         .items_center()
-        .gap(px(5.0))
+        .gap(sp(5.0))
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(px(12.5))
+        .text_size(sp(12.5))
         .text_color(rgb(fg))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
         })
-        .when_some(icon, |el, ic| el.child(svg_icon(ic, 12.0, rgb(fg))))
+        .when_some(icon, |el, (ic, weight)| {
+            el.child(svg_icon_weighted(ic, weight, 12.0 * t.ui_scale, rgb(fg)))
+        })
         .child(label.into())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pager_step_button(
     id: &'static str,
     icon: IconName,
     label: &'static str,
     enabled: bool,
     icon_trailing: bool,
+    t: ThemePalette,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
-    let fg = if enabled { TEXT_PRIMARY } else { TEXT_MUTED };
+    let fg = if enabled { t.text_primary } else { t.text_muted };
     let mut btn = div()
         .id(id)
-        .h(px(30.0))
-        .px(px(10.0))
+        .h(sp(30.0))
+        .px(sp(10.0))
         .rounded(px(RADIUS_POSTER))
-        .bg(rgba(GLASS_TROUGH_BG))
+        .bg(rgba(t.glass_trough_bg))
         .border_1()
-        .border_color(rgba(GLASS_BORDER))
+        .border_color(rgba(t.glass_border))
         .flex()
         .items_center()
-        .gap(px(4.0))
+        .gap(sp(4.0))
         .font(ui_sans(FontWeight::MEDIUM))
         .text_xs()
         .text_color(rgb(fg));
@@ -3383,9 +3626,9 @@ fn render_pager_step_button(
     if enabled {
         btn = btn
             .cursor_pointer()
-            .hover(|s| {
-                s.bg(rgba(GLASS_ROW_HOVER_BG))
-                    .border_color(rgba(GLASS_BORDER_STRONG))
+            .hover(move |s| {
+                s.bg(rgba(t.glass_row_hover_bg))
+                    .border_color(rgba(t.glass_border_strong))
             })
             .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                 cx.stop_propagation();
@@ -3394,9 +3637,20 @@ fn render_pager_step_button(
     }
 
     if icon_trailing {
-        btn.child(label).child(svg_icon(icon, 12.0, rgb(fg)))
+        btn.child(label).child(svg_icon_weighted(
+            icon,
+            IconWeight::Regular,
+            12.0 * t.ui_scale,
+            rgb(fg),
+        ))
     } else {
-        btn.child(svg_icon(icon, 12.0, rgb(fg))).child(label)
+        btn.child(svg_icon_weighted(
+            icon,
+            IconWeight::Regular,
+            12.0 * t.ui_scale,
+            rgb(fg),
+        ))
+        .child(label)
     }
 }
 

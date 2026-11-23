@@ -730,6 +730,68 @@ impl Drop for RangeCursorGuard {
     }
 }
 
+const TAIL_WARMER_MULTI_PEER_GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
+const TAIL_WARMER_PEER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const TAIL_WARMER_MULTI_PEER_MIN_LIVE: u32 = 2;
+
+fn has_multi_peer_swarm(handle: &ManagedTorrent) -> bool {
+    handle
+        .stats()
+        .live
+        .as_ref()
+        .is_some_and(|l| l.snapshot.peer_stats.live >= TAIL_WARMER_MULTI_PEER_MIN_LIVE)
+}
+
+async fn wait_for_tail_warmer_gate<F>(
+    head_done_rx: &mut tokio::sync::watch::Receiver<bool>,
+    cancel: &CancellationToken,
+    grace: std::time::Duration,
+    poll_interval: std::time::Duration,
+    mut is_multi_peer: F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
+    if *head_done_rx.borrow() {
+        return !cancel.is_cancelled();
+    }
+
+    // Always give head warming up to `grace` (2.5s) first; on 0-1 peer swarms keep waiting
+    // strictly for `head_done` (re-checking peer count periodically in case more peers join).
+    let grace_deadline = tokio::time::sleep(grace);
+    tokio::pin!(grace_deadline);
+
+    tokio::select! {
+        _ = cancel.cancelled() => return false,
+        res = head_done_rx.wait_for(|&done| done) => {
+            return res.is_ok() && !cancel.is_cancelled();
+        }
+        _ = &mut grace_deadline => {}
+    }
+
+    if is_multi_peer() {
+        return !cancel.is_cancelled();
+    }
+
+    let mut peer_poll = tokio::time::interval(poll_interval);
+    peer_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    peer_poll.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            res = head_done_rx.wait_for(|&done| done) => {
+                return res.is_ok() && !cancel.is_cancelled();
+            }
+            _ = peer_poll.tick() => {
+                if is_multi_peer() {
+                    return !cancel.is_cancelled();
+                }
+            }
+        }
+    }
+}
+
 fn spawn_critical_head_tail_warmers(
     handle: Arc<ManagedTorrent>,
     file_idx: usize,
@@ -777,13 +839,16 @@ fn spawn_critical_head_tail_warmers(
 
     if file_len > HEAD_CRITICAL_BYTES {
         tokio::spawn(async move {
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                res = head_done_rx.wait_for(|&done| done) => {
-                    if res.is_err() || cancel.is_cancelled() {
-                        return;
-                    }
-                }
+            let proceed = wait_for_tail_warmer_gate(
+                &mut head_done_rx,
+                &cancel,
+                TAIL_WARMER_MULTI_PEER_GRACE,
+                TAIL_WARMER_PEER_POLL_INTERVAL,
+                || has_multi_peer_swarm(&handle),
+            )
+            .await;
+            if !proceed {
+                return;
             }
 
             let tail_start = file_len.saturating_sub(TAIL_CRITICAL_BYTES);
@@ -1119,5 +1184,146 @@ mod tests {
 
         session.cancellation_token().cancel();
         seeder.cancellation_token().cancel();
+    }
+
+    #[tokio::test]
+    async fn tail_warmer_gate_wakes_after_grace_only_for_multi_peer_swarms() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        assert_eq!(TAIL_WARMER_MULTI_PEER_GRACE, Duration::from_millis(2500));
+        assert_eq!(TAIL_WARMER_MULTI_PEER_MIN_LIVE, 2);
+
+        let test_grace = Duration::from_millis(80);
+        let test_poll = Duration::from_millis(15);
+
+        // 1. Single-peer / 0-peer swarm: stays gated past grace until head_done fires.
+        {
+            let (tx, mut rx) = tokio::sync::watch::channel(false);
+            let cancel = CancellationToken::new();
+            let done_flag = Arc::new(AtomicBool::new(false));
+            let done_clone = Arc::clone(&done_flag);
+            let task = tokio::spawn(async move {
+                let res =
+                    wait_for_tail_warmer_gate(&mut rx, &cancel, test_grace, test_poll, || false)
+                        .await;
+                done_clone.store(res, Ordering::Release);
+                res
+            });
+
+            tokio::time::sleep(Duration::from_millis(160)).await;
+            assert!(
+                !done_flag.load(Ordering::Acquire),
+                "1-peer swarm must keep strict head-first serialization past grace window"
+            );
+
+            tx.send(true).unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap());
+        }
+
+        // 2. Multi-peer swarm (>= 2 live peers): gives head grace priority first, then wakes.
+        {
+            let (_tx, mut rx) = tokio::sync::watch::channel(false);
+            let cancel = CancellationToken::new();
+            let done_flag = Arc::new(AtomicBool::new(false));
+            let done_clone = Arc::clone(&done_flag);
+            let task = tokio::spawn(async move {
+                let res =
+                    wait_for_tail_warmer_gate(&mut rx, &cancel, test_grace, test_poll, || true)
+                        .await;
+                done_clone.store(res, Ordering::Release);
+                res
+            });
+
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(
+                !done_flag.load(Ordering::Acquire),
+                "tail warmer must give head initial grace priority first"
+            );
+
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap());
+        }
+
+        // 3. Fast head completion on multi-peer swarm wakes immediately before grace expires.
+        {
+            let (tx, mut rx) = tokio::sync::watch::channel(false);
+            let cancel = CancellationToken::new();
+            let t0 = Instant::now();
+            let task = tokio::spawn(async move {
+                wait_for_tail_warmer_gate(
+                    &mut rx,
+                    &cancel,
+                    Duration::from_secs(5),
+                    test_poll,
+                    || true,
+                )
+                .await
+            });
+
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            tx.send(true).unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap());
+            assert!(t0.elapsed() < Duration::from_secs(1));
+        }
+
+        // 4. Swarm ramps up from 1 peer to >= 2 peers after grace -> wakes on peer poll.
+        {
+            let (_tx, mut rx) = tokio::sync::watch::channel(false);
+            let cancel = CancellationToken::new();
+            let multi = Arc::new(AtomicBool::new(false));
+            let multi_clone = Arc::clone(&multi);
+            let done_flag = Arc::new(AtomicBool::new(false));
+            let done_clone = Arc::clone(&done_flag);
+            let task = tokio::spawn(async move {
+                let res = wait_for_tail_warmer_gate(&mut rx, &cancel, test_grace, test_poll, || {
+                    multi_clone.load(Ordering::Acquire)
+                })
+                .await;
+                done_clone.store(res, Ordering::Release);
+                res
+            });
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert!(!done_flag.load(Ordering::Acquire));
+
+            multi.store(true, Ordering::Release);
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap());
+        }
+
+        // 5. Cancellation aborts cleanly without triggering tail warming.
+        {
+            let (_tx, mut rx) = tokio::sync::watch::channel(false);
+            let cancel = CancellationToken::new();
+            let cancel_clone = cancel.clone();
+            let task = tokio::spawn(async move {
+                wait_for_tail_warmer_gate(
+                    &mut rx,
+                    &cancel_clone,
+                    Duration::from_secs(5),
+                    test_poll,
+                    || true,
+                )
+                .await
+            });
+
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap());
+        }
     }
 }

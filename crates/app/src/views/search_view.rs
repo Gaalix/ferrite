@@ -14,29 +14,34 @@ use stremio_core_runtime::{
 use url::Url;
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
-    state::{AppRoute, BrowsingContextMenu, FocusedInput, KbFocusableCard, LibraryStatusTab},
+    state::{
+        AppRoute, BrowsingContextMenu, FocusedInput, KbFocusableCard, LibraryStatusTab,
+        QuickPeekTarget,
+    },
     theme::{
-        editorial_serif, meta_divider, mono_font, neutral_chip, placeholder_tint_for_id,
-        poster_card_shadow, sentence_case_label, ui_sans, ACCENT, ACCENT_AMBER, BG_SURFACE,
-        BORDER_POSTER_HOVER, GLASS_BORDER, GLASS_BORDER_STRONG, GLASS_CARD_BG, GLASS_ROW_HOVER_BG,
-        GLASS_TROUGH_BG, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER, TEXT_MUTED,
-        TEXT_PRIMARY, TEXT_SECONDARY,
+        active_theme, editorial_serif, mono_font, neutral_chip, placeholder_tint_for_id,
+        poster_card_shadow, sentence_case_label, sp, ui_sans, ThemePalette, RADIUS_CARD,
+        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
     ui_components::{
-        glass_back_button, primary_accent_button, render_poster_card, secondary_glass_button,
-        PosterCardProps,
+        glass_back_button, primary_accent_button, render_poster_card, PosterCardProps,
     },
     virtual_grid::{compute_dynamic_grid_metrics, slice_row_items, PosterAspect},
 };
 
-const GRID_MIN_CARD_WIDTH_PX: f32 = 176.0;
-const GRID_COL_GAP_PX: f32 = 18.0;
-const GRID_ROW_GAP_PX: f32 = 16.0;
-const GRID_METADATA_HEIGHT_PX: f32 = 48.0;
+const GRID_METADATA_HEIGHT_PX: f32 = 52.0;
 const PEOPLE_MIN_CARD_WIDTH_PX: f32 = 270.0;
 const PEOPLE_GAP_PX: f32 = 16.0;
+
+const CINEMA_INK_PRIMARY: u32 = 0xF5F1E8;
+const CINEMA_INK_SECONDARY: u32 = 0xC8C8D2;
+const CINEMA_GLASS_BG: u32 = 0xFFFFFF14;
+const CINEMA_GLASS_HOVER_BG: u32 = 0xFFFFFF24;
+const CINEMA_GLASS_BORDER: u32 = 0xFFFFFF29;
+const CINEMA_GLASS_BORDER_STRONG: u32 = 0xFFFFFF42;
+const CINEMA_DIVIDER: u32 = 0xFFFFFF24;
 
 pub(crate) fn person_initials(name: &str) -> String {
     let mut parts = name.split_whitespace();
@@ -167,6 +172,10 @@ impl AppShell {
         let play_type = hit.media_type.clone();
         let play_id = target_id.clone();
         let toggle_preview = preview.clone();
+        let peek_type = hit.media_type.clone();
+        let peek_id = target_id.clone();
+        let peek_title = hit.title.clone();
+        let peek_preview = preview.clone();
         let ctx_type = hit.media_type.clone();
         let ctx_id = target_id.clone();
         let ctx_title = hit.title.clone();
@@ -193,6 +202,18 @@ impl AppShell {
             .on_toggle_library(cx.listener(move |this, _, _, cx| {
                 this.core.toggle_library_item(toggle_preview.clone());
                 cx.notify();
+            }))
+            .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                this.open_quick_peek(
+                    QuickPeekTarget {
+                        type_name: peek_type.clone(),
+                        id: peek_id.clone(),
+                        video_id: None,
+                        title: peek_title.clone(),
+                        preview: Some(peek_preview.clone()),
+                    },
+                    cx,
+                );
             }))
             .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                 let menu = BrowsingContextMenu::new(
@@ -224,6 +245,9 @@ impl AppShell {
         route_query: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = active_theme();
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
+
         if self.full_search_query.trim().is_empty() && !route_query.trim().is_empty() {
             self.full_search_query = route_query.to_owned();
         }
@@ -236,7 +260,7 @@ impl AppShell {
         let enriched_top = res
             .top_match
             .as_ref()
-            .and_then(|t| self.core.cached_enriched_meta(&t.canonical_id));
+            .and_then(|m| self.core.cached_enriched_meta(&m.canonical_id));
 
         let library_statuses = self.cached_library_statuses();
 
@@ -263,27 +287,33 @@ impl AppShell {
             || !res.people.is_empty();
 
         let viewport_w = self.viewport_size_px.0;
+        let side_pad = if viewport_w.is_finite() && viewport_w > 0.0 {
+            (viewport_w * 0.03).clamp(24.0, 56.0)
+        } else {
+            32.0
+        };
+        let grid_gap = t.density.grid_gap_px() * t.ui_scale;
         let media_metrics = compute_dynamic_grid_metrics(
             res.movies.len().max(res.series.len()),
             viewport_w,
             0.0,
-            64.0,
-            Some(1440.0),
-            GRID_MIN_CARD_WIDTH_PX,
-            GRID_COL_GAP_PX,
-            GRID_ROW_GAP_PX,
-            GRID_METADATA_HEIGHT_PX,
+            side_pad * 2.0,
+            None,
+            t.density.target_poster_width_px() * t.ui_scale,
+            grid_gap,
+            grid_gap,
+            GRID_METADATA_HEIGHT_PX * t.ui_scale,
             PosterAspect::Portrait2x3,
         );
         let people_metrics = compute_dynamic_grid_metrics(
             res.people.len(),
             viewport_w,
             0.0,
-            64.0,
-            Some(1440.0),
-            PEOPLE_MIN_CARD_WIDTH_PX,
-            PEOPLE_GAP_PX,
-            PEOPLE_GAP_PX,
+            side_pad * 2.0,
+            None,
+            PEOPLE_MIN_CARD_WIDTH_PX * t.ui_scale,
+            PEOPLE_GAP_PX * t.ui_scale,
+            PEOPLE_GAP_PX * t.ui_scale,
             0.0,
             PosterAspect::Square1x1,
         );
@@ -361,7 +391,7 @@ impl AppShell {
                 }
             }
             let top_status = hit_library_status(&merged, &library_statuses);
-            self.render_search_top_match(&merged, top_status, cx)
+            self.render_search_top_match(&merged, top_status, t, cx)
         });
 
         let people_rows: Vec<Vec<usize>> = (0..res.people.len())
@@ -378,30 +408,28 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(1440.0))
-                    .mx_auto()
-                    .px(px(32.0))
-                    .pt(px(28.0))
-                    .pb(px(72.0))
+                    .px(px(side_pad))
+                    .pt(sp(16.0))
+                    .pb(sp(72.0))
                     .flex()
                     .flex_col()
-                    .gap(px(36.0))
+                    .gap(sp(32.0))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(14.0))
+                            .gap(sp(14.0))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .justify_between()
-                                    .gap(px(16.0))
+                                    .gap(sp(16.0))
                                     .child(
                                         div()
                                             .flex()
                                             .items_center()
-                                            .gap(px(12.0))
+                                            .gap(sp(12.0))
                                             .child(glass_back_button(
                                                 "search-view-back",
                                                 "Back",
@@ -412,8 +440,8 @@ impl AppShell {
                                             .child(
                                                 div()
                                                     .font(editorial_serif())
-                                                    .text_size(px(32.0))
-                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .text_size(sp(32.0))
+                                                    .text_color(rgb(t.text_primary))
                                                     .child("Search"),
                                             ),
                                     )
@@ -424,20 +452,20 @@ impl AppShell {
                                     .id("full-search-input")
                                     .cursor_text()
                                     .w_full()
-                                    .h(px(50.0))
-                                    .px(px(18.0))
+                                    .h(sp(48.0))
+                                    .px(sp(16.0))
                                     .rounded(px(RADIUS_CONTROL))
-                                    .bg(rgba(GLASS_TROUGH_BG))
+                                    .bg(rgba(t.glass_trough_bg))
                                     .border_1()
                                     .border_color(if focused {
-                                        rgba(BORDER_POSTER_HOVER)
+                                        rgba(t.border_poster_hover)
                                     } else {
-                                        rgba(GLASS_BORDER)
+                                        rgba(t.glass_border)
                                     })
                                     .flex()
                                     .items_center()
                                     .justify_between()
-                                    .gap(px(12.0))
+                                    .gap(sp(12.0))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -456,14 +484,15 @@ impl AppShell {
                                             .min_w(px(0.0))
                                             .flex()
                                             .items_center()
-                                            .gap(px(12.0))
-                                            .child(svg_icon(
+                                            .gap(sp(12.0))
+                                            .child(svg_icon_weighted(
                                                 IconName::Search,
-                                                18.0,
+                                                IconWeight::Regular,
+                                                18.0 * t.ui_scale,
                                                 if focused {
-                                                    rgb(ACCENT)
+                                                    rgb(accent_ink)
                                                 } else {
-                                                    rgb(TEXT_MUTED)
+                                                    rgb(t.text_muted)
                                                 },
                                             ))
                                             .child(
@@ -471,11 +500,11 @@ impl AppShell {
                                                     .flex_1()
                                                     .truncate()
                                                     .font(ui_sans(FontWeight::MEDIUM))
-                                                    .text_size(px(16.0))
+                                                    .text_size(sp(15.5))
                                                     .text_color(if q_empty && !focused {
-                                                        rgb(TEXT_MUTED)
+                                                        rgb(t.text_muted)
                                                     } else {
-                                                        rgb(TEXT_PRIMARY)
+                                                        rgb(t.text_primary)
                                                     })
                                                     .child(search_display),
                                             ),
@@ -485,10 +514,10 @@ impl AppShell {
                                             div()
                                                 .id("full-search-clear")
                                                 .cursor_pointer()
-                                                .w(px(28.0))
-                                                .h(px(28.0))
+                                                .w(sp(28.0))
+                                                .h(sp(28.0))
                                                 .rounded(px(RADIUS_PILL))
-                                                .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                                                .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                                                 .flex()
                                                 .items_center()
                                                 .justify_center()
@@ -507,10 +536,11 @@ impl AppShell {
                                                         this.refresh_full_search(cx);
                                                     }),
                                                 )
-                                                .child(svg_icon(
+                                                .child(svg_icon_weighted(
                                                     IconName::X,
-                                                    14.0,
-                                                    rgb(TEXT_SECONDARY),
+                                                    IconWeight::Regular,
+                                                    14.0 * t.ui_scale,
+                                                    rgb(t.text_secondary),
                                                 )),
                                         )
                                     }),
@@ -519,26 +549,26 @@ impl AppShell {
                     .when(q_empty, |el| {
                         el.child(
                             div()
-                                .p(px(36.0))
+                                .p(sp(32.0))
                                 .rounded(px(RADIUS_CARD))
-                                .bg(rgba(GLASS_CARD_BG))
+                                .bg(rgba(t.glass_card_bg))
                                 .border_1()
-                                .border_color(rgba(GLASS_BORDER))
+                                .border_color(rgba(t.glass_border))
                                 .flex()
                                 .flex_col()
-                                .gap(px(8.0))
+                                .gap(sp(8.0))
                                 .child(
                                     div()
                                         .font(editorial_serif())
-                                        .text_size(px(28.0))
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_size(sp(26.0))
+                                        .text_color(rgb(t.text_primary))
                                         .child("Search movies, series, and people"),
                                 )
                                 .child(
                                     div()
                                         .max_w(px(620.0))
-                                        .text_size(px(14.0))
-                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .text_size(sp(14.0))
+                                        .text_color(rgb(t.text_secondary))
                                         .child("Find titles across your library, installed catalogs, and connected metadata sources."),
                                 ),
                         )
@@ -546,25 +576,25 @@ impl AppShell {
                     .when(!q_empty && !has_any_hits && !self.full_search_loading_tmdb, |el| {
                         el.child(
                             div()
-                                .p(px(36.0))
+                                .p(sp(32.0))
                                 .rounded(px(RADIUS_CARD))
-                                .bg(rgba(GLASS_CARD_BG))
+                                .bg(rgba(t.glass_card_bg))
                                 .border_1()
-                                .border_color(rgba(GLASS_BORDER))
+                                .border_color(rgba(t.glass_border))
                                 .flex()
                                 .flex_col()
-                                .gap(px(8.0))
+                                .gap(sp(8.0))
                                 .child(
                                     div()
                                         .font(editorial_serif())
-                                        .text_size(px(28.0))
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_size(sp(26.0))
+                                        .text_color(rgb(t.text_primary))
                                         .child(format!("No matches for \"{}\"", res.query)),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(14.0))
-                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .text_size(sp(14.0))
+                                        .text_color(rgb(t.text_secondary))
                                         .child("Try another title, actor, or director — or add a TMDB key in Settings for broader discovery."),
                                 ),
                         )
@@ -574,12 +604,12 @@ impl AppShell {
                             div()
                                 .flex()
                                 .flex_col()
-                                .gap(px(14.0))
+                                .gap(sp(12.0))
                                 .child(
                                     div()
                                         .font(mono_font())
                                         .text_xs()
-                                        .text_color(rgb(ACCENT))
+                                        .text_color(rgb(accent_ink))
                                         .child("TOP MATCH"),
                                 )
                                 .child(card),
@@ -595,6 +625,8 @@ impl AppShell {
                             &res.movies,
                             &library_statuses,
                             movies_kb_offset,
+                            side_pad,
+                            t,
                             cx,
                         ))
                     })
@@ -608,6 +640,8 @@ impl AppShell {
                             &res.series,
                             &library_statuses,
                             series_kb_offset,
+                            side_pad,
+                            t,
                             cx,
                         ))
                     })
@@ -616,7 +650,7 @@ impl AppShell {
                             div()
                                 .flex()
                                 .flex_col()
-                                .gap(px(16.0))
+                                .gap(sp(16.0))
                                 .child(
                                     div()
                                         .flex()
@@ -626,18 +660,18 @@ impl AppShell {
                                             div()
                                                 .flex()
                                                 .items_baseline()
-                                                .gap(px(12.0))
+                                                .gap(sp(12.0))
                                                 .child(
                                                     div()
                                                         .font(editorial_serif())
-                                                        .text_size(px(28.0))
-                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .text_size(sp(26.0))
+                                                        .text_color(rgb(t.text_primary))
                                                         .child("People"),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_size(px(13.0))
-                                                        .text_color(rgb(TEXT_MUTED))
+                                                        .text_size(sp(13.0))
+                                                        .text_color(rgb(t.text_muted))
                                                         .child("Cast & Directors"),
                                                 ),
                                         )
@@ -648,7 +682,7 @@ impl AppShell {
                                         .w_full()
                                         .flex()
                                         .flex_col()
-                                        .gap(px(PEOPLE_GAP_PX))
+                                        .gap(sp(PEOPLE_GAP_PX))
                                         .children(people_rows.into_iter().enumerate().map(
                                             |(row_idx, row_indices)| {
                                                 let empty_slots =
@@ -658,7 +692,7 @@ impl AppShell {
                                                     .w_full()
                                                     .flex()
                                                     .items_stretch()
-                                                    .gap(px(PEOPLE_GAP_PX))
+                                                    .gap(sp(PEOPLE_GAP_PX))
                                                     .children(row_indices.into_iter().map(|idx| {
                                                         let person = &res.people[idx];
                                                         let pk = person.person_key.clone();
@@ -685,20 +719,20 @@ impl AppShell {
                                                             .cursor_pointer()
                                                             .flex_1()
                                                             .min_w(px(0.0))
-                                                            .p(px(14.0))
+                                                            .p(sp(14.0))
                                                             .rounded(px(RADIUS_CARD))
-                                                            .bg(rgba(GLASS_CARD_BG))
+                                                            .bg(rgba(t.glass_card_bg))
                                                             .hover(move |s| {
-                                                                s.bg(rgba(GLASS_ROW_HOVER_BG))
+                                                                s.bg(rgba(t.glass_row_hover_bg))
                                                                     .border_color(if is_focused {
-                                                                        rgb(ACCENT)
+                                                                        rgb(t.accent)
                                                                     } else {
-                                                                        rgba(GLASS_BORDER_STRONG)
+                                                                        rgba(t.glass_border_strong)
                                                                     })
                                                             })
                                                             .flex()
                                                             .items_center()
-                                                            .gap(px(14.0))
+                                                            .gap(sp(14.0))
                                                             .on_mouse_down(
                                                                 MouseButton::Left,
                                                                 cx.listener(move |this, _, _, cx| {
@@ -712,22 +746,22 @@ impl AppShell {
 
                                                         let card = if is_focused {
                                                             card.border_2()
-                                                                .border_color(rgb(ACCENT))
+                                                                .border_color(rgb(t.accent))
                                                         } else {
                                                             card.border_1()
-                                                                .border_color(rgba(GLASS_BORDER))
+                                                                .border_color(rgba(t.glass_border))
                                                         };
 
                                                         card.child(
                                                             div()
-                                                                .w(px(56.0))
-                                                                .h(px(56.0))
+                                                                .w(sp(56.0))
+                                                                .h(sp(56.0))
                                                                 .flex_shrink_0()
                                                                 .rounded(px(RADIUS_PILL))
                                                                 .overflow_hidden()
-                                                                .bg(rgba(GLASS_TROUGH_BG))
+                                                                .bg(rgba(t.glass_trough_bg))
                                                                 .border_1()
-                                                                .border_color(rgba(GLASS_BORDER))
+                                                                .border_color(rgba(t.glass_border))
                                                                 .flex()
                                                                 .items_center()
                                                                 .justify_center()
@@ -743,9 +777,9 @@ impl AppShell {
                                                                 } else {
                                                                     div()
                                                                         .font(editorial_serif())
-                                                                        .text_size(px(20.0))
+                                                                        .text_size(sp(20.0))
                                                                         .text_color(rgb(
-                                                                            TEXT_SECONDARY,
+                                                                            t.text_secondary,
                                                                         ))
                                                                         .child(initials)
                                                                         .into_any_element()
@@ -757,15 +791,15 @@ impl AppShell {
                                                                 .min_w(px(0.0))
                                                                 .flex()
                                                                 .flex_col()
-                                                                .gap(px(4.0))
+                                                                .gap(sp(4.0))
                                                                 .child(
                                                                     div()
                                                                         .font(ui_sans(
                                                                             FontWeight::SEMIBOLD,
                                                                         ))
-                                                                        .text_size(px(14.5))
+                                                                        .text_size(sp(14.5))
                                                                         .text_color(rgb(
-                                                                            TEXT_PRIMARY,
+                                                                            t.text_primary,
                                                                         ))
                                                                         .truncate()
                                                                         .child(person.name.clone()),
@@ -774,7 +808,7 @@ impl AppShell {
                                                                     div()
                                                                         .font(mono_font())
                                                                         .text_xs()
-                                                                        .text_color(rgb(ACCENT))
+                                                                        .text_color(rgb(accent_ink))
                                                                         .child(
                                                                             person
                                                                                 .department
@@ -784,7 +818,7 @@ impl AppShell {
                                                                 .child(
                                                                     div()
                                                                         .text_xs()
-                                                                        .text_color(rgb(TEXT_MUTED))
+                                                                        .text_color(rgb(t.text_muted))
                                                                         .truncate()
                                                                         .child(known_for),
                                                                 ),
@@ -805,6 +839,7 @@ impl AppShell {
         &self,
         hit: &EditorialMediaHit,
         lib_status: Option<LibraryStatusTab>,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let target_id = hit_target_id(hit);
@@ -819,6 +854,10 @@ impl AppShell {
         let details_type = hit.media_type.clone();
         let details_id = target_id.clone();
         let toggle_preview = preview.clone();
+        let peek_type = hit.media_type.clone();
+        let peek_id = target_id.clone();
+        let peek_title = hit.title.clone();
+        let peek_preview = preview.clone();
         let ctx_type = hit.media_type.clone();
         let ctx_id = target_id.clone();
         let ctx_title = hit.title.clone();
@@ -866,19 +905,26 @@ impl AppShell {
         );
 
         let type_label = sentence_case_label(&hit.media_type);
+        let cinema_meta_divider = || {
+            div()
+                .w(px(1.0))
+                .h(px(11.0))
+                .flex_shrink_0()
+                .bg(rgba(CINEMA_DIVIDER))
+        };
 
         div()
             .id("search-top-match-card")
             .cursor_pointer()
             .w_full()
-            .h(px(280.0))
+            .h(sp(280.0))
             .rounded(px(RADIUS_CARD))
             .overflow_hidden()
             .relative()
             .bg(rgb(placeholder_tint_for_id(&hit.canonical_id)))
             .border_1()
-            .border_color(rgba(GLASS_BORDER))
-            .hover(|s| s.border_color(rgba(GLASS_BORDER_STRONG)))
+            .border_color(rgba(t.glass_border))
+            .hover(move |s| s.border_color(rgba(t.glass_border_strong)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -936,28 +982,28 @@ impl AppShell {
                     .inset_0()
                     .bg(linear_gradient(
                         90.0,
-                        linear_color_stop(rgba(0x0b0b0df2), 0.25),
-                        linear_color_stop(rgba(0x0b0b0d85), 1.0),
+                        linear_color_stop(rgba(0x0B0D14F2), 0.25),
+                        linear_color_stop(rgba(0x0B0D1485), 1.0),
                     )),
             )
             .child(
                 div()
                     .relative()
                     .size_full()
-                    .p(px(28.0))
+                    .p(sp(28.0))
                     .flex()
                     .items_center()
-                    .gap(px(28.0))
+                    .gap(sp(28.0))
                     .child(
                         div()
-                            .w(px(148.0))
-                            .h(px(222.0))
+                            .w(sp(148.0))
+                            .h(sp(222.0))
                             .flex_shrink_0()
                             .rounded(px(RADIUS_POSTER))
                             .overflow_hidden()
-                            .bg(rgb(BG_SURFACE))
+                            .bg(rgb(0x141417))
                             .border_1()
-                            .border_color(rgba(GLASS_BORDER))
+                            .border_color(rgba(CINEMA_GLASS_BORDER))
                             .shadow(poster_card_shadow())
                             .child(if let Some(ptex) = poster_tex {
                                 img(ptex)
@@ -967,14 +1013,14 @@ impl AppShell {
                             } else {
                                 div()
                                     .size_full()
-                                    .p(px(14.0))
+                                    .p(sp(14.0))
                                     .flex()
                                     .items_end()
                                     .child(
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(px(20.0))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_size(sp(20.0))
+                                            .text_color(rgb(CINEMA_INK_SECONDARY))
                                             .child(hit.title.clone()),
                                     )
                                     .into_any_element()
@@ -987,19 +1033,19 @@ impl AppShell {
                             .flex()
                             .flex_col()
                             .items_start()
-                            .gap(px(10.0))
+                            .gap(sp(10.0))
                             .child(if let Some(ltex) = logo_tex {
                                 img(ltex)
-                                    .h(px(72.0))
-                                    .max_w(px(380.0))
+                                    .h(sp(72.0))
+                                    .max_w(sp(380.0))
                                     .object_fit(gpui::ObjectFit::Contain)
                                     .into_any_element()
                             } else {
                                 div()
                                     .font(editorial_serif())
-                                    .text_size(px(40.0))
+                                    .text_size(sp(40.0))
                                     .line_height(gpui::relative(1.06))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(rgb(CINEMA_INK_PRIMARY))
                                     .truncate()
                                     .child(hit.title.clone())
                                     .into_any_element()
@@ -1008,51 +1054,53 @@ impl AppShell {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(10.0))
+                                    .gap(sp(10.0))
                                     .font(mono_font())
                                     .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(rgb(CINEMA_INK_SECONDARY))
                                     .child(type_label)
                                     .when_some(hit.year.clone(), |el, y| {
-                                        el.child(meta_divider()).child(y)
+                                        el.child(cinema_meta_divider()).child(y)
                                     })
                                     .when_some(hit.imdb_rating.clone(), |el, r| {
-                                        el.child(meta_divider()).child(
+                                        el.child(cinema_meta_divider()).child(
                                             div()
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(4.0))
-                                                .text_color(rgb(TEXT_PRIMARY))
-                                                .child(svg_icon(
+                                                .gap(sp(4.0))
+                                                .text_color(rgb(CINEMA_INK_PRIMARY))
+                                                .child(svg_icon_weighted(
                                                     IconName::Star,
-                                                    11.5,
-                                                    rgb(ACCENT_AMBER),
+                                                    IconWeight::Fill,
+                                                    11.5 * t.ui_scale,
+                                                    rgb(0xFBBF24),
                                                 ))
                                                 .child(r),
                                         )
                                     })
                                     .when(!hit.genres.is_empty(), |el| {
-                                        el.child(meta_divider()).child(hit.genres.join(" · "))
+                                        el.child(cinema_meta_divider())
+                                            .child(hit.genres.join(" · "))
                                     }),
                             )
                             .when_some(hit.overview.clone(), |el, desc| {
                                 el.child(
                                     div()
                                         .max_w(px(640.0))
-                                        .text_size(px(13.5))
-                                        .text_color(rgb(TEXT_SECONDARY))
-                                        .max_h(px(42.0))
+                                        .text_size(sp(13.5))
+                                        .text_color(rgb(CINEMA_INK_SECONDARY))
+                                        .max_h(sp(42.0))
                                         .overflow_hidden()
                                         .child(desc),
                                 )
                             })
                             .child(
                                 div()
-                                    .mt(px(4.0))
+                                    .mt(sp(4.0))
                                     .flex()
                                     .flex_wrap()
                                     .items_center()
-                                    .gap(px(10.0))
+                                    .gap(sp(10.0))
                                     .child(primary_accent_button(
                                         "search-top-match-watch",
                                         Some(IconName::Play),
@@ -1065,11 +1113,13 @@ impl AppShell {
                                             );
                                         }),
                                     ))
-                                    .child(secondary_glass_button(
+                                    .child(render_cinema_glass_button(
                                         "search-top-match-details",
-                                        Some(IconName::Info),
+                                        IconName::Info,
+                                        IconWeight::Regular,
                                         "Details",
                                         false,
+                                        t,
                                         cx.listener(move |this, _, _, cx| {
                                             this.open_editorial_media_hit(
                                                 details_type.clone(),
@@ -1079,19 +1129,41 @@ impl AppShell {
                                             );
                                         }),
                                     ))
-                                    .child(secondary_glass_button(
-                                        "search-top-match-watchlist",
-                                        Some(if in_library {
-                                            IconName::Check
-                                        } else {
-                                            IconName::Bookmark
+                                    .child(render_cinema_glass_button(
+                                        "search-top-match-peek",
+                                        IconName::Eye,
+                                        IconWeight::Regular,
+                                        "Quick Peek",
+                                        false,
+                                        t,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.open_quick_peek(
+                                                QuickPeekTarget {
+                                                    type_name: peek_type.clone(),
+                                                    id: peek_id.clone(),
+                                                    video_id: None,
+                                                    title: peek_title.clone(),
+                                                    preview: Some(peek_preview.clone()),
+                                                },
+                                                cx,
+                                            );
                                         }),
+                                    ))
+                                    .child(render_cinema_glass_button(
+                                        "search-top-match-watchlist",
+                                        IconName::Bookmark,
+                                        if in_library {
+                                            IconWeight::Fill
+                                        } else {
+                                            IconWeight::Regular
+                                        },
                                         if in_library {
                                             "On watchlist"
                                         } else {
                                             "Watchlist"
                                         },
                                         in_library,
+                                        t,
                                         cx.listener(move |this, _, _, cx| {
                                             this.core.toggle_library_item(toggle_preview.clone());
                                             cx.notify();
@@ -1113,19 +1185,22 @@ impl AppShell {
         hits: &[EditorialMediaHit],
         library_statuses: &Arc<HashMap<String, LibraryStatusTab>>,
         kb_idx_offset: usize,
+        side_pad: f32,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let total_items = hits.len();
+        let grid_gap = t.density.grid_gap_px() * t.ui_scale;
         let metrics = compute_dynamic_grid_metrics(
             total_items,
             self.viewport_size_px.0,
             0.0,
-            64.0,
-            Some(1440.0),
-            GRID_MIN_CARD_WIDTH_PX,
-            GRID_COL_GAP_PX,
-            GRID_ROW_GAP_PX,
-            GRID_METADATA_HEIGHT_PX,
+            side_pad * 2.0,
+            None,
+            t.density.target_poster_width_px() * t.ui_scale,
+            grid_gap,
+            grid_gap,
+            GRID_METADATA_HEIGHT_PX * t.ui_scale,
             PosterAspect::Portrait2x3,
         );
         let columns = metrics.columns;
@@ -1143,7 +1218,7 @@ impl AppShell {
         div()
             .flex()
             .flex_col()
-            .gap(px(16.0))
+            .gap(sp(16.0))
             .child(
                 div()
                     .flex()
@@ -1152,8 +1227,8 @@ impl AppShell {
                     .child(
                         div()
                             .font(editorial_serif())
-                            .text_size(px(28.0))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(26.0))
+                            .text_color(rgb(t.text_primary))
                             .child(heading),
                     )
                     .child(neutral_chip(format!("{total_items} titles"))),
@@ -1178,10 +1253,10 @@ impl AppShell {
                                             .id((row_id_prefix, row_idx))
                                             .w_full()
                                             .h(px(row_stride_px))
-                                            .pb(px(GRID_ROW_GAP_PX))
+                                            .pb(px(grid_gap))
                                             .flex()
                                             .items_start()
-                                            .gap(px(GRID_COL_GAP_PX))
+                                            .gap(px(grid_gap))
                                             .children(range.map(|item_idx| {
                                                 let hit = &hits_arc[item_idx];
                                                 let sub = hit
@@ -1224,6 +1299,62 @@ impl AppShell {
                     ),
             )
     }
+}
+
+fn render_cinema_glass_button(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    weight: IconWeight,
+    label: impl Into<SharedString>,
+    active: bool,
+    t: ThemePalette,
+    on_click: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let fg = if active { t.accent } else { CINEMA_INK_PRIMARY };
+    let active_bg = (t.accent << 8) | 0x29;
+    let active_border = (t.accent << 8) | 0x73;
+    div()
+        .id(id)
+        .cursor_pointer()
+        .h(sp(40.0))
+        .px(sp(16.0))
+        .rounded(px(RADIUS_CONTROL))
+        .bg(if active {
+            rgba(active_bg)
+        } else {
+            rgba(CINEMA_GLASS_BG)
+        })
+        .border_1()
+        .border_color(if active {
+            rgba(active_border)
+        } else {
+            rgba(CINEMA_GLASS_BORDER)
+        })
+        .hover(move |s| {
+            s.bg(if active {
+                rgba(active_bg)
+            } else {
+                rgba(CINEMA_GLASS_HOVER_BG)
+            })
+            .border_color(if active {
+                rgb(t.accent)
+            } else {
+                rgba(CINEMA_GLASS_BORDER_STRONG)
+            })
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(sp(8.0))
+        .font(ui_sans(FontWeight::MEDIUM))
+        .text_size(sp(13.5))
+        .text_color(rgb(fg))
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
+        .child(svg_icon_weighted(icon, weight, 14.5 * t.ui_scale, rgb(fg)))
+        .child(label.into())
 }
 
 #[cfg(test)]

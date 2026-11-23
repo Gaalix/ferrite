@@ -16,9 +16,11 @@ pub use dcomp::{
 };
 pub use element::{mpv_viewport, MpvViewport};
 pub use player::{
-    drain_evicted_video_images, extract_audio_pcm_s16le_8khz, shorten_codec_label,
-    validate_local_subtitle_path, validate_stream_url, MediaTrack, MpvController, PlayerEvent,
-    PlayerSnapshot, SubtitleAssOverride, SubtitleBackgroundMode, SubtitleStyle,
+    decide_smart_forced_visibility, drain_evicted_video_images, extract_audio_pcm_s16le_8khz,
+    extract_embedded_text_subtitle_window, is_image_subtitle_codec_name,
+    is_untranslated_foreign_placeholder, shorten_codec_label, validate_local_subtitle_path,
+    validate_stream_url, MediaTrack, MpvController, PlayerEvent, PlayerSnapshot,
+    SecondaryForcedMode, SubtitleAssOverride, SubtitleBackgroundMode, SubtitleStyle,
     ToneMappingPreset, TrackType, UpscalePreset,
 };
 pub use shaders::{

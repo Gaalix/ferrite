@@ -12,18 +12,15 @@ use stremio_core_runtime::stremio_core::{
 use url::Url;
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{
         format_movietracker_episode_code, AppRoute, BrowsingContextMenu, KbFocusableCard,
         SidebarTab,
     },
     theme::{
-        editorial_serif, mono_font, placeholder_tint_for_id, tabular_nums, ui_sans, ACCENT,
-        ACCENT_SOFT, BORDER_ACCENT, BORDER_POSTER_HOVER, CTA_ON_ACCENT, GLASS_BORDER,
-        GLASS_BORDER_STRONG, GLASS_CARD_BG, GLASS_ROW_HOVER_BG, GLASS_SHEET_BG, GLASS_TROUGH_BG,
-        RADIUS_CARD, RADIUS_PILL, RADIUS_POSTER, RADIUS_SHEET, STATUS_WATCHED, TEXT_MUTED,
-        TEXT_PRIMARY, TEXT_SECONDARY,
+        active_theme, editorial_serif, mono_font, placeholder_tint_for_id, sp, tabular_nums,
+        ui_sans, ThemePalette, RADIUS_CARD, RADIUS_PILL, RADIUS_POSTER, RADIUS_SHEET,
     },
     ui_components::{
         format_notification_badge_label, glass_back_button, glass_segmented_bar,
@@ -253,6 +250,13 @@ impl AppShell {
             )
         });
 
+        let t = active_theme();
+        let side_pad = if self.viewport_size_px.0.is_finite() && self.viewport_size_px.0 > 0.0 {
+            (self.viewport_size_px.0 * 0.03).clamp(24.0, 56.0)
+        } else {
+            32.0
+        };
+
         let is_current_month =
             selected.year == local_today.year() && selected.month == local_today.month();
         let has_any_episodes = total_episodes > 0;
@@ -266,7 +270,7 @@ impl AppShell {
             None
         } else {
             Some(
-                self.render_cw_notification_strip(&cw_alerts, cx)
+                self.render_cw_notification_strip(&cw_alerts, t, cx)
                     .into_any_element(),
             )
         };
@@ -275,19 +279,20 @@ impl AppShell {
             None
         } else {
             Some(
-                self.render_up_next_strip(&up_next_entries, local_today, &mut kb_cards, cx)
+                self.render_up_next_strip(&up_next_entries, local_today, &mut kb_cards, t, cx)
                     .into_any_element(),
             )
         };
 
         let body_el = if !has_any_episodes && !is_loading {
-            self.render_calendar_empty_state(cx).into_any_element()
+            self.render_calendar_empty_state(t, cx).into_any_element()
         } else {
             self.render_monthly_release_grid(
                 &grid_cells,
                 today_day,
                 &days_map,
                 &mut kb_cards,
+                t,
                 cx,
             )
             .into_any_element()
@@ -303,41 +308,39 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(1440.0))
-                    .mx_auto()
-                    .px(px(32.0))
-                    .pt(px(28.0))
-                    .pb(px(72.0))
+                    .px(px(side_pad))
+                    .pt(sp(16.0))
+                    .pb(sp(72.0))
                     .flex()
                     .flex_col()
-                    .gap(px(28.0))
+                    .gap(sp(24.0))
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
                             .items_end()
                             .justify_between()
-                            .gap(px(20.0))
+                            .gap(sp(16.0))
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(4.0))
+                                    .gap(sp(4.0))
                                     .child(
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(px(52.0))
-                                            .line_height(gpui::relative(1.04))
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .text_size(sp(38.0))
+                                            .line_height(gpui::relative(1.06))
+                                            .text_color(rgb(t.text_primary))
                                             .child("Release Calendar"),
                                     )
                                     .child(
                                         div()
                                             .flex()
                                             .items_center()
-                                            .gap(px(10.0))
-                                            .text_size(px(14.0))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .gap(sp(10.0))
+                                            .text_size(sp(13.5))
+                                            .text_color(rgb(t.text_secondary))
                                             .child(if is_loading {
                                                 "Updating episode release dates from your library..."
                                                     .to_owned()
@@ -371,7 +374,7 @@ impl AppShell {
                                     .flex()
                                     .flex_wrap()
                                     .items_center()
-                                    .gap(px(10.0))
+                                    .gap(sp(10.0))
                                     .child(glass_back_button(
                                         "cal-prev-month",
                                         format!(
@@ -388,11 +391,11 @@ impl AppShell {
                                         glass_segmented_bar("cal-month-bar")
                                             .child(
                                                 div()
-                                                    .px(px(14.0))
+                                                    .px(sp(14.0))
                                                     .font(ui_sans(FontWeight::SEMIBOLD))
                                                     .font_features(tabular_nums())
-                                                    .text_size(px(13.0))
-                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .text_size(sp(13.0))
+                                                    .text_color(rgb(t.text_primary))
                                                     .whitespace_nowrap()
                                                     .child(format!(
                                                         "{} {}",
@@ -411,24 +414,45 @@ impl AppShell {
                                             )),
                                     )
                                     .child(
-                                        secondary_glass_button(
-                                            "cal-next-month",
-                                            None,
-                                            format!(
-                                                "{} {} ›",
+                                        div()
+                                            .id("cal-next-month")
+                                            .cursor_pointer()
+                                            .h(sp(34.0))
+                                            .px(sp(12.0))
+                                            .rounded(px(RADIUS_PILL))
+                                            .bg(rgba(t.glass_trough_bg))
+                                            .border_1()
+                                            .border_color(rgba(t.glass_border))
+                                            .hover(move |s| {
+                                                s.bg(rgba(t.glass_row_hover_bg))
+                                                    .border_color(rgba(t.glass_border_strong))
+                                            })
+                                            .flex()
+                                            .items_center()
+                                            .gap(sp(6.0))
+                                            .font(ui_sans(FontWeight::MEDIUM))
+                                            .text_size(sp(13.0))
+                                            .text_color(rgb(t.text_secondary))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.core
+                                                        .load_calendar(Some(next_for_click.clone()));
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(format!(
+                                                "{} {}",
                                                 month_short_name(next_ym.month),
                                                 next_ym.year
-                                            ),
-                                            false,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.core
-                                                    .load_calendar(Some(next_for_click.clone()));
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .h(px(34.0))
-                                        .px(px(14.0))
-                                        .rounded(px(RADIUS_PILL)),
+                                            ))
+                                            .child(svg_icon_weighted(
+                                                IconName::ChevronRight,
+                                                IconWeight::Regular,
+                                                14.0 * t.ui_scale,
+                                                rgb(t.text_secondary),
+                                            )),
                                     ),
                             ),
                     )
@@ -441,8 +465,10 @@ impl AppShell {
     fn render_cw_notification_strip(
         &self,
         alerts: &[CwNotificationAlert],
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         let mut alert_chips: Vec<AnyElement> = Vec::with_capacity(alerts.len());
         for (idx, alert) in alerts.iter().enumerate() {
             let open_type = alert.r#type.clone();
@@ -456,20 +482,20 @@ impl AppShell {
                 div()
                     .id(("cal-notif-chip", idx))
                     .cursor_pointer()
-                    .h(px(30.0))
-                    .pl(px(10.0))
-                    .pr(px(6.0))
+                    .h(sp(30.0))
+                    .pl(sp(10.0))
+                    .pr(sp(6.0))
                     .rounded(px(RADIUS_PILL))
-                    .bg(rgba(GLASS_TROUGH_BG))
+                    .bg(rgba(t.glass_trough_bg))
                     .border_1()
-                    .border_color(rgba(GLASS_BORDER))
-                    .hover(|s| {
-                        s.bg(rgba(GLASS_ROW_HOVER_BG))
-                            .border_color(rgba(GLASS_BORDER_STRONG))
+                    .border_color(rgba(t.glass_border))
+                    .hover(move |s| {
+                        s.bg(rgba(t.glass_row_hover_bg))
+                            .border_color(rgba(t.glass_border_strong))
                     })
                     .flex()
                     .items_center()
-                    .gap(px(7.0))
+                    .gap(sp(7.0))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -483,31 +509,31 @@ impl AppShell {
                     )
                     .child(
                         div()
-                            .px(px(6.0))
-                            .py(px(1.5))
+                            .px(sp(6.0))
+                            .py(sp(1.5))
                             .rounded(px(RADIUS_PILL))
-                            .bg(rgb(ACCENT))
+                            .bg(rgb(t.accent))
                             .font(mono_font())
                             .font_weight(FontWeight::BOLD)
-                            .text_size(px(9.5))
-                            .text_color(rgb(CTA_ON_ACCENT))
+                            .text_size(sp(9.5))
+                            .text_color(rgb(t.cta_on_accent))
                             .child(badge),
                     )
                     .child(
                         div()
                             .font(ui_sans(FontWeight::MEDIUM))
-                            .text_size(px(12.5))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(12.5))
+                            .text_color(rgb(t.text_primary))
                             .child(alert.name.clone()),
                     )
                     .child(
                         div()
                             .id(("cal-notif-dismiss", idx))
                             .cursor_pointer()
-                            .w(px(20.0))
-                            .h(px(20.0))
+                            .w(sp(20.0))
+                            .h(sp(20.0))
                             .rounded(px(RADIUS_PILL))
-                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                            .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -519,31 +545,41 @@ impl AppShell {
                                     cx.notify();
                                 }),
                             )
-                            .child(svg_icon(IconName::X, 11.0, rgb(TEXT_MUTED))),
+                            .child(svg_icon_weighted(
+                                IconName::X,
+                                IconWeight::Regular,
+                                11.0 * t.ui_scale,
+                                rgb(t.text_muted),
+                            )),
                     )
                     .into_any_element(),
             );
         }
 
         div()
-            .p(px(14.0))
+            .p(sp(14.0))
             .rounded(px(RADIUS_CARD))
-            .bg(rgba(GLASS_CARD_BG))
+            .bg(rgba(t.glass_card_bg))
             .border_1()
-            .border_color(rgba(GLASS_BORDER))
+            .border_color(rgba(t.glass_border))
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(10.0))
+            .gap(sp(10.0))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(sp(6.0))
                     .font(mono_font())
                     .text_xs()
-                    .text_color(rgb(ACCENT))
-                    .child(svg_icon(IconName::Sparkles, 12.5, rgb(ACCENT)))
+                    .text_color(rgb(accent_ink))
+                    .child(svg_icon_weighted(
+                        IconName::Sparkles,
+                        IconWeight::Fill,
+                        12.5 * t.ui_scale,
+                        rgb(accent_ink),
+                    ))
                     .child("NEW EPISODE ALERTS"),
             )
             .children(alert_chips)
@@ -554,6 +590,7 @@ impl AppShell {
         entries: &[CalendarEpisodeEntry],
         local_today: NaiveDate,
         kb_cards: &mut Vec<KbFocusableCard>,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut cards: Vec<AnyElement> = Vec::with_capacity(entries.len());
@@ -606,11 +643,11 @@ impl AppShell {
                 div()
                     .id(("cal-upnext-card", idx))
                     .cursor_pointer()
-                    .w(px(276.0))
+                    .w(sp(276.0))
                     .flex_shrink_0()
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
+                    .gap(sp(8.0))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -653,20 +690,20 @@ impl AppShell {
                     .child(
                         div()
                             .w_full()
-                            .h(px(155.0))
+                            .h(sp(155.0))
                             .rounded(px(RADIUS_POSTER))
                             .overflow_hidden()
                             .relative()
                             .bg(rgb(placeholder_tint_for_id(&entry.meta_id)))
                             .border_1()
                             .border_color(if is_focused {
-                                rgb(ACCENT)
+                                rgb(t.accent)
                             } else if is_today_pill {
-                                rgba(BORDER_ACCENT)
+                                rgba(t.border_accent)
                             } else {
-                                rgba(GLASS_BORDER)
+                                rgba(t.glass_border)
                             })
-                            .hover(|s| s.border_color(rgba(BORDER_POSTER_HOVER)))
+                            .hover(move |s| s.border_color(rgba(t.border_poster_hover)))
                             .child(if let Some(tex) = card_tex {
                                 img(tex)
                                     .size_full()
@@ -675,16 +712,16 @@ impl AppShell {
                             } else {
                                 div()
                                     .size_full()
-                                    .p(px(14.0))
-                                    .bg(rgba(GLASS_CARD_BG))
+                                    .p(sp(14.0))
+                                    .bg(rgb(t.bg_surface))
                                     .flex()
                                     .items_end()
                                     .child(
                                         div()
                                             .w_full()
                                             .font(editorial_serif())
-                                            .text_size(px(20.0))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_size(sp(20.0))
+                                            .text_color(rgb(t.text_secondary))
                                             .truncate()
                                             .child(entry.series_name.clone()),
                                     )
@@ -696,8 +733,8 @@ impl AppShell {
                                     .inset_0()
                                     .bg(linear_gradient(
                                         180.0,
-                                        linear_color_stop(rgba(0x0b0b0d14), 0.2),
-                                        linear_color_stop(rgba(0x0b0b0de0), 1.0),
+                                        linear_color_stop(rgba(0x0B0D1414), 0.2),
+                                        linear_color_stop(rgba(0x0B0D14E0), 1.0),
                                     )),
                             )
                             .child(
@@ -705,29 +742,29 @@ impl AppShell {
                                     .absolute()
                                     .top(px(8.0))
                                     .left(px(8.0))
-                                    .h(px(22.0))
-                                    .px(px(8.0))
+                                    .h(sp(22.0))
+                                    .px(sp(8.0))
                                     .rounded(px(RADIUS_PILL))
                                     .bg(if is_today_pill {
-                                        rgba(0xff5e3aff)
+                                        rgb(t.accent)
                                     } else {
-                                        rgba(0x141417d9)
+                                        rgba(0x0B0D14D9)
                                     })
                                     .border_1()
                                     .border_color(if is_today_pill {
-                                        rgba(0xff5e3aff)
+                                        rgb(t.accent)
                                     } else {
-                                        rgba(GLASS_BORDER)
+                                        rgba(0xFFFFFF26)
                                     })
                                     .flex()
                                     .items_center()
                                     .font(mono_font())
                                     .font_weight(FontWeight::BOLD)
-                                    .text_size(px(10.0))
+                                    .text_size(sp(10.0))
                                     .text_color(if is_today_pill {
-                                        rgb(CTA_ON_ACCENT)
+                                        rgb(t.cta_on_accent)
                                     } else {
-                                        rgb(TEXT_PRIMARY)
+                                        rgb(0xF5F1E8)
                                     })
                                     .child(date_label),
                             )
@@ -737,16 +774,16 @@ impl AppShell {
                                         .absolute()
                                         .top(px(8.0))
                                         .right(px(8.0))
-                                        .h(px(20.0))
-                                        .px(px(7.0))
+                                        .h(sp(20.0))
+                                        .px(sp(7.0))
                                         .rounded(px(RADIUS_PILL))
-                                        .bg(rgb(ACCENT))
+                                        .bg(rgb(t.accent))
                                         .flex()
                                         .items_center()
                                         .font(mono_font())
                                         .font_weight(FontWeight::BOLD)
-                                        .text_size(px(10.0))
-                                        .text_color(rgb(CTA_ON_ACCENT))
+                                        .text_size(sp(10.0))
+                                        .text_color(rgb(t.cta_on_accent))
                                         .child(badge),
                                 )
                             })
@@ -755,19 +792,19 @@ impl AppShell {
                                     .absolute()
                                     .bottom(px(8.0))
                                     .left(px(8.0))
-                                    .px(px(7.0))
-                                    .py(px(2.5))
+                                    .px(sp(7.0))
+                                    .py(sp(2.5))
                                     .rounded(px(6.0))
-                                    .bg(rgba(0x0b0b0dd9))
+                                    .bg(rgba(0x0B0D14D9))
                                     .border_1()
-                                    .border_color(rgba(GLASS_BORDER))
+                                    .border_color(rgba(0xFFFFFF26))
                                     .font(mono_font())
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_size(px(10.5))
+                                    .text_size(sp(10.5))
                                     .text_color(if entry.is_episode_watched {
-                                        rgb(STATUS_WATCHED)
+                                        rgb(0x4ADE80)
                                     } else {
-                                        rgb(ACCENT)
+                                        rgb(t.accent)
                                     })
                                     .child(entry.episode_badge_spaced.clone()),
                             ),
@@ -778,20 +815,20 @@ impl AppShell {
                             .min_w(px(0.0))
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
+                            .gap(sp(2.0))
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(px(13.5))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(13.5))
+                                    .text_color(rgb(t.text_primary))
                                     .truncate()
                                     .child(entry.series_name.clone()),
                             )
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::NORMAL))
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_size(sp(12.0))
+                                    .text_color(rgb(t.text_secondary))
                                     .truncate()
                                     .child(entry.episode_title.clone()),
                             ),
@@ -803,25 +840,25 @@ impl AppShell {
         div()
             .flex()
             .flex_col()
-            .gap(px(14.0))
+            .gap(sp(14.0))
             .child(
                 div()
                     .flex()
                     .items_baseline()
                     .justify_between()
-                    .gap(px(12.0))
+                    .gap(sp(12.0))
                     .child(
                         div()
                             .font(editorial_serif())
-                            .text_size(px(28.0))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(26.0))
+                            .text_color(rgb(t.text_primary))
                             .child("Airing This Week & Up Next"),
                     )
                     .child(
                         div()
                             .font(mono_font())
                             .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(rgb(t.text_muted))
                             .child(format!("{} upcoming", entries.len())),
                     ),
             )
@@ -830,7 +867,7 @@ impl AppShell {
                     .id("cal-upnext-strip")
                     .w_full()
                     .overflow_x_scroll()
-                    .child(div().flex().items_start().gap(px(16.0)).children(cards)),
+                    .child(div().flex().items_start().gap(sp(16.0)).children(cards)),
             )
     }
 
@@ -840,8 +877,11 @@ impl AppShell {
         today_day: Option<u32>,
         days_map: &HashMap<u32, Vec<CalendarEpisodeEntry>>,
         kb_cards: &mut Vec<KbFocusableCard>,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
+        let empty_cell_bg = if t.is_light { 0x0F172A06 } else { 0xFFFFFF03 };
         let mut week_rows: Vec<AnyElement> = Vec::new();
 
         for (week_idx, week) in grid_cells.chunks(7).enumerate() {
@@ -856,11 +896,11 @@ impl AppShell {
                             .id(("cal-pad-cell", week_idx * 7 + col_idx))
                             .flex_1()
                             .min_w(px(0.0))
-                            .min_h(px(120.0))
+                            .min_h(sp(120.0))
                             .rounded(px(RADIUS_CARD))
-                            .bg(rgba(0xFFFFFF02))
+                            .bg(rgba(empty_cell_bg))
                             .border_1()
-                            .border_color(rgba(0xFFFFFF08))
+                            .border_color(rgba(t.glass_divider))
                             .into_any_element(),
                     );
                     continue;
@@ -909,23 +949,23 @@ impl AppShell {
                             .cursor_pointer()
                             .w_full()
                             .min_w(px(0.0))
-                            .px(px(7.0))
-                            .py(px(4.0))
+                            .px(sp(7.0))
+                            .py(sp(4.0))
                             .rounded(px(6.0))
-                            .bg(rgba(GLASS_TROUGH_BG))
+                            .bg(rgba(t.glass_trough_bg))
                             .border_1()
                             .border_color(if is_focused {
-                                rgb(ACCENT)
+                                rgb(t.accent)
                             } else {
-                                rgba(GLASS_BORDER)
+                                rgba(t.glass_border)
                             })
-                            .hover(|s| {
-                                s.bg(rgba(GLASS_ROW_HOVER_BG))
-                                    .border_color(rgba(BORDER_POSTER_HOVER))
+                            .hover(move |s| {
+                                s.bg(rgba(t.glass_row_hover_bg))
+                                    .border_color(rgba(t.border_poster_hover))
                             })
                             .flex()
                             .items_center()
-                            .gap(px(5.0))
+                            .gap(sp(5.0))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
@@ -962,11 +1002,11 @@ impl AppShell {
                                     .flex_shrink_0()
                                     .font(mono_font())
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_size(px(10.0))
+                                    .text_size(sp(10.0))
                                     .text_color(if entry.is_episode_watched {
-                                        rgb(STATUS_WATCHED)
+                                        rgb(t.status_watched)
                                     } else {
-                                        rgb(ACCENT)
+                                        rgb(accent_ink)
                                     })
                                     .child(entry.episode_badge_compact.clone()),
                             )
@@ -975,8 +1015,8 @@ impl AppShell {
                                     .flex_1()
                                     .min_w(px(0.0))
                                     .font(ui_sans(FontWeight::MEDIUM))
-                                    .text_size(px(11.5))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(11.5))
+                                    .text_color(rgb(t.text_primary))
                                     .truncate()
                                     .child(entry.series_name.clone()),
                             )
@@ -989,34 +1029,34 @@ impl AppShell {
                         .id(("cal-day-cell", day as usize))
                         .flex_1()
                         .min_w(px(0.0))
-                        .min_h(px(120.0))
-                        .p(px(10.0))
+                        .min_h(sp(120.0))
+                        .p(sp(10.0))
                         .rounded(px(RADIUS_CARD))
                         .bg(if is_today {
-                            rgba(ACCENT_SOFT)
+                            rgba(t.accent_soft)
                         } else {
-                            rgba(GLASS_CARD_BG)
+                            rgba(t.glass_card_bg)
                         })
                         .border_1()
                         .border_color(if is_today {
-                            rgb(ACCENT)
+                            rgb(t.accent)
                         } else {
-                            rgba(GLASS_BORDER)
+                            rgba(t.glass_border)
                         })
                         .flex()
                         .flex_col()
-                        .gap(px(6.0))
+                        .gap(sp(6.0))
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .gap(px(6.0))
+                                .gap(sp(6.0))
                                 .child(
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap(px(6.0))
+                                        .gap(sp(6.0))
                                         .child(
                                             div()
                                                 .font(ui_sans(if is_today {
@@ -1025,27 +1065,27 @@ impl AppShell {
                                                     FontWeight::SEMIBOLD
                                                 }))
                                                 .font_features(tabular_nums())
-                                                .text_size(px(13.0))
+                                                .text_size(sp(13.0))
                                                 .text_color(if is_today {
-                                                    rgb(ACCENT)
+                                                    rgb(accent_ink)
                                                 } else if !entries.is_empty() {
-                                                    rgb(TEXT_PRIMARY)
+                                                    rgb(t.text_primary)
                                                 } else {
-                                                    rgb(TEXT_MUTED)
+                                                    rgb(t.text_muted)
                                                 })
                                                 .child(day.to_string()),
                                         )
                                         .when(is_today, |hdr| {
                                             hdr.child(
                                                 div()
-                                                    .px(px(6.0))
-                                                    .py(px(1.5))
+                                                    .px(sp(6.0))
+                                                    .py(sp(1.5))
                                                     .rounded(px(RADIUS_PILL))
-                                                    .bg(rgb(ACCENT))
+                                                    .bg(rgb(t.accent))
                                                     .font(mono_font())
                                                     .font_weight(FontWeight::BOLD)
-                                                    .text_size(px(9.0))
-                                                    .text_color(rgb(CTA_ON_ACCENT))
+                                                    .text_size(sp(9.0))
+                                                    .text_color(rgb(t.cta_on_accent))
                                                     .child("TODAY"),
                                             )
                                         }),
@@ -1053,13 +1093,13 @@ impl AppShell {
                                 .when(!entries.is_empty(), |hdr| {
                                     hdr.child(
                                         div()
-                                            .px(px(6.0))
-                                            .py(px(1.0))
+                                            .px(sp(6.0))
+                                            .py(sp(1.0))
                                             .rounded(px(RADIUS_PILL))
-                                            .bg(rgba(GLASS_TROUGH_BG))
+                                            .bg(rgba(t.glass_trough_bg))
                                             .font(mono_font())
-                                            .text_size(px(10.0))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_size(sp(10.0))
+                                            .text_color(rgb(t.text_secondary))
                                             .child(entries.len().to_string()),
                                     )
                                 }),
@@ -1068,10 +1108,10 @@ impl AppShell {
                         .when(hidden_count > 0, |cell| {
                             cell.child(
                                 div()
-                                    .px(px(4.0))
+                                    .px(sp(4.0))
                                     .font(mono_font())
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_size(sp(10.5))
+                                    .text_color(rgb(t.text_muted))
                                     .child(format!("+{hidden_count} more")),
                             )
                         })
@@ -1084,7 +1124,7 @@ impl AppShell {
                     .w_full()
                     .flex()
                     .items_stretch()
-                    .gap(px(8.0))
+                    .gap(sp(8.0))
                     .children(day_cells)
                     .into_any_element(),
             );
@@ -1093,77 +1133,83 @@ impl AppShell {
         div()
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(sp(8.0))
             .child(
                 div()
                     .w_full()
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(sp(8.0))
                     .children(WEEKDAYS_MON_FIRST.into_iter().map(|day_name| {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .px(px(10.0))
-                            .py(px(6.0))
+                            .px(sp(10.0))
+                            .py(sp(6.0))
                             .font(mono_font())
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_size(px(11.5))
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_size(sp(11.5))
+                            .text_color(rgb(t.text_muted))
                             .child(day_name)
                     })),
             )
             .children(week_rows)
     }
 
-    fn render_calendar_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_calendar_empty_state(&self, t: ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         div()
             .w_full()
-            .p(px(36.0))
+            .p(sp(36.0))
             .rounded(px(RADIUS_SHEET))
-            .bg(rgba(GLASS_SHEET_BG))
+            .bg(rgba(t.glass_card_bg))
             .border_1()
-            .border_color(rgba(GLASS_BORDER))
+            .border_color(rgba(t.glass_border))
             .flex()
             .flex_col()
             .items_start()
-            .gap(px(12.0))
+            .gap(sp(12.0))
             .child(
                 div()
-                    .w(px(42.0))
-                    .h(px(42.0))
+                    .w(sp(42.0))
+                    .h(sp(42.0))
                     .rounded(px(RADIUS_CARD))
-                    .bg(rgba(ACCENT_SOFT))
+                    .bg(rgba(t.accent_soft))
                     .border_1()
-                    .border_color(rgba(BORDER_ACCENT))
+                    .border_color(rgba(t.border_accent))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(svg_icon(IconName::Calendar, 20.0, rgb(ACCENT))),
+                    .child(svg_icon_weighted(
+                        IconName::Calendar,
+                        IconWeight::Fill,
+                        20.0 * t.ui_scale,
+                        rgb(accent_ink),
+                    )),
             )
             .child(
                 div()
                     .font(editorial_serif())
-                    .text_size(px(32.0))
-                    .text_color(rgb(TEXT_PRIMARY))
+                    .text_size(sp(30.0))
+                    .text_color(rgb(t.text_primary))
                     .child("No releases scheduled this month"),
             )
             .child(
                 div()
                     .max_w(px(540.0))
-                    .text_size(px(14.0))
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .text_size(sp(14.0))
+                    .text_color(rgb(t.text_secondary))
                     .child(
                         "Add ongoing series to your library to track upcoming episode air dates here.",
                     ),
             )
             .child(
                 div()
-                    .mt(px(6.0))
+                    .mt(sp(6.0))
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(10.0))
+                    .gap(sp(10.0))
                     .child(primary_accent_button(
                         "cal-empty-discover",
                         Some(IconName::Compass),

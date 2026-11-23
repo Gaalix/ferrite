@@ -1,19 +1,21 @@
 use gpui::{div, prelude::*, px, rgb, rgba, Context, FontWeight, MouseButton, SharedString};
 use gpui_mpv::{MediaTrack, TrackType};
-use stremio_core_runtime::human_language_name;
+use stremio_core_runtime::{
+    human_language_name, is_forced_subtitle_track, is_sdh_subtitle_track,
+};
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{NativeSubtitleMatchStatus, PlayerPopover, SubtitleBackgroundChoice},
-    theme::{ui_sans, ACCENT, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY},
+    theme::ui_sans,
 };
 
 use super::components::{
-    drilldown_row, parse_hex_rgb, player_sheet_card, section_eyebrow, segmented_item,
-    segmented_trough, selectable_row, sheet_header_back, sheet_header_close, stepper_row,
-    subtitle_color_short_name, subtitle_size_short_badge, toggle_switch_row, ROW_HOVER_BG,
-    SHEET_DIVIDER, SUBTITLE_SWATCHES,
+    drilldown_row, parse_hex_rgb, player_hud_palette, player_sheet_card, section_eyebrow,
+    segmented_item, segmented_trough, selectable_row, sheet_header_back, sheet_header_close,
+    stepper_row, subtitle_color_short_name, subtitle_size_short_badge, toggle_switch_row,
+    SUBTITLE_SWATCHES,
 };
 
 const SUBTITLE_SIZE_PRESETS: [(&str, u32); 4] = [("S", 38), ("M", 46), ("L", 56), ("XL", 66)];
@@ -123,10 +125,8 @@ fn format_subtitle_track_display(tr: &MediaTrack) -> (String, String) {
         );
     }
 
-    let is_sdh = tr
-        .title
-        .as_deref()
-        .is_some_and(|t| t.to_ascii_uppercase().contains("SDH"));
+    let is_sdh = tr.hearing_impaired || is_sdh_subtitle_track(tr.title.as_deref());
+    let is_forced = tr.forced || (!tr.external && is_forced_subtitle_track(tr.title.as_deref(), tr.forced));
     let mut primary = tr
         .lang
         .as_deref()
@@ -150,7 +150,30 @@ fn format_subtitle_track_display(tr: &MediaTrack) -> (String, String) {
     } else {
         "Embedded".to_owned()
     }];
-    if tr.forced && !tr.external {
+    if let Some(raw_title) = tr.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let lower = raw_title.to_ascii_lowercase();
+        let primary_lower = primary.to_ascii_lowercase();
+        let lang_lower = tr.lang.as_deref().map(|l| l.trim().to_ascii_lowercase());
+        let lang_name_lower = tr
+            .lang
+            .as_deref()
+            .map(human_language_name)
+            .map(|n| n.to_ascii_lowercase());
+        let is_redundant = lower == primary_lower
+            || lang_lower.as_deref() == Some(lower.as_str())
+            || lang_name_lower.as_deref() == Some(lower.as_str())
+            || matches!(lower.as_str(), "sdh" | "forced" | "hi" | "cc" | "full")
+            || lang_name_lower.as_deref().is_some_and(|ln| {
+                lower == format!("{ln} sdh")
+                    || lower == format!("{ln} (sdh)")
+                    || lower == format!("{ln} forced")
+                    || lower == format!("{ln} (forced)")
+            });
+        if !is_redundant {
+            meta.push(raw_title.to_owned());
+        }
+    }
+    if is_forced && !tr.external {
         meta.push("Forced".to_owned());
     }
     if let Some(codec) = tr.codec.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
@@ -179,6 +202,7 @@ impl AppShell {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = player_hud_palette();
         let prefs = &self.preferences;
         let audio_tracks: Vec<MediaTrack> = self
             .player_snapshot
@@ -257,7 +281,7 @@ impl AppShell {
                                         .px(px(14.0))
                                         .py(px(10.0))
                                         .text_size(px(12.5))
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(t.text_muted))
                                         .child("No audio tracks detected"),
                                 )
                             })
@@ -324,10 +348,11 @@ impl AppShell {
                                     .h(px(36.0))
                                     .rounded(px(10.0))
                                     .border_1()
-                                    .border_color(rgba(0xFFFFFF18))
-                                    .bg(rgba(0xFFFFFF05))
+                                    .border_color(rgba(t.glass_border))
+                                    .bg(rgba(t.glass_card_bg))
                                     .when(!search_busy, |btn| {
-                                        btn.cursor_pointer().hover(|s| s.bg(rgba(0xFFFFFF10)))
+                                        btn.cursor_pointer()
+                                            .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                                     })
                                     .flex()
                                     .items_center()
@@ -335,7 +360,7 @@ impl AppShell {
                                     .gap(px(7.0))
                                     .font(ui_sans(FontWeight::MEDIUM))
                                     .text_size(px(12.5))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(rgb(t.text_primary))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
@@ -345,14 +370,15 @@ impl AppShell {
                                             }
                                         }),
                                     )
-                                    .child(svg_icon(
+                                    .child(svg_icon_weighted(
                                         if search_busy {
                                             IconName::RefreshCw
                                         } else {
                                             IconName::Search
                                         },
+                                        IconWeight::Regular,
                                         14.0,
-                                        rgb(TEXT_PRIMARY),
+                                        rgb(t.text_primary),
                                     ))
                                     .child(search_label),
                             )
@@ -364,17 +390,17 @@ impl AppShell {
                                     .h(px(36.0))
                                     .rounded(px(10.0))
                                     .border_1()
-                                    .border_color(rgba(0xFFFFFF18))
-                                    .bg(rgba(0xFFFFFF05))
+                                    .border_color(rgba(t.glass_border))
+                                    .bg(rgba(t.glass_card_bg))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgba(0xFFFFFF10)))
+                                    .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .gap(px(7.0))
                                     .font(ui_sans(FontWeight::MEDIUM))
                                     .text_size(px(12.5))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(rgb(t.text_primary))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -382,10 +408,11 @@ impl AppShell {
                                             this.prompt_and_load_local_subtitle(cx);
                                         }),
                                     )
-                                    .child(svg_icon(
+                                    .child(svg_icon_weighted(
                                         IconName::FileText,
+                                        IconWeight::Regular,
                                         14.0,
-                                        rgb(TEXT_PRIMARY),
+                                        rgb(t.text_primary),
                                     ))
                                     .child("Load file..."),
                             ),
@@ -396,7 +423,7 @@ impl AppShell {
                     .px(px(18.0))
                     .py(px(12.0))
                     .border_t_1()
-                    .border_color(rgba(SHEET_DIVIDER))
+                    .border_color(rgba(t.glass_divider))
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -433,6 +460,7 @@ impl AppShell {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = player_hud_palette();
         let prefs = &self.preferences;
         let active_size_idx = match prefs.subtitle_font_size {
             0..=41 => 0,
@@ -449,10 +477,13 @@ impl AppShell {
             .px(px(6.0))
             .py(px(4.0))
             .rounded(px(6.0))
-            .hover(|s| s.bg(rgba(ROW_HOVER_BG)).text_color(rgb(TEXT_PRIMARY)))
+            .hover(move |s| {
+                s.bg(rgba(t.glass_row_hover_bg))
+                    .text_color(rgb(t.text_primary))
+            })
             .font(ui_sans(FontWeight::MEDIUM))
             .text_size(px(12.5))
-            .text_color(rgb(TEXT_SECONDARY))
+            .text_color(rgb(t.text_secondary))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -518,7 +549,7 @@ impl AppShell {
                                         div()
                                             .font(ui_sans(FontWeight::NORMAL))
                                             .text_size(px(12.0))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_color(rgb(t.text_secondary))
                                             .child(active_color_name),
                                     ),
                             )
@@ -537,12 +568,14 @@ impl AppShell {
                                         .p(px(2.0))
                                         .border_2()
                                         .border_color(if selected {
-                                            rgb(ACCENT)
+                                            rgb(t.accent)
                                         } else {
                                             rgba(0x00000000)
                                         })
                                         .when(!selected, |d| {
-                                            d.hover(|s| s.border_color(rgba(0xFFFFFF30)))
+                                            d.hover(move |s| {
+                                                s.border_color(rgba(t.glass_border_strong))
+                                            })
                                         })
                                         .flex()
                                         .items_center()
@@ -631,7 +664,7 @@ impl AppShell {
                     .px(px(18.0))
                     .py(px(12.0))
                     .border_t_1()
-                    .border_color(rgba(SHEET_DIVIDER))
+                    .border_color(rgba(t.glass_divider))
                     .child(toggle_switch_row(
                         "sub-appearance-ass-override",
                         "Apply to styled (ASS) subtitles",
@@ -665,6 +698,7 @@ mod tests {
             selected: false,
             external: false,
             forced: false,
+            hearing_impaired: false,
             default: false,
         }
     }
@@ -708,6 +742,40 @@ mod tests {
         assert_eq!(
             format_subtitle_track_display(&fre),
             ("French".to_owned(), "Embedded · PGS".to_owned())
+        );
+
+        let non_english = track(
+            3,
+            TrackType::Sub,
+            Some("Non-English"),
+            Some("eng"),
+            Some("subrip"),
+        );
+        assert_eq!(
+            format_subtitle_track_display(&non_english),
+            ("English".to_owned(), "Embedded · Non-English · Forced · SRT".to_owned())
+        );
+
+        let online_translated = track(
+            4,
+            TrackType::Sub,
+            Some("English — OpenSubtitles — Foreign translated · Synced (+0.2s)"),
+            Some("eng"),
+            None,
+        );
+        assert_eq!(
+            format_subtitle_track_display(&online_translated),
+            (
+                "English".to_owned(),
+                "OpenSubtitles · Foreign translated · Synced (+0.2s)".to_owned()
+            )
+        );
+
+        let mut hi_flag_only = track(5, TrackType::Sub, None, Some("eng"), Some("subrip"));
+        hi_flag_only.hearing_impaired = true;
+        assert_eq!(
+            format_subtitle_track_display(&hi_flag_only),
+            ("English SDH".to_owned(), "Embedded · SRT".to_owned())
         );
     }
 }

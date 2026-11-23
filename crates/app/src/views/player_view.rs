@@ -14,17 +14,16 @@ use gpui::{
 use gpui_mpv::mpv_viewport;
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{compute_scrub_preview_left, parse_season_episode_from_video_id, PlayerPopover},
     theme::{
-        editorial_serif, format_timestamp_secs, glass_capsule_shadow, meta_divider, mono_font,
-        movietracker_mark, obsidian_fade_in, semantic_status_pill, summarize_stream_for_humans,
-        tabular_nums, transparent_cutout, ui_sans, ACCENT, ACCENT_HOVER, ACCENT_SOFT, BG_ELEVATED,
-        BG_OBSIDIAN, BG_OSD_GLASS, BG_POPOVER_GLASS, BG_SURFACE, BG_SURFACE_3, BORDER_ACCENT,
-        BORDER_STRONG, BORDER_SUBTLE, STATUS_WATCHED, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+        editorial_serif, format_timestamp_secs, mono_font, movietracker_mark, obsidian_fade_in,
+        summarize_stream_for_humans, tabular_nums, transparent_cutout, ui_sans,
     },
 };
+
+use self::components::{player_glass_shadow, player_hud_palette, player_meta_divider};
 
 const SCRUB_PREVIEW_THUMB_CARD_W: f32 = 208.0;
 const SCRUB_PREVIEW_TIME_CARD_W: f32 = 88.0;
@@ -54,6 +53,7 @@ fn sheet_icon_btn(
     active: bool,
     on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let t = player_hud_palette();
     div()
         .id(id)
         .cursor_pointer()
@@ -61,13 +61,19 @@ fn sheet_icon_btn(
         .h(px(36.0))
         .rounded(px(999.0))
         .bg(if active {
-            rgba(0xFFFFFF1F)
+            rgba(t.accent_soft)
         } else {
             rgba(0x00000000)
         })
-        .hover(|s| {
+        .border_1()
+        .border_color(if active {
+            rgba(t.border_accent)
+        } else {
+            rgba(0x00000000)
+        })
+        .hover(move |s| {
             if active {
-                s.bg(rgba(0xFFFFFF29))
+                s.bg(rgba(t.accent_soft))
             } else {
                 s.bg(rgba(0xFFFFFF12))
             }
@@ -79,7 +85,16 @@ fn sheet_icon_btn(
             cx.stop_propagation();
             on_click(ev, window, cx);
         })
-        .child(svg_icon(icon, icon_size, rgb(0xFFFFFF)))
+        .child(svg_icon_weighted(
+            icon,
+            IconWeight::Regular,
+            icon_size,
+            if active {
+                rgb(t.accent)
+            } else {
+                rgb(0xFFFFFF)
+            },
+        ))
 }
 
 impl AppShell {
@@ -88,6 +103,7 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = player_hud_palette();
         let is_fullscreen = window.is_fullscreen();
         let hud_visible = self.is_player_osd_visible();
         if let Some(ctrl) = &self.mpv {
@@ -106,7 +122,7 @@ impl AppShell {
             div()
                 .id("ferrite-mpv-fallback")
                 .size_full()
-                .bg(rgb(BG_OBSIDIAN))
+                .bg(rgb(t.bg_canvas))
                 .child(overlay)
                 .into_any_element()
         };
@@ -114,10 +130,10 @@ impl AppShell {
         div()
             .id("ferrite-player-drop-root")
             .size_full()
-            .drag_over::<gpui::ExternalPaths>(|style, _, _, _| {
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
                 style
                     .border_2()
-                    .border_color(rgb(ACCENT))
+                    .border_color(rgb(t.accent))
                     .bg(rgba(0x0B0B0E55))
             })
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
@@ -133,6 +149,7 @@ impl AppShell {
         player_csd_controls: Option<gpui::Div>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = player_hud_palette();
         let snap = &self.player_snapshot;
         let session = self.playback_session.as_ref();
         let video_ready = self.is_player_video_frame_ready();
@@ -250,7 +267,7 @@ impl AppShell {
             .bg(if video_ready {
                 transparent_cutout()
             } else {
-                rgb(BG_OBSIDIAN)
+                rgb(t.bg_canvas)
             })
             .relative()
             .flex()
@@ -333,17 +350,22 @@ impl AppShell {
                                 .px(px(14.0))
                                 .py(px(6.0))
                                 .rounded(px(999.0))
-                                .bg(rgba(BG_OSD_GLASS))
+                                .bg(rgba(t.glass_popover_bg))
                                 .border_1()
-                                .border_color(rgba(BORDER_ACCENT))
-                                .shadow(glass_capsule_shadow())
+                                .border_color(rgba(t.border_accent))
+                                .shadow(player_glass_shadow())
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
                                 .font(mono_font())
                                 .text_xs()
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .child(svg_icon(IconName::SkipForward, 13.0, rgb(ACCENT)))
+                                .text_color(rgb(t.text_primary))
+                                .child(svg_icon_weighted(
+                                    IconName::SkipForward,
+                                    IconWeight::Fill,
+                                    13.0,
+                                    rgb(t.accent),
+                                ))
                                 .child("2x speed"),
                         ),
                 )
@@ -372,15 +394,15 @@ impl AppShell {
                                         .h(px(40.0))
                                         .px(px(18.0))
                                         .rounded(px(999.0))
-                                        .bg(rgb(ACCENT))
-                                        .hover(|s| s.bg(rgb(ACCENT_HOVER)))
-                                        .shadow(glass_capsule_shadow())
+                                        .bg(rgb(t.accent))
+                                        .hover(move |s| s.bg(rgb(t.accent_hover)))
+                                        .shadow(player_glass_shadow())
                                         .flex()
                                         .items_center()
                                         .gap(px(8.0))
                                         .font(ui_sans(FontWeight::MEDIUM))
                                         .text_size(px(13.5))
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_color(rgb(t.cta_on_accent))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -388,10 +410,11 @@ impl AppShell {
                                                 this.seek_player_absolute(target_secs, cx);
                                             }),
                                         )
-                                        .child(svg_icon(
+                                        .child(svg_icon_weighted(
                                             IconName::SkipForward,
+                                            IconWeight::Fill,
                                             14.0,
-                                            rgb(TEXT_PRIMARY),
+                                            rgb(t.cta_on_accent),
                                         ))
                                         .child("Skip intro"),
                                 )
@@ -421,15 +444,15 @@ impl AppShell {
                                         .px(px(16.0))
                                         .py(px(10.0))
                                         .rounded(px(12.0))
-                                        .bg(rgba(BG_POPOVER_GLASS))
+                                        .bg(rgba(t.glass_popover_bg))
                                         .border_1()
                                         .border_color(if prebuffered {
-                                            rgba(0x4ade8066)
+                                            rgba((t.status_watched << 8) | 0x66)
                                         } else {
-                                            rgba(BORDER_STRONG)
+                                            rgba(t.glass_border_strong)
                                         })
-                                        .hover(|s| s.bg(rgb(BG_ELEVATED)))
-                                        .shadow(glass_capsule_shadow())
+                                        .hover(move |s| s.bg(rgb(t.bg_elevated)))
+                                        .shadow(player_glass_shadow())
                                         .flex()
                                         .flex_col()
                                         .gap(px(4.0))
@@ -454,20 +477,21 @@ impl AppShell {
                                                         .items_center()
                                                         .gap(px(8.0))
                                                         .min_w(px(0.0))
-                                                        .child(svg_icon(
+                                                        .child(svg_icon_weighted(
                                                             IconName::StepForward,
+                                                            IconWeight::Fill,
                                                             14.0,
                                                             rgb(if prebuffered {
-                                                                STATUS_WATCHED
+                                                                t.status_watched
                                                             } else {
-                                                                ACCENT
+                                                                t.accent
                                                             }),
                                                         ))
                                                         .child(
                                                             div()
                                                                 .font(ui_sans(FontWeight::SEMIBOLD))
                                                                 .text_size(px(13.0))
-                                                                .text_color(rgb(TEXT_PRIMARY))
+                                                                .text_color(rgb(t.text_primary))
                                                                 .truncate()
                                                                 .child(ep_badge.unwrap_or_else(
                                                                     || "Next episode".to_owned(),
@@ -475,13 +499,32 @@ impl AppShell {
                                                         ),
                                                 )
                                                 .when(prebuffered, |r| {
-                                                    r.child(semantic_status_pill(
-                                                        IconName::Check,
-                                                        "Pre-buffered",
-                                                        STATUS_WATCHED,
-                                                        0x4ade804d,
-                                                        0x4ade801c,
-                                                    ))
+                                                    r.child(
+                                                        div()
+                                                            .h(px(26.0))
+                                                            .px(px(10.0))
+                                                            .rounded(px(999.0))
+                                                            .bg(rgba(
+                                                                (t.status_watched << 8) | 0x1c,
+                                                            ))
+                                                            .border_1()
+                                                            .border_color(rgba(
+                                                                (t.status_watched << 8) | 0x4d,
+                                                            ))
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap(px(6.0))
+                                                            .text_xs()
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .text_color(rgb(t.status_watched))
+                                                            .child(svg_icon_weighted(
+                                                                IconName::Check,
+                                                                IconWeight::Fill,
+                                                                12.0,
+                                                                rgb(t.status_watched),
+                                                            ))
+                                                            .child("Pre-buffered"),
+                                                    )
                                                 }),
                                         )
                                         .when(match_badge.is_some() || auto_play, |card| {
@@ -492,7 +535,7 @@ impl AppShell {
                                                     .justify_between()
                                                     .gap(px(8.0))
                                                     .text_size(px(11.0))
-                                                    .text_color(rgb(TEXT_SECONDARY))
+                                                    .text_color(rgb(t.text_secondary))
                                                     .when_some(match_badge, |row, b| {
                                                         row.child(
                                                             div().truncate().child(format!(
@@ -504,7 +547,7 @@ impl AppShell {
                                                         row.child(
                                                             div()
                                                                 .flex_shrink_0()
-                                                                .text_color(rgb(TEXT_MUTED))
+                                                                .text_color(rgb(t.text_muted))
                                                                 .child("Auto-plays at end"),
                                                         )
                                                     }),
@@ -583,10 +626,11 @@ impl AppShell {
                                             this.exit_fullscreen_on_next_render = false;
                                         }),
                                     )
-                                    .child(svg_icon(
+                                    .child(svg_icon_weighted(
                                         IconName::ChevronLeft,
+                                        IconWeight::Regular,
                                         18.0,
-                                        rgb(TEXT_PRIMARY),
+                                        rgb(t.text_primary),
                                     )),
                             )
                             .child(
@@ -600,7 +644,7 @@ impl AppShell {
                                             .font(ui_sans(FontWeight::SEMIBOLD))
                                             .text_size(px(15.5))
                                             .line_height(px(20.0))
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .text_color(rgb(t.text_primary))
                                             .truncate()
                                             .child(title),
                                     )
@@ -610,7 +654,7 @@ impl AppShell {
                                                 .font(ui_sans(FontWeight::NORMAL))
                                                 .text_size(px(12.5))
                                                 .line_height(px(16.0))
-                                                .text_color(rgb(TEXT_SECONDARY))
+                                                .text_color(rgb(t.text_secondary))
                                                 .truncate()
                                                 .child(sub),
                                         )
@@ -631,13 +675,19 @@ impl AppShell {
                                     .h(px(34.0))
                                     .rounded(px(999.0))
                                     .bg(if stats_open {
-                                        rgba(0xFFFFFF1C)
+                                        rgba(t.accent_soft)
                                     } else {
                                         rgba(0x00000000)
                                     })
-                                    .hover(|s| {
+                                    .border_1()
+                                    .border_color(if stats_open {
+                                        rgba(t.border_accent)
+                                    } else {
+                                        rgba(0x00000000)
+                                    })
+                                    .hover(move |s| {
                                         if stats_open {
-                                            s.bg(rgba(0xFFFFFF24))
+                                            s.bg(rgba(t.accent_soft))
                                         } else {
                                             s.bg(rgba(0xFFFFFF12))
                                         }
@@ -652,7 +702,16 @@ impl AppShell {
                                             this.toggle_player_stats_for_nerds(cx);
                                         }),
                                     )
-                                    .child(svg_icon(IconName::Info, 18.0, rgb(TEXT_PRIMARY))),
+                                    .child(svg_icon_weighted(
+                                        IconName::Info,
+                                        IconWeight::Regular,
+                                        18.0,
+                                        if stats_open {
+                                            rgb(t.accent)
+                                        } else {
+                                            rgb(t.text_primary)
+                                        },
+                                    )),
                             )
                             .when_some(player_csd_controls, |row, csd| {
                                 row.child(div().w(px(1.0)).h(px(16.0)).bg(rgba(0xFFFFFF22)))
@@ -701,6 +760,7 @@ impl AppShell {
         model_bg_url: Option<&str>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = player_hud_palette();
         let session = self.playback_session.as_ref();
         let loaded_into_mpv = session.is_some_and(|s| s.loaded_into_mpv);
         let candidate_count = session.map(|s| s.candidates.len()).unwrap_or(0);
@@ -747,7 +807,7 @@ impl AppShell {
             .id("player-loading-showcase")
             .absolute()
             .inset_0()
-            .bg(rgb(BG_OBSIDIAN))
+            .bg(rgb(t.bg_canvas))
             .overflow_hidden()
             .when_some(ambient_img, |el, amb| {
                 el.child(
@@ -761,8 +821,8 @@ impl AppShell {
             .child(
                 div().absolute().inset_0().bg(linear_gradient(
                     180.0,
-                    linear_color_stop(rgba(0x0b0b0db5), 0.0),
-                    linear_color_stop(rgba(0x0b0b0df7), 1.0),
+                    linear_color_stop(rgba((t.bg_canvas << 8) | 0xb5), 0.0),
+                    linear_color_stop(rgba((t.bg_canvas << 8) | 0xf7), 1.0),
                 )),
             )
             .child(
@@ -781,10 +841,10 @@ impl AppShell {
                             .h(px(222.0))
                             .rounded(px(10.0))
                             .overflow_hidden()
-                            .bg(rgb(BG_SURFACE))
+                            .bg(rgb(t.bg_surface))
                             .border_1()
-                            .border_color(rgba(BORDER_SUBTLE))
-                            .shadow(glass_capsule_shadow())
+                            .border_color(rgba(t.glass_border))
+                            .shadow(player_glass_shadow())
                             .flex()
                             .items_center()
                             .justify_center()
@@ -808,7 +868,7 @@ impl AppShell {
                                 div()
                                     .font(editorial_serif())
                                     .text_size(px(34.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(rgb(t.text_primary))
                                     .text_center()
                                     .child(title.to_owned()),
                             )
@@ -817,7 +877,7 @@ impl AppShell {
                                     div()
                                         .font(mono_font())
                                         .text_xs()
-                                        .text_color(rgb(ACCENT))
+                                        .text_color(rgb(t.accent))
                                         .child(ep.to_owned()),
                                 )
                             }),
@@ -827,47 +887,52 @@ impl AppShell {
                             .px(px(16.0))
                             .py(px(8.0))
                             .rounded(px(999.0))
-                            .bg(rgba(BG_OSD_GLASS))
+                            .bg(rgba(t.glass_popover_bg))
                             .border_1()
-                            .border_color(rgba(BORDER_SUBTLE))
-                            .shadow(glass_capsule_shadow())
+                            .border_color(rgba(t.glass_border))
+                            .shadow(player_glass_shadow())
                             .flex()
                             .flex_wrap()
                             .items_center()
                             .justify_center()
                             .gap(px(10.0))
-                            .child(svg_icon(IconName::RefreshCw, 13.0, rgb(ACCENT)))
+                            .child(svg_icon_weighted(
+                                IconName::RefreshCw,
+                                IconWeight::Regular,
+                                13.0,
+                                rgb(t.accent),
+                            ))
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::MEDIUM))
                                     .text_size(px(13.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(rgb(t.text_primary))
                                     .child(status_label),
                             )
                             .when(show_dl_telemetry, |pill| {
-                                pill.child(meta_divider()).child(
+                                pill.child(player_meta_divider(&t)).child(
                                     div()
                                         .font(mono_font())
                                         .text_xs()
-                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .text_color(rgb(t.text_secondary))
                                         .child(format!("{dl_mbps:.2} MB/s")),
                                 )
                             })
                             .when_some(peers_opt, |pill, peers| {
-                                pill.child(meta_divider()).child(
+                                pill.child(player_meta_divider(&t)).child(
                                     div()
                                         .font(mono_font())
                                         .text_xs()
-                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .text_color(rgb(t.text_secondary))
                                         .child(format!("{peers} peers")),
                                 )
                             })
                             .when_some(active_summary, |pill, sum| {
-                                pill.child(meta_divider()).child(
+                                pill.child(player_meta_divider(&t)).child(
                                     div()
                                         .font(mono_font())
                                         .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(t.text_muted))
                                         .child(match sum.addon_label {
                                             Some(addon) => format!("{} / {addon}", sum.resolution),
                                             None => sum.resolution.to_owned(),
@@ -885,18 +950,19 @@ impl AppShell {
                                 .px(px(14.0))
                                 .rounded(px(999.0))
                                 .bg(if drawer_open {
-                                    rgba(ACCENT_SOFT)
+                                    rgba(t.accent_soft)
                                 } else {
-                                    rgb(BG_ELEVATED)
+                                    rgb(t.bg_elevated)
                                 })
                                 .border_1()
                                 .border_color(if drawer_open {
-                                    rgba(BORDER_ACCENT)
+                                    rgba(t.border_accent)
                                 } else {
-                                    rgba(BORDER_SUBTLE)
+                                    rgba(t.glass_border)
                                 })
-                                .hover(|s| {
-                                    s.bg(rgb(BG_SURFACE_3)).border_color(rgba(BORDER_STRONG))
+                                .hover(move |s| {
+                                    s.bg(rgb(t.bg_surface_3))
+                                        .border_color(rgba(t.glass_border_strong))
                                 })
                                 .flex()
                                 .items_center()
@@ -904,9 +970,9 @@ impl AppShell {
                                 .font(ui_sans(FontWeight::MEDIUM))
                                 .text_xs()
                                 .text_color(if drawer_open {
-                                    rgb(ACCENT)
+                                    rgb(t.accent)
                                 } else {
-                                    rgb(TEXT_SECONDARY)
+                                    rgb(t.text_secondary)
                                 })
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -915,10 +981,15 @@ impl AppShell {
                                         this.toggle_player_popover(PlayerPopover::SwitchStream, cx);
                                     }),
                                 )
-                                .child(svg_icon(
+                                .child(svg_icon_weighted(
                                     IconName::Layers,
+                                    IconWeight::Regular,
                                     13.0,
-                                    rgb(if drawer_open { ACCENT } else { TEXT_SECONDARY }),
+                                    rgb(if drawer_open {
+                                        t.accent
+                                    } else {
+                                        t.text_secondary
+                                    }),
                                 ))
                                 .child(format!("Switch source ({candidate_count})")),
                         )
@@ -934,6 +1005,7 @@ impl AppShell {
         vol_slider_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = player_hud_palette();
         let snap = &self.player_snapshot;
         let duration = snap.duration.max(0.0);
         let pos = snap.time_pos.clamp(0.0, duration.max(0.001));
@@ -1081,7 +1153,7 @@ impl AppShell {
                                         .bottom_0()
                                         .left(relative(intro_start))
                                         .w(relative(intro_w))
-                                        .bg(rgba(0xfbbf2477)),
+                                        .bg(rgba((t.accent_amber << 8) | 0x77)),
                                 )
                             })
                             .child(
@@ -1091,7 +1163,7 @@ impl AppShell {
                                     .bottom_0()
                                     .left_0()
                                     .w(relative(play_frac))
-                                    .bg(rgb(ACCENT)),
+                                    .bg(rgb(t.accent)),
                             ),
                     )
                     .child(
@@ -1125,7 +1197,7 @@ impl AppShell {
                                         .w(px(2.0))
                                         .h(px(16.0))
                                         .rounded(px(1.0))
-                                        .bg(rgb(TEXT_PRIMARY)),
+                                        .bg(rgb(t.text_primary)),
                                 )
                                 .child(
                                     deferred(
@@ -1136,10 +1208,10 @@ impl AppShell {
                                             .w(px(card_w))
                                             .p(px(8.0))
                                             .rounded(px(8.0))
-                                            .bg(rgba(BG_POPOVER_GLASS))
+                                            .bg(rgba(t.glass_popover_bg))
                                             .border_1()
-                                            .border_color(rgba(BORDER_SUBTLE))
-                                            .shadow(glass_capsule_shadow())
+                                            .border_color(rgba(t.glass_border))
+                                            .shadow(player_glass_shadow())
                                             .flex()
                                             .flex_col()
                                             .items_center()
@@ -1150,7 +1222,7 @@ impl AppShell {
                                                         .w(px(192.0))
                                                         .h(px(108.0))
                                                         .rounded(px(4.0))
-                                                        .bg(rgb(BG_SURFACE))
+                                                        .bg(rgb(t.bg_surface))
                                                         .overflow_hidden()
                                                         .child(
                                                             img(thumb)
@@ -1163,7 +1235,7 @@ impl AppShell {
                                                 div()
                                                     .font(mono_font())
                                                     .text_xs()
-                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .text_color(rgb(t.text_primary))
                                                     .child(format_timestamp_secs(preview_secs)),
                                             ),
                                     )
@@ -1209,12 +1281,13 @@ impl AppShell {
                                             }
                                         }),
                                     )
-                                    .child(svg_icon(
+                                    .child(svg_icon_weighted(
                                         if snap.paused {
                                             IconName::Play
                                         } else {
                                             IconName::Pause
                                         },
+                                        IconWeight::Fill,
                                         18.0,
                                         rgb(0xFFFFFF),
                                     )),
@@ -1237,7 +1310,12 @@ impl AppShell {
                                             this.seek_player_relative(-10.0, cx);
                                         }),
                                     )
-                                    .child(svg_icon(IconName::Replay10, 20.0, rgb(0xFFFFFF))),
+                                    .child(svg_icon_weighted(
+                                        IconName::Replay10,
+                                        IconWeight::Regular,
+                                        20.0,
+                                        rgb(0xFFFFFF),
+                                    )),
                             )
                             .child(
                                 div()
@@ -1257,7 +1335,12 @@ impl AppShell {
                                             this.seek_player_relative(10.0, cx);
                                         }),
                                     )
-                                    .child(svg_icon(IconName::Forward10, 20.0, rgb(0xFFFFFF))),
+                                    .child(svg_icon_weighted(
+                                        IconName::Forward10,
+                                        IconWeight::Regular,
+                                        20.0,
+                                        rgb(0xFFFFFF),
+                                    )),
                             )
                             .child(
                                 div()
@@ -1288,12 +1371,13 @@ impl AppShell {
                                                     this.adjust_player_volume_by_wheel(ev.delta, cx);
                                                 },
                                             ))
-                                            .child(svg_icon(
+                                            .child(svg_icon_weighted(
                                                 if muted || snap.volume <= 0.5 {
                                                     IconName::VolumeX
                                                 } else {
                                                     IconName::Volume2
                                                 },
+                                                IconWeight::Fill,
                                                 19.0,
                                                 rgb(0xFFFFFF),
                                             )),
@@ -1389,7 +1473,7 @@ impl AppShell {
                                                             .bottom_0()
                                                             .left_0()
                                                             .w(relative(vol_frac))
-                                                            .bg(rgb(0xFFFFFF)),
+                                                            .bg(rgb(t.accent)),
                                                     ),
                                             )
                                             .child(
@@ -1414,12 +1498,12 @@ impl AppShell {
                                     .text_size(px(13.0))
                                     .child(
                                         div()
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .text_color(rgb(t.text_primary))
                                             .child(format_timestamp_secs(pos)),
                                     )
                                     .child(
                                         div()
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_color(rgb(t.text_secondary))
                                             .child(format!(" / {}", format_timestamp_secs(duration))),
                                     ),
                             ),

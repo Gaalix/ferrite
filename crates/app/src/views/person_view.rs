@@ -4,14 +4,12 @@ use gpui::{div, img, prelude::*, px, rgb, rgba, Context, FontWeight, MouseButton
 use stremio_core_runtime::{EditorialMediaHit, PersonFilmography};
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{AppRoute, KbFocusableCard, PersonDeptFilter},
     theme::{
-        editorial_serif, meta_divider, mono_font, neutral_chip, poster_card_shadow,
-        sentence_case_label, ui_sans, ACCENT, BG_ELEVATED, GLASS_BORDER, GLASS_BORDER_STRONG,
-        GLASS_CARD_BG, GLASS_ROW_HOVER_BG, GLASS_TROUGH_BG, RADIUS_CARD, RADIUS_PILL,
-        RADIUS_POSTER, TEXT_PRIMARY, TEXT_SECONDARY,
+        active_theme, editorial_serif, meta_divider, mono_font, neutral_chip, poster_card_shadow,
+        sentence_case_label, sp, ui_sans, RADIUS_CARD, RADIUS_PILL, RADIUS_POSTER,
     },
     ui_components::{glass_back_button, glass_segmented_bar, glass_segmented_item},
     views::search_view::{hit_target_id, person_initials},
@@ -19,10 +17,7 @@ use crate::{
 };
 
 const BIO_COLLAPSE_CHARS: usize = 340;
-const GRID_MIN_CARD_WIDTH_PX: f32 = 176.0;
-const GRID_COL_GAP_PX: f32 = 18.0;
-const GRID_ROW_GAP_PX: f32 = 16.0;
-const GRID_METADATA_HEIGHT_PX: f32 = 48.0;
+const GRID_METADATA_HEIGHT_PX: f32 = 52.0;
 
 fn truncate_bio_at_word_boundary(bio: &str, max_chars: usize) -> (String, bool) {
     let trimmed = bio.trim();
@@ -192,6 +187,8 @@ impl AppShell {
         route_name: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = active_theme();
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         let filmo = self.active_person_filmography.clone();
         let display_name = filmo
             .as_ref()
@@ -245,16 +242,23 @@ impl AppShell {
             .unwrap_or_default();
 
         let total_credits = credits.len();
+        let viewport_w = self.viewport_size_px.0;
+        let side_pad = if viewport_w.is_finite() && viewport_w > 0.0 {
+            (viewport_w * 0.03).clamp(24.0, 56.0)
+        } else {
+            32.0
+        };
+        let grid_gap = t.density.grid_gap_px() * t.ui_scale;
         let metrics = compute_dynamic_grid_metrics(
             total_credits,
-            self.viewport_size_px.0,
+            viewport_w,
             0.0,
-            64.0,
-            Some(1440.0),
-            GRID_MIN_CARD_WIDTH_PX,
-            GRID_COL_GAP_PX,
-            GRID_ROW_GAP_PX,
-            GRID_METADATA_HEIGHT_PX,
+            side_pad * 2.0,
+            None,
+            t.density.target_poster_width_px() * t.ui_scale,
+            grid_gap,
+            grid_gap,
+            GRID_METADATA_HEIGHT_PX * t.ui_scale,
             PosterAspect::Portrait2x3,
         );
         let columns = metrics.columns;
@@ -301,14 +305,12 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(1440.0))
-                    .mx_auto()
-                    .px(px(32.0))
-                    .pt(px(28.0))
-                    .pb(px(72.0))
+                    .px(px(side_pad))
+                    .pt(sp(16.0))
+                    .pb(sp(72.0))
                     .flex()
                     .flex_col()
-                    .gap(px(32.0))
+                    .gap(sp(28.0))
                     .child(
                         div()
                             .flex()
@@ -327,24 +329,24 @@ impl AppShell {
                     )
                     .child(
                         div()
-                            .p(px(28.0))
+                            .p(sp(24.0))
                             .rounded(px(RADIUS_CARD))
-                            .bg(rgba(GLASS_CARD_BG))
+                            .bg(rgba(t.glass_card_bg))
                             .border_1()
-                            .border_color(rgba(GLASS_BORDER))
+                            .border_color(rgba(t.glass_border))
                             .flex()
                             .items_start()
-                            .gap(px(28.0))
+                            .gap(sp(24.0))
                             .child(
                                 div()
-                                    .w(px(128.0))
-                                    .h(px(168.0))
+                                    .w(sp(128.0))
+                                    .h(sp(168.0))
                                     .flex_shrink_0()
                                     .rounded(px(RADIUS_POSTER))
                                     .overflow_hidden()
-                                    .bg(rgb(BG_ELEVATED))
+                                    .bg(rgb(t.bg_elevated))
                                     .border_1()
-                                    .border_color(rgba(GLASS_BORDER))
+                                    .border_color(rgba(t.glass_border))
                                     .shadow(poster_card_shadow())
                                     .flex()
                                     .items_center()
@@ -357,8 +359,8 @@ impl AppShell {
                                     } else {
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(px(40.0))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_size(sp(38.0))
+                                            .text_color(rgb(t.text_secondary))
                                             .child(initials)
                                             .into_any_element()
                                     }),
@@ -369,13 +371,13 @@ impl AppShell {
                                     .min_w(px(0.0))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(10.0))
+                                    .gap(sp(10.0))
                                     .child(
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(px(44.0))
+                                            .text_size(sp(40.0))
                                             .line_height(gpui::relative(1.06))
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .text_color(rgb(t.text_primary))
                                             .child(display_name.clone()),
                                     )
                                     .child(
@@ -383,13 +385,13 @@ impl AppShell {
                                             .flex()
                                             .flex_wrap()
                                             .items_center()
-                                            .gap(px(10.0))
+                                            .gap(sp(10.0))
                                             .font(mono_font())
                                             .text_xs()
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_color(rgb(t.text_secondary))
                                             .child(
                                                 div()
-                                                    .text_color(rgb(ACCENT))
+                                                    .text_color(rgb(accent_ink))
                                                     .child(department),
                                             )
                                             .when_some(
@@ -409,17 +411,17 @@ impl AppShell {
                                     .when_some(bio_block, |el, (bio_text, is_long)| {
                                         el.child(
                                             div()
-                                                .mt(px(4.0))
+                                                .mt(sp(4.0))
                                                 .max_w(px(780.0))
                                                 .flex()
                                                 .flex_col()
                                                 .items_start()
-                                                .gap(px(8.0))
+                                                .gap(sp(8.0))
                                                 .child(
                                                     div()
-                                                        .text_size(px(14.0))
-                                                        .line_height(px(21.0))
-                                                        .text_color(rgb(TEXT_SECONDARY))
+                                                        .text_size(sp(14.0))
+                                                        .line_height(sp(21.0))
+                                                        .text_color(rgb(t.text_secondary))
                                                         .child(bio_text),
                                                 )
                                                 .when(is_long, |col| {
@@ -427,24 +429,24 @@ impl AppShell {
                                                         div()
                                                             .id("person-bio-toggle")
                                                             .cursor_pointer()
-                                                            .h(px(28.0))
-                                                            .px(px(11.0))
+                                                            .h(sp(28.0))
+                                                            .px(sp(11.0))
                                                             .rounded(px(RADIUS_PILL))
-                                                            .bg(rgba(GLASS_TROUGH_BG))
+                                                            .bg(rgba(t.glass_trough_bg))
                                                             .border_1()
-                                                            .border_color(rgba(GLASS_BORDER))
-                                                            .hover(|s| {
-                                                                s.bg(rgba(GLASS_ROW_HOVER_BG))
+                                                            .border_color(rgba(t.glass_border))
+                                                            .hover(move |s| {
+                                                                s.bg(rgba(t.glass_row_hover_bg))
                                                                     .border_color(rgba(
-                                                                        GLASS_BORDER_STRONG,
+                                                                        t.glass_border_strong,
                                                                     ))
                                                             })
                                                             .flex()
                                                             .items_center()
-                                                            .gap(px(5.0))
+                                                            .gap(sp(5.0))
                                                             .font(ui_sans(FontWeight::MEDIUM))
-                                                            .text_size(px(12.0))
-                                                            .text_color(rgb(ACCENT))
+                                                            .text_size(sp(12.0))
+                                                            .text_color(rgb(accent_ink))
                                                             .on_mouse_down(
                                                                 MouseButton::Left,
                                                                 cx.listener(|this, _, _, cx| {
@@ -459,14 +461,15 @@ impl AppShell {
                                                             } else {
                                                                 "Read more"
                                                             })
-                                                            .child(svg_icon(
+                                                            .child(svg_icon_weighted(
                                                                 if bio_expanded {
                                                                     IconName::ArrowUp
                                                                 } else {
                                                                     IconName::ArrowDown
                                                                 },
-                                                                12.0,
-                                                                rgb(ACCENT),
+                                                                IconWeight::Regular,
+                                                                12.0 * t.ui_scale,
+                                                                rgb(accent_ink),
                                                             )),
                                                     )
                                                 }),
@@ -481,17 +484,17 @@ impl AppShell {
                                 .flex_wrap()
                                 .items_center()
                                 .justify_between()
-                                .gap(px(14.0))
+                                .gap(sp(14.0))
                                 .child(
                                     div()
                                         .flex()
                                         .items_baseline()
-                                        .gap(px(12.0))
+                                        .gap(sp(12.0))
                                         .child(
                                             div()
                                                 .font(editorial_serif())
-                                                .text_size(px(28.0))
-                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .text_size(sp(26.0))
+                                                .text_color(rgb(t.text_primary))
                                                 .child("Filmography"),
                                         )
                                         .child(neutral_chip(credit_count_label)),
@@ -501,7 +504,7 @@ impl AppShell {
                                         .flex()
                                         .flex_wrap()
                                         .items_center()
-                                        .gap(px(10.0))
+                                        .gap(sp(10.0))
                                         .child(glass_segmented_bar("person-dept-filter").children(
                                             PersonDeptFilter::ALL.into_iter().enumerate().map(
                                                 |(idx, dept)| {
@@ -594,10 +597,10 @@ impl AppShell {
                                                             .id(("person-credit-row", row_idx))
                                                             .w_full()
                                                             .h(px(row_stride_px))
-                                                            .pb(px(GRID_ROW_GAP_PX))
+                                                            .pb(px(grid_gap))
                                                             .flex()
                                                             .items_start()
-                                                            .gap(px(GRID_COL_GAP_PX))
+                                                            .gap(px(grid_gap))
                                                             .children(range.map(|item_idx| {
                                                                 let hit = &credits_arc[item_idx];
                                                                 let sub =
@@ -641,19 +644,19 @@ impl AppShell {
                     .when(total_credits == 0 && total_raw_credits > 0, |el| {
                         el.child(
                             div()
-                                .p(px(28.0))
+                                .p(sp(28.0))
                                 .rounded(px(RADIUS_CARD))
-                                .bg(rgba(GLASS_CARD_BG))
+                                .bg(rgba(t.glass_card_bg))
                                 .border_1()
-                                .border_color(rgba(GLASS_BORDER))
+                                .border_color(rgba(t.glass_border))
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .gap(px(16.0))
+                                .gap(sp(16.0))
                                 .child(
                                     div()
-                                        .text_size(px(14.0))
-                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .text_size(sp(14.0))
+                                        .text_color(rgb(t.text_secondary))
                                         .child(format!(
                                             "No {} credits matched for {}.",
                                             dept_filter.label().to_ascii_lowercase(),
@@ -664,21 +667,21 @@ impl AppShell {
                                     div()
                                         .id("person-filter-reset")
                                         .cursor_pointer()
-                                        .h(px(32.0))
-                                        .px(px(14.0))
+                                        .h(sp(32.0))
+                                        .px(sp(14.0))
                                         .rounded(px(RADIUS_PILL))
-                                        .bg(rgba(GLASS_TROUGH_BG))
+                                        .bg(rgba(t.glass_trough_bg))
                                         .border_1()
-                                        .border_color(rgba(GLASS_BORDER))
-                                        .hover(|s| {
-                                            s.bg(rgba(GLASS_ROW_HOVER_BG))
-                                                .border_color(rgba(GLASS_BORDER_STRONG))
+                                        .border_color(rgba(t.glass_border))
+                                        .hover(move |s| {
+                                            s.bg(rgba(t.glass_row_hover_bg))
+                                                .border_color(rgba(t.glass_border_strong))
                                         })
                                         .flex()
                                         .items_center()
                                         .font(ui_sans(FontWeight::MEDIUM))
-                                        .text_size(px(12.5))
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_size(sp(12.5))
+                                        .text_color(rgb(t.text_primary))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -700,13 +703,13 @@ impl AppShell {
                     .when(!self.person_loading && total_raw_credits == 0, |el| {
                         el.child(
                             div()
-                                .p(px(28.0))
+                                .p(sp(28.0))
                                 .rounded(px(RADIUS_CARD))
-                                .bg(rgba(GLASS_CARD_BG))
+                                .bg(rgba(t.glass_card_bg))
                                 .border_1()
-                                .border_color(rgba(GLASS_BORDER))
-                                .text_size(px(14.0))
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .border_color(rgba(t.glass_border))
+                                .text_size(sp(14.0))
+                                .text_color(rgb(t.text_secondary))
                                 .child(if has_tmdb {
                                     "No filmography credits returned for this person."
                                 } else {

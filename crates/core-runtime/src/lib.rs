@@ -64,17 +64,20 @@ pub use stream_parser::{
     VideoCodec,
 };
 pub use subtitles::{
-    decode_subtitle_payload, extract_best_subtitle_from_zip, human_language_name,
+    analyze_subtitle_content, decode_subtitle_payload, extract_best_subtitle_from_zip,
+    has_explicit_forced_marker, human_language_name, is_untranslated_foreign_placeholder,
     normalize_bytes_to_utf8, normalize_subtitle_lang_code, normalize_subtitle_lang_iso639_1,
     normalize_subtitle_lang_iso639_2, prune_subtitle_cache_dir, short_language_badge,
-    subtitle_lang_matches, AudioSpeechFingerprint, AudioSpeechWindow, FetchedNativeSubtitle,
-    FpsHint, NativeSubtitleClient, NativeSubtitleEndpoints, NativeSubtitleQuery, ReleaseEdition,
-    StreamingServiceTag, SubtitleAlignmentResult, SubtitleMatchRanker, SubtitleMatchTier,
-    SubtitleSourceCut, SubtitleSyncAligner, VideoReleaseFingerprint, AUDIO_ENV_FRAME_MS,
-    AUDIO_SAMPLE_RATE_HZ, DEFAULT_OPENSUBTITLES_API_BASE, DEFAULT_OPENSUBTITLES_V3_BASE,
-    DEFAULT_SUBDL_API_BASE, DEFAULT_SUBDL_DL_BASE, MAX_SUBTITLE_ARCHIVE_BYTES,
-    MAX_SUBTITLE_CACHE_BYTES, MAX_SUBTITLE_CACHE_FILES, MAX_UNCOMPRESSED_SUBTITLE_BYTES,
-    NATIVE_SUBTITLE_HTTP_TIMEOUT_MS, NATIVE_SUBTITLE_POOL_IDLE_SECS,
+    subtitle_lang_matches, AnalyzedSubtitleContent, AudioSpeechFingerprint, AudioSpeechWindow,
+    FetchedNativeSubtitle, ForeignTranslationStatus, FpsHint, NativeSubtitleClient,
+    NativeSubtitleEndpoints, NativeSubtitleQuery, ReleaseEdition, StreamingServiceTag,
+    SubtitleAlignmentResult, SubtitleContentProfile, SubtitleMatchRanker, SubtitleMatchTier,
+    SubtitleSearchMode, SubtitleSourceCut, SubtitleSyncAligner, VideoReleaseFingerprint,
+    AUDIO_ENV_FRAME_MS, AUDIO_SAMPLE_RATE_HZ, DEFAULT_OPENSUBTITLES_API_BASE,
+    DEFAULT_OPENSUBTITLES_V3_BASE, DEFAULT_SUBDL_API_BASE, DEFAULT_SUBDL_DL_BASE,
+    MAX_SUBTITLE_ARCHIVE_BYTES, MAX_SUBTITLE_CACHE_BYTES, MAX_SUBTITLE_CACHE_FILES,
+    MAX_UNCOMPRESSED_SUBTITLE_BYTES, NATIVE_SUBTITLE_HTTP_TIMEOUT_MS,
+    NATIVE_SUBTITLE_POOL_IDLE_SECS,
 };
 pub use tmdb::{
     build_unified_editorial_search, cmp_editorial_hits, enriched_to_stremio_meta_item,
@@ -86,8 +89,11 @@ pub use tmdb::{
     DEFAULT_TMDB_IMAGE_BASE_URL,
 };
 pub use track_prefs::{
-    extract_track_keywords, has_full_embedded_subtitle_for_lang, parse_lang_tag,
-    select_preferred_tracks, MatchedTracks, SeriesTrackPreference, TrackCandidate, TrackKind,
+    assess_embedded_subtitles, extract_track_keywords, has_full_embedded_subtitle_for_lang,
+    is_forced_subtitle_track, is_image_subtitle_codec, is_sdh_subtitle_track, parse_lang_tag,
+    select_alternative_embedded_full_track, select_embedded_forced_track,
+    select_embedded_image_track_for_inline_forced, select_preferred_tracks,
+    EmbeddedSubtitleQuality, MatchedTracks, SeriesTrackPreference, TrackCandidate, TrackKind,
     SERIES_TRACK_PREFS_STORAGE_KEY,
 };
 

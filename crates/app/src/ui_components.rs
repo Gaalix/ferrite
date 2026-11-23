@@ -10,13 +10,9 @@ use crate::{
     icons::{svg_icon, IconName},
     state::LibraryStatusTab,
     theme::{
-        editorial_serif, glass_capsule_shadow, mono_font, placeholder_tint_for_id,
-        poster_card_shadow, tabular_nums, ui_sans, ACCENT, ACCENT_HOVER, ACCENT_SOFT, BG_OBSIDIAN,
-        BG_SURFACE, BORDER_ACCENT, BORDER_POSTER_HOVER, CTA_ON_ACCENT, GLASS_BORDER,
-        GLASS_BORDER_STRONG, GLASS_CARD_BG, GLASS_DIVIDER, GLASS_ROW_HOVER_BG,
-        GLASS_ROW_SELECTED_BG, GLASS_SHEET_BG, GLASS_TROUGH_BG, RADIUS_CARD, RADIUS_CONTROL,
-        RADIUS_PILL, RADIUS_POSTER, SEGMENT_ACTIVE_BG, SEGMENT_ACTIVE_TEXT, STATUS_WATCHED,
-        STATUS_WATCHING, STATUS_WATCHLIST, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+        active_theme, editorial_serif, glass_capsule_shadow, mono_font, placeholder_tint_for_id,
+        poster_card_shadow, poster_hover_glow_shadow, sp, tabular_nums, ui_sans, RADIUS_CARD,
+        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
     virtual_grid::PosterAspect,
 };
@@ -41,18 +37,19 @@ pub fn hover_handler(f: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Hove
     Box::new(f)
 }
 
-/// Frosted segmented control trough matching the `v0.4.5` player sheet aesthetic.
+/// Frosted segmented control trough styled from the active Ethereal `ThemePalette`.
 pub fn glass_segmented_bar(id: impl Into<ElementId>) -> Stateful<Div> {
+    let theme = active_theme();
     div()
         .id(id)
-        .p(px(3.0))
+        .p(sp(3.0))
         .rounded(px(RADIUS_CONTROL))
-        .bg(rgba(GLASS_TROUGH_BG))
+        .bg(rgba(theme.glass_trough_bg))
         .border_1()
-        .border_color(rgba(GLASS_BORDER))
+        .border_color(rgba(theme.glass_border))
         .flex()
         .items_center()
-        .gap(px(2.0))
+        .gap(sp(2.0))
 }
 
 /// Individual segment button inside a `glass_segmented_bar`.
@@ -62,58 +59,66 @@ pub fn glass_segmented_item(
     active: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let theme = active_theme();
     let base = div()
         .id(id)
-        .h(px(30.0))
-        .px(px(12.0))
+        .h(sp(30.0))
+        .px(sp(12.0))
         .rounded(px(RADIUS_POSTER))
         .cursor_pointer()
         .flex()
         .items_center()
         .justify_center()
         .whitespace_nowrap()
-        .text_size(px(12.5))
+        .text_size(sp(12.5))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
         });
 
     if active {
-        base.bg(rgb(SEGMENT_ACTIVE_BG))
+        base.bg(rgb(theme.segment_active_bg))
             .font(ui_sans(FontWeight::SEMIBOLD))
-            .text_color(rgb(SEGMENT_ACTIVE_TEXT))
+            .text_color(rgb(theme.segment_active_text))
     } else {
         base.bg(rgba(0x00000000))
-            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)).text_color(rgb(TEXT_PRIMARY)))
+            .hover(move |s| {
+                s.bg(rgba(theme.glass_row_hover_bg))
+                    .text_color(rgb(theme.text_primary))
+            })
             .font(ui_sans(FontWeight::MEDIUM))
-            .text_color(rgb(TEXT_SECONDARY))
+            .text_color(rgb(theme.text_secondary))
     }
     .child(label.into())
 }
 
-/// Unified `v0.4.5` 40x22 glass toggle switch with crisp white thumb.
+/// Unified 40x22 glass toggle switch with crisp white thumb, adapting across dark and light presets.
 pub fn glass_switch(
     id: impl Into<ElementId>,
     checked: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let theme = active_theme();
+    let unchecked_bg = if theme.is_light { 0x0F172A29 } else { 0xFFFFFF1E };
+    let unchecked_hover_bg = if theme.is_light { 0x0F172A3D } else { 0xFFFFFF2B };
+
     div()
         .id(id)
-        .w(px(40.0))
-        .h(px(22.0))
+        .w(sp(40.0))
+        .h(sp(22.0))
         .flex_shrink_0()
         .rounded_full()
-        .p(px(2.0))
+        .p(sp(2.0))
         .cursor_pointer()
         .flex()
         .items_center()
-        .when(checked, |s| s.bg(rgb(ACCENT)).justify_end())
-        .when(!checked, |s| s.bg(rgba(0xFFFFFF1E)).justify_start())
-        .hover(|s| {
+        .when(checked, |s| s.bg(rgb(theme.accent)).justify_end())
+        .when(!checked, |s| s.bg(rgba(unchecked_bg)).justify_start())
+        .hover(move |s| {
             if checked {
-                s.bg(rgb(ACCENT_HOVER))
+                s.bg(rgb(theme.accent_hover))
             } else {
-                s.bg(rgba(0xFFFFFF2B))
+                s.bg(rgba(unchecked_hover_bg))
             }
         })
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
@@ -122,10 +127,13 @@ pub fn glass_switch(
         })
         .child(
             div()
-                .w(px(18.0))
-                .h(px(18.0))
+                .w(sp(18.0))
+                .h(sp(18.0))
                 .rounded_full()
-                .bg(rgb(0xFFFFFF)),
+                .bg(rgb(0xFFFFFF))
+                .when(theme.is_light, |thumb| {
+                    thumb.border_1().border_color(rgba(0x0000001A))
+                }),
         )
 }
 
@@ -137,57 +145,63 @@ pub fn glass_stepper(
     on_reset: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_inc: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
+    let theme = active_theme();
     let prefix = id_prefix.into();
     let dec_id: SharedString = format!("{prefix}-dec").into();
     let reset_id: SharedString = format!("{prefix}-reset").into();
     let inc_id: SharedString = format!("{prefix}-inc").into();
+    let icon_sz = 13.0 * theme.ui_scale;
 
     div()
-        .h(px(34.0))
-        .min_w(px(114.0))
+        .h(sp(34.0))
+        .min_w(sp(114.0))
         .rounded_full()
-        .bg(rgba(GLASS_TROUGH_BG))
+        .bg(rgba(theme.glass_trough_bg))
         .border_1()
-        .border_color(rgba(GLASS_BORDER))
-        .px(px(6.0))
+        .border_color(rgba(theme.glass_border))
+        .px(sp(6.0))
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(4.0))
+        .gap(sp(4.0))
         .child(
             div()
                 .id(dec_id)
-                .w(px(24.0))
-                .h(px(24.0))
+                .w(sp(24.0))
+                .h(sp(24.0))
                 .rounded_full()
                 .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
-                .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
                     on_dec(ev, window, cx);
                 })
-                .child(svg_icon(IconName::Minus, 13.0, rgb(TEXT_SECONDARY))),
+                .child(svg_icon(
+                    IconName::Minus,
+                    icon_sz,
+                    rgb(theme.text_secondary),
+                )),
         )
         .child(
             div()
                 .id(reset_id)
                 .flex_1()
-                .px(px(6.0))
-                .py(px(2.0))
+                .px(sp(6.0))
+                .py(sp(2.0))
                 .rounded(px(6.0))
                 .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
                 .whitespace_nowrap()
-                .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
                 .font(ui_sans(FontWeight::MEDIUM))
                 .font_features(tabular_nums())
-                .text_size(px(12.5))
-                .text_color(rgb(TEXT_PRIMARY))
+                .text_size(sp(12.5))
+                .text_color(rgb(theme.text_primary))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
                     on_reset(ev, window, cx);
@@ -197,37 +211,42 @@ pub fn glass_stepper(
         .child(
             div()
                 .id(inc_id)
-                .w(px(24.0))
-                .h(px(24.0))
+                .w(sp(24.0))
+                .h(sp(24.0))
                 .rounded_full()
                 .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
-                .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
                     on_inc(ev, window, cx);
                 })
-                .child(svg_icon(IconName::Plus, 13.0, rgb(TEXT_SECONDARY))),
+                .child(svg_icon(
+                    IconName::Plus,
+                    icon_sz,
+                    rgb(theme.text_secondary),
+                )),
         )
 }
 
-/// Floating frosted dropdown/context-menu panel container (`rounded(14)`, `GLASS_SHEET_BG`, `GLASS_BORDER`).
+/// Floating frosted dropdown/context-menu panel container styled from `active_theme()`.
 pub fn glass_dropdown_panel(id: impl Into<ElementId>, width_px: f32) -> Stateful<Div> {
+    let theme = active_theme();
     div()
         .id(id)
         .occlude()
-        .w(px(width_px))
-        .p(px(6.0))
+        .w(sp(width_px))
+        .p(sp(6.0))
         .rounded(px(14.0))
-        .bg(rgba(GLASS_SHEET_BG))
+        .bg(rgba(theme.glass_sheet_bg))
         .border_1()
-        .border_color(rgba(GLASS_BORDER))
+        .border_color(rgba(theme.glass_border))
         .shadow(glass_capsule_shadow())
         .flex()
         .flex_col()
-        .gap(px(2.0))
+        .gap(sp(2.0))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 
@@ -239,24 +258,30 @@ pub fn glass_dropdown_option(
     selected: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let theme = active_theme();
+    let check_color = if theme.is_light {
+        theme.accent_press
+    } else {
+        theme.accent
+    };
     div()
         .id(id)
         .w_full()
         .flex_shrink_0()
-        .px(px(12.0))
-        .py(px(8.0))
+        .px(sp(12.0))
+        .py(sp(8.0))
         .rounded(px(RADIUS_CONTROL))
         .cursor_pointer()
         .bg(if selected {
-            rgba(GLASS_ROW_SELECTED_BG)
+            rgba(theme.glass_row_selected_bg)
         } else {
             rgba(0x00000000)
         })
-        .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+        .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(10.0))
+        .gap(sp(10.0))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
@@ -267,7 +292,7 @@ pub fn glass_dropdown_option(
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(sp(2.0))
                 .child(
                     div()
                         .font(ui_sans(if selected {
@@ -275,8 +300,8 @@ pub fn glass_dropdown_option(
                         } else {
                             FontWeight::MEDIUM
                         }))
-                        .text_size(px(13.0))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_size(sp(13.0))
+                        .text_color(rgb(theme.text_primary))
                         .truncate()
                         .child(label.into()),
                 )
@@ -284,15 +309,19 @@ pub fn glass_dropdown_option(
                     d.child(
                         div()
                             .font(ui_sans(FontWeight::NORMAL))
-                            .text_size(px(11.5))
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_size(sp(11.5))
+                            .text_color(rgb(theme.text_muted))
                             .truncate()
                             .child(sub),
                     )
                 }),
         )
         .when(selected, |d| {
-            d.child(svg_icon(IconName::Check, 14.0, rgb(ACCENT)))
+            d.child(svg_icon(
+                IconName::Check,
+                14.0 * theme.ui_scale,
+                rgb(check_color),
+            ))
         })
 }
 
@@ -302,62 +331,72 @@ pub fn glass_back_button(
     label: impl Into<SharedString>,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let theme = active_theme();
     div()
         .id(id)
         .cursor_pointer()
-        .h(px(34.0))
-        .px(px(12.0))
+        .h(sp(34.0))
+        .px(sp(12.0))
         .rounded(px(RADIUS_PILL))
-        .bg(rgba(GLASS_TROUGH_BG))
+        .bg(rgba(theme.glass_trough_bg))
         .border_1()
-        .border_color(rgba(GLASS_BORDER))
-        .hover(|s| {
-            s.bg(rgba(GLASS_ROW_HOVER_BG))
-                .border_color(rgba(GLASS_BORDER_STRONG))
+        .border_color(rgba(theme.glass_border))
+        .hover(move |s| {
+            s.bg(rgba(theme.glass_row_hover_bg))
+                .border_color(rgba(theme.glass_border_strong))
         })
         .flex()
         .items_center()
-        .gap(px(6.0))
+        .gap(sp(6.0))
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(px(13.0))
-        .text_color(rgb(TEXT_SECONDARY))
+        .text_size(sp(13.0))
+        .text_color(rgb(theme.text_secondary))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
         })
-        .child(svg_icon(IconName::ChevronLeft, 14.0, rgb(TEXT_SECONDARY)))
+        .child(svg_icon(
+            IconName::ChevronLeft,
+            14.0 * theme.ui_scale,
+            rgb(theme.text_secondary),
+        ))
         .child(label.into())
 }
 
-/// Primary coral accent CTA button with dark `CTA_ON_ACCENT` text and optional leading icon.
+/// Primary accent CTA button with `cta_on_accent` ink and optional leading icon.
 pub fn primary_accent_button(
     id: impl Into<ElementId>,
     icon: Option<IconName>,
     label: impl Into<SharedString>,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let theme = active_theme();
     div()
         .id(id)
         .cursor_pointer()
-        .h(px(40.0))
-        .px(px(18.0))
+        .h(sp(40.0))
+        .px(sp(18.0))
         .rounded(px(RADIUS_CONTROL))
-        .bg(rgb(ACCENT))
-        .hover(|s| s.bg(rgb(ACCENT_HOVER)))
+        .bg(rgb(theme.accent))
+        .hover(move |s| s.bg(rgb(theme.accent_hover)))
         .flex()
         .items_center()
         .justify_center()
-        .gap(px(8.0))
+        .gap(sp(8.0))
         .font(ui_sans(FontWeight::SEMIBOLD))
         .font_features(tabular_nums())
-        .text_size(px(13.5))
-        .text_color(rgb(CTA_ON_ACCENT))
+        .text_size(sp(13.5))
+        .text_color(rgb(theme.cta_on_accent))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
         })
         .when_some(icon, |d, ic| {
-            d.child(svg_icon(ic, 14.5, rgb(CTA_ON_ACCENT)))
+            d.child(svg_icon(
+                ic,
+                14.5 * theme.ui_scale,
+                rgb(theme.cta_on_accent),
+            ))
         })
         .child(label.into())
 }
@@ -370,48 +409,59 @@ pub fn secondary_glass_button(
     active: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
-    let fg = if active { ACCENT } else { TEXT_PRIMARY };
+    let theme = active_theme();
+    let fg = if active {
+        if theme.is_light {
+            theme.accent_press
+        } else {
+            theme.accent
+        }
+    } else {
+        theme.text_primary
+    };
     div()
         .id(id)
         .cursor_pointer()
-        .h(px(40.0))
-        .px(px(16.0))
+        .h(sp(40.0))
+        .px(sp(16.0))
         .rounded(px(RADIUS_CONTROL))
         .bg(if active {
-            rgba(ACCENT_SOFT)
+            rgba(theme.accent_soft)
         } else {
-            rgba(GLASS_TROUGH_BG)
+            rgba(theme.glass_trough_bg)
         })
         .border_1()
         .border_color(if active {
-            rgba(BORDER_ACCENT)
+            rgba(theme.border_accent)
         } else {
-            rgba(GLASS_BORDER)
+            rgba(theme.glass_border)
         })
-        .hover(|s| {
+        .hover(move |s| {
             s.bg(if active {
-                rgba(ACCENT_SOFT)
+                rgba(theme.accent_soft)
             } else {
-                rgba(GLASS_ROW_HOVER_BG)
+                rgba(theme.glass_row_hover_bg)
             })
             .border_color(if active {
-                rgb(ACCENT)
+                rgb(theme.accent)
             } else {
-                rgba(GLASS_BORDER_STRONG)
+                rgba(theme.glass_border_strong)
             })
         })
         .flex()
         .items_center()
         .justify_center()
-        .gap(px(8.0))
+        .gap(sp(8.0))
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(px(13.5))
+        .text_size(sp(13.5))
         .text_color(rgb(fg))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
         })
-        .when_some(icon, |d, ic| d.child(svg_icon(ic, 14.5, rgb(fg))))
+        .when_some(icon, |d, ic| {
+            d.child(svg_icon(ic, 14.5 * theme.ui_scale, rgb(fg)))
+        })
         .child(label.into())
 }
 
@@ -434,6 +484,8 @@ pub struct PosterCardProps {
     pub on_open: Option<ClickHandler>,
     pub on_quick_play: Option<ClickHandler>,
     pub on_toggle_library: Option<ClickHandler>,
+    pub on_quick_peek: Option<ClickHandler>,
+    pub quick_action: Option<AnyElement>,
     pub on_context_menu: Option<ClickHandler>,
     pub on_hover: Option<HoverHandler>,
 }
@@ -463,6 +515,8 @@ impl PosterCardProps {
             on_open: None,
             on_quick_play: None,
             on_toggle_library: None,
+            on_quick_peek: None,
+            quick_action: None,
             on_context_menu: None,
             on_hover: None,
         }
@@ -547,6 +601,19 @@ impl PosterCardProps {
         self
     }
 
+    pub fn on_quick_peek(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_quick_peek = Some(Box::new(handler));
+        self
+    }
+
+    pub fn quick_action(mut self, action: impl Into<Option<AnyElement>>) -> Self {
+        self.quick_action = action.into();
+        self
+    }
+
     pub fn on_context_menu(
         mut self,
         handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -579,17 +646,35 @@ pub fn format_notification_badge_label(count: usize) -> Option<SharedString> {
     }
 }
 
-/// Renders the unified v0.5.0 poster/episode card with focus ring, badges, progress bar, and hover actions.
+/// Renders the unified Ethereal poster/episode card with luminous hairline border, ambient hover glow,
+/// focus ring, badges, progress bar, quick-peek drawer button, and optional quick-action slot.
 pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
+    let theme = active_theme();
     let base_id = Arc::new(props.id.clone());
     let grp: SharedString = format!("poster-card-grp-{base_id}").into();
-    let quick_play_id = ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("quick-play"));
-    let toggle_lib_id = ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("toggle-lib"));
+    let quick_play_id =
+        ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("quick-play"));
+    let toggle_lib_id =
+        ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("toggle-lib"));
+    let quick_peek_id =
+        ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("quick-peek"));
 
     let notif_label = format_notification_badge_label(props.notification_count);
     let progress = clamp_progress_fraction(props.progress_fraction);
     let has_bottom_left_hover_btn = props.on_toggle_library.is_some();
     let rating_bottom_px = if progress.is_some() { 10.0 } else { 8.0 };
+    let hover_glow = poster_hover_glow_shadow(&theme);
+    let scrim_top_transparent = theme.scrim_bottom & 0xFFFFFF00;
+    let badge_fg_on_status = if theme.is_light {
+        0xFFFFFF
+    } else {
+        theme.bg_canvas
+    };
+    let top_hairline_rgba = if theme.is_light {
+        0xFFFFFF80
+    } else {
+        0xFFFFFF24
+    };
 
     let mut art_frame = div()
         .w_full()
@@ -606,12 +691,18 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
     }
 
     if props.is_focused {
-        art_frame = art_frame.border_2().border_color(rgb(ACCENT));
+        art_frame = art_frame
+            .border_2()
+            .border_color(rgb(theme.accent))
+            .shadow(hover_glow);
     } else {
         art_frame = art_frame
             .border_1()
-            .border_color(rgba(GLASS_BORDER))
-            .group_hover(grp.clone(), |s| s.border_color(rgba(BORDER_POSTER_HOVER)));
+            .border_color(rgba(theme.glass_border))
+            .group_hover(grp.clone(), move |s| {
+                s.border_color(rgba(theme.border_poster_hover))
+                    .shadow(hover_glow)
+            });
     }
 
     art_frame = art_frame
@@ -624,20 +715,30 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
             div()
                 .size_full()
                 .p(px(14.0))
-                .bg(rgb(BG_SURFACE))
+                .bg(rgb(theme.bg_surface))
                 .flex()
                 .items_end()
                 .child(
                     div()
                         .w_full()
                         .font(editorial_serif())
-                        .text_size(px(19.0))
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_size(sp(19.0))
+                        .text_color(rgb(theme.text_secondary))
                         .truncate()
                         .child(props.title.clone()),
                 )
                 .into_any_element()
         })
+        // Luminous inner top glass edge highlight.
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(1.0))
+                .bg(rgba(top_hairline_rgba)),
+        )
         .child(
             div()
                 .absolute()
@@ -646,8 +747,8 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                 .group_hover(grp.clone(), |s| s.opacity(1.0))
                 .bg(linear_gradient(
                     180.0,
-                    linear_color_stop(rgba(0x0b0b0d00), 0.40),
-                    linear_color_stop(rgba(0x0b0b0de6), 1.0),
+                    linear_color_stop(rgba(scrim_top_transparent), 0.40),
+                    linear_color_stop(rgba(theme.scrim_bottom), 1.0),
                 )),
         )
         .when_some(notif_label, |el, label| {
@@ -659,22 +760,22 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                     .h(px(20.0))
                     .px(px(7.0))
                     .rounded(px(RADIUS_PILL))
-                    .bg(rgb(ACCENT))
+                    .bg(rgb(theme.accent))
                     .flex()
                     .items_center()
                     .justify_center()
                     .font(mono_font())
                     .font_weight(FontWeight::BOLD)
                     .text_size(px(10.0))
-                    .text_color(rgb(CTA_ON_ACCENT))
+                    .text_color(rgb(theme.cta_on_accent))
                     .child(label),
             )
         })
         .when_some(props.status_tab, |el, st| {
             let (icon, bg_col) = match st {
-                LibraryStatusTab::Watched => (IconName::Check, STATUS_WATCHED),
-                LibraryStatusTab::Watching => (IconName::Play, STATUS_WATCHING),
-                LibraryStatusTab::Watchlist => (IconName::Bookmark, STATUS_WATCHLIST),
+                LibraryStatusTab::Watched => (IconName::Check, theme.status_watched),
+                LibraryStatusTab::Watching => (IconName::Play, theme.status_watching),
+                LibraryStatusTab::Watchlist => (IconName::Bookmark, theme.status_watchlist),
             };
             el.child(
                 div()
@@ -688,7 +789,7 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(svg_icon(icon, 12.0, rgb(BG_OBSIDIAN))),
+                    .child(svg_icon(icon, 12.0, rgb(badge_fg_on_status))),
             )
         })
         .when_some(props.imdb_rating, |el, rating| {
@@ -700,13 +801,15 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                     .px(px(6.5))
                     .py(px(2.5))
                     .rounded(px(4.0))
-                    .bg(rgba(0x0b0b0dc7))
+                    .bg(rgba(0x0B0D14D4))
+                    .border_1()
+                    .border_color(rgba(0xFFFFFF22))
                     .flex()
                     .items_center()
                     .gap(px(4.0))
                     .font(mono_font())
                     .text_size(px(11.0))
-                    .text_color(rgb(TEXT_PRIMARY))
+                    .text_color(rgb(0xF5F1E8))
                     .when(has_bottom_left_hover_btn, |badge| {
                         badge.group_hover(grp.clone(), |s| s.opacity(0.0))
                     })
@@ -732,8 +835,9 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                         .w(px(44.0))
                         .h(px(44.0))
                         .rounded(px(RADIUS_PILL))
-                        .bg(rgb(ACCENT))
-                        .hover(|s| s.bg(rgb(ACCENT_HOVER)))
+                        .bg(rgb(theme.accent))
+                        .hover(move |s| s.bg(rgb(theme.accent_hover)))
+                        .shadow(glass_capsule_shadow())
                         .flex()
                         .items_center()
                         .justify_center()
@@ -741,7 +845,7 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                             cx.stop_propagation();
                             on_quick_play(ev, window, cx);
                         })
-                        .child(svg_icon(IconName::Play, 17.0, rgb(CTA_ON_ACCENT))),
+                        .child(svg_icon(IconName::Play, 17.0, rgb(theme.cta_on_accent))),
                 ),
         );
     }
@@ -761,17 +865,20 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                 .h(px(30.0))
                 .rounded(px(RADIUS_PILL))
                 .bg(if in_lib {
-                    rgb(STATUS_WATCHLIST)
+                    rgb(theme.status_watchlist)
                 } else {
-                    rgba(0x141417eb)
+                    rgba(0x0B0D14D9)
                 })
                 .border_1()
                 .border_color(if in_lib {
-                    rgb(STATUS_WATCHLIST)
+                    rgb(theme.status_watchlist)
                 } else {
-                    rgba(GLASS_BORDER_STRONG)
+                    rgba(0xFFFFFF33)
                 })
-                .hover(|s| s.bg(rgb(ACCENT)).border_color(rgb(ACCENT)))
+                .hover(move |s| {
+                    s.bg(rgb(theme.accent_press))
+                        .border_color(rgb(theme.accent))
+                })
                 .flex()
                 .items_center()
                 .justify_center()
@@ -787,12 +894,56 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                     },
                     13.0,
                     if in_lib {
-                        rgb(BG_OBSIDIAN)
+                        rgb(badge_fg_on_status)
                     } else {
-                        rgb(TEXT_PRIMARY)
+                        rgb(0xF5F1E8)
                     },
                 )),
         );
+    }
+
+    if props.quick_action.is_some() || props.on_quick_peek.is_some() {
+        let mut right_actions = div()
+            .absolute()
+            .bottom(px(rating_bottom_px))
+            .right(px(8.0))
+            .opacity(0.0)
+            .group_hover(grp.clone(), |s| s.opacity(1.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0));
+
+        if let Some(slot) = props.quick_action {
+            right_actions = right_actions.child(slot);
+        }
+
+        if let Some(on_quick_peek) = props.on_quick_peek {
+            right_actions = right_actions.child(
+                div()
+                    .id(quick_peek_id)
+                    .cursor_pointer()
+                    .w(px(30.0))
+                    .h(px(30.0))
+                    .rounded(px(RADIUS_PILL))
+                    .bg(rgba(0x0B0D14D9))
+                    .border_1()
+                    .border_color(rgba(0xFFFFFF33))
+                    .hover(move |s| {
+                        s.bg(rgb(theme.accent_press))
+                            .border_color(rgb(theme.accent))
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                        cx.stop_propagation();
+                        on_quick_peek(ev, window, cx);
+                    })
+                    .child(svg_icon(IconName::Eye, 13.5, rgb(0xF5F1E8))),
+            );
+        }
+
+        art_frame = art_frame.child(right_actions);
     }
 
     if let Some(frac) = progress {
@@ -803,8 +954,8 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                 .left_0()
                 .right_0()
                 .h(px(3.0))
-                .bg(rgba(0xFFFFFF2E))
-                .child(div().h_full().w(relative(frac)).bg(rgb(ACCENT))),
+                .bg(rgba(0xFFFFFF33))
+                .child(div().h_full().w(relative(frac)).bg(rgb(theme.accent))),
         );
     }
 
@@ -813,7 +964,7 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
         .group(grp)
         .flex()
         .flex_col()
-        .gap(px(8.0));
+        .gap(sp(8.0));
 
     if let Some(w) = props.fixed_width_px {
         card = card.w(px(w)).flex_shrink_0();
@@ -845,13 +996,13 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(sp(2.0))
                 .child(
                     div()
                         .font(ui_sans(FontWeight::MEDIUM))
-                        .text_size(px(13.5))
-                        .line_height(px(18.0))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_size(sp(13.5))
+                        .line_height(sp(18.0))
+                        .text_color(rgb(theme.text_primary))
                         .truncate()
                         .child(props.title),
                 )
@@ -860,9 +1011,9 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
                         div()
                             .font(ui_sans(FontWeight::NORMAL))
                             .font_features(tabular_nums())
-                            .text_size(px(12.0))
-                            .line_height(px(16.0))
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_size(sp(12.0))
+                            .line_height(sp(16.0))
+                            .text_color(rgb(theme.text_muted))
                             .truncate()
                             .child(sub),
                     )
@@ -1000,6 +1151,12 @@ impl StreamSourceRowProps {
 
 /// Renders a unified 3-line stream source row with optional `"Last used"` badge and expandable metadata/copy drawer.
 pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
+    let theme = active_theme();
+    let accent_ink = if theme.is_light {
+        theme.accent_press
+    } else {
+        theme.accent
+    };
     let base_id = Arc::new(props.id.clone());
     let expand_id = ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("expand"));
     let copy_url_id = ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("copy-url"));
@@ -1014,15 +1171,15 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
     let mut main_row = div()
         .id(props.id)
         .w_full()
-        .px(px(16.0))
-        .py(px(12.0))
+        .px(sp(16.0))
+        .py(sp(12.0))
         .when(!props.is_active, |row| {
-            row.hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+            row.hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
         })
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(14.0));
+        .gap(sp(14.0));
 
     if let Some(on_play) = props.on_play {
         main_row = main_row
@@ -1035,37 +1192,41 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
         .min_w(px(0.0))
         .flex()
         .flex_col()
-        .gap(px(3.0))
+        .gap(sp(3.0))
         .child(
             div()
                 .w_full()
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
-                .gap(px(8.0))
-                .child(svg_icon(IconName::Play, 12.0, rgb(ACCENT)))
+                .gap(sp(8.0))
+                .child(svg_icon(
+                    IconName::Play,
+                    12.0 * theme.ui_scale,
+                    rgb(accent_ink),
+                ))
                 .child(
                     div()
                         .min_w(px(0.0))
                         .truncate()
                         .font(ui_sans(FontWeight::SEMIBOLD))
-                        .text_size(px(13.5))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_size(sp(13.5))
+                        .text_color(rgb(theme.text_primary))
                         .child(props.headline),
                 )
                 .when(props.is_last_used, |row| {
                     row.child(
                         div()
                             .flex_shrink_0()
-                            .px(px(7.0))
-                            .py(px(2.0))
+                            .px(sp(7.0))
+                            .py(sp(2.0))
                             .rounded(px(RADIUS_PILL))
-                            .bg(rgba(ACCENT_SOFT))
+                            .bg(rgba(theme.accent_soft))
                             .border_1()
-                            .border_color(rgba(BORDER_ACCENT))
+                            .border_color(rgba(theme.border_accent))
                             .font(ui_sans(FontWeight::MEDIUM))
-                            .text_size(px(10.5))
-                            .text_color(rgb(ACCENT))
+                            .text_size(sp(10.5))
+                            .text_color(rgb(accent_ink))
                             .child("Last used"),
                     )
                 })
@@ -1074,8 +1235,8 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                         div()
                             .flex_shrink_0()
                             .font(ui_sans(FontWeight::NORMAL))
-                            .text_size(px(11.5))
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_size(sp(11.5))
+                            .text_color(rgb(theme.text_muted))
                             .child(addon),
                     )
                 }),
@@ -1086,7 +1247,7 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
-                .gap(px(6.0))
+                .gap(sp(6.0))
                 .when(props.is_cached, |row| {
                     row.child(
                         div()
@@ -1094,7 +1255,7 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                             .h(px(6.0))
                             .rounded_full()
                             .flex_shrink_0()
-                            .bg(rgb(STATUS_WATCHED)),
+                            .bg(rgb(theme.status_watched)),
                     )
                 })
                 .child(
@@ -1103,8 +1264,8 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                         .truncate()
                         .font(ui_sans(FontWeight::NORMAL))
                         .font_features(tabular_nums())
-                        .text_size(px(12.0))
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_size(sp(12.0))
+                        .text_color(rgb(theme.text_secondary))
                         .child(props.metadata_line),
                 ),
         )
@@ -1114,18 +1275,22 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                     .w_full()
                     .min_w(px(0.0))
                     .font(mono_font())
-                    .text_size(px(11.5))
-                    .text_color(rgb(TEXT_MUTED))
+                    .text_size(sp(11.5))
+                    .text_color(rgb(theme.text_muted))
                     .truncate()
                     .text_ellipsis()
                     .child(release),
             )
         });
 
-    let mut right_col = div().flex_shrink_0().flex().items_center().gap(px(8.0));
+    let mut right_col = div().flex_shrink_0().flex().items_center().gap(sp(8.0));
 
     if props.is_active {
-        right_col = right_col.child(svg_icon(IconName::Check, 15.0, rgb(ACCENT)));
+        right_col = right_col.child(svg_icon(
+            IconName::Check,
+            15.0 * theme.ui_scale,
+            rgb(accent_ink),
+        ));
     }
 
     if let Some(on_toggle_expand) = props.on_toggle_expand {
@@ -1134,24 +1299,24 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
             div()
                 .id(expand_id)
                 .cursor_pointer()
-                .px(px(9.0))
-                .py(px(4.0))
+                .px(sp(9.0))
+                .py(sp(4.0))
                 .rounded(px(RADIUS_POSTER))
                 .bg(if expanded {
-                    rgba(ACCENT_SOFT)
+                    rgba(theme.accent_soft)
                 } else {
                     rgba(0x00000000)
                 })
-                .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
                 .flex()
                 .items_center()
-                .gap(px(4.0))
+                .gap(sp(4.0))
                 .font(ui_sans(FontWeight::MEDIUM))
-                .text_size(px(11.5))
+                .text_size(sp(11.5))
                 .text_color(if expanded {
-                    rgb(ACCENT)
+                    rgb(accent_ink)
                 } else {
-                    rgb(TEXT_MUTED)
+                    rgb(theme.text_muted)
                 })
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
@@ -1164,11 +1329,11 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                     } else {
                         IconName::ChevronRight
                     },
-                    11.5,
+                    11.5 * theme.ui_scale,
                     if expanded {
-                        rgb(ACCENT)
+                        rgb(accent_ink)
                     } else {
-                        rgb(TEXT_MUTED)
+                        rgb(theme.text_muted)
                     },
                 )),
         );
@@ -1180,15 +1345,15 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
         .w_full()
         .rounded(px(RADIUS_CARD))
         .bg(if props.is_active {
-            rgba(GLASS_ROW_SELECTED_BG)
+            rgba(theme.glass_row_selected_bg)
         } else {
-            rgba(GLASS_CARD_BG)
+            rgba(theme.glass_card_bg)
         })
         .border_1()
         .border_color(if props.is_active {
-            rgba(BORDER_ACCENT)
+            rgba(theme.border_accent)
         } else {
-            rgba(GLASS_BORDER)
+            rgba(theme.glass_border)
         })
         .overflow_hidden()
         .flex()
@@ -1198,20 +1363,20 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
     if props.is_expanded && has_drawer_content {
         let mut drawer = div()
             .w_full()
-            .px(px(16.0))
-            .py(px(12.0))
-            .bg(rgba(0x0b0b0d66))
+            .px(sp(16.0))
+            .py(sp(12.0))
+            .bg(rgba(theme.glass_trough_bg))
             .border_t_1()
-            .border_color(rgba(GLASS_DIVIDER))
+            .border_color(rgba(theme.glass_divider))
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(sp(8.0))
             .when_some(props.raw_filename, |el, filename| {
                 el.child(
                     div()
                         .font(mono_font())
-                        .text_size(px(11.5))
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_size(sp(11.5))
+                        .text_color(rgb(theme.text_secondary))
                         .child(filename),
                 )
             })
@@ -1221,18 +1386,18 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(6.0))
+                        .gap(sp(6.0))
                         .children(props.technical_specs.into_iter().map(|spec| {
                             div()
-                                .px(px(7.0))
-                                .py(px(2.0))
+                                .px(sp(7.0))
+                                .py(sp(2.0))
                                 .rounded(px(RADIUS_PILL))
-                                .bg(rgba(GLASS_TROUGH_BG))
+                                .bg(rgba(theme.glass_trough_bg))
                                 .border_1()
-                                .border_color(rgba(GLASS_BORDER))
+                                .border_color(rgba(theme.glass_border))
                                 .font(mono_font())
-                                .text_size(px(11.0))
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_size(sp(11.0))
+                                .text_color(rgb(theme.text_muted))
                                 .child(spec)
                         })),
                 )
@@ -1241,14 +1406,14 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                 el.child(
                     div()
                         .font(mono_font())
-                        .text_size(px(11.0))
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_size(sp(11.0))
+                        .text_color(rgb(theme.text_muted))
                         .child(format!("info_hash {hash}")),
                 )
             });
 
         if props.on_copy_url.is_some() || props.on_copy_hash.is_some() {
-            let mut actions = div().flex().flex_wrap().items_center().gap(px(8.0));
+            let mut actions = div().flex().flex_wrap().items_center().gap(sp(8.0));
             if let Some(on_copy_url) = props.on_copy_url {
                 actions = actions.child(render_drawer_copy_button(
                     copy_url_id,
@@ -1277,30 +1442,35 @@ fn render_drawer_copy_button(
     label: &'static str,
     on_click: ClickHandler,
 ) -> Stateful<Div> {
+    let theme = active_theme();
     div()
         .id(id)
         .cursor_pointer()
-        .h(px(28.0))
-        .px(px(10.0))
+        .h(sp(28.0))
+        .px(sp(10.0))
         .rounded(px(RADIUS_POSTER))
-        .bg(rgba(GLASS_TROUGH_BG))
+        .bg(rgba(theme.glass_trough_bg))
         .border_1()
-        .border_color(rgba(GLASS_BORDER))
-        .hover(|s| {
-            s.bg(rgba(GLASS_ROW_HOVER_BG))
-                .border_color(rgba(GLASS_BORDER_STRONG))
+        .border_color(rgba(theme.glass_border))
+        .hover(move |s| {
+            s.bg(rgba(theme.glass_row_hover_bg))
+                .border_color(rgba(theme.glass_border_strong))
         })
         .flex()
         .items_center()
-        .gap(px(6.0))
+        .gap(sp(6.0))
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(px(11.5))
-        .text_color(rgb(TEXT_SECONDARY))
+        .text_size(sp(11.5))
+        .text_color(rgb(theme.text_secondary))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
         })
-        .child(svg_icon(IconName::Clipboard, 11.5, rgb(TEXT_MUTED)))
+        .child(svg_icon(
+            IconName::Clipboard,
+            11.5 * theme.ui_scale,
+            rgb(theme.text_muted),
+        ))
         .child(label)
 }
 
@@ -1329,5 +1499,18 @@ mod tests {
             format_notification_badge_label(4),
             Some(SharedString::from("4 NEW"))
         );
+    }
+
+    #[test]
+    fn poster_card_props_builders_set_quick_peek_and_slot() {
+        let props = PosterCardProps::new("card-1", "Dune", "tt1160419")
+            .on_quick_peek(|_, _, _| {})
+            .quick_action(div().into_any_element());
+        assert!(props.on_quick_peek.is_some());
+        assert!(props.quick_action.is_some());
+
+        let default_props = PosterCardProps::new("card-2", "Arrival", "tt2543164");
+        assert!(default_props.on_quick_peek.is_none());
+        assert!(default_props.quick_action.is_none());
     }
 }

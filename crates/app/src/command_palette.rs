@@ -4,16 +4,13 @@ use gpui::{div, img, prelude::*, px, rgb, rgba, AnimationExt, Context, FontWeigh
 use stremio_core_runtime::UnifiedEditorialSearch;
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{FocusedInput, LibraryStatusTab, SidebarTab},
     theme::{
-        glass_capsule_shadow, keycap, meta_divider, mono_font, obsidian_fade_in,
-        placeholder_tint_for_id, sentence_case_label, tabular_nums, ui_sans, ACCENT, ACCENT_AMBER,
-        ACCENT_SOFT, BG_ELEVATED, BORDER_ACCENT, GLASS_BORDER, GLASS_DIVIDER, GLASS_ROW_HOVER_BG,
-        GLASS_ROW_SELECTED_BG, GLASS_SHEET_BG, GLASS_TROUGH_BG, RADIUS_CONTROL, RADIUS_PILL,
-        RADIUS_POSTER, RADIUS_SHEET, STATUS_WATCHED, STATUS_WATCHING, STATUS_WATCHLIST, TEXT_MUTED,
-        TEXT_PRIMARY, TEXT_SECONDARY,
+        active_theme, glass_capsule_shadow, keycap, meta_divider, mono_font, obsidian_fade_in,
+        placeholder_tint_for_id, sentence_case_label, sp, tabular_nums, ui_sans, ThemePalette,
+        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER, RADIUS_SHEET,
     },
     views::search_view::{hit_library_status, hit_target_id, person_initials},
 };
@@ -235,6 +232,8 @@ impl AppShell {
     }
 
     pub fn render_command_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = active_theme();
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         let entries = self.build_palette_entries();
         let selected_idx = if entries.is_empty() {
             0
@@ -251,9 +250,9 @@ impl AppShell {
             .id("search-dropdown-panel")
             .occlude()
             .rounded(px(RADIUS_SHEET))
-            .bg(rgba(GLASS_SHEET_BG))
+            .bg(rgba(t.glass_sheet_bg))
             .border_1()
-            .border_color(rgba(GLASS_BORDER))
+            .border_color(rgba(t.glass_border))
             .shadow(glass_capsule_shadow())
             .flex()
             .flex_col()
@@ -264,30 +263,35 @@ impl AppShell {
 
         let panel_positioned = if on_player {
             panel_base
-                .w(px(560.0))
-                .max_w(px(560.0))
-                .max_h(px(520.0))
+                .w(sp(560.0))
+                .max_w(sp(560.0))
+                .max_h(sp(520.0))
                 .child(
                     div()
                         .id("player-palette-search-header")
                         .w_full()
-                        .px(px(16.0))
-                        .py(px(12.0))
+                        .px(sp(16.0))
+                        .py(sp(12.0))
                         .border_b_1()
-                        .border_color(rgba(GLASS_DIVIDER))
-                        .bg(rgba(GLASS_TROUGH_BG))
+                        .border_color(rgba(t.glass_divider))
+                        .bg(rgba(t.glass_trough_bg))
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap(px(10.0))
+                        .gap(sp(10.0))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .flex()
                                 .items_center()
-                                .gap(px(10.0))
-                                .child(svg_icon(IconName::Search, 16.0, rgb(ACCENT)))
+                                .gap(sp(10.0))
+                                .child(svg_icon_weighted(
+                                    IconName::Search,
+                                    IconWeight::Regular,
+                                    16.0 * t.ui_scale,
+                                    rgb(accent_ink),
+                                ))
                                 .child(
                                     div()
                                         .flex_1()
@@ -295,16 +299,16 @@ impl AppShell {
                                         .flex()
                                         .items_center()
                                         .font(ui_sans(FontWeight::MEDIUM))
-                                        .text_size(px(14.5))
-                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .text_size(sp(14.5))
+                                        .text_color(rgb(t.text_primary))
                                         .truncate()
                                         .child(caret_query)
                                         .when(!query_has_chars, |el| {
                                             el.child(
                                                 div()
-                                                    .pl(px(4.0))
+                                                    .pl(sp(4.0))
                                                     .font(ui_sans(FontWeight::NORMAL))
-                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .text_color(rgb(t.text_muted))
                                                     .child(
                                                         "Search movies, shows, people, commands...",
                                                     ),
@@ -317,15 +321,15 @@ impl AppShell {
                                 .flex_shrink_0()
                                 .flex()
                                 .items_center()
-                                .gap(px(8.0))
+                                .gap(sp(8.0))
                                 .when(query_has_chars, |row| {
                                     row.child(
                                         div()
                                             .id("player-palette-search-clear")
                                             .cursor_pointer()
-                                            .p(px(4.0))
+                                            .p(sp(4.0))
                                             .rounded(px(RADIUS_POSTER))
-                                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                                            .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
@@ -333,7 +337,12 @@ impl AppShell {
                                                     this.clear_palette_query(cx);
                                                 }),
                                             )
-                                            .child(svg_icon(IconName::X, 13.0, rgb(TEXT_MUTED))),
+                                            .child(svg_icon_weighted(
+                                                IconName::X,
+                                                IconWeight::Regular,
+                                                13.0 * t.ui_scale,
+                                                rgb(t.text_muted),
+                                            )),
                                     )
                                 })
                                 .child(keycap("Esc")),
@@ -342,10 +351,10 @@ impl AppShell {
         } else {
             panel_base
                 .absolute()
-                .top(px(60.0))
-                .right(px(76.0))
-                .w(px(460.0))
-                .max_h(px(500.0))
+                .top(sp(62.0))
+                .right(sp(76.0))
+                .w(sp(460.0))
+                .max_h(sp(500.0))
         };
 
         let panel = panel_positioned
@@ -356,19 +365,19 @@ impl AppShell {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
-                    .p(px(6.0))
+                    .p(sp(6.0))
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
+                    .gap(sp(2.0))
                     .when(entries.is_empty(), |el| {
                         el.child(
                             div()
                                 .flex_shrink_0()
-                                .py(px(28.0))
+                                .py(sp(28.0))
                                 .flex()
                                 .justify_center()
-                                .text_size(px(13.5))
-                                .text_color(rgb(TEXT_SECONDARY))
+                                .text_size(sp(13.5))
+                                .text_color(rgb(t.text_secondary))
                                 .child("Searching catalogs..."),
                         )
                     })
@@ -380,33 +389,33 @@ impl AppShell {
                             .id(("palette-row", idx))
                             .flex_shrink_0()
                             .cursor_pointer()
-                            .px(px(10.0))
-                            .py(px(8.0))
+                            .px(sp(10.0))
+                            .py(sp(8.0))
                             .rounded(px(RADIUS_CONTROL))
                             .bg(if is_selected {
-                                rgba(GLASS_ROW_SELECTED_BG)
+                                rgba(t.glass_row_selected_bg)
                             } else {
                                 rgba(0x00000000)
                             })
                             .border_1()
                             .border_color(if is_selected {
-                                rgba(BORDER_ACCENT)
+                                rgba(t.border_accent)
                             } else {
                                 rgba(0x00000000)
                             })
-                            .hover(|s| s.bg(rgba(GLASS_ROW_HOVER_BG)))
+                            .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                             .flex()
                             .items_center()
                             .justify_between()
-                            .gap(px(12.0))
+                            .gap(sp(12.0))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     this.execute_palette_entry(entry_for_click.clone(), cx);
                                 }),
                             )
-                            .child(self.render_palette_row_left(&entry))
-                            .child(Self::render_palette_row_right(&entry))
+                            .child(self.render_palette_row_left(&entry, t))
+                            .child(Self::render_palette_row_right(&entry, t))
                     })),
             )
             .when(query_non_empty, |el| {
@@ -414,18 +423,18 @@ impl AppShell {
                     div()
                         .id("search-dropdown-more")
                         .cursor_pointer()
-                        .px(px(14.0))
-                        .py(px(10.0))
+                        .px(sp(14.0))
+                        .py(sp(10.0))
                         .border_t_1()
-                        .border_color(rgba(GLASS_DIVIDER))
-                        .bg(rgba(ACCENT_SOFT))
-                        .hover(|s| s.bg(rgb(BG_ELEVATED)))
+                        .border_color(rgba(t.glass_divider))
+                        .bg(rgba(t.accent_soft))
+                        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                         .flex()
                         .items_center()
                         .justify_between()
                         .font(ui_sans(FontWeight::MEDIUM))
-                        .text_size(px(12.5))
-                        .text_color(rgb(ACCENT))
+                        .text_size(sp(12.5))
+                        .text_color(rgb(accent_ink))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -435,7 +444,12 @@ impl AppShell {
                             }),
                         )
                         .child("See all deduplicated results (Enter)")
-                        .child(svg_icon(IconName::ChevronRight, 13.5, rgb(ACCENT))),
+                        .child(svg_icon_weighted(
+                            IconName::ChevronRight,
+                            IconWeight::Regular,
+                            13.5 * t.ui_scale,
+                            rgb(accent_ink),
+                        )),
                 )
             })
             .with_animation("search-dropdown-mount", obsidian_fade_in(), |el, delta| {
@@ -447,11 +461,11 @@ impl AppShell {
             .absolute()
             .inset_0()
             .when(on_player, |el| {
-                el.bg(rgba(0x0b0b0d80))
+                el.bg(rgba(0x00000080))
                     .flex()
                     .items_start()
                     .justify_center()
-                    .pt(px(84.0))
+                    .pt(sp(84.0))
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -462,15 +476,21 @@ impl AppShell {
             .child(panel)
     }
 
-    fn render_palette_row_left(&self, entry: &PaletteEntry) -> impl IntoElement {
+    fn render_palette_row_left(&self, entry: &PaletteEntry, t: ThemePalette) -> impl IntoElement {
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         match entry {
             PaletteEntry::OpenFullSearch { query } => div()
                 .flex_1()
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
-                .gap(px(12.0))
-                .child(svg_icon(IconName::Search, 15.5, rgb(ACCENT)))
+                .gap(sp(12.0))
+                .child(svg_icon_weighted(
+                    IconName::Search,
+                    IconWeight::Regular,
+                    15.5 * t.ui_scale,
+                    rgb(accent_ink),
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -480,15 +500,15 @@ impl AppShell {
                         .child(
                             div()
                                 .font(ui_sans(FontWeight::SEMIBOLD))
-                                .text_size(px(13.5))
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_size(sp(13.5))
+                                .text_color(rgb(t.text_primary))
                                 .truncate()
                                 .child(format!("Search everything for \"{query}\"")),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(t.text_muted))
                                 .truncate()
                                 .child("Deduplicated Top Match, Movies, Series & People"),
                         ),
@@ -502,8 +522,13 @@ impl AppShell {
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
-                .gap(px(12.0))
-                .child(svg_icon(tab.icon_name(), 15.5, rgb(TEXT_SECONDARY)))
+                .gap(sp(12.0))
+                .child(svg_icon_weighted(
+                    tab.icon_name(),
+                    IconWeight::Regular,
+                    15.5 * t.ui_scale,
+                    rgb(t.text_secondary),
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -513,15 +538,15 @@ impl AppShell {
                         .child(
                             div()
                                 .font(ui_sans(FontWeight::SEMIBOLD))
-                                .text_size(px(13.5))
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_size(sp(13.5))
+                                .text_color(rgb(t.text_primary))
                                 .truncate()
                                 .child(*title),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
+                                .text_color(rgb(t.text_muted))
                                 .truncate()
                                 .child(*subtitle),
                         ),
@@ -529,23 +554,33 @@ impl AppShell {
             PaletteEntry::ActionClearRecent => div()
                 .flex()
                 .items_center()
-                .gap(px(12.0))
-                .child(svg_icon(IconName::X, 15.0, rgb(TEXT_MUTED)))
+                .gap(sp(12.0))
+                .child(svg_icon_weighted(
+                    IconName::X,
+                    IconWeight::Regular,
+                    15.0 * t.ui_scale,
+                    rgb(t.text_muted),
+                ))
                 .child(
                     div()
-                        .text_size(px(13.5))
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_size(sp(13.5))
+                        .text_color(rgb(t.text_secondary))
                         .child("Clear recent"),
                 ),
             PaletteEntry::ActionReloadEngine => div()
                 .flex()
                 .items_center()
-                .gap(px(12.0))
-                .child(svg_icon(IconName::RefreshCw, 15.0, rgb(TEXT_SECONDARY)))
+                .gap(sp(12.0))
+                .child(svg_icon_weighted(
+                    IconName::RefreshCw,
+                    IconWeight::Regular,
+                    15.0 * t.ui_scale,
+                    rgb(t.text_secondary),
+                ))
                 .child(
                     div()
-                        .text_size(px(13.5))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_size(sp(13.5))
+                        .text_color(rgb(t.text_primary))
                         .child("Reload streaming engine"),
                 ),
             PaletteEntry::RecentQuery(q) => div()
@@ -553,12 +588,17 @@ impl AppShell {
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
-                .gap(px(12.0))
-                .child(svg_icon(IconName::Clock, 15.0, rgb(TEXT_MUTED)))
+                .gap(sp(12.0))
+                .child(svg_icon_weighted(
+                    IconName::Clock,
+                    IconWeight::Regular,
+                    15.0 * t.ui_scale,
+                    rgb(t.text_muted),
+                ))
                 .child(
                     div()
-                        .text_size(px(13.5))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_size(sp(13.5))
+                        .text_color(rgb(t.text_primary))
                         .truncate()
                         .child(q.clone()),
                 ),
@@ -584,17 +624,17 @@ impl AppShell {
                     .min_w(px(0.0))
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
+                    .gap(sp(12.0))
                     .child(
                         div()
-                            .w(px(40.0))
-                            .h(px(40.0))
+                            .w(sp(40.0))
+                            .h(sp(40.0))
                             .flex_shrink_0()
                             .rounded(px(RADIUS_PILL))
                             .overflow_hidden()
-                            .bg(rgb(BG_ELEVATED))
+                            .bg(rgb(t.bg_elevated))
                             .border_1()
-                            .border_color(rgba(GLASS_BORDER))
+                            .border_color(rgba(t.glass_border))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -607,7 +647,7 @@ impl AppShell {
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
                                     .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(rgb(t.text_secondary))
                                     .child(initials)
                                     .into_any_element()
                             }),
@@ -618,19 +658,19 @@ impl AppShell {
                             .min_w(px(0.0))
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
+                            .gap(sp(2.0))
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(px(14.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(14.0))
+                                    .text_color(rgb(t.text_primary))
                                     .truncate()
                                     .child(name.clone()),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(rgb(t.text_muted))
                                     .truncate()
                                     .child(subtitle),
                             ),
@@ -658,15 +698,17 @@ impl AppShell {
                     .min_w(px(0.0))
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
+                    .gap(sp(12.0))
                     .child(
                         div()
-                            .w(px(40.0))
-                            .h(px(60.0))
+                            .w(sp(40.0))
+                            .h(sp(60.0))
                             .flex_shrink_0()
-                            .rounded(px(3.0))
+                            .rounded(px(4.0))
                             .overflow_hidden()
                             .bg(rgb(placeholder_tint_for_id(id)))
+                            .border_1()
+                            .border_color(rgba(t.glass_border))
                             .when_some(poster_tex, |el, tex| {
                                 el.child(img(tex).size_full().object_fit(gpui::ObjectFit::Cover))
                             }),
@@ -677,12 +719,12 @@ impl AppShell {
                             .min_w(px(0.0))
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
+                            .gap(sp(2.0))
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(px(14.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(14.0))
+                                    .text_color(rgb(t.text_primary))
                                     .truncate()
                                     .child(name.clone()),
                             )
@@ -690,9 +732,9 @@ impl AppShell {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(8.0))
+                                    .gap(sp(8.0))
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(rgb(t.text_muted))
                                     .child(clean_type)
                                     .when_some(year_clean, |el, yr| {
                                         el.child(meta_divider()).child(
@@ -705,7 +747,7 @@ impl AppShell {
         }
     }
 
-    fn render_palette_row_right(entry: &PaletteEntry) -> impl IntoElement {
+    fn render_palette_row_right(entry: &PaletteEntry, t: ThemePalette) -> impl IntoElement {
         match entry {
             PaletteEntry::OpenFullSearch { .. } => div().flex_shrink_0().child(keycap("Enter")),
             PaletteEntry::QuickNav { tab, .. } => div()
@@ -715,25 +757,25 @@ impl AppShell {
                 .flex_shrink_0()
                 .font(mono_font())
                 .text_xs()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(t.text_muted))
                 .child("History"),
             PaletteEntry::ActionReloadEngine => div()
                 .flex_shrink_0()
                 .font(mono_font())
                 .text_xs()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(t.text_muted))
                 .child("Action"),
             PaletteEntry::RecentQuery(_) => div()
                 .flex_shrink_0()
                 .font(mono_font())
                 .text_xs()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(t.text_muted))
                 .child("Recent"),
             PaletteEntry::PersonHit { .. } => div()
                 .flex_shrink_0()
                 .font(mono_font())
                 .text_xs()
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(t.text_muted))
                 .child("Person"),
             PaletteEntry::MediaHit {
                 imdb_rating,
@@ -743,27 +785,38 @@ impl AppShell {
                 .flex_shrink_0()
                 .flex()
                 .items_center()
-                .gap(px(10.0))
+                .gap(sp(10.0))
                 .when_some(imdb_rating.clone(), |el, rating| {
                     el.child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(4.0))
+                            .gap(sp(4.0))
                             .font(mono_font())
                             .text_xs()
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .child(svg_icon(IconName::Star, 11.0, rgb(ACCENT_AMBER)))
+                            .text_color(rgb(t.text_secondary))
+                            .child(svg_icon_weighted(
+                                IconName::Star,
+                                IconWeight::Fill,
+                                11.0 * t.ui_scale,
+                                rgb(t.accent_amber),
+                            ))
                             .child(rating),
                     )
                 })
                 .when_some(*library_status, |el, st| {
-                    let (icon, col) = match st {
-                        LibraryStatusTab::Watched => (IconName::Check, STATUS_WATCHED),
-                        LibraryStatusTab::Watching => (IconName::Play, STATUS_WATCHING),
-                        LibraryStatusTab::Watchlist => (IconName::Bookmark, STATUS_WATCHLIST),
+                    let (icon, weight, col) = match st {
+                        LibraryStatusTab::Watched => {
+                            (IconName::Check, IconWeight::Regular, t.status_watched)
+                        }
+                        LibraryStatusTab::Watching => {
+                            (IconName::Play, IconWeight::Fill, t.status_watching)
+                        }
+                        LibraryStatusTab::Watchlist => {
+                            (IconName::Bookmark, IconWeight::Fill, t.status_watchlist)
+                        }
                     };
-                    el.child(svg_icon(icon, 14.0, rgb(col)))
+                    el.child(svg_icon_weighted(icon, weight, 14.0 * t.ui_scale, rgb(col)))
                 }),
         }
     }

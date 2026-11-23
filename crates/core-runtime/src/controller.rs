@@ -1864,6 +1864,55 @@ impl CoreController {
         self.addon_engine.reset_circuit(transport_url_or_origin)
     }
 
+    pub fn probe_addon_health(&self, transport_url: &str) {
+        let controller = self.clone();
+        let target = transport_url.to_owned();
+        self.runtime_handle.spawn(async move {
+            let _ = controller.probe_addon_health_async(&target).await;
+        });
+    }
+
+    pub async fn probe_addon_health_async(
+        &self,
+        transport_url: &str,
+    ) -> Result<AddonTelemetrySnapshot, String> {
+        let target_url = resolve_probe_manifest_url(transport_url)?;
+        let redacted_url = redact_url(&target_url);
+        let client = self.http_client.clone();
+        let engine = Arc::clone(&self.addon_engine);
+        let fetch_url = target_url.to_string();
+        let event_tx = self.event_tx.clone();
+
+        let fetch_res = self
+            .runtime_handle
+            .spawn(async move {
+                let res = engine
+                    .execute_bytes(
+                        &client,
+                        http::Method::GET,
+                        fetch_url,
+                        http::HeaderMap::new(),
+                        None,
+                        true,
+                    )
+                    .await;
+                let _ = event_tx.send(Arc::new(RuntimeEvent::NewState(vec![
+                    DesktopModelField::InstalledAddons,
+                ])));
+                res.map(|bytes| (bytes, engine.telemetry_for_url(&target_url)))
+            })
+            .await
+            .map_err(|join_err| format!("Health probe task failed: {join_err}"))?;
+
+        let (bytes, snapshot) = fetch_res.map_err(|env_err| env_err.to_string())?;
+        if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+            return Err(format!(
+                "Manifest endpoint at {redacted_url} returned non-JSON response"
+            ));
+        }
+        Ok(snapshot)
+    }
+
     pub fn update_profile_settings(&self, settings: ProfileSettings) {
         self.dispatch_action(Action::Ctx(ActionCtx::UpdateSettings(settings)));
     }
@@ -2473,6 +2522,19 @@ fn persist_profile_snapshot(
             error!("Failed to serialize profile snapshot: {err}");
         }
     }
+}
+
+fn resolve_probe_manifest_url(raw: &str) -> Result<Url, String> {
+    let trimmed = raw.trim();
+    if let Ok(parsed) = Url::parse(trimmed) {
+        if matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some_and(|h| !h.is_empty())
+            && !parsed.path().trim_end_matches('/').is_empty()
+        {
+            return Ok(parsed);
+        }
+    }
+    normalize_addon_url(trimmed)
 }
 
 fn compute_addon_side_effects(model: &DesktopModel) -> AddonMutationSideEffects {

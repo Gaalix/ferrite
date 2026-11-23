@@ -7,5 +7,7 @@ pub mod library_view;
 pub mod meta_details_view;
 pub mod person_view;
 pub mod player_view;
+pub mod preview_drawer;
 pub mod search_view;
 pub mod settings_view;
+pub mod top_nav;

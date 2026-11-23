@@ -20,7 +20,9 @@ use stremio_core::{
     },
 };
 use stremio_core_runtime::{
-    default_storage_path, migrate_legacy_storage_file, DesktopEnv, EnvConfig, SqliteStorage,
+    default_storage_path,
+    env::{DEFAULT_BROWSER_USER_AGENT, DEFAULT_CONNECT_TIMEOUT},
+    migrate_legacy_storage_file, DesktopEnv, EnvConfig, SqliteStorage,
 };
 use tempfile::tempdir;
 use tokio::{
@@ -37,7 +39,11 @@ struct TestPayload {
 
 #[test]
 fn ferrite_defaults_and_legacy_storage_migration_preserve_user_data_and_unix_permissions() {
-    assert_eq!(EnvConfig::default().user_agent, "Ferrite/0.1.0");
+    let defaults = EnvConfig::default();
+    assert_eq!(defaults.user_agent, DEFAULT_BROWSER_USER_AGENT);
+    assert!(defaults.user_agent.contains("Chrome/"));
+    assert_eq!(defaults.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+    assert_eq!(defaults.connect_timeout, Duration::from_secs(8));
     let def_path = default_storage_path();
     assert_eq!(def_path.file_name().and_then(|n| n.to_str()), Some("storage.db"));
     assert_eq!(
@@ -298,12 +304,13 @@ async fn fetch_handles_get_post_headers_status_and_json() {
                 let first_line = req_text.lines().next().unwrap_or("");
 
                 let (status, body) = if first_line.starts_with("GET /ok") {
-                    assert!(req_text
-                        .to_ascii_lowercase()
-                        .contains("x-test-header: ferrite"));
-                    assert!(req_text
-                        .to_ascii_lowercase()
-                        .contains("user-agent: ferrite/0.1.0"));
+                    let lower_req = req_text.to_ascii_lowercase();
+                    assert!(lower_req.contains("x-test-header: ferrite"));
+                    assert!(lower_req.contains(&format!(
+                        "user-agent: {}",
+                        DEFAULT_BROWSER_USER_AGENT.to_ascii_lowercase()
+                    )));
+                    assert!(lower_req.contains("accept: application/json, text/plain, */*"));
                     (
                         "200 OK",
                         serde_json::json!({ "greeting": "pong", "count": 7 }).to_string(),

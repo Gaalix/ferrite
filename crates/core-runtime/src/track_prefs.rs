@@ -67,7 +67,11 @@ impl SeriesTrackPreference {
                     .as_deref()
                     .map(extract_track_keywords)
                     .unwrap_or_default();
-                let role = classify_subtitle_role(sub.title.as_deref(), sub.forced);
+                let role = classify_subtitle_role_with_flags(
+                    sub.title.as_deref(),
+                    sub.forced,
+                    sub.hearing_impaired,
+                );
                 (lang, keywords, role == SubtitleRole::ForcedOrSigns)
             } else {
                 (None, Vec::new(), false)
@@ -106,6 +110,8 @@ pub struct TrackCandidate {
     pub forced: bool,
     pub default: bool,
     pub external: bool,
+    #[serde(default)]
+    pub hearing_impaired: bool,
 }
 
 impl TrackCandidate {
@@ -119,6 +125,7 @@ impl TrackCandidate {
             forced: false,
             default: false,
             external: false,
+            hearing_impaired: false,
         }
     }
 
@@ -132,6 +139,7 @@ impl TrackCandidate {
             forced: false,
             default: false,
             external: false,
+            hearing_impaired: false,
         }
     }
 
@@ -154,12 +162,323 @@ impl TrackCandidate {
         self.external = external;
         self
     }
+
+    pub fn with_hearing_impaired(mut self, hearing_impaired: bool) -> Self {
+        self.hearing_impaired = hearing_impaired;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchedTracks {
     pub audio_id: Option<i64>,
     pub sub_id: Option<Option<i64>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedSubtitleQuality {
+    /// Any usable embedded full subtitle (clean text, clean Blu-ray PGS/VobSub, or SDH).
+    /// Always selected at 0 ms and NEVER speculatively replaced with online subtitles.
+    UsableFull {
+        full_id: i64,
+        full_is_text: bool,
+        forced_id: Option<i64>,
+        forced_is_text: bool,
+        is_sdh: bool,
+    },
+    /// Only an embedded Forced/Signs track exists in the preferred language (no full track).
+    ForcedOnly {
+        forced_id: i64,
+        forced_is_text: bool,
+    },
+    None,
+}
+
+/// Returns true when the mpv codec name identifies an image-based subtitle format
+/// (PGS, VobSub, DVB, XSUB) whose text cannot be inspected or styled cleanly.
+pub fn is_image_subtitle_codec(codec: Option<&str>) -> bool {
+    let Some(raw) = codec.map(str::trim).filter(|c| !c.is_empty()) else {
+        return false;
+    };
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("pgs")
+        || lower.contains("dvd_subtitle")
+        || lower.contains("vobsub")
+        || lower.contains("dvb_subtitle")
+        || lower.contains("xsub")
+}
+
+/// Returns true when a subtitle track's title or forced flag indicates it is a Forced / foreign-parts track.
+pub fn is_forced_subtitle_track(title: Option<&str>, forced_flag: bool) -> bool {
+    classify_subtitle_role(title, forced_flag) == SubtitleRole::ForcedOrSigns
+}
+
+/// Returns true when a subtitle track's title indicates SDH / Hearing Impaired / Closed Captions.
+pub fn is_sdh_subtitle_track(title: Option<&str>) -> bool {
+    classify_subtitle_role(title, false) == SubtitleRole::Sdh
+}
+
+/// Selects the best embedded Forced / foreign-parts track for `preferred_lang`, returning `(track_id, is_text_codec)`.
+pub fn select_embedded_forced_track(
+    tracks: &[TrackCandidate],
+    preferred_lang: &str,
+) -> Option<(i64, bool)> {
+    let (target_primary, target_region) = parse_lang_tag(preferred_lang)?;
+    let mut best: Option<(i32, usize, i64, bool)> = None;
+
+    for (idx, track) in tracks.iter().enumerate() {
+        if track.kind != TrackKind::Sub || track.external {
+            continue;
+        }
+        let Some(lang_points) =
+            match_track_language(&target_primary, target_region.as_deref(), track)
+        else {
+            continue;
+        };
+        if classify_subtitle_role_with_flags(
+            track.title.as_deref(),
+            track.forced,
+            track.hearing_impaired,
+        ) != SubtitleRole::ForcedOrSigns
+        {
+            continue;
+        }
+        let is_text = !is_image_subtitle_codec(track.codec.as_deref());
+        let mut score = lang_points;
+        if is_text {
+            score += 40;
+        }
+        if track.forced {
+            score += 20;
+        }
+        if track.default {
+            score += 5;
+        }
+        match best {
+            None => best = Some((score, idx, track.id, is_text)),
+            Some((best_score, best_idx, _, _))
+                if score > best_score || (score == best_score && idx < best_idx) =>
+            {
+                best = Some((score, idx, track.id, is_text));
+            }
+            _ => {}
+        }
+    }
+
+    best.map(|(_, _, id, is_text)| (id, is_text))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EmbeddedFullRankKey {
+    tier: u8,
+    lang_points: i32,
+    is_full_explicit: bool,
+    is_default: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RankedEmbeddedFull {
+    key: EmbeddedFullRankKey,
+    idx: usize,
+    id: i64,
+    is_text: bool,
+    is_sdh: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct InlineForcedRankKey {
+    is_clean: bool,
+    lang_points: i32,
+    is_full_explicit: bool,
+    is_default: bool,
+}
+
+/// Ranking key for embedded full subtitle tracks (higher is better):
+/// 1. Clean non-SDH text (`!is_sdh && !is_image`)
+/// 2. Clean non-SDH image (Blu-ray PGS/VobSub, `!is_sdh && is_image`)
+/// 3. SDH text (`is_sdh && !is_image`)
+/// 4. SDH image (`is_sdh && is_image`)
+///
+/// Ties within a tier break by language match score, `FullExplicit` > `Standard`, `default`, then track order.
+fn embedded_full_rank_key(
+    is_sdh: bool,
+    is_image: bool,
+    lang_points: i32,
+    role: SubtitleRole,
+    is_default: bool,
+) -> EmbeddedFullRankKey {
+    let tier = match (is_sdh, is_image) {
+        (false, false) => 4,
+        (false, true) => 3,
+        (true, false) => 2,
+        (true, true) => 1,
+    };
+    EmbeddedFullRankKey {
+        tier,
+        lang_points,
+        is_full_explicit: role == SubtitleRole::FullExplicit,
+        is_default,
+    }
+}
+
+/// Evaluates embedded subtitle track quality for `preferred_lang` so playback starts at 0 ms
+/// with any usable embedded full track (clean text, Blu-ray PGS/VobSub, or SDH) without
+/// speculatively replacing it with online subtitles.
+pub fn assess_embedded_subtitles(
+    tracks: &[TrackCandidate],
+    preferred_lang: &str,
+) -> EmbeddedSubtitleQuality {
+    let Some((target_primary, target_region)) = parse_lang_tag(preferred_lang) else {
+        return EmbeddedSubtitleQuality::None;
+    };
+
+    let forced = select_embedded_forced_track(tracks, preferred_lang);
+    let mut best_full: Option<RankedEmbeddedFull> = None;
+
+    for (idx, track) in tracks.iter().enumerate() {
+        if track.kind != TrackKind::Sub || track.external {
+            continue;
+        }
+        let Some(lang_points) =
+            match_track_language(&target_primary, target_region.as_deref(), track)
+        else {
+            continue;
+        };
+        let role = classify_subtitle_role_with_flags(
+            track.title.as_deref(),
+            track.forced,
+            track.hearing_impaired,
+        );
+        if !matches!(
+            role,
+            SubtitleRole::FullExplicit | SubtitleRole::Standard | SubtitleRole::Sdh
+        ) {
+            continue;
+        }
+
+        let is_image = is_image_subtitle_codec(track.codec.as_deref());
+        let is_sdh = role == SubtitleRole::Sdh;
+        let key = embedded_full_rank_key(is_sdh, is_image, lang_points, role, track.default);
+        let cand = RankedEmbeddedFull {
+            key,
+            idx,
+            id: track.id,
+            is_text: !is_image,
+            is_sdh,
+        };
+
+        if best_full.is_none_or(|b| cand.key > b.key || (cand.key == b.key && cand.idx < b.idx)) {
+            best_full = Some(cand);
+        }
+    }
+
+    if let Some(best) = best_full {
+        return EmbeddedSubtitleQuality::UsableFull {
+            full_id: best.id,
+            full_is_text: best.is_text,
+            forced_id: forced.map(|(id, _)| id),
+            forced_is_text: forced.is_some_and(|(_, is_text)| is_text),
+            is_sdh: best.is_sdh,
+        };
+    }
+
+    if let Some((forced_id, forced_is_text)) = forced {
+        return EmbeddedSubtitleQuality::ForcedOnly {
+            forced_id,
+            forced_is_text,
+        };
+    }
+
+    EmbeddedSubtitleQuality::None
+}
+
+/// Picks the best embedded PGS/VobSub full track in `preferred_lang` (clean > SDH,
+/// non-commentary, non-forced) so mpv can render inline Blu-ray forced events with
+/// `sub-forced-events-only=yes` when full subtitles are OFF.
+pub fn select_embedded_image_track_for_inline_forced(
+    tracks: &[TrackCandidate],
+    preferred_lang: &str,
+) -> Option<i64> {
+    let (target_primary, target_region) = parse_lang_tag(preferred_lang)?;
+    let mut best: Option<(InlineForcedRankKey, usize, i64)> = None;
+
+    for (idx, track) in tracks.iter().enumerate() {
+        if track.kind != TrackKind::Sub || track.external {
+            continue;
+        }
+        if !is_image_subtitle_codec(track.codec.as_deref()) {
+            continue;
+        }
+        let Some(lang_points) =
+            match_track_language(&target_primary, target_region.as_deref(), track)
+        else {
+            continue;
+        };
+        let role = classify_subtitle_role_with_flags(
+            track.title.as_deref(),
+            track.forced,
+            track.hearing_impaired,
+        );
+        if !matches!(
+            role,
+            SubtitleRole::FullExplicit | SubtitleRole::Standard | SubtitleRole::Sdh
+        ) {
+            continue;
+        }
+        let key = InlineForcedRankKey {
+            is_clean: role != SubtitleRole::Sdh,
+            lang_points,
+            is_full_explicit: role == SubtitleRole::FullExplicit,
+            is_default: track.default,
+        };
+        if best.is_none_or(|(bk, bi, _)| key > bk || (key == bk && idx < bi)) {
+            best = Some((key, idx, track.id));
+        }
+    }
+
+    best.map(|(_, _, id)| id)
+}
+
+/// Picks another embedded full track in `preferred_lang` different from `exclude_id`
+/// (clean > SDH, text > image) for runtime `[speaking ...]` placeholder rescue before
+/// falling back to online providers.
+pub fn select_alternative_embedded_full_track(
+    tracks: &[TrackCandidate],
+    preferred_lang: &str,
+    exclude_id: i64,
+) -> Option<i64> {
+    let (target_primary, target_region) = parse_lang_tag(preferred_lang)?;
+    let mut best: Option<(EmbeddedFullRankKey, usize, i64)> = None;
+
+    for (idx, track) in tracks.iter().enumerate() {
+        if track.kind != TrackKind::Sub || track.external || track.id == exclude_id {
+            continue;
+        }
+        let Some(lang_points) =
+            match_track_language(&target_primary, target_region.as_deref(), track)
+        else {
+            continue;
+        };
+        let role = classify_subtitle_role_with_flags(
+            track.title.as_deref(),
+            track.forced,
+            track.hearing_impaired,
+        );
+        if !matches!(
+            role,
+            SubtitleRole::FullExplicit | SubtitleRole::Standard | SubtitleRole::Sdh
+        ) {
+            continue;
+        }
+        let is_image = is_image_subtitle_codec(track.codec.as_deref());
+        let is_sdh = role == SubtitleRole::Sdh;
+        let key = embedded_full_rank_key(is_sdh, is_image, lang_points, role, track.default);
+        if best.is_none_or(|(bk, bi, _)| key > bk || (key == bk && idx < bi)) {
+            best = Some((key, idx, track.id));
+        }
+    }
+
+    best.map(|(_, _, id)| id)
 }
 
 pub fn has_full_embedded_subtitle_for_lang(
@@ -177,7 +496,11 @@ pub fn has_full_embedded_subtitle_for_lang(
             return false;
         }
         matches!(
-            classify_subtitle_role(track.title.as_deref(), track.forced),
+            classify_subtitle_role_with_flags(
+                track.title.as_deref(),
+                track.forced,
+                track.hearing_impaired,
+            ),
             SubtitleRole::FullExplicit | SubtitleRole::Standard | SubtitleRole::Sdh
         )
     })
@@ -301,7 +624,11 @@ fn select_subtitle_track(pref: &SeriesTrackPreference, tracks: &[TrackCandidate]
             }
         }
 
-        let role = classify_subtitle_role(track.title.as_deref(), track.forced);
+        let role = classify_subtitle_role_with_flags(
+            track.title.as_deref(),
+            track.forced,
+            track.hearing_impaired,
+        );
 
         match role {
             SubtitleRole::Commentary => {
@@ -387,6 +714,14 @@ enum SubtitleRole {
 }
 
 fn classify_subtitle_role(title: Option<&str>, forced_flag: bool) -> SubtitleRole {
+    classify_subtitle_role_with_flags(title, forced_flag, false)
+}
+
+fn classify_subtitle_role_with_flags(
+    title: Option<&str>,
+    forced_flag: bool,
+    hearing_impaired: bool,
+) -> SubtitleRole {
     let raw = title.unwrap_or_default().to_ascii_lowercase();
     let tokens = tokenize_alphanumeric(&raw);
 
@@ -407,27 +742,34 @@ fn classify_subtitle_role(title: Option<&str>, forced_flag: bool) -> SubtitleRol
         || raw.contains("signs & songs")
         || raw.contains("signs/songs")
         || raw.contains("sign/song")
-        || tokens
-            .iter()
-            .any(|tok| matches!(tok.as_str(), "signs" | "sign" | "songs" | "forced" | "typeset"));
+        || raw.contains("non-english")
+        || raw.contains("non english")
+        || raw.contains("foreign parts")
+        || raw.contains("foreign only")
+        || raw.contains("foreign-only")
+        || tokens.iter().any(|tok| {
+            matches!(
+                tok.as_str(),
+                "signs" | "sign" | "songs" | "forced" | "typeset" | "foreign"
+            )
+        });
 
-    if has_full_marker && !forced_flag {
-        return SubtitleRole::FullExplicit;
-    }
-    if has_signs_or_forced_marker {
+    if has_signs_or_forced_marker && !(has_full_marker && !forced_flag) {
         return SubtitleRole::ForcedOrSigns;
     }
-    if has_full_marker {
-        return SubtitleRole::FullExplicit;
-    }
 
-    let has_sdh_marker = raw.contains("hearing impaired")
+    let has_sdh_marker = hearing_impaired
+        || raw.contains("hearing impaired")
         || raw.contains("closed caption")
         || tokens
             .iter()
             .any(|tok| matches!(tok.as_str(), "sdh" | "cc" | "hi" | "deaf"));
     if has_sdh_marker {
         return SubtitleRole::Sdh;
+    }
+
+    if has_full_marker {
+        return SubtitleRole::FullExplicit;
     }
 
     SubtitleRole::Standard
@@ -450,7 +792,7 @@ fn keywords_request_forced(keywords: &[String]) -> bool {
     keywords.iter().any(|kw| {
         matches!(
             kw.as_str(),
-            "signs" | "sign" | "songs" | "s&s" | "forced" | "typeset"
+            "signs" | "sign" | "songs" | "s&s" | "forced" | "typeset" | "foreign"
         )
     })
 }
@@ -978,5 +1320,272 @@ mod tests {
         ];
         assert!(has_full_embedded_subtitle_for_lang(&with_full, "eng"));
         assert!(!has_full_embedded_subtitle_for_lang(&with_full, "spa"));
+    }
+
+    #[test]
+    fn assesses_embedded_subtitle_quality_across_mkv_layouts() {
+        let clean_plus_text_forced = vec![
+            TrackCandidate::sub(1, Some("eng"), Some("English")).with_codec("subrip"),
+            TrackCandidate::sub(2, Some("eng"), Some("Non-English")).with_codec("subrip"),
+        ];
+        assert_eq!(
+            assess_embedded_subtitles(&clean_plus_text_forced, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 1,
+                full_is_text: true,
+                forced_id: Some(2),
+                forced_is_text: true,
+                is_sdh: false,
+            }
+        );
+
+        let clean_plus_pgs_forced = vec![
+            TrackCandidate::sub(1, Some("eng"), Some("English")).with_codec("ass"),
+            TrackCandidate::sub(2, Some("eng"), Some("Foreign Parts"))
+                .with_codec("hdmv_pgs_subtitle")
+                .with_forced(true),
+        ];
+        assert_eq!(
+            assess_embedded_subtitles(&clean_plus_pgs_forced, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 1,
+                full_is_text: true,
+                forced_id: Some(2),
+                forced_is_text: false,
+                is_sdh: false,
+            }
+        );
+
+        let clean_only = vec![TrackCandidate::sub(1, Some("eng"), Some("English")).with_codec("srt")];
+        assert_eq!(
+            assess_embedded_subtitles(&clean_only, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 1,
+                full_is_text: true,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: false,
+            }
+        );
+
+        let sdh_and_forced = vec![
+            TrackCandidate::sub(1, Some("eng"), Some("English (SDH)")).with_codec("srt"),
+            TrackCandidate::sub(2, Some("eng"), Some("Forced"))
+                .with_codec("srt")
+                .with_forced(true),
+        ];
+        assert_eq!(
+            assess_embedded_subtitles(&sdh_and_forced, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 1,
+                full_is_text: true,
+                forced_id: Some(2),
+                forced_is_text: true,
+                is_sdh: true,
+            }
+        );
+
+        let pgs_only = vec![
+            TrackCandidate::sub(1, Some("eng"), Some("English")).with_codec("hdmv_pgs_subtitle"),
+        ];
+        assert_eq!(
+            assess_embedded_subtitles(&pgs_only, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 1,
+                full_is_text: false,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: false,
+            }
+        );
+
+        let forced_only_text = vec![
+            TrackCandidate::sub(4, Some("eng"), Some("Forced"))
+                .with_forced(true)
+                .with_codec("srt"),
+        ];
+        assert_eq!(
+            assess_embedded_subtitles(&forced_only_text, "eng"),
+            EmbeddedSubtitleQuality::ForcedOnly {
+                forced_id: 4,
+                forced_is_text: true,
+            }
+        );
+
+        let forced_only_pgs = vec![
+            TrackCandidate::sub(5, Some("eng"), Some("Forced"))
+                .with_forced(true)
+                .with_codec("hdmv_pgs_subtitle"),
+        ];
+        assert_eq!(
+            assess_embedded_subtitles(&forced_only_pgs, "eng"),
+            EmbeddedSubtitleQuality::ForcedOnly {
+                forced_id: 5,
+                forced_is_text: false,
+            }
+        );
+
+        assert_eq!(
+            assess_embedded_subtitles(&clean_only, "spa"),
+            EmbeddedSubtitleQuality::None
+        );
+    }
+
+    #[test]
+    fn embedded_assessment_strict_four_tier_order_and_hearing_impaired_flag() {
+        // Tier 4 (SDH image) < Tier 3 (SDH text) < Tier 2 (Clean image) < Tier 1 (Clean text)
+        let all_four = vec![
+            TrackCandidate::sub(1, Some("eng"), None)
+                .with_codec("hdmv_pgs_subtitle")
+                .with_hearing_impaired(true)
+                .with_default(true),
+            TrackCandidate::sub(2, Some("eng"), None)
+                .with_codec("subrip")
+                .with_hearing_impaired(true),
+            TrackCandidate::sub(3, Some("eng"), Some("English"))
+                .with_codec("hdmv_pgs_subtitle"),
+            TrackCandidate::sub(4, Some("eng"), Some("English"))
+                .with_codec("subrip"),
+        ];
+
+        assert_eq!(
+            assess_embedded_subtitles(&all_four, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 4,
+                full_is_text: true,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: false,
+            }
+        );
+
+        // Without clean text, clean Blu-ray PGS beats SDH text!
+        let no_clean_text = &all_four[..3];
+        assert_eq!(
+            assess_embedded_subtitles(no_clean_text, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 3,
+                full_is_text: false,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: false,
+            }
+        );
+
+        // Without any clean tracks, SDH text beats SDH image!
+        let sdh_only = &all_four[..2];
+        assert_eq!(
+            assess_embedded_subtitles(sdh_only, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 2,
+                full_is_text: true,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: true,
+            }
+        );
+
+        // Only SDH image still returns UsableFull!
+        let sdh_image_only = &all_four[..1];
+        assert_eq!(
+            assess_embedded_subtitles(sdh_image_only, "eng"),
+            EmbeddedSubtitleQuality::UsableFull {
+                full_id: 1,
+                full_is_text: false,
+                forced_id: None,
+                forced_is_text: false,
+                is_sdh: true,
+            }
+        );
+
+        // Matroska hearing_impaired flag on untitled track deprioritizes it in select_preferred_tracks
+        let pref = SeriesTrackPreference {
+            series_id: "tt999".to_owned(),
+            audio_lang: None,
+            audio_title_keywords: vec![],
+            subtitles_enabled: true,
+            sub_lang: Some("eng".to_owned()),
+            sub_title_keywords: vec![],
+            prefer_forced_only: false,
+            sub_delay_secs: 0.0,
+        };
+        let tracks_hi_flag = vec![
+            TrackCandidate::sub(10, Some("eng"), None)
+                .with_hearing_impaired(true)
+                .with_default(true),
+            TrackCandidate::sub(11, Some("eng"), None),
+        ];
+        assert_eq!(select_preferred_tracks(&pref, &tracks_hi_flag).sub_id, Some(Some(11)));
+    }
+
+    #[test]
+    fn selects_embedded_image_track_for_inline_forced_and_alternative_full_track() {
+        let tracks = vec![
+            TrackCandidate::sub(1, Some("eng"), Some("English")).with_codec("subrip"),
+            TrackCandidate::sub(2, Some("eng"), None)
+                .with_codec("hdmv_pgs_subtitle")
+                .with_hearing_impaired(true)
+                .with_default(true),
+            TrackCandidate::sub(3, Some("eng"), Some("English"))
+                .with_codec("hdmv_pgs_subtitle"),
+            TrackCandidate::sub(4, Some("eng"), Some("Forced"))
+                .with_codec("hdmv_pgs_subtitle")
+                .with_forced(true),
+            TrackCandidate::sub(5, Some("eng"), Some("Commentary"))
+                .with_codec("hdmv_pgs_subtitle"),
+            TrackCandidate::sub(6, Some("eng"), Some("External PGS"))
+                .with_codec("hdmv_pgs_subtitle")
+                .with_external(true),
+            TrackCandidate::sub(7, Some("eng"), Some("English SDH")).with_codec("srt"),
+            TrackCandidate::sub(8, Some("spa"), Some("Spanish"))
+                .with_codec("hdmv_pgs_subtitle"),
+        ];
+
+        // Inline forced picks clean Blu-ray PGS (3) over SDH PGS (2), ignoring text/forced/commentary/external/spa
+        assert_eq!(
+            select_embedded_image_track_for_inline_forced(&tracks, "eng"),
+            Some(3)
+        );
+        // When clean PGS is absent, falls back to SDH PGS (2)
+        let sdh_pgs_only: Vec<TrackCandidate> = tracks
+            .iter()
+            .filter(|t| t.id != 3)
+            .cloned()
+            .collect();
+        assert_eq!(
+            select_embedded_image_track_for_inline_forced(&sdh_pgs_only, "eng"),
+            Some(2)
+        );
+        assert_eq!(
+            select_embedded_image_track_for_inline_forced(&tracks, "fra"),
+            None
+        );
+
+        // Alternative embedded full track excluding primary clean SRT (1):
+        // Clean PGS (3) > SDH SRT (7) > SDH PGS (2)
+        assert_eq!(
+            select_alternative_embedded_full_track(&tracks, "eng", 1),
+            Some(3)
+        );
+        // Excluding clean PGS (3) returns primary clean SRT (1)
+        assert_eq!(
+            select_alternative_embedded_full_track(&tracks, "eng", 3),
+            Some(1)
+        );
+        // If only SDH SRT (7) and SDH PGS (2) remain (excluding 1 & 3), SDH SRT (7) wins
+        let no_clean: Vec<TrackCandidate> = tracks
+            .iter()
+            .filter(|t| t.id != 1 && t.id != 3)
+            .cloned()
+            .collect();
+        assert_eq!(
+            select_alternative_embedded_full_track(&no_clean, "eng", 99),
+            Some(7)
+        );
+        // Excluding the only full track in Spanish returns None
+        assert_eq!(
+            select_alternative_embedded_full_track(&tracks, "spa", 8),
+            None
+        );
     }
 }

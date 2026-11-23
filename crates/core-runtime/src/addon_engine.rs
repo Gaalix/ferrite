@@ -34,19 +34,23 @@ pub const ADDON_CACHE_MAX_BYTES: usize = 6 * 1024 * 1024;
 
 pub const ADDON_CACHE_MAX_SINGLE_ENTRY_BYTES: usize = 512 * 1024;
 
-pub const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+pub const DEGRADED_FAILURE_THRESHOLD: u32 = 2;
+
+pub const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 4;
+
+pub const DEGRADED_DECAY_WINDOW: Duration = Duration::from_secs(300);
 
 pub const DEFAULT_CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
-pub const SLOW_ADDON_LATENCY_MS: u32 = 1_200;
+pub const SLOW_ADDON_LATENCY_MS: u32 = 2_500;
 
 pub const STREMIO_API_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub const LOCALHOST_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub const ADDON_MANIFEST_TIMEOUT: Duration = Duration::from_secs(6);
+pub const ADDON_MANIFEST_TIMEOUT: Duration = Duration::from_secs(12);
 
-pub const ADDON_RESOURCE_TIMEOUT: Duration = Duration::from_millis(6_500);
+pub const ADDON_RESOURCE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub const TTL_MANIFEST: Duration = Duration::from_secs(30 * 60);
 
@@ -1376,33 +1380,33 @@ struct OriginTelemetryState {
     cache_hits: u64,
     consecutive_failures: u32,
     last_error: Option<String>,
+    last_failure_at: Option<Instant>,
     circuit_open_until: Option<Instant>,
 }
 
 impl OriginTelemetryState {
     fn to_snapshot(&self, origin: String, now: Instant) -> AddonTelemetrySnapshot {
         let ema_u32 = self.ema_latency_ms.map(|v| v.round() as u32);
-        let status = if let Some(until) = self.circuit_open_until {
-            if until > now {
-                let remaining = until.duration_since(now).as_secs().max(1);
-                AddonHealthStatus::CircuitOpen {
-                    remaining_secs: remaining,
-                }
-            } else if self.consecutive_failures > 0 {
-                AddonHealthStatus::Degraded
-            } else {
-                AddonHealthStatus::Healthy
+        let is_degraded = self.consecutive_failures >= DEGRADED_FAILURE_THRESHOLD
+            && self
+                .last_failure_at
+                .is_some_and(|t| now.saturating_duration_since(t) < DEGRADED_DECAY_WINDOW);
+        let status = if let Some(until) = self.circuit_open_until.filter(|u| *u > now) {
+            let remaining = until.duration_since(now).as_secs().max(1);
+            AddonHealthStatus::CircuitOpen {
+                remaining_secs: remaining,
             }
         } else if self.total_requests == 0 {
             AddonHealthStatus::Idle
-        } else if self.consecutive_failures > 0 {
+        } else if is_degraded {
             AddonHealthStatus::Degraded
         } else if ema_u32.unwrap_or(0) > SLOW_ADDON_LATENCY_MS {
             AddonHealthStatus::Slow
-        } else {
+        } else if self.ema_latency_ms.is_some() {
             AddonHealthStatus::Healthy
-        }
-        ;
+        } else {
+            AddonHealthStatus::Idle
+        };
 
         AddonTelemetrySnapshot {
             origin,
@@ -1626,6 +1630,7 @@ impl AddonHttpEngine {
             state.circuit_open_until = None;
             state.consecutive_failures = 0;
             state.last_error = None;
+            state.last_failure_at = None;
             return true;
         }
         false
@@ -1703,9 +1708,16 @@ impl AddonHttpEngine {
         if let Ok(mut guard) = self.telemetry.lock() {
             let entry = guard.entry(origin.to_owned()).or_default();
             entry.total_requests += 1;
-            entry.last_error = Some(error_msg.to_owned());
 
             if counts_toward_circuit {
+                if entry
+                    .last_failure_at
+                    .is_some_and(|t| now.saturating_duration_since(t) >= DEGRADED_DECAY_WINDOW)
+                {
+                    entry.consecutive_failures = 0;
+                }
+                entry.last_error = Some(error_msg.to_owned());
+                entry.last_failure_at = Some(now);
                 entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
                 if allow_circuit_breaker
                     && entry.consecutive_failures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD
@@ -2113,6 +2125,7 @@ fn record_network_success_map(
         entry.consecutive_failures = 0;
         entry.circuit_open_until = None;
         entry.last_error = None;
+        entry.last_failure_at = None;
     }
 }
 
@@ -2215,6 +2228,69 @@ async fn persist_disk_snapshot(
     .await;
 }
 
+fn format_reqwest_error(err: reqwest::Error, redacted_target: &str) -> String {
+    let is_timeout = err.is_timeout();
+    let is_connect = err.is_connect();
+    let clean = err.without_url();
+
+    let mut causes = Vec::new();
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&clean);
+    while let Some(source) = cur {
+        let text = redact_sensitive_text(&source.to_string());
+        if !text.trim().is_empty() && causes.last().is_none_or(|prev| prev != &text) {
+            causes.push(text);
+        }
+        cur = source.source();
+    }
+
+    let joined_causes = causes.join(": ");
+    let lower = joined_causes.to_ascii_lowercase();
+
+    let category = if is_timeout || lower.contains("timed out") || lower.contains("timeout") {
+        "Request timed out"
+    } else if lower.contains("dns")
+        || lower.contains("lookup address")
+        || lower.contains("name or service not known")
+        || lower.contains("nodename nor servname")
+        || lower.contains("no such host")
+        || lower.contains("failed to resolve")
+    {
+        "DNS lookup failed"
+    } else if lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("certificate")
+        || lower.contains("handshake")
+        || lower.contains("rustls")
+        || lower.contains("webpki")
+    {
+        "TLS error"
+    } else if is_connect
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("error trying to connect")
+        || lower.contains("network unreachable")
+        || lower.contains("host unreachable")
+    {
+        "Connection failed"
+    } else {
+        ""
+    };
+
+    let summary = if !category.is_empty() {
+        if joined_causes.is_empty() {
+            category.to_owned()
+        } else {
+            format!("{category}: {joined_causes}")
+        }
+    } else if joined_causes.is_empty() {
+        clean.to_string()
+    } else {
+        format!("{clean}: {joined_causes}")
+    };
+
+    format!("{summary} ({redacted_target})")
+}
+
 async fn fetch_http_bytes(
     client: &reqwest::Client,
     method: Method,
@@ -2237,6 +2313,12 @@ async fn fetch_http_bytes(
     for (name, value) in headers {
         req_builder = req_builder.header(name, value);
     }
+    if !headers.contains_key(http::header::ACCEPT) {
+        req_builder = req_builder.header(
+            http::header::ACCEPT,
+            "application/json, text/plain, */*",
+        );
+    }
     if let Some(body_bytes) = serialized_body {
         if !headers.contains_key(http::header::CONTENT_TYPE) {
             req_builder = req_builder.header(http::header::CONTENT_TYPE, "application/json");
@@ -2250,29 +2332,24 @@ async fn fetch_http_bytes(
         Ok(response) => {
             let status = response.status();
             if !status.is_success() {
-                let is_server_fault = status.is_server_error() || status.as_u16() == 408;
+                let counts_toward_circuit =
+                    status.is_server_error() || matches!(status.as_u16(), 403 | 408 | 429);
                 Err((
                     format!(
                         "Unexpected HTTP status code {} for {}",
                         status.as_u16(),
                         redacted_target
                     ),
-                    is_server_fault,
+                    counts_toward_circuit,
                 ))
             } else {
                 match response.bytes().await {
                     Ok(bytes) => Ok(Arc::<[u8]>::from(bytes.as_ref())),
-                    Err(err) => {
-                        let clean = err.without_url();
-                        Err((format!("{clean} ({redacted_target})"), true))
-                    }
+                    Err(err) => Err((format_reqwest_error(err, redacted_target), true)),
                 }
             }
         }
-        Err(err) => {
-            let clean = err.without_url();
-            Err((format!("{clean} ({redacted_target})"), true))
-        }
+        Err(err) => Err((format_reqwest_error(err, redacted_target), true)),
     };
     (outcome, started_at.elapsed())
 }
@@ -2370,7 +2447,7 @@ mod tests {
         let manifest_url = Url::parse("https://comet.elfhosted.com/manifest.json").unwrap();
         assert_eq!(
             classify_request_deadline(&Method::GET, &manifest_url, false),
-            Duration::from_secs(6)
+            Duration::from_secs(12)
         );
         assert_eq!(
             classify_cache_ttl(&Method::GET, &manifest_url, &empty_headers, false),
@@ -2381,7 +2458,7 @@ mod tests {
             Url::parse("https://comet.elfhosted.com/stream/movie/tt0133093.json").unwrap();
         assert_eq!(
             classify_request_deadline(&Method::GET, &stream_url, false),
-            Duration::from_millis(6_500)
+            Duration::from_secs(15)
         );
         assert_eq!(
             classify_cache_ttl(&Method::GET, &stream_url, &empty_headers, false),
@@ -2949,5 +3026,89 @@ mod tests {
             assert!(Instant::now() < deadline, "background preload timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn degraded_requires_two_failures_and_decays_after_window() {
+        let base = Instant::now();
+        let origin = "https://addon.example".to_owned();
+
+        // Single failure after prior healthy response stays Healthy (not Degraded).
+        let single_failure = OriginTelemetryState {
+            ema_latency_ms: Some(180.0),
+            last_latency_ms: Some(180),
+            total_requests: 2,
+            cache_hits: 0,
+            consecutive_failures: 1,
+            last_error: Some("Request timed out".to_owned()),
+            last_failure_at: Some(base),
+            circuit_open_until: None,
+        };
+        assert_eq!(
+            single_failure.to_snapshot(origin.clone(), base).status,
+            AddonHealthStatus::Healthy
+        );
+
+        // Single failure with no prior latency measurement stays Idle (not Degraded).
+        let cold_single_failure = OriginTelemetryState {
+            total_requests: 1,
+            consecutive_failures: 1,
+            last_error: Some("Request timed out".to_owned()),
+            last_failure_at: Some(base),
+            ..Default::default()
+        };
+        assert_eq!(
+            cold_single_failure.to_snapshot(origin.clone(), base).status,
+            AddonHealthStatus::Idle
+        );
+
+        // Two consecutive failures within DEGRADED_DECAY_WINDOW trigger Degraded.
+        let degraded = OriginTelemetryState {
+            ema_latency_ms: Some(180.0),
+            last_latency_ms: Some(180),
+            total_requests: 3,
+            cache_hits: 0,
+            consecutive_failures: DEGRADED_FAILURE_THRESHOLD,
+            last_error: Some("Unexpected HTTP status code 502".to_owned()),
+            last_failure_at: Some(base),
+            circuit_open_until: None,
+        };
+        assert_eq!(
+            degraded
+                .to_snapshot(origin.clone(), base + Duration::from_secs(60))
+                .status,
+            AddonHealthStatus::Degraded
+        );
+
+        // After DEGRADED_DECAY_WINDOW elapses, Degraded cools back to Healthy/Slow/Idle.
+        assert_eq!(
+            degraded
+                .to_snapshot(origin.clone(), base + DEGRADED_DECAY_WINDOW)
+                .status,
+            AddonHealthStatus::Healthy
+        );
+        let degraded_slow = OriginTelemetryState {
+            ema_latency_ms: Some((SLOW_ADDON_LATENCY_MS + 250) as f64),
+            ..degraded
+        };
+        assert_eq!(
+            degraded_slow
+                .to_snapshot(origin.clone(), base + DEGRADED_DECAY_WINDOW)
+                .status,
+            AddonHealthStatus::Slow
+        );
+        let degraded_cold = OriginTelemetryState {
+            total_requests: 2,
+            consecutive_failures: DEGRADED_FAILURE_THRESHOLD,
+            last_error: Some("DNS lookup failed".to_owned()),
+            last_failure_at: Some(base),
+            ..Default::default()
+        };
+        assert_eq!(
+            degraded_cold
+                .to_snapshot(origin, base + DEGRADED_DECAY_WINDOW)
+                .status,
+            AddonHealthStatus::Idle
+        );
     }
 }

@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-pub const DEFAULT_DISK_LRU_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+pub const DEFAULT_DISK_LRU_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const DEFAULT_RAM_ONLY_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const LRU_INDEX_FILENAME: &str = "lru_index.json";
 
@@ -553,6 +553,7 @@ mod tests {
 
     #[test]
     fn storage_mode_defaults_and_helpers() {
+        assert_eq!(DEFAULT_DISK_LRU_MAX_BYTES, 5 * 1024 * 1024 * 1024);
         let def = StorageMode::default();
         assert_eq!(
             def,
@@ -560,6 +561,7 @@ mod tests {
                 max_bytes: DEFAULT_DISK_LRU_MAX_BYTES
             }
         );
+        assert_eq!(def.max_bytes(), 5 * 1024 * 1024 * 1024);
         assert!(def.is_disk_lru());
         assert!(!def.is_ram_only());
 

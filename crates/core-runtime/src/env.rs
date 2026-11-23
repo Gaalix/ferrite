@@ -47,7 +47,14 @@ const DEFAULT_APP_DIR_NAME: &str = "ferrite";
 const LEGACY_APP_DIR_NAME: &str = "stremio-gpui";
 const DEFAULT_DB_FILENAME: &str = "storage.db";
 const DEFAULT_LEGACY_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(2_500);
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(target_os = "windows")]
+pub const DEFAULT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+#[cfg(target_os = "macos")]
+pub const DEFAULT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub const DEFAULT_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
 type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -90,7 +97,7 @@ impl Default for EnvConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             circuit_breaker_cooldown: DEFAULT_CIRCUIT_BREAKER_COOLDOWN,
             treat_loopback_as_remote_addon: false,
-            user_agent: format!("Ferrite/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: DEFAULT_BROWSER_USER_AGENT.to_owned(),
             runtime_handle: None,
         }
     }

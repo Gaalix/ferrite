@@ -59,3 +59,15 @@ Ferrite does **not** statically link `libmpv`:
 - On **Windows 11**, Ferrite loads `libmpv-2.dll` dynamically at runtime from the application
   directory (or a user-specified `FERRITE_MPV_DLL` path), allowing end users to inspect, upgrade,
   or replace `libmpv-2.dll` freely with any compatible build.
+
+---
+
+## 6. Phosphor Icons (`@phosphor-icons/core`)
+
+- **Upstream:** `https://github.com/phosphor-icons/core` (`@phosphor-icons/core@2.1.1`)
+- **Copyright:** Copyright (c) 2023 Phosphor Icons
+- **License:** MIT License (full text in `assets/icons/phosphor/LICENSE`)
+
+Verbatim UI icon SVGs in `assets/icons/phosphor/regular/` and `assets/icons/phosphor/fill/` are
+vendored from `@phosphor-icons/core` under the MIT License and synced via
+`scripts/sync-phosphor-icons.sh`.

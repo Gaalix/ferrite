@@ -218,6 +218,38 @@ pub fn short_language_badge(code: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubtitleSearchMode {
+    #[default]
+    Full,
+    ForcedOnly,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignTranslationStatus {
+    #[default]
+    Unknown,
+    Translated,
+    MissingForeign,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleContentProfile {
+    pub cue_count: usize,
+    pub span_ms: i64,
+    pub foreign_placeholder_count: usize,
+    pub sdh_cue_count: usize,
+    pub sdh_ratio_pct: u8,
+    pub foreign_status: ForeignTranslationStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnalyzedSubtitleContent {
+    pub profile: SubtitleContentProfile,
+    pub spoken_cues: Vec<(i64, i64)>,
+    pub foreign_placeholder_timestamps_ms: Vec<i64>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSubtitleQuery {
     pub imdb_id: String,
@@ -228,6 +260,8 @@ pub struct NativeSubtitleQuery {
     pub video_byte_size: Option<u64>,
     pub video_filename: Option<String>,
     pub preferred_langs: Vec<String>,
+    #[serde(default)]
+    pub search_mode: SubtitleSearchMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -299,6 +333,7 @@ pub enum SubtitleMatchTier {
     SameServiceAndCut,
     CompatibleCut,
     Fallback,
+    Conflicting,
 }
 
 impl SubtitleMatchTier {
@@ -308,7 +343,19 @@ impl SubtitleMatchTier {
             Self::ExactRelease => "Release-Matched",
             Self::SameServiceAndCut | Self::CompatibleCut => "Cut-Matched",
             Self::Fallback => "Fallback",
+            Self::Conflicting => "Mismatched cut",
         }
+    }
+
+    pub fn is_trusted_sync(self) -> bool {
+        matches!(self, Self::ExactHash | Self::ExactRelease)
+    }
+
+    pub fn is_compatible_sync(self) -> bool {
+        matches!(
+            self,
+            Self::ExactHash | Self::ExactRelease | Self::SameServiceAndCut | Self::CompatibleCut
+        )
     }
 }
 
@@ -356,13 +403,38 @@ impl VideoReleaseFingerprint {
     }
 }
 
+fn strip_trailing_subtitle_suffixes(base_name: &str) -> &str {
+    const STRIPPABLE_SUFFIXES: &[&str] = &[
+        "srt", "vtt", "ass", "ssa", "sub", "eng", "en", "hi", "sdh", "cc", "forced", "foreign",
+    ];
+    let mut cur = base_name.trim();
+    loop {
+        let mut stripped_any = false;
+        if let Some(sep_idx) = cur.rfind(['.', '_']) {
+            let suffix = &cur[sep_idx + 1..];
+            if STRIPPABLE_SUFFIXES
+                .iter()
+                .any(|s| suffix.eq_ignore_ascii_case(s))
+            {
+                cur = cur[..sep_idx].trim_end();
+                stripped_any = true;
+            }
+        }
+        if !stripped_any {
+            break;
+        }
+    }
+    cur
+}
+
 fn extract_subtitle_release_group(raw: &str) -> Option<String> {
     let base_name = Path::new(raw)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(raw)
         .trim();
-    let group = RE_SUB_RELEASE_GROUP.captures(base_name)?.get(1)?.as_str();
+    let cleaned = strip_trailing_subtitle_suffixes(base_name);
+    let group = RE_SUB_RELEASE_GROUP.captures(cleaned)?.get(1)?.as_str();
     let lower = group.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
@@ -593,21 +665,18 @@ impl SubtitleMatchRanker {
 
         let compatible_cut = v_family.is_some() && v_family == c_family;
 
-        let tier = if release_group_match && !has_hard_conflict {
+        let tier = if has_hard_conflict {
+            SubtitleMatchTier::Conflicting
+        } else if release_group_match {
             score += 4_000_000;
             SubtitleMatchTier::ExactRelease
-        } else if same_service_and_cut && !has_hard_conflict {
+        } else if same_service_and_cut {
             score += 1_800_000;
             SubtitleMatchTier::SameServiceAndCut
-        } else if compatible_cut && !has_hard_conflict {
+        } else if compatible_cut {
             score += 600_000;
             SubtitleMatchTier::CompatibleCut
         } else {
-            if release_group_match {
-                score += 4_000_000;
-            } else if same_service_and_cut {
-                score += 1_800_000;
-            }
             SubtitleMatchTier::Fallback
         };
 
@@ -644,6 +713,12 @@ pub struct FetchedNativeSubtitle {
     pub score: i64,
     pub local_path: PathBuf,
     pub lookup_elapsed_ms: u64,
+    #[serde(default)]
+    pub hearing_impaired: bool,
+    #[serde(default)]
+    pub forced: bool,
+    #[serde(default)]
+    pub content_profile: SubtitleContentProfile,
 }
 
 #[derive(Clone, Debug)]
@@ -660,7 +735,92 @@ struct RankedSubtitleCandidate {
     release_name: String,
     match_tier: SubtitleMatchTier,
     score: i64,
+    hearing_impaired: bool,
+    forced: bool,
     download: ProviderDownloadSpec,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadedSubtitleAnalysis {
+    sub: FetchedNativeSubtitle,
+    analysis: AnalyzedSubtitleContent,
+}
+
+pub fn has_explicit_forced_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("unforced") {
+        return false;
+    }
+    if lower.contains("forced")
+        || lower.contains("foreign parts")
+        || lower.contains("foreign-parts")
+        || lower.contains("foreign_parts")
+        || lower.contains("foreign only")
+        || lower.contains("foreign-only")
+        || lower.contains("foreign dialogue")
+        || lower.contains("non-english")
+        || lower.contains("non english")
+        || lower.contains("non_english")
+        || lower.contains("signs & songs")
+        || lower.contains("signs and songs")
+        || lower.contains("signs/songs")
+        || lower.contains("s&s")
+    {
+        return true;
+    }
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == "foreign")
+}
+
+fn json_opt_u32(val: Option<&Value>) -> Option<u32> {
+    let v = val?;
+    v.as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u32>().ok()))
+}
+
+fn fps_hint_from_milli(val: Option<&Value>) -> Option<FpsHint> {
+    let milli = json_opt_u32(val)?;
+    match milli {
+        23_970..=23_985 => Some(FpsHint::Fps23976),
+        23_990..=24_010 => Some(FpsHint::Fps24000),
+        24_990..=25_010 => Some(FpsHint::Fps25000),
+        29_960..=29_980 => Some(FpsHint::Fps29970),
+        _ => None,
+    }
+}
+
+fn merge_fingerprint(
+    mut base: VideoReleaseFingerprint,
+    extra: VideoReleaseFingerprint,
+) -> VideoReleaseFingerprint {
+    if base.release_group.is_none() {
+        base.release_group = extra.release_group;
+    }
+    if base.streaming_service.is_none() {
+        base.streaming_service = extra.streaming_service;
+    }
+    if base.source_cut == SubtitleSourceCut::Unknown {
+        base.source_cut = extra.source_cut;
+    }
+    if base.edition.is_none() {
+        base.edition = extra.edition;
+    }
+    if base.fps_hint.is_none() {
+        base.fps_hint = extra.fps_hint;
+    }
+    base
+}
+
+fn is_sdh_metadata_title(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("hearing impaired") || lower.contains("closed caption") {
+        return true;
+    }
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| matches!(tok, "sdh" | "cc" | "hi"))
 }
 
 #[derive(Clone, Debug)]
@@ -764,9 +924,9 @@ impl NativeSubtitleClient {
         }
 
         candidates.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| a.match_tier.cmp(&b.match_tier))
+            a.match_tier
+                .cmp(&b.match_tier)
+                .then_with(|| b.score.cmp(&a.score))
                 .then_with(|| a.provider.cmp(&b.provider))
                 .then_with(|| a.release_name.cmp(&b.release_name))
         });
@@ -782,32 +942,43 @@ impl NativeSubtitleClient {
             seen_downloads.insert(key)
         });
 
-        let attempt_limit = max_downloads.saturating_mul(2).max(max_downloads);
+        let attempt_limit = max_downloads.saturating_mul(2).clamp(4, 8);
+        let mut to_download: Vec<RankedSubtitleCandidate> = Vec::with_capacity(attempt_limit + 1);
+        match query.search_mode {
+            SubtitleSearchMode::Full => {
+                for cand in candidates.iter().filter(|c| !c.forced).take(attempt_limit) {
+                    to_download.push(cand.clone());
+                }
+                if let Some(oracle) = candidates.iter().find(|c| c.forced) {
+                    to_download.push(oracle.clone());
+                }
+                if to_download.is_empty() {
+                    to_download.extend(candidates.into_iter().take(attempt_limit));
+                }
+            }
+            SubtitleSearchMode::ForcedOnly => {
+                to_download.extend(candidates.into_iter().filter(|c| c.forced).take(attempt_limit));
+            }
+        }
 
-        let fetch_futs = candidates.into_iter().take(attempt_limit).map(|cand| {
+        let fetch_futs = to_download.into_iter().map(|cand| {
             let endpoints_clone = endpoints.clone();
             async move { self.download_and_cache(cand, &endpoints_clone, query).await }
         });
 
-        let downloaded = futures::future::join_all(fetch_futs).await;
+        let downloaded: Vec<DownloadedSubtitleAnalysis> =
+            futures::future::join_all(fetch_futs)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        let mut out: Vec<FetchedNativeSubtitle> = downloaded
-            .into_iter()
-            .flatten()
-            .map(|mut item| {
-                item.lookup_elapsed_ms = elapsed_ms;
-                item
-            })
-            .collect();
-
-        out.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| a.match_tier.cmp(&b.match_tier))
-                .then_with(|| a.provider.cmp(&b.provider))
-        });
-        out.truncate(max_downloads);
+        let mut out =
+            rerank_downloaded_subtitles(downloaded, query.search_mode, max_downloads, &self.cache_dir);
+        for item in &mut out {
+            item.lookup_elapsed_ms = elapsed_ms;
+        }
         out
     }
 
@@ -888,22 +1059,32 @@ impl NativeSubtitleClient {
             }
         };
 
-        let (primary_items_opt, plain_items_opt) = if has_hash.is_some() && primary_url != plain_url
-        {
-            tokio::join!(
-                fetch_subtitles_json(primary_url),
-                fetch_subtitles_json(plain_url)
-            )
-        } else {
-            (fetch_subtitles_json(primary_url).await, None)
-        };
-
-        let Some(items) = primary_items_opt else {
+        let Some(items) = fetch_subtitles_json(primary_url.clone()).await else {
             return Vec::new();
         };
 
-        // OpenSubtitles v3 Stremio addon returns plain items without explicit `hashMatch` boolean:
-        // compare hash-queried items against plain IMDb items per language to detect hash-matched/promoted IDs.
+        let primary_has_explicit_hash_metadata = items.iter().any(|item| {
+            item.get("m")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+                || item.get("hashMatch").and_then(Value::as_bool).is_some()
+                || item
+                    .get("MovieHash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+        });
+
+        // Only fetch `plain_url` lazily when the primary response lacks explicit hash metadata
+        // (`m`, `hashMatch`, `MovieHash`) on all items.
+        let plain_items_opt = if has_hash.is_some()
+            && primary_url != plain_url
+            && !primary_has_explicit_hash_metadata
+        {
+            fetch_subtitles_json(plain_url).await
+        } else {
+            None
+        };
+
         let mut plain_ranks_by_lang: HashMap<String, HashMap<String, usize>> = HashMap::new();
         let plain_available = plain_items_opt
             .as_ref()
@@ -933,6 +1114,18 @@ impl NativeSubtitleClient {
             if !is_allowed_addon_stream_url(sub_url) {
                 continue;
             }
+            if let (Some(req_s), Some(item_s)) = (query.season, json_opt_u32(item.get("season"))) {
+                if item_s != req_s {
+                    continue;
+                }
+            }
+            if let (Some(req_e), Some(item_e)) = (query.episode, json_opt_u32(item.get("episode")))
+            {
+                if item_e != req_e {
+                    continue;
+                }
+            }
+
             let lang_raw = item
                 .get("lang")
                 .and_then(Value::as_str)
@@ -953,14 +1146,29 @@ impl NativeSubtitleClient {
                 continue;
             }
 
-            let release_name = item
-                .get("SubFileName")
-                .or_else(|| item.get("release"))
-                .or_else(|| item.get("title"))
-                .or_else(|| item.get("id"))
+            let subtitle_file_name = item
+                .get("subtitleFileName")
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let movie_release_name = item
+                .get("movieReleaseName")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let release_name = subtitle_file_name
+                .or(movie_release_name)
+                .or_else(|| {
+                    item.get("SubFileName")
+                        .or_else(|| item.get("release"))
+                        .or_else(|| item.get("title"))
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or("OpenSubtitles v3")
-                .trim()
                 .to_owned();
             let title = item
                 .get("title")
@@ -989,24 +1197,75 @@ impl NativeSubtitleClient {
                 false
             };
 
-            let explicit_hash_tag = item
-                .get("hashMatch")
+            let explicit_m = item
+                .get("m")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let hash_match = if let Some(m_tag) = explicit_m {
+                m_tag.eq_ignore_ascii_case("h")
+            } else if let Some(hm) = item.get("hashMatch").and_then(Value::as_bool) {
+                hm
+            } else if let (Some(mh), Some(qh)) = (
+                item.get("MovieHash")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                has_hash,
+            ) {
+                mh.eq_ignore_ascii_case(qh)
+            } else {
+                plain_diff_match
+            };
+
+            let forced = item.get("forced").and_then(Value::as_bool).unwrap_or(false)
+                || has_explicit_forced_marker(&release_name)
+                || movie_release_name.is_some_and(has_explicit_forced_marker)
+                || has_explicit_forced_marker(&title)
+                || has_explicit_forced_marker(sub_url);
+            if query.search_mode == SubtitleSearchMode::ForcedOnly && !forced {
+                continue;
+            }
+            let hearing_impaired = item
+                .get("hearingImpaired")
+                .or_else(|| item.get("hi"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-                || item
-                    .get("m")
+                || is_sdh_metadata_title(&release_name)
+                || movie_release_name.is_some_and(is_sdh_metadata_title)
+                || is_sdh_metadata_title(&title);
+
+            let mut cand_fp = match (subtitle_file_name, movie_release_name) {
+                (Some(sub_fn), Some(mov_rel)) => merge_fingerprint(
+                    VideoReleaseFingerprint::parse(sub_fn),
+                    VideoReleaseFingerprint::parse(mov_rel),
+                ),
+                (Some(sub_fn), None) => VideoReleaseFingerprint::parse(sub_fn),
+                (None, Some(mov_rel)) => VideoReleaseFingerprint::parse(mov_rel),
+                (None, None) => VideoReleaseFingerprint::parse(&release_name),
+            };
+            if cand_fp.release_group.is_none() {
+                if let Some(group) = item
+                    .get("releaseGroup")
                     .and_then(Value::as_str)
-                    .is_some_and(|m| m.eq_ignore_ascii_case("h"))
-                || (query.opensubhash.is_some()
-                    && item
-                        .get("MovieHash")
-                        .and_then(Value::as_str)
-                        .zip(query.opensubhash.as_deref())
-                        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)));
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    cand_fp.release_group = Some(group.to_owned());
+                }
+            }
+            if let Some(fmt) = item
+                .get("releaseFormat")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                cand_fp = merge_fingerprint(cand_fp, VideoReleaseFingerprint::parse(fmt));
+            }
+            if cand_fp.fps_hint.is_none() {
+                cand_fp.fps_hint = fps_hint_from_milli(item.get("fpsMilli"));
+            }
 
-            let hash_match = explicit_hash_tag || plain_diff_match;
-
-            let cand_fp = VideoReleaseFingerprint::parse(&release_name);
             let (tier, score) = SubtitleMatchRanker::score_candidate(
                 video_fp,
                 &cand_fp,
@@ -1014,7 +1273,7 @@ impl NativeSubtitleClient {
                 &lang,
                 &query.preferred_langs,
                 None,
-                false,
+                hearing_impaired,
             );
 
             out.push(RankedSubtitleCandidate {
@@ -1024,6 +1283,8 @@ impl NativeSubtitleClient {
                 release_name,
                 match_tier: tier,
                 score,
+                hearing_impaired,
+                forced,
                 download: ProviderDownloadSpec::DirectUrl(sub_url.to_owned()),
             });
         }
@@ -1076,6 +1337,14 @@ impl NativeSubtitleClient {
             if !langs_csv.is_empty() {
                 pairs.append_pair("languages", &langs_csv.join(","));
             }
+            pairs.append_pair(
+                "foreign_parts_only",
+                if query.search_mode == SubtitleSearchMode::ForcedOnly {
+                    "only"
+                } else {
+                    "include"
+                },
+            );
         }
 
         let resp = match self
@@ -1156,7 +1425,18 @@ impl NativeSubtitleClient {
             let hi = attrs
                 .get("hearing_impaired")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || is_sdh_metadata_title(&effective_release)
+                || is_sdh_metadata_title(&title);
+            let forced = attrs
+                .get("foreign_parts_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || has_explicit_forced_marker(&effective_release)
+                || has_explicit_forced_marker(&title);
+            if query.search_mode == SubtitleSearchMode::ForcedOnly && !forced {
+                continue;
+            }
 
             let cand_fp = VideoReleaseFingerprint::parse(&effective_release);
             let (tier, score) = SubtitleMatchRanker::score_candidate(
@@ -1176,6 +1456,8 @@ impl NativeSubtitleClient {
                 release_name: effective_release,
                 match_tier: tier,
                 score,
+                hearing_impaired: hi,
+                forced,
                 download: ProviderDownloadSpec::OpenSubtitlesFileId {
                     file_id,
                     api_key: key.to_owned(),
@@ -1294,7 +1576,21 @@ impl NativeSubtitleClient {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&release_name)
                 .to_owned();
-            let hi = item.get("hi").and_then(Value::as_bool).unwrap_or(false);
+            let comment = item
+                .get("comment")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let hi = item.get("hi").and_then(Value::as_bool).unwrap_or(false)
+                || is_sdh_metadata_title(&release_name)
+                || is_sdh_metadata_title(&title)
+                || is_sdh_metadata_title(comment);
+            let forced = item.get("forced").and_then(Value::as_bool).unwrap_or(false)
+                || has_explicit_forced_marker(&release_name)
+                || has_explicit_forced_marker(&title)
+                || has_explicit_forced_marker(comment);
+            if query.search_mode == SubtitleSearchMode::ForcedOnly && !forced {
+                continue;
+            }
 
             let cand_fp = VideoReleaseFingerprint::parse(&release_name);
             let (tier, score) = SubtitleMatchRanker::score_candidate(
@@ -1314,6 +1610,8 @@ impl NativeSubtitleClient {
                 release_name,
                 match_tier: tier,
                 score,
+                hearing_impaired: hi,
+                forced,
                 download: ProviderDownloadSpec::DirectUrl(full_url),
             });
         }
@@ -1325,7 +1623,7 @@ impl NativeSubtitleClient {
         candidate: RankedSubtitleCandidate,
         endpoints: &NativeSubtitleEndpoints,
         query: &NativeSubtitleQuery,
-    ) -> Option<FetchedNativeSubtitle> {
+    ) -> Option<DownloadedSubtitleAnalysis> {
         let raw_bytes = match &candidate.download {
             ProviderDownloadSpec::DirectUrl(url) => self.fetch_bytes_bounded(url).await?,
             ProviderDownloadSpec::OpenSubtitlesFileId { file_id, api_key } => {
@@ -1365,10 +1663,13 @@ impl NativeSubtitleClient {
             }
         };
 
-        let (utf8_text, detected_ext) = match decode_subtitle_payload(
+        let prefer_forced_entry =
+            candidate.forced || query.search_mode == SubtitleSearchMode::ForcedOnly;
+        let (utf8_text, detected_ext) = match decode_subtitle_payload_with_mode(
             &raw_bytes,
             query.season,
             query.episode,
+            prefer_forced_entry,
         ) {
             Ok(decoded) => decoded,
             Err(err) => {
@@ -1376,6 +1677,10 @@ impl NativeSubtitleClient {
                 return None;
             }
         };
+
+        let analysis = analyze_subtitle_content(&utf8_text);
+        let hearing_impaired =
+            candidate.hearing_impaired || analysis.profile.sdh_ratio_pct >= 25;
 
         let local_path = match write_cached_subtitle(&self.cache_dir, &utf8_text, detected_ext) {
             Ok(path) => path,
@@ -1385,7 +1690,7 @@ impl NativeSubtitleClient {
             }
         };
 
-        Some(FetchedNativeSubtitle {
+        let sub = FetchedNativeSubtitle {
             provider: candidate.provider,
             lang: candidate.lang,
             title: candidate.title,
@@ -1394,7 +1699,11 @@ impl NativeSubtitleClient {
             score: candidate.score,
             local_path,
             lookup_elapsed_ms: 0,
-        })
+            hearing_impaired,
+            forced: candidate.forced,
+            content_profile: analysis.profile.clone(),
+        };
+        Some(DownloadedSubtitleAnalysis { sub, analysis })
     }
 
     async fn fetch_bytes_bounded(&self, url: &str) -> Option<Vec<u8>> {
@@ -1424,6 +1733,15 @@ pub fn decode_subtitle_payload(
     season: Option<u32>,
     episode: Option<u32>,
 ) -> Result<(String, &'static str), String> {
+    decode_subtitle_payload_with_mode(raw, season, episode, false)
+}
+
+fn decode_subtitle_payload_with_mode(
+    raw: &[u8],
+    season: Option<u32>,
+    episode: Option<u32>,
+    prefer_forced: bool,
+) -> Result<(String, &'static str), String> {
     if raw.is_empty() {
         return Err("Empty subtitle payload".to_owned());
     }
@@ -1436,7 +1754,8 @@ pub fn decode_subtitle_payload(
     let (plain_bytes, hint_ext): (Vec<u8>, Option<&'static str>) = if raw.starts_with(&[0x1f, 0x8b]) {
         (decompress_gzip_bounded(raw)?, None)
     } else if raw.starts_with(&[0x50, 0x4b, 0x03, 0x04]) {
-        let (entry_bytes, ext) = extract_best_subtitle_from_zip(raw, season, episode)?;
+        let (entry_bytes, ext) =
+            extract_best_subtitle_from_zip_with_mode(raw, season, episode, prefer_forced)?;
         (entry_bytes, Some(ext))
     } else {
         (raw.to_vec(), None)
@@ -1504,6 +1823,7 @@ fn score_zip_entry(
     ext: &str,
     season: Option<u32>,
     episode: Option<u32>,
+    prefer_forced: bool,
 ) -> i32 {
     let mut score: i32 = match ext {
         "ass" | "ssa" => 300,
@@ -1513,8 +1833,8 @@ fn score_zip_entry(
     };
 
     let lower = name.to_ascii_lowercase();
-    if lower.contains("forced") {
-        score -= 100;
+    if has_explicit_forced_marker(&lower) {
+        score += if prefer_forced { 500 } else { -100 };
     }
     if lower.contains("sdh") || lower.contains("hearing") {
         score -= 20;
@@ -1563,6 +1883,15 @@ pub fn extract_best_subtitle_from_zip(
     archive: &[u8],
     season: Option<u32>,
     episode: Option<u32>,
+) -> Result<(Vec<u8>, &'static str), String> {
+    extract_best_subtitle_from_zip_with_mode(archive, season, episode, false)
+}
+
+fn extract_best_subtitle_from_zip_with_mode(
+    archive: &[u8],
+    season: Option<u32>,
+    episode: Option<u32>,
+    prefer_forced: bool,
 ) -> Result<(Vec<u8>, &'static str), String> {
     if archive.len() > MAX_SUBTITLE_ARCHIVE_BYTES {
         return Err(format!(
@@ -1660,7 +1989,7 @@ pub fn extract_best_subtitle_from_zip(
             continue;
         }
 
-        let score = score_zip_entry(&name, ext, season, episode);
+        let score = score_zip_entry(&name, ext, season, episode, prefer_forced);
         let candidate = ZipCandidate {
             ext,
             method,
@@ -2734,6 +3063,59 @@ impl SubtitleSyncAligner {
 
         write_private_file(output_path, &rewritten)
     }
+
+    /// Parses cues from `reference_srt_text`, aligns `target_path` onto the reference timeline
+    /// requiring `matched_onsets >= 10` and `confidence >= 0.40`, and writes the aligned file.
+    pub fn align_subtitle_file_to_reference_text(
+        target_path: &Path,
+        reference_srt_text: &str,
+        output_path: &Path,
+    ) -> Result<SubtitleAlignmentResult, String> {
+        let target_bytes = std::fs::read(target_path).map_err(|err| match err.kind() {
+            ErrorKind::NotFound => format!("Subtitle file not found: {}", target_path.display()),
+            _ => format!("Failed to read subtitle file {}: {err}", target_path.display()),
+        })?;
+        let target_text = normalize_bytes_to_utf8(&target_bytes)?;
+        let target_cues = {
+            let spoken = Self::parse_spoken_dialogue_cues(&target_text);
+            if spoken.len() >= 10 {
+                spoken
+            } else {
+                Self::parse_subtitle_cues(&target_text)
+            }
+        };
+        let reference_cues = {
+            let spoken = Self::parse_spoken_dialogue_cues(reference_srt_text);
+            if spoken.len() >= 10 {
+                spoken
+            } else {
+                Self::parse_subtitle_cues(reference_srt_text)
+            }
+        };
+        if target_cues.len() < 10 || reference_cues.len() < 10 {
+            return Err(format!(
+                "Insufficient subtitle cues for alignment (target={}, reference={})",
+                target_cues.len(),
+                reference_cues.len()
+            ));
+        }
+
+        let alignment = Self::solve_subtitle_alignment(&target_cues, &reference_cues);
+        if alignment.matched_onsets < 10 || alignment.confidence < 0.40 {
+            return Err(format!(
+                "Subtitle alignment below confidence threshold (matched_onsets={}, confidence={:.2})",
+                alignment.matched_onsets, alignment.confidence
+            ));
+        }
+
+        Self::write_aligned_subtitle_file(
+            target_path,
+            output_path,
+            alignment.offset_ms,
+            alignment.drift_ratio,
+        )?;
+        Ok(alignment)
+    }
 }
 
 fn transform_ms(ms: i64, offset_ms: i64, drift_ratio: f64) -> i64 {
@@ -2872,6 +3254,644 @@ fn format_ass_timestamp(ms: i64) -> String {
     format!("{hours}:{mins:02}:{secs:02}.{cs:02}")
 }
 
+fn clean_cue_text_preserving_lines(raw: &str) -> String {
+    let no_ass = if raw.contains('{') {
+        RE_ASS_OVERRIDE.replace_all(raw, " ")
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
+    let no_html = if no_ass.contains('<') {
+        RE_HTML_TAG.replace_all(&no_ass, " ")
+    } else {
+        no_ass
+    };
+    no_html
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace("\\N", "\n")
+        .replace("\\n", "\n")
+        .replace("\\h", " ")
+}
+
+fn is_single_line_foreign_placeholder(line: &str) -> bool {
+    let mut s = line.trim();
+    if let Some(rest) = s.strip_prefix('-').or_else(|| s.strip_prefix('–')) {
+        s = rest.trim();
+    }
+    let inner = if let Some(rest) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        rest.trim()
+    } else if let Some(rest) = s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        rest.trim()
+    } else {
+        return false;
+    };
+
+    if inner.is_empty()
+        || inner.contains('[')
+        || inner.contains(']')
+        || inner.contains('(')
+        || inner.contains(')')
+    {
+        return false;
+    }
+
+    let normalized = inner
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if normalized.is_empty() {
+        return false;
+    }
+
+    const EXPLICIT_FOREIGN_PHRASES: &[&str] = &[
+        "foreign language",
+        "foreign dialogue",
+        "foreign dialog",
+        "foreign speech",
+        "foreign tongue",
+        "non-english",
+        "non english",
+        "native tongue",
+        "native language",
+        "alien language",
+        "unknown language",
+        "another language",
+        "other language",
+    ];
+    if EXPLICIT_FOREIGN_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        return !normalized.contains("in english");
+    }
+
+    for prefix in ["speaking ", "speaks "] {
+        if let Some(rest) = normalized.strip_prefix(prefix) {
+            return is_plausible_foreign_target(rest, true);
+        }
+    }
+
+    const VERB_IN_PREFIXES: &[&str] = &[
+        "in ",
+        "talking in ",
+        "conversing in ",
+        "dialogue in ",
+        "dialog in ",
+        "chanting in ",
+        "singing in ",
+        "shouting in ",
+        "yelling in ",
+        "screaming in ",
+        "whispering in ",
+        "muttering in ",
+        "mutters in ",
+        "arguing in ",
+        "spoken in ",
+    ];
+    for prefix in VERB_IN_PREFIXES {
+        if let Some(rest) = normalized.strip_prefix(prefix) {
+            return is_plausible_foreign_target(rest, false);
+        }
+    }
+
+    false
+}
+
+fn is_plausible_foreign_target(raw_target: &str, allow_in_prefix: bool) -> bool {
+    let mut target = raw_target
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-')
+        .trim();
+    if allow_in_prefix {
+        if let Some(after_in) = target.strip_prefix("in ") {
+            target = after_in.trim();
+        }
+    }
+    if target.is_empty() {
+        return false;
+    }
+
+    let words: Vec<&str> = target.split_whitespace().collect();
+    if words.is_empty() || words.len() > 3 {
+        return false;
+    }
+
+    const EXCLUDED_PHRASES: &[&str] = &[
+        "english",
+        "unison",
+        "background",
+        "the background",
+        "distance",
+        "the distance",
+        "pain",
+        "tears",
+        "shock",
+        "fear",
+        "panic",
+        "awe",
+        "wonder",
+        "anger",
+        "silence",
+        "whisper",
+        "a whisper",
+        "chorus",
+        "harmony",
+        "tongues",
+        "riddles",
+        "code",
+    ];
+    if EXCLUDED_PHRASES.contains(&target) {
+        return false;
+    }
+
+    const EXCLUDED_FIRST_WORDS: &[&str] = &[
+        "softly",
+        "quietly",
+        "loudly",
+        "slowly",
+        "quickly",
+        "fast",
+        "calmly",
+        "angrily",
+        "sadly",
+        "gently",
+        "coldly",
+        "firmly",
+        "urgently",
+        "nervously",
+        "weakly",
+        "faintly",
+        "hoarsely",
+        "harshly",
+        "brightly",
+        "excitedly",
+        "rapidly",
+        "briefly",
+        "indistinctly",
+        "inaudibly",
+        "overlapping",
+        "simultaneously",
+        "into",
+        "on",
+        "over",
+        "through",
+        "to",
+        "with",
+        "from",
+        "at",
+        "for",
+        "out",
+        "off",
+        "clearly",
+        "directly",
+    ];
+    if EXCLUDED_FIRST_WORDS.contains(&words[0]) {
+        return false;
+    }
+
+    if target.contains("phone")
+        || target.contains("radio")
+        || target.contains("speaker")
+        || target.contains("mic")
+        || target.contains("intercom")
+        || target.contains("walkie")
+        || target.contains("voiceover")
+        || target.contains("offscreen")
+        || target.contains("off-screen")
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Returns true when the entire subtitle cue is an untranslated foreign-speech placeholder
+/// such as `[speaking Dothraki]`, `(in Japanese)`, or `(in foreign language)`.
+pub fn is_untranslated_foreign_placeholder(raw_or_cleaned: &str) -> bool {
+    let cleaned = clean_cue_text_preserving_lines(raw_or_cleaned);
+    let non_empty: Vec<&str> = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return false;
+    }
+    non_empty
+        .iter()
+        .all(|line| is_single_line_foreign_placeholder(line))
+}
+
+fn is_sdh_line_or_cue(cleaned_text: &str) -> bool {
+    if is_non_speech_cue(cleaned_text) {
+        return true;
+    }
+    let trimmed = cleaned_text.trim();
+    if trimmed.contains('♪') || trimmed.contains('♫') {
+        return true;
+    }
+    if (trimmed.starts_with('[') && trimmed.contains(']'))
+        || (trimmed.starts_with('(') && trimmed.contains(')'))
+    {
+        return true;
+    }
+    false
+}
+
+/// Single-pass content analyzer for downloaded `.srt`/`.vtt`/`.ass` subtitle files (< 1 ms).
+pub fn analyze_subtitle_content(content: &str) -> AnalyzedSubtitleContent {
+    let entries = extract_subtitle_cue_entries(content);
+    if entries.is_empty() {
+        return AnalyzedSubtitleContent::default();
+    }
+
+    let mut cue_count = 0usize;
+    let mut foreign_placeholder_count = 0usize;
+    let mut sdh_cue_count = 0usize;
+    let mut min_start = i64::MAX;
+    let mut max_end = i64::MIN;
+    let mut spoken_cues = Vec::with_capacity(entries.len());
+    let mut foreign_placeholder_timestamps_ms = Vec::new();
+
+    for (start_ms, end_ms, raw_body, cleaned) in entries {
+        cue_count += 1;
+        min_start = min_start.min(start_ms);
+        max_end = max_end.max(end_ms);
+
+        if is_untranslated_foreign_placeholder(&raw_body) {
+            foreign_placeholder_count += 1;
+            if foreign_placeholder_timestamps_ms.len() < 80 {
+                foreign_placeholder_timestamps_ms.push(start_ms);
+            }
+        } else if is_non_speech_cue(&cleaned) {
+            sdh_cue_count += 1;
+        } else {
+            if is_sdh_line_or_cue(&cleaned) {
+                sdh_cue_count += 1;
+            }
+            spoken_cues.push((start_ms, end_ms));
+        }
+    }
+
+    spoken_cues.sort_unstable();
+    let span_ms = if max_end > min_start {
+        max_end - min_start
+    } else {
+        0
+    };
+    let sdh_ratio_pct = ((sdh_cue_count * 100) / cue_count.max(1)).min(100) as u8;
+
+    AnalyzedSubtitleContent {
+        profile: SubtitleContentProfile {
+            cue_count,
+            span_ms,
+            foreign_placeholder_count,
+            sdh_cue_count,
+            sdh_ratio_pct,
+            foreign_status: if foreign_placeholder_count > 0 {
+                ForeignTranslationStatus::MissingForeign
+            } else {
+                ForeignTranslationStatus::Unknown
+            },
+        },
+        spoken_cues,
+        foreign_placeholder_timestamps_ms,
+    }
+}
+
+fn is_timestamp_covered_by_spoken_cues(sorted_cues: &[(i64, i64)], t: i64, tol_ms: i64) -> bool {
+    let idx = sorted_cues.partition_point(|&(s, _)| s <= t + tol_ms);
+    sorted_cues[..idx]
+        .iter()
+        .rev()
+        .take_while(|&&(s, _)| s >= t - 60_000)
+        .any(|&(_, e)| e >= t - tol_ms)
+}
+
+fn forced_oracle_shares_timeline(
+    oracle: &FetchedNativeSubtitle,
+    candidate: &FetchedNativeSubtitle,
+) -> bool {
+    if oracle.match_tier == SubtitleMatchTier::ExactHash
+        && candidate.match_tier == SubtitleMatchTier::ExactHash
+    {
+        return true;
+    }
+    if oracle.match_tier == SubtitleMatchTier::ExactRelease
+        && candidate.match_tier == SubtitleMatchTier::ExactRelease
+    {
+        if let (Some(og), Some(cg)) = (
+            extract_subtitle_release_group(&oracle.release_name),
+            extract_subtitle_release_group(&candidate.release_name),
+        ) {
+            return og.eq_ignore_ascii_case(&cg);
+        }
+    }
+    false
+}
+
+fn rerank_downloaded_subtitles(
+    mut downloaded: Vec<DownloadedSubtitleAnalysis>,
+    mode: SubtitleSearchMode,
+    max_downloads: usize,
+    cache_dir: &Path,
+) -> Vec<FetchedNativeSubtitle> {
+    if downloaded.is_empty() || max_downloads == 0 {
+        return Vec::new();
+    }
+
+    if mode == SubtitleSearchMode::ForcedOnly {
+        let mut forced_out: Vec<FetchedNativeSubtitle> = downloaded
+            .into_iter()
+            .filter(|item| {
+                item.sub.forced
+                    && item.analysis.profile.cue_count > 0
+                    && item.analysis.profile.cue_count <= 400
+            })
+            .map(|item| item.sub)
+            .collect();
+        forced_out.sort_by(|a, b| {
+            a.match_tier
+                .cmp(&b.match_tier)
+                .then_with(|| b.score.cmp(&a.score))
+                .then_with(|| a.provider.cmp(&b.provider))
+        });
+        forced_out.truncate(max_downloads);
+        return forced_out;
+    }
+
+    let non_forced_indices: Vec<usize> = downloaded
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !item.sub.forced)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if non_forced_indices.is_empty() {
+        return Vec::new();
+    }
+
+    let max_non_forced_cues = non_forced_indices
+        .iter()
+        .map(|&i| downloaded[i].analysis.profile.cue_count)
+        .max()
+        .unwrap_or(0);
+
+    // Collect foreign-speech oracle timestamps from (a) placeholder captions in any full track
+    // and (b) explicit Forced/foreign-parts tracks downloaded in the same parallel batch.
+    let mut oracle_sources: Vec<(usize, bool)> = Vec::new();
+    for (idx, item) in downloaded.iter().enumerate() {
+        if !item.analysis.foreign_placeholder_timestamps_ms.is_empty() {
+            oracle_sources.push((idx, false));
+        } else if item.sub.forced
+            && !item.analysis.spoken_cues.is_empty()
+            && item.analysis.spoken_cues.len() <= 400
+        {
+            oracle_sources.push((idx, true));
+        }
+    }
+
+    let mut computed_statuses = Vec::with_capacity(non_forced_indices.len());
+    for &idx in &non_forced_indices {
+        let item = &downloaded[idx];
+        let status = if item.analysis.profile.foreign_placeholder_count > 0 {
+            ForeignTranslationStatus::MissingForeign
+        } else if !oracle_sources.is_empty() && item.analysis.profile.cue_count > 0 {
+            let mut total_checks = 0usize;
+            let mut total_covered = 0usize;
+
+            for &(o_idx, is_forced_oracle) in &oracle_sources {
+                if o_idx == idx {
+                    continue;
+                }
+                let oracle = &downloaded[o_idx];
+                if !is_forced_oracle {
+                    if item.analysis.spoken_cues.len() < 10
+                        || oracle.analysis.spoken_cues.len() < 10
+                    {
+                        continue;
+                    }
+                    let align = SubtitleSyncAligner::solve_subtitle_alignment(
+                        &oracle.analysis.spoken_cues,
+                        &item.analysis.spoken_cues,
+                    );
+                    if align.matched_onsets < 10 || align.confidence < 0.35 {
+                        continue;
+                    }
+
+                    for &ts in oracle
+                        .analysis
+                        .foreign_placeholder_timestamps_ms
+                        .iter()
+                        .take(40)
+                    {
+                        let mapped = transform_ms(ts, align.offset_ms, align.drift_ratio);
+                        total_checks += 1;
+                        if is_timestamp_covered_by_spoken_cues(
+                            &item.analysis.spoken_cues,
+                            mapped,
+                            1_200,
+                        ) {
+                            total_covered += 1;
+                        }
+                    }
+                } else {
+                    if !forced_oracle_shares_timeline(&oracle.sub, &item.sub) {
+                        continue;
+                    }
+                    for &(ts, _) in oracle.analysis.spoken_cues.iter().take(60) {
+                        total_checks += 1;
+                        if is_timestamp_covered_by_spoken_cues(
+                            &item.analysis.spoken_cues,
+                            ts,
+                            1_800,
+                        ) {
+                            total_covered += 1;
+                        }
+                    }
+                }
+            }
+
+            if total_checks >= 1 && total_covered * 100 >= total_checks * 50 {
+                ForeignTranslationStatus::Translated
+            } else if (total_checks >= 2 && total_covered * 100 < total_checks * 30)
+                || (total_checks == 1 && total_covered == 0)
+            {
+                ForeignTranslationStatus::MissingForeign
+            } else {
+                ForeignTranslationStatus::Unknown
+            }
+        } else {
+            ForeignTranslationStatus::Unknown
+        };
+        computed_statuses.push((idx, status));
+    }
+
+    for (idx, status) in computed_statuses {
+        let item = &mut downloaded[idx];
+        item.sub.content_profile.foreign_status = status;
+
+        if max_non_forced_cues >= 150 && item.analysis.profile.cue_count < 30 {
+            item.sub.match_tier = SubtitleMatchTier::Conflicting;
+            item.sub.score -= 15_000_000;
+        }
+        match status {
+            ForeignTranslationStatus::Translated => {
+                item.sub.score += 150_000;
+            }
+            ForeignTranslationStatus::MissingForeign => {
+                item.sub.score -= 150_000;
+            }
+            ForeignTranslationStatus::Unknown => {}
+        }
+        if !item.sub.hearing_impaired && item.analysis.profile.sdh_ratio_pct < 18 {
+            item.sub.score += 40_000;
+        }
+    }
+
+    let mut non_forced_items: Vec<DownloadedSubtitleAnalysis> = downloaded
+        .into_iter()
+        .filter(|item| !item.sub.forced)
+        .collect();
+    non_forced_items.sort_by(|a, b| {
+        a.sub
+            .match_tier
+            .cmp(&b.sub.match_tier)
+            .then_with(|| b.sub.score.cmp(&a.sub.score))
+            .then_with(|| a.sub.provider.cmp(&b.sub.provider))
+    });
+
+    // Verified cross-tier alignment: if the #1 high-trust timing reference (ExactHash / ExactRelease)
+    // is MissingForeign, promote another non-forced downloaded track ONLY if it has zero placeholders,
+    // aligns tightly to #1's spoken timeline (matched_onsets >= 15, confidence >= 0.45), and covers
+    // >= 50% of #1's foreign placeholder timestamps after alignment.
+    if non_forced_items.len() >= 2
+        && non_forced_items[0].sub.match_tier.is_trusted_sync()
+        && non_forced_items[0].sub.content_profile.foreign_status
+            == ForeignTranslationStatus::MissingForeign
+        && !non_forced_items[0]
+            .analysis
+            .foreign_placeholder_timestamps_ms
+            .is_empty()
+        && non_forced_items[0].analysis.spoken_cues.len() >= 15
+    {
+        let ref_spoken = &non_forced_items[0].analysis.spoken_cues;
+        let ref_placeholders: Vec<i64> = non_forced_items[0]
+            .analysis
+            .foreign_placeholder_timestamps_ms
+            .iter()
+            .copied()
+            .take(40)
+            .collect();
+
+        let mut best_match: Option<(usize, SubtitleAlignmentResult, bool, usize)> = None;
+        for (idx, cand) in non_forced_items.iter().enumerate().skip(1) {
+            if cand.analysis.profile.foreign_placeholder_count > 0 {
+                continue;
+            }
+            if max_non_forced_cues >= 150 && cand.analysis.profile.cue_count < 30 {
+                continue;
+            }
+            if cand.analysis.spoken_cues.len() < 15 {
+                continue;
+            }
+            let align = SubtitleSyncAligner::solve_subtitle_alignment(
+                &cand.analysis.spoken_cues,
+                ref_spoken,
+            );
+            if align.matched_onsets < 15 || align.confidence < 0.45 {
+                continue;
+            }
+
+            let mut aligned_cues: Vec<(i64, i64)> = cand
+                .analysis
+                .spoken_cues
+                .iter()
+                .map(|&(s, e)| {
+                    let ns = transform_ms(s, align.offset_ms, align.drift_ratio);
+                    let ne = transform_ms(e, align.offset_ms, align.drift_ratio).max(ns);
+                    (ns, ne)
+                })
+                .collect();
+            aligned_cues.sort_unstable();
+
+            let covered = ref_placeholders
+                .iter()
+                .filter(|&&ts| is_timestamp_covered_by_spoken_cues(&aligned_cues, ts, 1_200))
+                .count();
+            if covered * 100 < ref_placeholders.len() * 50 {
+                continue;
+            }
+
+            let is_clean = !cand.sub.hearing_impaired && cand.analysis.profile.sdh_ratio_pct < 18;
+            let is_better = match &best_match {
+                None => true,
+                Some((prev_idx, prev_align, prev_clean, prev_cov)) => {
+                    let prev_sub = &non_forced_items[*prev_idx].sub;
+                    (is_clean, covered, align.matched_onsets)
+                        > (*prev_clean, *prev_cov, prev_align.matched_onsets)
+                        || ((is_clean, covered, align.matched_onsets)
+                            == (*prev_clean, *prev_cov, prev_align.matched_onsets)
+                            && (align.confidence > prev_align.confidence
+                                || ((align.confidence - prev_align.confidence).abs() < 1e-9
+                                    && (cand.sub.match_tier < prev_sub.match_tier
+                                        || (cand.sub.match_tier == prev_sub.match_tier
+                                            && cand.sub.score > prev_sub.score)))))
+                }
+            };
+            if is_better {
+                best_match = Some((idx, align, is_clean, covered));
+            }
+        }
+
+        if let Some((best_idx, best_align, _, _)) = best_match {
+            let src_path = non_forced_items[best_idx].sub.local_path.clone();
+            let ext = src_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .filter(|e| matches!(e.as_str(), "srt" | "ass" | "ssa" | "vtt"))
+                .unwrap_or_else(|| "srt".to_owned());
+            let mut hasher = Sha256::new();
+            hasher.update(src_path.to_string_lossy().as_bytes());
+            hasher.update(best_align.offset_ms.to_le_bytes());
+            hasher.update(best_align.drift_ratio.to_bits().to_le_bytes());
+            let prefix = &hex::encode(hasher.finalize())[..24];
+            let aligned_path = cache_dir.join(format!("{prefix}.aligned.{ext}"));
+
+            if SubtitleSyncAligner::write_aligned_subtitle_file(
+                &src_path,
+                &aligned_path,
+                best_align.offset_ms,
+                best_align.drift_ratio,
+            )
+            .is_ok()
+            {
+                let _ = prune_subtitle_cache_dir_with_limits(
+                    cache_dir,
+                    MAX_SUBTITLE_CACHE_FILES,
+                    MAX_SUBTITLE_CACHE_BYTES,
+                    Some(&aligned_path),
+                );
+                let ref_tier = non_forced_items[0].sub.match_tier;
+                let mut promoted = non_forced_items.remove(best_idx);
+                promoted.sub.local_path = aligned_path;
+                promoted.sub.content_profile.foreign_status = ForeignTranslationStatus::Translated;
+                promoted.sub.match_tier = ref_tier;
+                non_forced_items.insert(0, promoted);
+            }
+        }
+    }
+
+    let mut non_forced_out: Vec<FetchedNativeSubtitle> = non_forced_items
+        .into_iter()
+        .map(|item| item.sub)
+        .collect();
+    non_forced_out.truncate(max_downloads);
+    non_forced_out
+}
+
 fn is_non_speech_cue(cleaned_text: &str) -> bool {
     let trimmed = cleaned_text.trim();
     if trimmed.is_empty() {
@@ -2884,11 +3904,17 @@ fn is_non_speech_cue(cleaned_text: &str) -> bool {
         || (trimmed.starts_with('(') && trimmed.ends_with(')'))
 }
 
-fn parse_srt_or_vtt_cues(content: &str) -> Vec<(i64, i64)> {
-    parse_srt_or_vtt_cues_filtered(content, false)
+fn extract_subtitle_cue_entries(content: &str) -> Vec<(i64, i64, String, String)> {
+    let trimmed = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let lower_head = head_ascii_lowercase(trimmed, 1024);
+    if lower_head.contains("[events]") || lower_head.contains("dialogue:") {
+        extract_ass_cue_entries(trimmed)
+    } else {
+        extract_srt_or_vtt_cue_entries(trimmed)
+    }
 }
 
-fn parse_srt_or_vtt_cues_filtered(content: &str, spoken_only: bool) -> Vec<(i64, i64)> {
+fn extract_srt_or_vtt_cue_entries(content: &str) -> Vec<(i64, i64, String, String)> {
     let mut cues = Vec::new();
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     for block in normalized.split("\n\n") {
@@ -2909,21 +3935,17 @@ fn parse_srt_or_vtt_cues_filtered(content: &str, spoken_only: bool) -> Vec<(i64,
         if end_ms <= start_ms {
             continue;
         }
-        let body = lines[ts_idx + 1..].join(" ");
+        let body = lines[ts_idx + 1..].join("\n");
         let cleaned = clean_cue_text(&body);
-        if is_watermark_cue(&cleaned) || (spoken_only && is_non_speech_cue(&cleaned)) {
+        if is_watermark_cue(&cleaned) {
             continue;
         }
-        cues.push((start_ms, end_ms));
+        cues.push((start_ms, end_ms, body, cleaned));
     }
     cues
 }
 
-fn parse_ass_cues(content: &str) -> Vec<(i64, i64)> {
-    parse_ass_cues_filtered(content, false)
-}
-
-fn parse_ass_cues_filtered(content: &str, spoken_only: bool) -> Vec<(i64, i64)> {
+fn extract_ass_cue_entries(content: &str) -> Vec<(i64, i64, String, String)> {
     let mut cues = Vec::new();
     let mut start_col = 1usize;
     let mut end_col = 2usize;
@@ -2958,14 +3980,39 @@ fn parse_ass_cues_filtered(content: &str, spoken_only: bool) -> Vec<(i64, i64)> 
             if end_ms <= start_ms {
                 continue;
             }
-            let cleaned = clean_cue_text(fields[text_col]);
-            if is_watermark_cue(&cleaned) || (spoken_only && is_non_speech_cue(&cleaned)) {
+            let raw_body = fields[text_col].to_owned();
+            let cleaned = clean_cue_text(&raw_body);
+            if is_watermark_cue(&cleaned) {
                 continue;
             }
-            cues.push((start_ms, end_ms));
+            cues.push((start_ms, end_ms, raw_body, cleaned));
         }
     }
     cues
+}
+
+fn parse_srt_or_vtt_cues(content: &str) -> Vec<(i64, i64)> {
+    parse_srt_or_vtt_cues_filtered(content, false)
+}
+
+fn parse_srt_or_vtt_cues_filtered(content: &str, spoken_only: bool) -> Vec<(i64, i64)> {
+    extract_srt_or_vtt_cue_entries(content)
+        .into_iter()
+        .filter(|(_, _, _, cleaned)| !spoken_only || !is_non_speech_cue(cleaned))
+        .map(|(s, e, _, _)| (s, e))
+        .collect()
+}
+
+fn parse_ass_cues(content: &str) -> Vec<(i64, i64)> {
+    parse_ass_cues_filtered(content, false)
+}
+
+fn parse_ass_cues_filtered(content: &str, spoken_only: bool) -> Vec<(i64, i64)> {
+    extract_ass_cue_entries(content)
+        .into_iter()
+        .filter(|(_, _, _, cleaned)| !spoken_only || !is_non_speech_cue(cleaned))
+        .map(|(s, e, _, _)| (s, e))
+        .collect()
 }
 
 fn rewrite_srt_or_vtt_timestamps(
@@ -3209,7 +4256,7 @@ mod tests {
         assert_eq!(tier_svc.display_label(), "Cut-Matched");
         assert!(score_rel > score_svc);
 
-        // NF vs AMZN cross-service penalty (-900_000)
+        // NF vs AMZN cross-service penalty (-900_000) -> Hard Sync Gate Conflicting
         let nf_video = VideoReleaseFingerprint::parse("Show.S01E01.1080p.NF.WEB-DL-GRP");
         let amzn_sub = VideoReleaseFingerprint::parse("Show.S01E01.1080p.AMZN.WEB-DL-OTHER");
         let (tier_cross_svc, score_cross_svc) = SubtitleMatchRanker::score_candidate(
@@ -3221,13 +4268,30 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(tier_cross_svc, SubtitleMatchTier::Fallback);
+        assert_eq!(tier_cross_svc, SubtitleMatchTier::Conflicting);
+        assert_eq!(tier_cross_svc.display_label(), "Mismatched cut");
+        assert!(!tier_cross_svc.is_trusted_sync());
+        assert!(!tier_cross_svc.is_compatible_sync());
         assert!(score_cross_svc < 0);
 
-        // BluRay vs WEB-DL penalty (-1_500_000)
+        // Even matching release group MUST stay Conflicting when cut/service conflicts (no +4M bonus)
+        let amzn_same_grp = VideoReleaseFingerprint::parse("Show.S01E01.1080p.AMZN.WEB-DL-GRP");
+        let (tier_conflict_grp, score_conflict_grp) = SubtitleMatchRanker::score_candidate(
+            Some(&nf_video),
+            &amzn_same_grp,
+            false,
+            "en",
+            &["en".to_owned()],
+            None,
+            false,
+        );
+        assert_eq!(tier_conflict_grp, SubtitleMatchTier::Conflicting);
+        assert!(score_conflict_grp < 0);
+
+        // BluRay vs WEB-DL penalty (-1_500_000) -> Conflicting
         let bluray_sub =
             VideoReleaseFingerprint::parse("Severance.S02E01.1080p.BluRay.x264-ROVERS");
-        let (_, score_bluray) = SubtitleMatchRanker::score_candidate(
+        let (tier_bluray, score_bluray) = SubtitleMatchRanker::score_candidate(
             Some(&video),
             &bluray_sub,
             false,
@@ -3236,13 +4300,14 @@ mod tests {
             None,
             false,
         );
+        assert_eq!(tier_bluray, SubtitleMatchTier::Conflicting);
         assert!(score_bluray < -900_000);
 
-        // Edition mismatch penalty (-2_000_000)
+        // Edition mismatch penalty (-2_000_000) -> Conflicting
         let dc_video =
             VideoReleaseFingerprint::parse("Movie.2024.Directors.Cut.2160p.BluRay-GROUP");
         let theatrical_sub = VideoReleaseFingerprint::parse("Movie.2024.2160p.BluRay-OTHER");
-        let (_, score_ed) = SubtitleMatchRanker::score_candidate(
+        let (tier_ed, score_ed) = SubtitleMatchRanker::score_candidate(
             Some(&dc_video),
             &theatrical_sub,
             false,
@@ -3251,13 +4316,14 @@ mod tests {
             None,
             false,
         );
+        assert_eq!(tier_ed, SubtitleMatchTier::Conflicting);
         assert!(score_ed < -1_400_000);
 
-        // 25fps vs 23.976fps penalty (-2_500_000)
+        // 25fps vs 23.976fps penalty (-2_500_000) -> Conflicting
         let ntsc_video =
             VideoReleaseFingerprint::parse("Movie.2024.1080p.BluRay.23.976fps-GRP");
         let pal_sub = VideoReleaseFingerprint::parse("Movie.2024.1080p.BluRay.25fps-PALGRP");
-        let (_, score_fps) = SubtitleMatchRanker::score_candidate(
+        let (tier_fps, score_fps) = SubtitleMatchRanker::score_candidate(
             Some(&ntsc_video),
             &pal_sub,
             false,
@@ -3266,7 +4332,18 @@ mod tests {
             None,
             false,
         );
+        assert_eq!(tier_fps, SubtitleMatchTier::Conflicting);
         assert!(score_fps < -1_900_000);
+
+        // Helper methods on SubtitleMatchTier
+        assert!(SubtitleMatchTier::ExactHash.is_trusted_sync());
+        assert!(SubtitleMatchTier::ExactRelease.is_trusted_sync());
+        assert!(!SubtitleMatchTier::SameServiceAndCut.is_trusted_sync());
+        assert!(SubtitleMatchTier::SameServiceAndCut.is_compatible_sync());
+        assert!(SubtitleMatchTier::CompatibleCut.is_compatible_sync());
+        assert!(!SubtitleMatchTier::Fallback.is_compatible_sync());
+        assert!(!SubtitleMatchTier::Conflicting.is_compatible_sync());
+        assert!(SubtitleMatchTier::Fallback < SubtitleMatchTier::Conflicting);
     }
 
     #[test]
@@ -3484,6 +4561,7 @@ mod tests {
                 "Severance.S02E01.1080p.ATVP.WEB-DL.DDP5.1.H.265-NTb.mkv".to_owned(),
             ),
             preferred_langs: vec!["eng".to_owned()],
+            ..Default::default()
         };
 
         let fetched = client
@@ -3825,5 +4903,821 @@ mod tests {
             "expected >=390s separation across windows, got {:?}",
             windows
         );
+    }
+
+    #[test]
+    fn universal_foreign_placeholder_analyzer_handles_multiple_shows_and_movies() {
+        let srt = "\
+1\n00:00:05,000 --> 00:00:07,000\nWelcome to Winterfell.\n\n\
+2\n00:00:10,000 --> 00:00:12,000\n[speaking Dothraki]\n\n\
+3\n00:00:15,000 --> 00:00:17,000\n(in Japanese)\n\n\
+4\n00:00:20,000 --> 00:00:22,000\n[chanting in Latin]\n\n\
+5\n00:00:25,000 --> 00:00:27,000\n(speaking foreign language)\n\n\
+6\n00:00:30,000 --> 00:00:32,000\n[door creaks]\n\n\
+7\n00:00:35,000 --> 00:00:37,000\n[speaking softly]\nDon't wake the guards.\n\n\
+8\n00:00:40,000 --> 00:00:42,000\n[speaking Spanish]\nMove back!\n";
+
+        let analyzed = analyze_subtitle_content(srt);
+        assert_eq!(analyzed.profile.cue_count, 8);
+        assert_eq!(analyzed.profile.foreign_placeholder_count, 4);
+        assert_eq!(
+            analyzed.foreign_placeholder_timestamps_ms,
+            vec![10_000, 15_000, 20_000, 25_000]
+        );
+        assert_eq!(
+            analyzed.profile.foreign_status,
+            ForeignTranslationStatus::MissingForeign
+        );
+        // Cues 1, 7 (mixed), 8 (mixed) are kept as spoken dialogue.
+        assert_eq!(analyzed.spoken_cues.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn search_and_fetch_promotes_foreign_translating_clean_track_over_placeholder_exact_hash() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("native_subtitles");
+
+        let mut base_lines = String::new();
+        let mut shifted_lines = String::new();
+        for idx in 0..20 {
+            let start_ms = 5_000 + (idx as i64) * 5_000;
+            let end_ms = start_ms + 2_000;
+            base_lines.push_str(&format!(
+                "{}\n{} --> {}\nRegular line {idx}.\n\n",
+                idx + 1,
+                format_srt_vtt_timestamp(start_ms, false),
+                format_srt_vtt_timestamp(end_ms, false),
+            ));
+            // Shifted +3,200ms relative to the ExactHash reference (simulating BluRay vs WEB-DL offset)
+            shifted_lines.push_str(&format!(
+                "{}\n{} --> {}\nRegular line {idx}.\n\n",
+                idx + 1,
+                format_srt_vtt_timestamp(start_ms + 3_200, false),
+                format_srt_vtt_timestamp(end_ms + 3_200, false),
+            ));
+        }
+
+        // Hash match candidate leaves foreign speech untranslated and has SDH cues.
+        let srt_hash_placeholder = format!(
+            "{base_lines}21\n00:02:00,000 --> 00:02:03,000\n[speaking Valyrian]\n\n22\n00:02:20,000 --> 00:02:23,000\n(in foreign language)\n\n23\n00:02:40,000 --> 00:02:43,000\n[door slams]\n"
+        );
+        // Candidate 2 leaves blank gaps at 02:00 & 02:20.
+        let srt_blank_gaps = base_lines.clone();
+        // Candidate 3 translates the foreign scenes cleanly at +3,200ms shifted timestamps.
+        let srt_translated = format!(
+            "{shifted_lines}21\n00:02:03,200 --> 00:02:06,200\nBend the knee or burn.\n\n22\n00:02:23,200 --> 00:02:26,200\nThe ships sail at dawn.\n"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let base_clone = base_url.clone();
+                let h_body = srt_hash_placeholder.clone();
+                let b_body = srt_blank_gaps.clone();
+                let t_body = srt_translated.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+
+                    let (status, ctype, body) = if path.starts_with("/osv3/subtitles/") {
+                        let json = serde_json::json!({
+                            "subtitles": [
+                                {
+                                    "id": "hash-ph",
+                                    "url": format!("{base_clone}/files/hash_ph.srt"),
+                                    "lang": "eng",
+                                    "hashMatch": true,
+                                    "SubFileName": "Show.S01E01.1080p.WEB-DL-GRP.srt"
+                                },
+                                {
+                                    "id": "blank",
+                                    "url": format!("{base_clone}/files/blank.srt"),
+                                    "lang": "eng",
+                                    "SubFileName": "Show.S01E01.1080p.WEB-DL-OTHER.srt"
+                                },
+                                {
+                                    "id": "translated",
+                                    "url": format!("{base_clone}/files/translated.srt"),
+                                    "lang": "eng",
+                                    "SubFileName": "Show.S01E01.1080p.BluRay-GOOD.srt"
+                                }
+                            ]
+                        });
+                        ("200 OK", "application/json", json.to_string())
+                    } else if path == "/files/hash_ph.srt" {
+                        ("200 OK", "text/plain", h_body)
+                    } else if path == "/files/blank.srt" {
+                        ("200 OK", "text/plain", b_body)
+                    } else if path == "/files/translated.srt" {
+                        ("200 OK", "text/plain", t_body)
+                    } else {
+                        ("404 Not Found", "text/plain", "not found".to_owned())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let endpoints = NativeSubtitleEndpoints {
+            opensubtitles_v3_base: format!("http://{addr}/osv3"),
+            ..Default::default()
+        };
+        let client = NativeSubtitleClient::with_endpoints(&cache_dir, endpoints);
+        let query = NativeSubtitleQuery {
+            imdb_id: "tt0944947".to_owned(),
+            media_type: "series".to_owned(),
+            season: Some(1),
+            episode: Some(1),
+            opensubhash: Some("abcdef1234567890".to_owned()),
+            video_filename: Some("Show.S01E01.1080p.WEB-DL-GRP.mkv".to_owned()),
+            preferred_langs: vec!["eng".to_owned()],
+            search_mode: SubtitleSearchMode::Full,
+            ..Default::default()
+        };
+
+        let fetched = client.search_and_fetch(&query, None, None, 4).await;
+        server_task.abort();
+
+        assert_eq!(fetched.len(), 3);
+        // Verified cross-tier alignment writes an aligned copy of BluRay-GOOD, promotes its tier to ExactHash,
+        // marks it Translated, and places it at index 0 locked to the ExactHash reference's 0ms timeline.
+        assert_eq!(fetched[0].release_name, "Show.S01E01.1080p.BluRay-GOOD.srt");
+        assert_eq!(fetched[0].match_tier, SubtitleMatchTier::ExactHash);
+        assert_eq!(
+            fetched[0].content_profile.foreign_status,
+            ForeignTranslationStatus::Translated
+        );
+        let aligned_txt = std::fs::read_to_string(&fetched[0].local_path).unwrap();
+        assert!(
+            aligned_txt.contains("00:02:00,000 --> 00:02:03,000"),
+            "expected aligned timestamps locked to ExactHash timeline, got:\n{aligned_txt}"
+        );
+        // Original ExactHash timing reference remains retained at index 1.
+        assert_eq!(fetched[1].release_name, "Show.S01E01.1080p.WEB-DL-GRP.srt");
+        assert_eq!(fetched[1].match_tier, SubtitleMatchTier::ExactHash);
+        // Blank-gap track must be detected as MissingForeign.
+        let blank = fetched
+            .iter()
+            .find(|s| s.release_name == "Show.S01E01.1080p.WEB-DL-OTHER.srt")
+            .unwrap();
+        assert_eq!(
+            blank.content_profile.foreign_status,
+            ForeignTranslationStatus::MissingForeign
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_oracle_detects_missing_foreign_gaps_and_forced_only_mode_ignores_all_english() {
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("native_subtitles");
+
+        let srt_blank = "1\n00:00:05,000 --> 00:00:08,000\nEnglish line.\n";
+        let srt_translated = "1\n00:00:05,000 --> 00:00:08,000\nEnglish line.\n\n2\n00:05:00,000 --> 00:05:03,000\nForeign speech translated!\n";
+        let srt_forced = "1\n00:05:00,500 --> 00:05:03,500\nForeign speech translated!\n";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let base_clone = base_url.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+
+                    let (status, ctype, body) = if path.starts_with("/osapi_none/subtitles") {
+                        // All-English movie with zero foreign_parts_only tracks.
+                        let json = serde_json::json!({
+                            "data": [{
+                                "attributes": {
+                                    "language": "en",
+                                    "release": "Comedy.2025.1080p.WEB-DL",
+                                    "foreign_parts_only": false,
+                                    "hearing_impaired": false,
+                                    "files": [{"file_id": 1001, "file_name": "full.srt"}]
+                                }
+                            }]
+                        });
+                        ("200 OK", "application/json", json.to_string())
+                    } else if path.starts_with("/osapi/subtitles") {
+                        let json = serde_json::json!({
+                            "data": [
+                                {
+                                    "attributes": {
+                                        "language": "en",
+                                        "release": "Epic.2025.WEB-DL-BLANK",
+                                        "moviehash_match": true,
+                                        "foreign_parts_only": false,
+                                        "download_count": 900,
+                                        "files": [{"file_id": 2001, "file_name": "blank.srt"}]
+                                    }
+                                },
+                                {
+                                    "attributes": {
+                                        "language": "en",
+                                        "release": "Epic.2025.WEB-DL-FULL",
+                                        "moviehash_match": true,
+                                        "foreign_parts_only": false,
+                                        "download_count": 200,
+                                        "files": [{"file_id": 2002, "file_name": "translated.srt"}]
+                                    }
+                                },
+                                {
+                                    "attributes": {
+                                        "language": "en",
+                                        "release": "Epic.2025.Forced",
+                                        "moviehash_match": true,
+                                        "foreign_parts_only": true,
+                                        "files": [{"file_id": 2003, "file_name": "forced.srt"}]
+                                    }
+                                }
+                            ]
+                        });
+                        ("200 OK", "application/json", json.to_string())
+                    } else if path == "/osapi/download" {
+                        let req_str = req.as_ref();
+                        let file_id = if req_str.contains("2001") {
+                            "blank"
+                        } else if req_str.contains("2002") {
+                            "translated"
+                        } else {
+                            "forced"
+                        };
+                        let json = serde_json::json!({
+                            "link": format!("{base_clone}/files/{file_id}.srt")
+                        });
+                        ("200 OK", "application/json", json.to_string())
+                    } else if path == "/files/blank.srt" {
+                        ("200 OK", "text/plain", srt_blank.to_owned())
+                    } else if path == "/files/translated.srt" {
+                        ("200 OK", "text/plain", srt_translated.to_owned())
+                    } else if path == "/files/forced.srt" {
+                        ("200 OK", "text/plain", srt_forced.to_owned())
+                    } else {
+                        ("404 Not Found", "text/plain", "not found".to_owned())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = NativeSubtitleClient::with_endpoints(
+            &cache_dir,
+            NativeSubtitleEndpoints {
+                opensubtitles_api_base: format!("http://{addr}/osapi_none"),
+                ..Default::default()
+            },
+        );
+        // 1. ForcedOnly on an all-English movie must return empty (never auto-enable full subs).
+        let forced_none = client
+            .search_and_fetch(
+                &NativeSubtitleQuery {
+                    imdb_id: "tt9999991".to_owned(),
+                    media_type: "movie".to_owned(),
+                    preferred_langs: vec!["eng".to_owned()],
+                    search_mode: SubtitleSearchMode::ForcedOnly,
+                    ..Default::default()
+                },
+                Some("k"),
+                None,
+                3,
+            )
+            .await;
+        assert!(forced_none.is_empty());
+
+        // 2. Full mode uses the same-timeline ExactHash Forced oracle to break ties within ExactHash.
+        client.set_endpoints(NativeSubtitleEndpoints {
+            opensubtitles_api_base: format!("http://{addr}/osapi"),
+            ..Default::default()
+        });
+        let full_res = client
+            .search_and_fetch(
+                &NativeSubtitleQuery {
+                    imdb_id: "tt9999992".to_owned(),
+                    media_type: "movie".to_owned(),
+                    preferred_langs: vec!["eng".to_owned()],
+                    search_mode: SubtitleSearchMode::Full,
+                    ..Default::default()
+                },
+                Some("k"),
+                None,
+                4,
+            )
+            .await;
+        assert_eq!(full_res.len(), 2);
+        assert_eq!(full_res[0].release_name, "Epic.2025.WEB-DL-FULL");
+        assert_eq!(
+            full_res[0].content_profile.foreign_status,
+            ForeignTranslationStatus::Translated
+        );
+        assert_eq!(
+            full_res[1].content_profile.foreign_status,
+            ForeignTranslationStatus::MissingForeign
+        );
+
+        // 3. ForcedOnly on the movie with foreign_parts_only=true returns only the forced track.
+        let forced_hit = client
+            .search_and_fetch(
+                &NativeSubtitleQuery {
+                    imdb_id: "tt9999992".to_owned(),
+                    media_type: "movie".to_owned(),
+                    preferred_langs: vec!["eng".to_owned()],
+                    search_mode: SubtitleSearchMode::ForcedOnly,
+                    ..Default::default()
+                },
+                Some("k"),
+                None,
+                3,
+            )
+            .await;
+        server_task.abort();
+        assert_eq!(forced_hit.len(), 1);
+        assert!(forced_hit[0].forced);
+        assert_eq!(forced_hit[0].release_name, "Epic.2025.Forced");
+    }
+
+    #[test]
+    fn extracts_release_group_after_stripping_trailing_subtitle_suffixes() {
+        assert_eq!(
+            extract_subtitle_release_group(
+                "Game.of.Thrones.S01E01.720p.HDTV.DD5.1.x264-EbP.HI.srt"
+            )
+            .as_deref(),
+            Some("EbP")
+        );
+        assert_eq!(
+            extract_subtitle_release_group(
+                "Game.of.Thrones.S01E01.1080p.BluRay.x264-ROVERS.eng.sdh.forced.vtt"
+            )
+            .as_deref(),
+            Some("ROVERS")
+        );
+        assert_eq!(
+            extract_subtitle_release_group(
+                "Show.S02E03.1080p.WEB-DL.DDP5.1.H.265-NTb.en.cc.ass"
+            )
+            .as_deref(),
+            Some("NTb")
+        );
+        assert_eq!(
+            extract_subtitle_release_group("Movie.2024.1080p.BluRay-HI.srt"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn opensubtitles_v3_camelcase_got_bluray_ranks_first_and_never_promotes_m_i() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let plain_hits = Arc::new(AtomicUsize::new(0));
+        let plain_hits_srv = Arc::clone(&plain_hits);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let base_clone = base_url.clone();
+                let plain_counter = Arc::clone(&plain_hits_srv);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+
+                    let (status, ctype, body) = if path.contains("videoHash=") {
+                        // Real-world OpenSubtitles v3 camelCase payload:
+                        // #1-#3 are HDTV with m="i" (IMDb fallback, NOT hash match),
+                        // #4 is BluRay with m="i", #5 is wrong episode S01E02!
+                        let json = serde_json::json!({
+                            "subtitles": [
+                                {
+                                    "id": "got-hdtv-1",
+                                    "url": format!("{base_clone}/hdtv1.srt"),
+                                    "lang": "eng",
+                                    "subtitleFileName": "Game.of.Thrones.S01E01.720p.HDTV.DD5.1.x264-EbP.HI.srt",
+                                    "movieReleaseName": "Game.of.Thrones.S01E01.720p.HDTV.DD5.1.x264-EbP",
+                                    "releaseGroup": "EbP",
+                                    "releaseFormat": "HDTV",
+                                    "fpsMilli": 23976,
+                                    "season": 1,
+                                    "episode": 1,
+                                    "m": "i"
+                                },
+                                {
+                                    "id": "got-hdtv-2",
+                                    "url": format!("{base_clone}/hdtv2.srt"),
+                                    "lang": "eng",
+                                    "subtitleFileName": "Game.of.Thrones.1x01.srt",
+                                    "releaseGroup": "CTU",
+                                    "releaseFormat": "HDTV",
+                                    "fpsMilli": 25000,
+                                    "season": 1,
+                                    "episode": 1,
+                                    "m": "i"
+                                },
+                                {
+                                    "id": "got-hdtv-3",
+                                    "url": format!("{base_clone}/hdtv3.srt"),
+                                    "lang": "eng",
+                                    "movieReleaseName": "Game.of.Thrones.S01E01.HDTV.XviD-FEVER",
+                                    "releaseFormat": "HDTV",
+                                    "fpsMilli": 23976,
+                                    "season": 1,
+                                    "episode": 1,
+                                    "m": "i"
+                                },
+                                {
+                                    "id": "got-bluray-4",
+                                    "url": format!("{base_clone}/bluray4.srt"),
+                                    "lang": "eng",
+                                    "subtitleFileName": "Game.of.Thrones.S01E01.1080p.BluRay.x264-EbP.srt",
+                                    "movieReleaseName": "Game.of.Thrones.S01E01.1080p.BluRay.x264-EbP",
+                                    "releaseGroup": "EbP",
+                                    "releaseFormat": "BluRay",
+                                    "fpsMilli": 23976,
+                                    "season": 1,
+                                    "episode": 1,
+                                    "m": "i"
+                                },
+                                {
+                                    "id": "got-wrong-ep",
+                                    "url": format!("{base_clone}/wrong_ep.srt"),
+                                    "lang": "eng",
+                                    "subtitleFileName": "Game.of.Thrones.S01E02.1080p.BluRay.x264-EbP.srt",
+                                    "releaseFormat": "BluRay",
+                                    "fpsMilli": 23976,
+                                    "season": 1,
+                                    "episode": 2,
+                                    "m": "h"
+                                }
+                            ]
+                        });
+                        ("200 OK", "application/json", json.to_string())
+                    } else if path.ends_with(".json") {
+                        plain_counter.fetch_add(1, Ordering::Relaxed);
+                        // Even if plain_url existed with different IDs, m="i" must NOT trigger a plain fetch!
+                        ("200 OK", "application/json", r#"{"subtitles":[]}"#.to_owned())
+                    } else {
+                        (
+                            "200 OK",
+                            "text/plain",
+                            "1\n00:00:05,000 --> 00:00:07,000\nWinter is coming.\n".to_owned(),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let endpoints = NativeSubtitleEndpoints {
+            opensubtitles_v3_base: format!("http://{addr}/osv3"),
+            ..Default::default()
+        };
+        let client = NativeSubtitleClient::with_endpoints(dir.path(), endpoints);
+        let query = NativeSubtitleQuery {
+            imdb_id: "tt0944947".to_owned(),
+            media_type: "series".to_owned(),
+            season: Some(1),
+            episode: Some(1),
+            opensubhash: Some("0123456789abcdef".to_owned()),
+            video_byte_size: Some(4_200_000_000),
+            video_filename: Some(
+                "Game.of.Thrones.S01E01.1080p.BluRay.23.976fps.x264-ROVERS.mkv".to_owned(),
+            ),
+            preferred_langs: vec!["eng".to_owned()],
+            ..Default::default()
+        };
+
+        let fetched = client.search_and_fetch(&query, None, None, 5).await;
+        server.abort();
+
+        // Plain URL must NOT have been fetched because primary response carried explicit `"m"`.
+        assert_eq!(plain_hits.load(Ordering::Relaxed), 0);
+        // Wrong episode S01E02 must be skipped even though it had m="h".
+        assert_eq!(fetched.len(), 4);
+        assert!(!fetched
+            .iter()
+            .any(|s| s.release_name.contains("S01E02")));
+
+        // #1 MUST be the BluRay candidate (CompatibleCut), NEVER promoted to ExactHash since m="i"!
+        assert_eq!(
+            fetched[0].release_name,
+            "Game.of.Thrones.S01E01.1080p.BluRay.x264-EbP.srt"
+        );
+        assert_eq!(fetched[0].match_tier, SubtitleMatchTier::CompatibleCut);
+
+        // All three HDTV candidates MUST be Conflicting (never ExactHash despite m="i" and hash query).
+        for hdtv in &fetched[1..] {
+            assert_eq!(
+                hdtv.match_tier,
+                SubtitleMatchTier::Conflicting,
+                "expected HDTV track {} to be Conflicting",
+                hdtv.release_name
+            );
+        }
+    }
+
+    #[test]
+    fn strict_sync_first_prevents_translated_conflicting_or_lower_tier_from_outranking_higher_tier()
+    {
+        let dir = tempdir().unwrap();
+
+        let mut base_srt = String::new();
+        for idx in 0..20 {
+            let s = 10_000 + (idx as i64) * 5_000;
+            base_srt.push_str(&format!(
+                "{}\n{} --> {}\nSpoken line {idx}\n\n",
+                idx + 1,
+                format_srt_vtt_timestamp(s, false),
+                format_srt_vtt_timestamp(s + 2_000, false),
+            ));
+        }
+
+        // CompatibleCut track has a placeholder (and is NOT trusted sync, so cross-tier alignment doesn't run)
+        let compat_srt = format!(
+            "{base_srt}21\n00:03:00,000 --> 00:03:03,000\n[speaking Dothraki]\n"
+        );
+        // Conflicting HDTV track translates 03:00 cleanly AND matches onsets -> gets Translated status
+        let conflict_srt = format!(
+            "{base_srt}21\n00:03:00,000 --> 00:03:03,000\nThe stallion who mounts the world.\n"
+        );
+
+        let compat_path = write_cached_subtitle(dir.path(), &compat_srt, "srt").unwrap();
+        let conflict_path = write_cached_subtitle(dir.path(), &conflict_srt, "srt").unwrap();
+
+        let compat_analysis = analyze_subtitle_content(&compat_srt);
+        let conflict_analysis = analyze_subtitle_content(&conflict_srt);
+
+        let downloaded = vec![
+            DownloadedSubtitleAnalysis {
+                sub: FetchedNativeSubtitle {
+                    provider: "OpenSubtitles v3".to_owned(),
+                    lang: "en".to_owned(),
+                    title: "BluRay".to_owned(),
+                    release_name: "Show.S01E01.1080p.BluRay-A.srt".to_owned(),
+                    match_tier: SubtitleMatchTier::CompatibleCut,
+                    score: 1_100_000,
+                    local_path: compat_path,
+                    lookup_elapsed_ms: 0,
+                    hearing_impaired: false,
+                    forced: false,
+                    content_profile: compat_analysis.profile.clone(),
+                },
+                analysis: compat_analysis,
+            },
+            DownloadedSubtitleAnalysis {
+                sub: FetchedNativeSubtitle {
+                    provider: "OpenSubtitles v3".to_owned(),
+                    lang: "en".to_owned(),
+                    title: "HDTV".to_owned(),
+                    release_name: "Show.S01E01.720p.HDTV-B.srt".to_owned(),
+                    match_tier: SubtitleMatchTier::Conflicting,
+                    score: -1_000_000,
+                    local_path: conflict_path,
+                    lookup_elapsed_ms: 0,
+                    hearing_impaired: false,
+                    forced: false,
+                    content_profile: conflict_analysis.profile.clone(),
+                },
+                analysis: conflict_analysis,
+            },
+        ];
+
+        let ranked = rerank_downloaded_subtitles(
+            downloaded,
+            SubtitleSearchMode::Full,
+            4,
+            dir.path(),
+        );
+        assert_eq!(ranked.len(), 2);
+        // CompatibleCut MUST stay #1 even though Conflicting HDTV is Translated!
+        assert_eq!(ranked[0].match_tier, SubtitleMatchTier::CompatibleCut);
+        assert_eq!(ranked[1].match_tier, SubtitleMatchTier::Conflicting);
+        assert_eq!(
+            ranked[1].content_profile.foreign_status,
+            ForeignTranslationStatus::Translated
+        );
+    }
+
+    #[test]
+    fn shifted_unaligned_track_never_false_positives_as_translated_against_oracles() {
+        let dir = tempdir().unwrap();
+
+        // Placeholder oracle with 20 cues at 10s, 15s, ... + placeholder at 03:00
+        let mut oracle_srt = String::new();
+        for idx in 0..20 {
+            let s = 10_000 + (idx as i64) * 5_000;
+            oracle_srt.push_str(&format!(
+                "{}\n{} --> {}\nOracle line {idx}\n\n",
+                idx + 1,
+                format_srt_vtt_timestamp(s, false),
+                format_srt_vtt_timestamp(s + 2_000, false),
+            ));
+        }
+        oracle_srt.push_str("21\n00:03:00,000 --> 00:03:03,000\n[speaking Valyrian]\n");
+
+        // Unrelated/mismatched-cut candidate with completely different cue spacing
+        // that happens to have a random English cue right at 03:00:00!
+        let mut unrelated_srt = String::new();
+        for idx in 0..20 {
+            let s = 7_000 + (idx as i64) * 8_300;
+            unrelated_srt.push_str(&format!(
+                "{}\n{} --> {}\nUnrelated cut line {idx}\n\n",
+                idx + 1,
+                format_srt_vtt_timestamp(s, false),
+                format_srt_vtt_timestamp(s + 2_000, false),
+            ));
+        }
+        unrelated_srt.push_str("21\n00:03:00,200 --> 00:03:02,800\nRandom English line.\n");
+
+        // Unaligned Fallback Forced track with a cue at 03:00:00
+        let forced_srt = "1\n00:03:00,000 --> 00:03:03,000\nForeign forced line.\n";
+
+        let oracle_path = write_cached_subtitle(dir.path(), &oracle_srt, "srt").unwrap();
+        let unrelated_path = write_cached_subtitle(dir.path(), &unrelated_srt, "srt").unwrap();
+        let forced_path = write_cached_subtitle(dir.path(), forced_srt, "srt").unwrap();
+
+        let oracle_analysis = analyze_subtitle_content(&oracle_srt);
+        let unrelated_analysis = analyze_subtitle_content(&unrelated_srt);
+        let forced_analysis = analyze_subtitle_content(forced_srt);
+
+        let downloaded = vec![
+            DownloadedSubtitleAnalysis {
+                sub: FetchedNativeSubtitle {
+                    provider: "OSv3".to_owned(),
+                    lang: "en".to_owned(),
+                    title: "ExactHash".to_owned(),
+                    release_name: "Show.S01E01.WEB-DL-REF.srt".to_owned(),
+                    match_tier: SubtitleMatchTier::ExactHash,
+                    score: 10_500_000,
+                    local_path: oracle_path,
+                    lookup_elapsed_ms: 0,
+                    hearing_impaired: false,
+                    forced: false,
+                    content_profile: oracle_analysis.profile.clone(),
+                },
+                analysis: oracle_analysis,
+            },
+            DownloadedSubtitleAnalysis {
+                sub: FetchedNativeSubtitle {
+                    provider: "OSv3".to_owned(),
+                    lang: "en".to_owned(),
+                    title: "Unrelated".to_owned(),
+                    release_name: "Show.S01E01.HDTV-BAD.srt".to_owned(),
+                    match_tier: SubtitleMatchTier::Conflicting,
+                    score: -1_000_000,
+                    local_path: unrelated_path,
+                    lookup_elapsed_ms: 0,
+                    hearing_impaired: false,
+                    forced: false,
+                    content_profile: unrelated_analysis.profile.clone(),
+                },
+                analysis: unrelated_analysis,
+            },
+            DownloadedSubtitleAnalysis {
+                sub: FetchedNativeSubtitle {
+                    provider: "OSv3".to_owned(),
+                    lang: "en".to_owned(),
+                    title: "Forced".to_owned(),
+                    release_name: "Show.S01E01.Forced.srt".to_owned(),
+                    match_tier: SubtitleMatchTier::Fallback,
+                    score: 500_000,
+                    local_path: forced_path,
+                    lookup_elapsed_ms: 0,
+                    hearing_impaired: false,
+                    forced: true,
+                    content_profile: forced_analysis.profile.clone(),
+                },
+                analysis: forced_analysis,
+            },
+        ];
+
+        let ranked = rerank_downloaded_subtitles(
+            downloaded,
+            SubtitleSearchMode::Full,
+            4,
+            dir.path(),
+        );
+        assert_eq!(ranked.len(), 2);
+        // ExactHash stays #1 because unrelated track failed both oracle alignment AND cross-tier alignment!
+        assert_eq!(ranked[0].release_name, "Show.S01E01.WEB-DL-REF.srt");
+        assert_eq!(ranked[0].match_tier, SubtitleMatchTier::ExactHash);
+        // Unrelated track MUST remain Unknown (never falsely marked Translated!)
+        assert_eq!(ranked[1].release_name, "Show.S01E01.HDTV-BAD.srt");
+        assert_eq!(
+            ranked[1].content_profile.foreign_status,
+            ForeignTranslationStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn align_subtitle_file_to_reference_text_aligns_valid_and_rejects_low_confidence() {
+        let dir = tempdir().unwrap();
+
+        let mut ref_srt = String::new();
+        let mut target_srt = String::new();
+        let mut decoy_srt = String::new();
+        for idx in 0..16 {
+            let s = 12_000 + (idx as i64) * 4_500;
+            ref_srt.push_str(&format!(
+                "{}\n{} --> {}\nReference line {idx}\n\n",
+                idx + 1,
+                format_srt_vtt_timestamp(s, false),
+                format_srt_vtt_timestamp(s + 2_000, false),
+            ));
+            target_srt.push_str(&format!(
+                "{}\n{} --> {}\nTarget line {idx}\n\n",
+                idx + 1,
+                format_srt_vtt_timestamp(s + 2_750, false),
+                format_srt_vtt_timestamp(s + 4_750, false),
+            ));
+            let decoy_s = 3_000 + (idx as i64) * 9_100;
+            decoy_srt.push_str(&format!(
+                "{}\n{} --> {}\nDecoy line {idx}\n\n",
+                idx + 1,
+                format_srt_vtt_timestamp(decoy_s, false),
+                format_srt_vtt_timestamp(decoy_s + 1_500, false),
+            ));
+        }
+
+        let target_path = dir.path().join("target.srt");
+        let decoy_path = dir.path().join("decoy.srt");
+        let out_path = dir.path().join("aligned.srt");
+        std::fs::write(&target_path, &target_srt).unwrap();
+        std::fs::write(&decoy_path, &decoy_srt).unwrap();
+
+        let res = SubtitleSyncAligner::align_subtitle_file_to_reference_text(
+            &target_path,
+            &ref_srt,
+            &out_path,
+        )
+        .expect("high-confidence alignment should succeed");
+        assert!(res.matched_onsets >= 10);
+        assert!(res.confidence >= 0.40);
+        assert!((res.offset_ms - (-2_750)).abs() <= 5);
+        let rewritten = std::fs::read_to_string(&out_path).unwrap();
+        assert!(rewritten.contains("00:00:12,000 --> 00:00:14,000"));
+
+        let decoy_out = dir.path().join("decoy_aligned.srt");
+        let err = SubtitleSyncAligner::align_subtitle_file_to_reference_text(
+            &decoy_path,
+            &ref_srt,
+            &decoy_out,
+        )
+        .expect_err("unrelated cut must be rejected");
+        assert!(err.contains("confidence") || err.contains("Insufficient"));
+        assert!(!decoy_out.exists());
     }
 }

@@ -11,7 +11,12 @@ use std::{
 };
 
 use gpui::RenderImage;
-use image::{imageops::FilterType, Frame, RgbaImage};
+use image::{
+    codecs::jpeg::JpegEncoder,
+    codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+    imageops::FilterType,
+    ExtendedColorType, Frame, ImageEncoder, RgbImage, RgbaImage,
+};
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
 use smallvec::{smallvec, SmallVec};
@@ -25,12 +30,13 @@ const HTTP_POSTER_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_POSTER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FAILED_ENTRIES: usize = 256;
 const DISK_PRUNE_INTERVAL_WRITES: u64 = 200;
+const VARIANT_JPEG_QUALITY: u8 = 82;
 
-pub const MAX_DECODED_TEXTURES: usize = 128;
-pub const MAX_THUMB_TEXTURES: usize = 32;
-pub const MAX_AMBIENT_TEXTURES: usize = 16;
-pub const MAX_HERO_TEXTURES: usize = 4;
-pub const MAX_STILL_TEXTURES: usize = 48;
+pub const MAX_DECODED_TEXTURES: usize = 64;
+pub const MAX_THUMB_TEXTURES: usize = 16;
+pub const MAX_AMBIENT_TEXTURES: usize = 6;
+pub const MAX_HERO_TEXTURES: usize = 2;
+pub const MAX_STILL_TEXTURES: usize = 24;
 
 pub const PLAYBACK_RETAINED_DECODED_TEXTURES: usize = 16;
 pub const PLAYBACK_RETAINED_THUMB_TEXTURES: usize = 8;
@@ -38,15 +44,22 @@ pub const PLAYBACK_RETAINED_HERO_TEXTURES: usize = 2;
 pub const PLAYBACK_RETAINED_AMBIENT_TEXTURES: usize = 2;
 pub const PLAYBACK_RETAINED_STILL_TEXTURES: usize = 8;
 
-pub const MAX_DISK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+pub const ROUTE_RETAINED_DECODED_TEXTURES: usize = 24;
+pub const ROUTE_RETAINED_STILL_TEXTURES: usize = 8;
+pub const ROUTE_RETAINED_THUMB_TEXTURES: usize = 8;
+pub const ROUTE_RETAINED_AMBIENT_TEXTURES: usize = 2;
+pub const ROUTE_RETAINED_HERO_TEXTURES: usize = 1;
 
-const POSTER_MAX_W: u32 = 300;
-const POSTER_MAX_H: u32 = 450;
+pub const MAX_DISK_CACHE_BYTES: u64 = 96 * 1024 * 1024;
+
+const POSTER_MAX_W: u32 = 240;
+const POSTER_MAX_H: u32 = 360;
 const POSTER_CDN_MAX_W: u32 = 342;
 const THUMB_MAX_W: u32 = 80;
 const THUMB_MAX_H: u32 = 120;
-const WIDESCREEN_MAX_W: u32 = 640;
-const WIDESCREEN_MAX_H: u32 = 360;
+const WIDESCREEN_MAX_W: u32 = 480;
+const WIDESCREEN_MAX_H: u32 = 270;
+const WIDESCREEN_CDN_MAX_W: u32 = 780;
 pub const STILL_MAX_W: u32 = 320;
 pub const STILL_MAX_H: u32 = 180;
 pub const HERO_MAX_W: u32 = 1280;
@@ -58,10 +71,6 @@ pub const AMBIENT_BLEED_WIDTH: u32 = 48;
 pub const AMBIENT_BLEED_HEIGHT: u32 = 27;
 
 const PROTECTED_EPOCH_WINDOW: u64 = 2;
-
-const SIDECAR_MAGIC: &[u8; 4] = b"FBG1";
-const SIDECAR_HEADER_LEN: usize = 12;
-const SIDECAR_MAX_DIMENSION: u32 = 2048;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CacheEntry {
@@ -95,13 +104,6 @@ impl ImageVariant {
             Self::Still => "still",
             Self::Ambient => "ambient",
         }
-    }
-
-    const fn uses_sidecar(self) -> bool {
-        matches!(
-            self,
-            Self::Poster | Self::Thumb | Self::Still | Self::Ambient
-        )
     }
 }
 
@@ -547,12 +549,17 @@ pub fn cache_path_for_url(cache_root: &Path, url: &str) -> PathBuf {
     cache_root.join(shard).join(format!("{digest}.{ext}"))
 }
 
-pub fn sidecar_path_for_url(cache_root: &Path, url: &str, variant: &str) -> PathBuf {
+pub fn variant_cache_path_for_url(cache_root: &Path, url: &str, variant: &str) -> PathBuf {
     let digest = url_sha256_hex(url);
     let shard = &digest[..2];
+    let ext = if variant == ImageVariant::Logo.as_str() {
+        "png"
+    } else {
+        "jpg"
+    };
     cache_root
         .join(shard)
-        .join(format!("{digest}.{variant}.bin"))
+        .join(format!("{digest}.{variant}.{ext}"))
 }
 
 fn infer_image_extension(url_str: &str) -> &'static str {
@@ -572,14 +579,8 @@ fn infer_image_extension(url_str: &str) -> &'static str {
     }
 }
 
-pub fn decode_scaled_render_image(bytes: &[u8], max_w: u32, max_h: u32) -> Option<Arc<RenderImage>> {
-    let dyn_img = image::load_from_memory(bytes).ok()?;
-    let resized = if dyn_img.width() > max_w || dyn_img.height() > max_h {
-        dyn_img.resize(max_w, max_h, FilterType::Triangle)
-    } else {
-        dyn_img
-    };
-    let mut rgba = resized.to_rgba8();
+fn dynamic_image_to_render_image(dyn_img: image::DynamicImage) -> Arc<RenderImage> {
+    let mut rgba = dyn_img.to_rgba8();
     for px_slice in rgba.as_chunks_mut::<4>().0 {
         let a = px_slice[3];
         if a == 255 {
@@ -599,10 +600,74 @@ pub fn decode_scaled_render_image(bytes: &[u8], max_w: u32, max_h: u32) -> Optio
         }
     }
     let frame = Frame::new(rgba);
-    Some(Arc::new(RenderImage::new(smallvec![frame])))
+    Arc::new(RenderImage::new(smallvec![frame]))
 }
 
-pub fn build_ambient_bleed_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+fn encode_variant_bytes(dyn_img: &image::DynamicImage, variant: ImageVariant) -> Option<Vec<u8>> {
+    if dyn_img.width() == 0 || dyn_img.height() == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    match variant {
+        ImageVariant::Logo => {
+            let rgba = dyn_img.to_rgba8();
+            let encoder = PngEncoder::new_with_quality(
+                &mut out,
+                CompressionType::Default,
+                PngFilterType::Adaptive,
+            );
+            encoder
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    ExtendedColorType::Rgba8,
+                )
+                .ok()?;
+        }
+        ImageVariant::Poster
+        | ImageVariant::Thumb
+        | ImageVariant::Wide
+        | ImageVariant::Still
+        | ImageVariant::Hero
+        | ImageVariant::Ambient => {
+            let rgb = dyn_img.to_rgb8();
+            let mut encoder = JpegEncoder::new_with_quality(&mut out, VARIANT_JPEG_QUALITY);
+            encoder.encode_image(&rgb).ok()?;
+        }
+        ImageVariant::Raw => return None,
+    }
+    Some(out)
+}
+
+pub fn decode_scaled_render_image(bytes: &[u8], max_w: u32, max_h: u32) -> Option<Arc<RenderImage>> {
+    let dyn_img = image::load_from_memory(bytes).ok()?;
+    let resized = if dyn_img.width() > max_w || dyn_img.height() > max_h {
+        dyn_img.resize(max_w, max_h, FilterType::Triangle)
+    } else {
+        dyn_img
+    };
+    Some(dynamic_image_to_render_image(resized))
+}
+
+fn decode_scaled_and_encode_variant(
+    bytes: &[u8],
+    max_w: u32,
+    max_h: u32,
+    variant: ImageVariant,
+) -> Option<(Arc<RenderImage>, Vec<u8>)> {
+    let dyn_img = image::load_from_memory(bytes).ok()?;
+    let resized = if dyn_img.width() > max_w || dyn_img.height() > max_h {
+        dyn_img.resize(max_w, max_h, FilterType::Triangle)
+    } else {
+        dyn_img
+    };
+    let encoded = encode_variant_bytes(&resized, variant)?;
+    let render_img = dynamic_image_to_render_image(resized);
+    Some((render_img, encoded))
+}
+
+fn build_ambient_bleed_rgba_raw(bytes: &[u8]) -> Option<Vec<u8>> {
     let dyn_img = image::load_from_memory(bytes).ok()?;
     let small = dyn_img
         .resize_exact(AMBIENT_BLEED_WIDTH, AMBIENT_BLEED_HEIGHT, FilterType::Triangle)
@@ -624,65 +689,43 @@ pub fn build_ambient_bleed_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
         let b = px_slice[2] as f32;
         let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         let sat = 1.18_f32;
-        let nr = (luma + (r - luma) * sat).clamp(0.0, 255.0) as u8;
-        let ng = (luma + (g - luma) * sat).clamp(0.0, 255.0) as u8;
-        let nb = (luma + (b - luma) * sat).clamp(0.0, 255.0) as u8;
-        px_slice[0] = nb;
-        px_slice[1] = ng;
-        px_slice[2] = nr;
+        px_slice[0] = (luma + (r - luma) * sat).clamp(0.0, 255.0) as u8;
+        px_slice[1] = (luma + (g - luma) * sat).clamp(0.0, 255.0) as u8;
+        px_slice[2] = (luma + (b - luma) * sat).clamp(0.0, 255.0) as u8;
         px_slice[3] = 255;
     }
 
+    Some(src)
+}
+
+fn rgba_bleed_to_render_image(mut src: Vec<u8>) -> Option<Arc<RenderImage>> {
+    for px_slice in src.as_chunks_mut::<4>().0 {
+        px_slice.swap(0, 2);
+    }
     let bgra_buf = RgbaImage::from_raw(AMBIENT_BLEED_WIDTH, AMBIENT_BLEED_HEIGHT, src)?;
     let frame = Frame::new(bgra_buf);
     Some(Arc::new(RenderImage::new(smallvec![frame])))
 }
 
-fn encode_sidecar_bytes(image: &RenderImage) -> Option<Vec<u8>> {
-    let size = image.size(0);
-    if size.width.0 <= 0 || size.height.0 <= 0 {
-        return None;
-    }
-    let width = size.width.0 as u32;
-    let height = size.height.0 as u32;
-    let raw = image.as_bytes(0)?;
-    let expected_len = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
-    if raw.len() != expected_len {
-        return None;
-    }
-    let mut out = Vec::with_capacity(SIDECAR_HEADER_LEN + raw.len());
-    out.extend_from_slice(SIDECAR_MAGIC);
-    out.extend_from_slice(&width.to_le_bytes());
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(raw);
-    Some(out)
+pub fn build_ambient_bleed_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let src = build_ambient_bleed_rgba_raw(bytes)?;
+    rgba_bleed_to_render_image(src)
 }
 
-fn decode_sidecar_render_image(
-    bytes: &[u8],
-    max_w: u32,
-    max_h: u32,
-) -> Option<Arc<RenderImage>> {
-    if bytes.len() < SIDECAR_HEADER_LEN || &bytes[0..4] != SIDECAR_MAGIC {
-        return None;
+fn build_ambient_bleed_and_encode(bytes: &[u8]) -> Option<(Arc<RenderImage>, Vec<u8>)> {
+    let src = build_ambient_bleed_rgba_raw(bytes)?;
+    let mut rgb_raw = Vec::with_capacity((AMBIENT_BLEED_WIDTH * AMBIENT_BLEED_HEIGHT * 3) as usize);
+    for px_slice in src.as_chunks::<4>().0 {
+        rgb_raw.push(px_slice[0]);
+        rgb_raw.push(px_slice[1]);
+        rgb_raw.push(px_slice[2]);
     }
-    let width = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-    let height = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    if width == 0
-        || height == 0
-        || width > max_w
-        || height > max_h
-        || width > SIDECAR_MAX_DIMENSION
-        || height > SIDECAR_MAX_DIMENSION
-    {
-        return None;
-    }
-    let expected_len = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
-    if bytes.len() != SIDECAR_HEADER_LEN + expected_len {
-        return None;
-    }
-    let bgra = RgbaImage::from_raw(width, height, bytes[SIDECAR_HEADER_LEN..].to_vec())?;
-    Some(Arc::new(RenderImage::new(smallvec![Frame::new(bgra)])))
+    let rgb_img = RgbImage::from_raw(AMBIENT_BLEED_WIDTH, AMBIENT_BLEED_HEIGHT, rgb_raw)?;
+    let mut encoded = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut encoded, VARIANT_JPEG_QUALITY);
+    encoder.encode_image(&rgb_img).ok()?;
+    let render_img = rgba_bleed_to_render_image(src)?;
+    Some((render_img, encoded))
 }
 
 struct DiskCacheFile {
@@ -691,9 +734,75 @@ struct DiskCacheFile {
     path: PathBuf,
 }
 
-pub fn prune_disk_cache_to_budget(cache_root: &Path, max_bytes: u64) -> u64 {
-    if !cache_root.is_dir() {
+fn is_legacy_sidecar_file(path: &Path) -> bool {
+    const LEGACY_SIDECAR_MAGIC: &[u8; 4] = b"FBG1";
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".fbg1") || lower.starts_with("sidecar_") {
+        return true;
+    }
+    if lower.ends_with(".bin") {
+        if let Ok(mut f) = std::fs::File::open(path) {
+            use std::io::Read as _;
+            let mut magic = [0_u8; 4];
+            if f.read_exact(&mut magic).is_ok() && &magic == LEGACY_SIDECAR_MAGIC {
+                return true;
+            }
+        }
+        return matches!(
+            lower.rsplit('.').nth(1),
+            Some("poster" | "thumb" | "wide" | "hero" | "logo" | "still" | "ambient")
+        );
+    }
+    false
+}
+
+fn is_recent_part_file(path: &Path, meta: &std::fs::Metadata, now: SystemTime) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".part."))
+        && meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_none_or(|age| age < Duration::from_secs(60))
+}
+
+fn measure_dir_bytes(root: &Path) -> u64 {
+    if !root.is_dir() {
         return 0;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    let mut total_bytes: u64 = 0;
+    let now = SystemTime::now();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() && !is_recent_part_file(&path, &meta, now) {
+                total_bytes = total_bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    total_bytes
+}
+
+fn prune_disk_cache_internal(
+    cache_root: &Path,
+    max_bytes: u64,
+    remove_legacy_sidecars: bool,
+) -> (u64, u64) {
+    if !cache_root.is_dir() {
+        return (0, 0);
     }
     let mut stack = vec![cache_root.to_path_buf()];
     let mut files: Vec<DiskCacheFile> = Vec::new();
@@ -712,16 +821,11 @@ pub fn prune_disk_cache_to_budget(cache_root: &Path, max_bytes: u64) -> u64 {
             if meta.is_dir() {
                 stack.push(path);
             } else if meta.is_file() {
-                let is_recent_part = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains(".part."))
-                    && meta
-                        .modified()
-                        .ok()
-                        .and_then(|m| now.duration_since(m).ok())
-                        .is_none_or(|age| age < Duration::from_secs(60));
-                if is_recent_part {
+                if is_recent_part_file(&path, &meta, now) {
+                    continue;
+                }
+                if remove_legacy_sidecars && is_legacy_sidecar_file(&path) {
+                    let _ = std::fs::remove_file(&path);
                     continue;
                 }
                 let len = meta.len();
@@ -733,7 +837,7 @@ pub fn prune_disk_cache_to_budget(cache_root: &Path, max_bytes: u64) -> u64 {
     }
 
     if total_bytes <= max_bytes {
-        return 0;
+        return (0, total_bytes);
     }
 
     files.sort_unstable_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.path.cmp(&b.path)));
@@ -747,7 +851,11 @@ pub fn prune_disk_cache_to_budget(cache_root: &Path, max_bytes: u64) -> u64 {
             freed = freed.saturating_add(file.len);
         }
     }
-    freed
+    (freed, total_bytes)
+}
+
+pub fn prune_disk_cache_to_budget(cache_root: &Path, max_bytes: u64) -> u64 {
+    prune_disk_cache_internal(cache_root, max_bytes, false).0
 }
 
 fn box_blur_horizontal(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) {
@@ -835,7 +943,7 @@ impl DecodeTargetSpec {
     };
     const WIDE: Self = Self {
         variant: ImageVariant::Wide,
-        cdn_max_w: WIDESCREEN_MAX_W,
+        cdn_max_w: WIDESCREEN_CDN_MAX_W,
         max_w: WIDESCREEN_MAX_W,
         max_h: WIDESCREEN_MAX_H,
         target: LruTarget::Decoded,
@@ -870,11 +978,17 @@ impl DecodeTargetSpec {
     };
 }
 
+struct InFlightDownload {
+    notify: Notify,
+    result: Mutex<Option<Option<Arc<Vec<u8>>>>>,
+}
+
 struct PosterCacheInner {
     cache_root: PathBuf,
     entries: RwLock<HashMap<String, CacheEntry>>,
     failed_entry_urls: Mutex<VecDeque<String>>,
     in_flight_urls: Mutex<HashMap<String, Arc<Notify>>>,
+    in_flight_downloads: Mutex<HashMap<String, Arc<InFlightDownload>>>,
     initialized_dirs: Mutex<HashSet<PathBuf>>,
     decoded_lru: Mutex<BoundedTextureLru>,
     thumb_lru: Mutex<BoundedTextureLru>,
@@ -891,7 +1005,10 @@ struct PosterCacheInner {
     temp_seq: AtomicU64,
     render_epoch: AtomicU64,
     disk_writes: AtomicU64,
+    disk_cache_bytes: AtomicU64,
+    disk_epoch: AtomicU64,
     disk_prune_in_flight: AtomicBool,
+    disk_maintenance_notify: Notify,
 }
 
 impl PosterCacheInner {
@@ -932,6 +1049,7 @@ impl PosterCache {
             entries: RwLock::new(HashMap::with_capacity(256)),
             failed_entry_urls: Mutex::new(VecDeque::with_capacity(64)),
             in_flight_urls: Mutex::new(HashMap::with_capacity(32)),
+            in_flight_downloads: Mutex::new(HashMap::with_capacity(32)),
             initialized_dirs: Mutex::new(HashSet::with_capacity(64)),
             decoded_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_DECODED_TEXTURES)),
             thumb_lru: Mutex::new(BoundedTextureLru::with_capacity(MAX_THUMB_TEXTURES)),
@@ -948,11 +1066,14 @@ impl PosterCache {
             temp_seq: AtomicU64::new(1),
             render_epoch: AtomicU64::new(1),
             disk_writes: AtomicU64::new(0),
+            disk_cache_bytes: AtomicU64::new(0),
+            disk_epoch: AtomicU64::new(1),
             disk_prune_in_flight: AtomicBool::new(false),
+            disk_maintenance_notify: Notify::new(),
         });
 
         if inner.cache_root.is_dir() {
-            trigger_background_disk_prune(&inner);
+            trigger_disk_maintenance(&inner, true);
         }
 
         Self { inner, wakeup_rx }
@@ -1087,39 +1208,42 @@ impl PosterCache {
         self.inner.evicted_images.lock().push(image);
     }
 
-    pub fn trim_for_playback(&self) {
-        let mut newly_evicted = self
-            .inner
-            .decoded_lru
-            .lock()
-            .trim_to_limit(PLAYBACK_RETAINED_DECODED_TEXTURES);
-        newly_evicted.extend(
-            self.inner
-                .thumb_lru
-                .lock()
-                .trim_to_limit(PLAYBACK_RETAINED_THUMB_TEXTURES),
-        );
-        newly_evicted.extend(
-            self.inner
-                .still_lru
-                .lock()
-                .trim_to_limit(PLAYBACK_RETAINED_STILL_TEXTURES),
-        );
-        newly_evicted.extend(
-            self.inner
-                .hero_lru
-                .lock()
-                .trim_to_limit(PLAYBACK_RETAINED_HERO_TEXTURES),
-        );
-        newly_evicted.extend(
-            self.inner
-                .ambient_lru
-                .lock()
-                .trim_to_limit(PLAYBACK_RETAINED_AMBIENT_TEXTURES),
-        );
+    fn trim_all_lrus(
+        &self,
+        decoded_keep: usize,
+        thumb_keep: usize,
+        still_keep: usize,
+        hero_keep: usize,
+        ambient_keep: usize,
+    ) {
+        let mut newly_evicted = self.inner.decoded_lru.lock().trim_to_limit(decoded_keep);
+        newly_evicted.extend(self.inner.thumb_lru.lock().trim_to_limit(thumb_keep));
+        newly_evicted.extend(self.inner.still_lru.lock().trim_to_limit(still_keep));
+        newly_evicted.extend(self.inner.hero_lru.lock().trim_to_limit(hero_keep));
+        newly_evicted.extend(self.inner.ambient_lru.lock().trim_to_limit(ambient_keep));
         if !newly_evicted.is_empty() {
             self.inner.evicted_images.lock().extend(newly_evicted);
         }
+    }
+
+    pub fn trim_for_playback(&self) {
+        self.trim_all_lrus(
+            PLAYBACK_RETAINED_DECODED_TEXTURES,
+            PLAYBACK_RETAINED_THUMB_TEXTURES,
+            PLAYBACK_RETAINED_STILL_TEXTURES,
+            PLAYBACK_RETAINED_HERO_TEXTURES,
+            PLAYBACK_RETAINED_AMBIENT_TEXTURES,
+        );
+    }
+
+    pub fn trim_for_route_transition(&self) {
+        self.trim_all_lrus(
+            ROUTE_RETAINED_DECODED_TEXTURES,
+            ROUTE_RETAINED_THUMB_TEXTURES,
+            ROUTE_RETAINED_STILL_TEXTURES,
+            ROUTE_RETAINED_HERO_TEXTURES,
+            ROUTE_RETAINED_AMBIENT_TEXTURES,
+        );
     }
 
     pub fn decoded_ready_count(&self) -> usize {
@@ -1132,6 +1256,60 @@ impl PosterCache {
 
     pub fn still_ready_count(&self) -> usize {
         self.inner.still_lru.lock().len_ready()
+    }
+
+    pub fn hero_ready_count(&self) -> usize {
+        self.inner.hero_lru.lock().len_ready()
+    }
+
+    pub fn ambient_ready_count(&self) -> usize {
+        self.inner.ambient_lru.lock().len_ready()
+    }
+
+    pub fn disk_cache_usage_bytes(&self) -> u64 {
+        self.inner.disk_cache_bytes.load(Ordering::Acquire)
+    }
+
+    pub fn clear_disk_cache(&self) {
+        self.inner.disk_epoch.fetch_add(1, Ordering::AcqRel);
+        self.inner
+            .entries
+            .write()
+            .retain(|_, v| matches!(v, CacheEntry::Loading));
+        self.inner.failed_entry_urls.lock().clear();
+        self.inner.initialized_dirs.lock().clear();
+
+        let mut remaining = 0_u64;
+        if self.inner.cache_root.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&self.inner.cache_root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if std::fs::remove_dir_all(&path).is_err() {
+                            remaining = remaining.saturating_add(measure_dir_bytes(&path));
+                        }
+                    } else if path.is_file() && std::fs::remove_file(&path).is_err() {
+                        if let Ok(meta) = entry.metadata() {
+                            remaining = remaining.saturating_add(meta.len());
+                        }
+                    }
+                }
+            }
+        }
+        self.inner.disk_cache_bytes.store(remaining, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn wait_for_disk_maintenance(&self) {
+        loop {
+            let notified = self.inner.disk_maintenance_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.inner.disk_prune_in_flight.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
     }
 
     pub fn drain_evicted_images(&self) -> Vec<Arc<RenderImage>> {
@@ -1286,6 +1464,27 @@ impl Drop for InFlightGuard {
     }
 }
 
+fn add_disk_cache_bytes(counter: &AtomicU64, delta: u64) -> u64 {
+    if delta == 0 {
+        return counter.load(Ordering::Acquire);
+    }
+    counter.fetch_add(delta, Ordering::AcqRel).saturating_add(delta)
+}
+
+fn sub_disk_cache_bytes(counter: &AtomicU64, delta: u64) -> u64 {
+    if delta == 0 {
+        return counter.load(Ordering::Acquire);
+    }
+    let mut prev = counter.load(Ordering::Acquire);
+    loop {
+        let next = prev.saturating_sub(delta);
+        match counter.compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
 struct PruneFlagGuard {
     inner: Arc<PosterCacheInner>,
 }
@@ -1295,10 +1494,11 @@ impl Drop for PruneFlagGuard {
         self.inner
             .disk_prune_in_flight
             .store(false, Ordering::Release);
+        self.inner.disk_maintenance_notify.notify_waiters();
     }
 }
 
-fn trigger_background_disk_prune(inner: &Arc<PosterCacheInner>) {
+fn trigger_disk_maintenance(inner: &Arc<PosterCacheInner>, remove_legacy_sidecars: bool) {
     if inner.disk_prune_in_flight.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -1306,12 +1506,41 @@ fn trigger_background_disk_prune(inner: &Arc<PosterCacheInner>) {
         inner: Arc::clone(inner),
     };
     let root = inner.cache_root.clone();
+    let inner_ref = Arc::clone(inner);
     inner.runtime.spawn(async move {
         let _guard = guard;
-        let _ = tokio::task::spawn_blocking(move || {
-            prune_disk_cache_to_budget(&root, MAX_DISK_CACHE_BYTES)
+        let epoch_before = inner_ref.disk_epoch.load(Ordering::Acquire);
+        let writes_before = inner_ref.disk_writes.load(Ordering::Acquire);
+        let scan_root = root.clone();
+        let Ok((freed, remaining)) = tokio::task::spawn_blocking(move || {
+            prune_disk_cache_internal(&scan_root, MAX_DISK_CACHE_BYTES, remove_legacy_sidecars)
         })
-        .await;
+        .await
+        else {
+            return;
+        };
+        if inner_ref.disk_epoch.load(Ordering::Acquire) != epoch_before {
+            return;
+        }
+        if inner_ref.disk_writes.load(Ordering::Acquire) == writes_before {
+            inner_ref
+                .disk_cache_bytes
+                .store(remaining, Ordering::Release);
+        } else if remove_legacy_sidecars {
+            let writes_mid = inner_ref.disk_writes.load(Ordering::Acquire);
+            if let Ok(recounted) = tokio::task::spawn_blocking(move || measure_dir_bytes(&root)).await
+            {
+                if inner_ref.disk_epoch.load(Ordering::Acquire) == epoch_before
+                    && inner_ref.disk_writes.load(Ordering::Acquire) == writes_mid
+                {
+                    inner_ref
+                        .disk_cache_bytes
+                        .store(recounted, Ordering::Release);
+                }
+            }
+        } else {
+            sub_disk_cache_bytes(&inner_ref.disk_cache_bytes, freed);
+        }
     });
 }
 
@@ -1336,30 +1565,12 @@ fn mark_entry_failed(inner: &PosterCacheInner, url: &str) {
     }
 }
 
-fn remove_stale_ready_entry(inner: &PosterCacheInner, url: &str, stale_path: &Path) {
-    let mut entries = inner.entries.write();
-    if matches!(entries.get(url), Some(CacheEntry::Ready(p)) if p == stale_path) {
-        entries.remove(url);
-    }
-}
-
-enum DiskOrBytes {
-    ReadyPath(PathBuf),
-    Downloaded(Vec<u8>),
-}
-
-async fn acquire_raw_artwork(
-    inner: &Arc<PosterCacheInner>,
-    fetch_url: &str,
-    force_disk_recheck: bool,
-) -> Option<DiskOrBytes> {
-    if !force_disk_recheck {
-        if let Some(entry) = inner.entries.read().get(fetch_url).cloned() {
-            match entry {
-                CacheEntry::Ready(path) => return Some(DiskOrBytes::ReadyPath(path)),
-                CacheEntry::Failed => return None,
-                CacheEntry::Loading => {}
-            }
+async fn acquire_raw_artwork(inner: &Arc<PosterCacheInner>, fetch_url: &str) -> Option<PathBuf> {
+    if let Some(entry) = inner.entries.read().get(fetch_url).cloned() {
+        match entry {
+            CacheEntry::Ready(path) => return Some(path),
+            CacheEntry::Failed => return None,
+            CacheEntry::Loading => {}
         }
     }
 
@@ -1391,7 +1602,7 @@ async fn acquire_raw_artwork(
                 notified.await;
             }
             match inner.entries.read().get(fetch_url).cloned() {
-                Some(CacheEntry::Ready(path)) => return Some(DiskOrBytes::ReadyPath(path)),
+                Some(CacheEntry::Ready(path)) => return Some(path),
                 Some(CacheEntry::Failed) => return None,
                 Some(CacheEntry::Loading) | None => continue,
             }
@@ -1403,20 +1614,18 @@ async fn acquire_raw_artwork(
             notify,
         };
 
-        if !force_disk_recheck {
-            if let Some(entry) = inner.entries.read().get(fetch_url).cloned() {
-                match entry {
-                    CacheEntry::Ready(path) => return Some(DiskOrBytes::ReadyPath(path)),
-                    CacheEntry::Failed => return None,
-                    CacheEntry::Loading => {}
-                }
+        if let Some(entry) = inner.entries.read().get(fetch_url).cloned() {
+            match entry {
+                CacheEntry::Ready(path) => return Some(path),
+                CacheEntry::Failed => return None,
+                CacheEntry::Loading => {}
             }
         }
 
         if let Ok(meta) = tokio::fs::metadata(&target_path).await {
             if meta.is_file() && meta.len() >= 64 {
                 mark_entry_ready(inner, fetch_url, target_path.clone());
-                return Some(DiskOrBytes::ReadyPath(target_path));
+                return Some(target_path);
             }
         }
 
@@ -1428,14 +1637,14 @@ async fn acquire_raw_artwork(
         if let Ok(meta) = tokio::fs::metadata(&target_path).await {
             if meta.is_file() && meta.len() >= 64 {
                 mark_entry_ready(inner, fetch_url, target_path.clone());
-                return Some(DiskOrBytes::ReadyPath(target_path));
+                return Some(target_path);
             }
         }
 
         match download_and_persist(inner, fetch_url, &target_path).await {
-            Ok(bytes) => {
-                mark_entry_ready(inner, fetch_url, target_path);
-                return Some(DiskOrBytes::Downloaded(bytes));
+            Ok(()) => {
+                mark_entry_ready(inner, fetch_url, target_path.clone());
+                return Some(target_path);
             }
             Err(err) => {
                 let safe_url = crate::updater::redact_url_for_log(fetch_url);
@@ -1451,88 +1660,131 @@ async fn acquire_raw_artwork(
     }
 }
 
-async fn read_and_decode_with_retry<F>(
-    inner: &Arc<PosterCacheInner>,
-    fetch_url: &str,
-    first_source: DiskOrBytes,
-    decode_fn: F,
-) -> Option<Arc<RenderImage>>
-where
-    F: Fn(&[u8]) -> Option<Arc<RenderImage>> + Send + Sync + Copy + 'static,
-{
-    let mut source = first_source;
-    for attempt in 0..2 {
-        match source {
-            DiskOrBytes::Downloaded(bytes) => {
-                let decode_permit = inner.decode_semaphore.acquire().await.ok()?;
-                let decoded = tokio::task::spawn_blocking(move || decode_fn(&bytes))
-                    .await
-                    .ok()
-                    .flatten();
-                drop(decode_permit);
-                return decoded;
-            }
-            DiskOrBytes::ReadyPath(path) => {
-                let decode_permit = inner.decode_semaphore.acquire().await.ok()?;
-                let disk_permit = inner.disk_io_semaphore.acquire().await.ok()?;
-                let read_res = tokio::fs::read(&path).await;
-                drop(disk_permit);
-
-                match read_res {
-                    Ok(bytes) if bytes.len() >= 64 => {
-                        let decoded = tokio::task::spawn_blocking(move || decode_fn(&bytes))
-                            .await
-                            .ok()
-                            .flatten();
-                        drop(decode_permit);
-                        return decoded;
-                    }
-                    _ => {
-                        drop(decode_permit);
-                        if attempt == 0 {
-                            remove_stale_ready_entry(inner, fetch_url, &path);
-                            source = acquire_raw_artwork(inner, fetch_url, true).await?;
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+struct InFlightDownloadGuard {
+    inner: Arc<PosterCacheInner>,
+    url: String,
+    slot: Arc<InFlightDownload>,
 }
 
-async fn try_read_sidecar_image(
+impl Drop for InFlightDownloadGuard {
+    fn drop(&mut self) {
+        {
+            let mut res = self.slot.result.lock();
+            if res.is_none() {
+                *res = Some(None);
+            }
+        }
+        {
+            let mut map = self.inner.in_flight_downloads.lock();
+            if map
+                .get(&self.url)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &self.slot))
+            {
+                map.remove(&self.url);
+            }
+        }
+        self.slot.notify.notify_waiters();
+    }
+}
+
+async fn download_bytes_coalesced(
+    inner: &Arc<PosterCacheInner>,
+    fetch_url: &str,
+) -> Option<Arc<Vec<u8>>> {
+    let (slot, is_leader) = {
+        let mut inflight = inner.in_flight_downloads.lock();
+        if let Some(existing) = inflight.get(fetch_url) {
+            (Arc::clone(existing), false)
+        } else {
+            let created = Arc::new(InFlightDownload {
+                notify: Notify::new(),
+                result: Mutex::new(None),
+            });
+            inflight.insert(fetch_url.to_owned(), Arc::clone(&created));
+            (created, true)
+        }
+    };
+
+    if !is_leader {
+        let notified = slot.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(res) = slot.result.lock().as_ref() {
+            return res.clone();
+        }
+        notified.await;
+        return slot.result.lock().as_ref().cloned().flatten();
+    }
+
+    let _guard = InFlightDownloadGuard {
+        inner: Arc::clone(inner),
+        url: fetch_url.to_owned(),
+        slot: Arc::clone(&slot),
+    };
+
+    let Ok(_download_permit) = inner.semaphore.acquire().await else {
+        *slot.result.lock() = Some(None);
+        return None;
+    };
+
+    match download_bytes_only(inner, fetch_url).await {
+        Ok(bytes) => {
+            let shared = Arc::new(bytes);
+            *slot.result.lock() = Some(Some(Arc::clone(&shared)));
+            Some(shared)
+        }
+        Err(err) => {
+            let safe_url = crate::updater::redact_url_for_log(fetch_url);
+            tracing::debug!(
+                target: "ferrite::poster_cache",
+                url = %safe_url,
+                "artwork fetch failed: {err}"
+            );
+            *slot.result.lock() = Some(None);
+            None
+        }
+    }
+}
+
+async fn run_blocking_decode<T, F>(inner: &PosterCacheInner, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    let decode_permit = inner.decode_semaphore.acquire().await.ok()?;
+    let res = tokio::task::spawn_blocking(f).await.ok().flatten();
+    drop(decode_permit);
+    res
+}
+
+async fn try_read_disk_bytes(inner: &PosterCacheInner, path: &Path) -> Option<Vec<u8>> {
+    let disk_permit = inner.disk_io_semaphore.acquire().await.ok()?;
+    let res = tokio::fs::read(path).await.ok();
+    drop(disk_permit);
+    res.filter(|b| !b.is_empty())
+}
+
+async fn remove_corrupt_disk_file(inner: &PosterCacheInner, path: &Path, len: u64) {
+    if tokio::fs::remove_file(path).await.is_ok() {
+        sub_disk_cache_bytes(&inner.disk_cache_bytes, len);
+    }
+}
+
+async fn try_read_variant_image(
     inner: &PosterCacheInner,
-    sidecar_path: &Path,
+    variant_path: &Path,
     max_w: u32,
     max_h: u32,
 ) -> Option<Arc<RenderImage>> {
-    let disk_permit = inner.disk_io_semaphore.acquire().await.ok()?;
-    let bytes = tokio::fs::read(sidecar_path).await.ok()?;
-    drop(disk_permit);
-    if let Some(img) = decode_sidecar_render_image(&bytes, max_w, max_h) {
+    let bytes = try_read_disk_bytes(inner, variant_path).await?;
+    let len = bytes.len() as u64;
+    if let Some(img) =
+        run_blocking_decode(inner, move || decode_scaled_render_image(&bytes, max_w, max_h)).await
+    {
         return Some(img);
     }
-    let _ = tokio::fs::remove_file(sidecar_path).await;
+    remove_corrupt_disk_file(inner, variant_path, len).await;
     None
-}
-
-async fn persist_sidecar_if_enabled(
-    inner: &Arc<PosterCacheInner>,
-    fetch_url: &str,
-    variant: ImageVariant,
-    image: &RenderImage,
-) {
-    if !variant.uses_sidecar() {
-        return;
-    }
-    let Some(bytes) = encode_sidecar_bytes(image) else {
-        return;
-    };
-    let sidecar_path = sidecar_path_for_url(&inner.cache_root, fetch_url, variant.as_str());
-    let _ = write_atomic_bytes(inner, &sidecar_path, &bytes).await;
 }
 
 fn insert_ready_and_wake(
@@ -1575,32 +1827,49 @@ async fn fetch_and_decode_into_target(
     let fetch_url = rewrite_cdn_image_url(&original_url, spec.cdn_max_w);
     let fetch_url_str: &str = fetch_url.as_ref();
 
-    if spec.variant.uses_sidecar() {
-        let sidecar_path =
-            sidecar_path_for_url(&inner.cache_root, fetch_url_str, spec.variant.as_str());
-        if let Some(render_img) =
-            try_read_sidecar_image(&inner, &sidecar_path, spec.max_w, spec.max_h).await
-        {
-            insert_ready_and_wake(&inner, spec.target, spec.variant, &original_url, render_img);
-            return;
-        }
-    }
-
-    let Some(source) = acquire_raw_artwork(&inner, fetch_url_str, false).await else {
-        mark_failed_and_wake(&inner, spec.target, spec.variant, &original_url);
+    let variant_path =
+        variant_cache_path_for_url(&inner.cache_root, fetch_url_str, spec.variant.as_str());
+    if let Some(render_img) =
+        try_read_variant_image(&inner, &variant_path, spec.max_w, spec.max_h).await
+    {
+        insert_ready_and_wake(&inner, spec.target, spec.variant, &original_url, render_img);
         return;
-    };
+    }
 
     let max_w = spec.max_w;
     let max_h = spec.max_h;
-    let decoded = read_and_decode_with_retry(&inner, fetch_url_str, source, move |bytes| {
-        decode_scaled_render_image(bytes, max_w, max_h)
-    })
-    .await;
+    let variant = spec.variant;
 
-    match decoded {
-        Some(render_img) => {
-            persist_sidecar_if_enabled(&inner, fetch_url_str, spec.variant, &render_img).await;
+    let raw_path = cache_path_for_url(&inner.cache_root, fetch_url_str);
+    let mut decoded_and_encoded = if let Some(raw_bytes) = try_read_disk_bytes(&inner, &raw_path).await
+    {
+        let raw_len = raw_bytes.len() as u64;
+        let decoded = run_blocking_decode(&inner, move || {
+            decode_scaled_and_encode_variant(&raw_bytes, max_w, max_h, variant)
+        })
+        .await;
+        if decoded.is_none() {
+            remove_corrupt_disk_file(&inner, &raw_path, raw_len).await;
+        }
+        decoded
+    } else {
+        None
+    };
+
+    if decoded_and_encoded.is_none() {
+        let Some(downloaded) = download_bytes_coalesced(&inner, fetch_url_str).await else {
+            mark_failed_and_wake(&inner, spec.target, spec.variant, &original_url);
+            return;
+        };
+        decoded_and_encoded = run_blocking_decode(&inner, move || {
+            decode_scaled_and_encode_variant(&downloaded, max_w, max_h, variant)
+        })
+        .await;
+    }
+
+    match decoded_and_encoded {
+        Some((render_img, encoded_bytes)) => {
+            let _ = write_atomic_bytes(&inner, &variant_path, &encoded_bytes).await;
             insert_ready_and_wake(&inner, spec.target, spec.variant, &original_url, render_img);
         }
         None => {
@@ -1610,18 +1879,9 @@ async fn fetch_and_decode_into_target(
 }
 
 async fn fetch_or_load_disk(inner: Arc<PosterCacheInner>, url: String) -> Option<PathBuf> {
-    match acquire_raw_artwork(&inner, &url, false).await {
-        Some(DiskOrBytes::ReadyPath(path)) => {
-            let _ = inner.wakeup_tx.try_send(());
-            Some(path)
-        }
-        Some(DiskOrBytes::Downloaded(_)) => {
-            let path = cache_path_for_url(&inner.cache_root, &url);
-            let _ = inner.wakeup_tx.try_send(());
-            Some(path)
-        }
-        None => None,
-    }
+    let path = acquire_raw_artwork(&inner, &url).await?;
+    let _ = inner.wakeup_tx.try_send(());
+    Some(path)
 }
 
 async fn compute_or_fetch_ambient(
@@ -1632,14 +1892,14 @@ async fn compute_or_fetch_ambient(
     let fetch_url = rewrite_cdn_image_url(&original_url, cdn_max_w);
     let fetch_url_str: &str = fetch_url.as_ref();
 
-    let sidecar_path = sidecar_path_for_url(
+    let variant_path = variant_cache_path_for_url(
         &inner.cache_root,
         fetch_url_str,
         ImageVariant::Ambient.as_str(),
     );
-    if let Some(render_img) = try_read_sidecar_image(
+    if let Some(render_img) = try_read_variant_image(
         &inner,
-        &sidecar_path,
+        &variant_path,
         AMBIENT_BLEED_WIDTH,
         AMBIENT_BLEED_HEIGHT,
     )
@@ -1655,23 +1915,43 @@ async fn compute_or_fetch_ambient(
         return;
     }
 
-    let Some(source) = acquire_raw_artwork(&inner, fetch_url_str, false).await else {
-        mark_failed_and_wake(
-            &inner,
-            LruTarget::Ambient,
-            ImageVariant::Ambient,
-            &original_url,
-        );
-        return;
-    };
+    let hero_path = variant_cache_path_for_url(
+        &inner.cache_root,
+        fetch_url_str,
+        ImageVariant::Hero.as_str(),
+    );
+    let raw_path = cache_path_for_url(&inner.cache_root, fetch_url_str);
+    let mut built = None;
+    for candidate_path in [&hero_path, &raw_path] {
+        if let Some(bytes) = try_read_disk_bytes(&inner, candidate_path).await {
+            let len = bytes.len() as u64;
+            let res =
+                run_blocking_decode(&inner, move || build_ambient_bleed_and_encode(&bytes)).await;
+            if res.is_some() {
+                built = res;
+                break;
+            }
+            remove_corrupt_disk_file(&inner, candidate_path, len).await;
+        }
+    }
 
-    let built =
-        read_and_decode_with_retry(&inner, fetch_url_str, source, build_ambient_bleed_image).await;
+    if built.is_none() {
+        let Some(downloaded) = download_bytes_coalesced(&inner, fetch_url_str).await else {
+            mark_failed_and_wake(
+                &inner,
+                LruTarget::Ambient,
+                ImageVariant::Ambient,
+                &original_url,
+            );
+            return;
+        };
+        built =
+            run_blocking_decode(&inner, move || build_ambient_bleed_and_encode(&downloaded)).await;
+    }
 
     match built {
-        Some(render_img) => {
-            persist_sidecar_if_enabled(&inner, fetch_url_str, ImageVariant::Ambient, &render_img)
-                .await;
+        Some((render_img, encoded_bytes)) => {
+            let _ = write_atomic_bytes(&inner, &variant_path, &encoded_bytes).await;
             insert_ready_and_wake(
                 &inner,
                 LruTarget::Ambient,
@@ -1726,14 +2006,22 @@ async fn write_atomic_bytes(
     };
     ensure_dir_initialized(inner, parent).await?;
 
+    let epoch_before = inner.disk_epoch.load(Ordering::Acquire);
     let seq = inner.temp_seq.fetch_add(1, Ordering::Relaxed);
     let tmp_path = target_path.with_extension(format!("part.{seq}"));
+    let old_len;
     {
         let disk_permit = inner
             .disk_io_semaphore
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("disk semaphore closed"))?;
+
+        old_len = tokio::fs::metadata(target_path)
+            .await
+            .ok()
+            .filter(|m| m.is_file())
+            .map_or(0, |m| m.len());
 
         if let Err(err) = tokio::fs::write(&tmp_path, bytes).await {
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -1764,18 +2052,26 @@ async fn write_atomic_bytes(
         drop(disk_permit);
     }
 
+    let effective_old_len = if inner.disk_epoch.load(Ordering::Acquire) == epoch_before {
+        old_len
+    } else {
+        0
+    };
+    let new_len = bytes.len() as u64;
+    let tracked_total = if new_len >= effective_old_len {
+        add_disk_cache_bytes(&inner.disk_cache_bytes, new_len - effective_old_len)
+    } else {
+        sub_disk_cache_bytes(&inner.disk_cache_bytes, effective_old_len - new_len)
+    };
+
     let writes = inner.disk_writes.fetch_add(1, Ordering::Relaxed) + 1;
-    if writes.is_multiple_of(DISK_PRUNE_INTERVAL_WRITES) {
-        trigger_background_disk_prune(inner);
+    if writes.is_multiple_of(DISK_PRUNE_INTERVAL_WRITES) || tracked_total > MAX_DISK_CACHE_BYTES {
+        trigger_disk_maintenance(inner, false);
     }
     Ok(())
 }
 
-async fn download_and_persist(
-    inner: &Arc<PosterCacheInner>,
-    url: &str,
-    target_path: &Path,
-) -> anyhow::Result<Vec<u8>> {
+async fn download_bytes_only(inner: &PosterCacheInner, url: &str) -> anyhow::Result<Vec<u8>> {
     let resp = inner
         .client
         .get(url)
@@ -1791,9 +2087,17 @@ async fn download_and_persist(
     if bytes.len() < 64 || bytes.len() > MAX_POSTER_BYTES {
         anyhow::bail!("invalid image byte length {}", bytes.len());
     }
-
-    write_atomic_bytes(inner, target_path, &bytes).await?;
     Ok(bytes.to_vec())
+}
+
+async fn download_and_persist(
+    inner: &Arc<PosterCacheInner>,
+    url: &str,
+    target_path: &Path,
+) -> anyhow::Result<()> {
+    let bytes = download_bytes_only(inner, url).await?;
+    write_atomic_bytes(inner, target_path, &bytes).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2076,6 +2380,13 @@ mod tests {
         );
         assert_eq!(
             rewrite_cdn_image_url("https://image.tmdb.org/t/p/original/wide.jpg", WIDESCREEN_MAX_W),
+            "https://image.tmdb.org/t/p/w342/wide.jpg"
+        );
+        assert_eq!(
+            rewrite_cdn_image_url(
+                "https://image.tmdb.org/t/p/original/wide.jpg",
+                WIDESCREEN_CDN_MAX_W
+            ),
             "https://image.tmdb.org/t/p/w780/wide.jpg"
         );
         assert_eq!(
@@ -2408,70 +2719,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prescaled_sidecar_roundtrip_serves_warm_launch_without_raw_file() {
+    async fn compact_encoded_variant_roundtrip_serves_warm_launch_for_opaque_jpeg_and_alpha_png() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicU64::new(0));
         let hits_srv = Arc::clone(&hits);
         let poster_png = sample_png_bytes(400, 600);
 
+        let mut logo_rgba = RgbaImage::new(600, 240);
+        for (x, y, p) in logo_rgba.enumerate_pixels_mut() {
+            if x < 10 && y < 10 {
+                *p = image::Rgba([0, 0, 0, 0]);
+            } else {
+                *p = image::Rgba([240, 120, 40, 255]);
+            }
+        }
+        let mut logo_png = Vec::new();
+        image::DynamicImage::ImageRgba8(logo_rgba)
+            .write_to(&mut std::io::Cursor::new(&mut logo_png), image::ImageFormat::Png)
+            .unwrap();
+        let logo_png_srv = logo_png.clone();
+
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 hits_srv.fetch_add(1, Ordering::SeqCst);
                 let mut buf = [0_u8; 1024];
-                let _ = sock.read(&mut buf).await;
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("logo") {
+                    &logo_png_srv
+                } else {
+                    &poster_png
+                };
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    poster_png.len()
+                    body.len()
                 );
                 let _ = sock.write_all(header.as_bytes()).await;
-                let _ = sock.write_all(&poster_png).await;
+                let _ = sock.write_all(body).await;
             }
         });
 
         let dir = tempfile::tempdir().unwrap();
         let cache1 = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
         let rx1 = cache1.wakeup_receiver();
-        let url = format!("http://{addr}/poster-sidecar.png");
+        let poster_url = format!("http://{addr}/poster-compact.png");
+        let logo_url = format!("http://{addr}/logo-alpha.png");
 
-        assert!(cache1.resolve_poster_image(&url).is_none());
-        tokio::time::timeout(Duration::from_secs(2), rx1.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        assert!(cache1.resolve_poster_image(&poster_url).is_none());
+        assert!(cache1.resolve_logo_image(&logo_url).is_none());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if cache1.resolve_poster_image(&poster_url).is_some()
+                && cache1.resolve_logo_image(&logo_url).is_some()
+            {
+                break;
+            }
+            tokio::time::timeout_at(deadline, rx1.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
         let img1 = cache1
-            .resolve_poster_image(&url)
+            .resolve_poster_image(&poster_url)
             .expect("poster decoded on cold run");
         assert_eq!(img1.size(0).width.0, POSTER_MAX_W as i32);
         assert_eq!(img1.size(0).height.0, POSTER_MAX_H as i32);
 
-        let raw_path = cache_path_for_url(dir.path(), &url);
-        let sidecar_path = sidecar_path_for_url(dir.path(), &url, "poster");
-        assert!(raw_path.is_file());
-        assert!(sidecar_path.is_file());
+        let logo1 = cache1
+            .resolve_logo_image(&logo_url)
+            .expect("logo decoded on cold run");
+        assert!(logo1.size(0).width.0 <= LOGO_DECODE_MAX_WIDTH as i32);
+        assert!(logo1.size(0).height.0 <= LOGO_DECODE_MAX_HEIGHT as i32);
+
+        let raw_poster_path = cache_path_for_url(dir.path(), &poster_url);
+        let poster_variant_path = variant_cache_path_for_url(dir.path(), &poster_url, "poster");
+        let logo_variant_path = variant_cache_path_for_url(dir.path(), &logo_url, "logo");
+        assert!(!raw_poster_path.exists());
+        assert!(poster_variant_path.is_file());
+        assert!(logo_variant_path.is_file());
+        assert_eq!(
+            poster_variant_path.extension().and_then(|e| e.to_str()),
+            Some("jpg")
+        );
+        assert_eq!(
+            logo_variant_path.extension().and_then(|e| e.to_str()),
+            Some("png")
+        );
+
+        let jpeg_bytes = std::fs::read(&poster_variant_path).unwrap();
+        assert_eq!(&jpeg_bytes[..3], &[0xFF, 0xD8, 0xFF]);
+        // Compact encoded JPEG should be vastly smaller than raw 240x360x4 BGRA (345,600 bytes)
+        assert!(jpeg_bytes.len() < 40_000, "unexpected JPEG size: {}", jpeg_bytes.len());
+
+        let png_bytes = std::fs::read(&logo_variant_path).unwrap();
+        assert_eq!(&png_bytes[..4], b"\x89PNG");
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&sidecar_path).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(&poster_variant_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600);
         }
 
-        // Remove raw compressed file to prove warm launch reads purely from pre-scaled sidecar!
-        std::fs::remove_file(&raw_path).unwrap();
-
+        // Warm launch reads purely from compact encoded disk cache with 0 new HTTP hits
         let cache2 = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        cache2.wait_for_disk_maintenance().await;
         let rx2 = cache2.wakeup_receiver();
-        assert!(cache2.resolve_poster_image(&url).is_none());
-        tokio::time::timeout(Duration::from_secs(2), rx2.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        assert!(cache2.resolve_poster_image(&poster_url).is_none());
+        assert!(cache2.resolve_logo_image(&logo_url).is_none());
+
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if cache2.resolve_poster_image(&poster_url).is_some()
+                && cache2.resolve_logo_image(&logo_url).is_some()
+            {
+                break;
+            }
+            tokio::time::timeout_at(deadline2, rx2.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
         let img2 = cache2
-            .resolve_poster_image(&url)
-            .expect("poster loaded from pre-scaled sidecar");
+            .resolve_poster_image(&poster_url)
+            .expect("poster loaded from compact JPEG disk cache");
         assert_eq!(img2.size(0), img1.size(0));
-        assert_eq!(img2.as_bytes(0), img1.as_bytes(0));
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let logo2 = cache2
+            .resolve_logo_image(&logo_url)
+            .expect("logo loaded from compact PNG disk cache");
+        assert_eq!(logo2.size(0), logo1.size(0));
+        assert_eq!(logo2.as_bytes(0), logo1.as_bytes(0));
+        assert_eq!(&logo2.as_bytes(0).unwrap()[0..4], &[0, 0, 0, 0]);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2486,7 +2873,7 @@ mod tests {
         let paths = [
             shard_a.join("oldest.jpg"),
             shard_b.join("second.jpg"),
-            shard_a.join("third.poster.bin"),
+            shard_a.join("third.poster.jpg"),
             shard_b.join("newest.jpg"),
         ];
 
@@ -2507,7 +2894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_sidecar_regenerates_from_raw_and_prefetch_populates_targets() {
+    async fn corrupt_variant_cache_recovers_and_prefetch_populates_targets() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicU64::new(0));
@@ -2551,24 +2938,221 @@ mod tests {
         }
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 
-        // Corrupt the poster sidecar; warm cache2 should discard corrupt sidecar and regenerate from raw
-        let sidecar_path = sidecar_path_for_url(dir.path(), &poster_url, "poster");
-        std::fs::write(&sidecar_path, b"BAD_MAGIC_DATA").unwrap();
+        // Corrupt the poster variant file; warm cache2 should discard corrupt file and re-fetch cleanly
+        let poster_variant_path = variant_cache_path_for_url(dir.path(), &poster_url, "poster");
+        std::fs::write(&poster_variant_path, b"BAD_JPEG_DATA").unwrap();
 
         let cache2 = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        cache2.wait_for_disk_maintenance().await;
         let rx2 = cache2.wakeup_receiver();
         assert!(cache2.resolve_poster_image(&poster_url).is_none());
-        tokio::time::timeout(Duration::from_secs(2), rx2.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(cache2.resolve_poster_image(&poster_url).is_some());
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
-        assert!(decode_sidecar_render_image(
-            &std::fs::read(&sidecar_path).unwrap(),
+        assert!(cache2.resolve_hero_backdrop_image(&hero_url).is_none());
+
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if cache2.resolve_poster_image(&poster_url).is_some()
+                && cache2.resolve_hero_backdrop_image(&hero_url).is_some()
+            {
+                break;
+            }
+            tokio::time::timeout_at(deadline2, rx2.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert!(decode_scaled_render_image(
+            &std::fs::read(&poster_variant_path).unwrap(),
             POSTER_MAX_W,
             POSTER_MAX_H
         )
         .is_some());
+    }
+
+    #[test]
+    fn cache_limits_and_halved_capacities_match_budget() {
+        assert_eq!(MAX_DISK_CACHE_BYTES, 96 * 1024 * 1024);
+        assert_eq!(MAX_DECODED_TEXTURES, 64);
+        assert_eq!(MAX_STILL_TEXTURES, 24);
+        assert_eq!(MAX_THUMB_TEXTURES, 16);
+        assert_eq!(MAX_AMBIENT_TEXTURES, 6);
+        assert_eq!(MAX_HERO_TEXTURES, 2);
+        assert_eq!(POSTER_MAX_W, 240);
+        assert_eq!(POSTER_MAX_H, 360);
+        assert_eq!(WIDESCREEN_MAX_W, 480);
+        assert_eq!(WIDESCREEN_MAX_H, 270);
+
+        let png = sample_png_bytes(8, 8);
+        let mut hero_lru = BoundedTextureLru::with_capacity(MAX_HERO_TEXTURES);
+        for i in 0..4 {
+            let img = decode_scaled_render_image(&png, 16, 9).unwrap();
+            assert!(hero_lru
+                .insert_ready_variant(
+                    ImageVariant::Hero,
+                    &format!("http://example/hero-{i}.jpg"),
+                    img,
+                    1,
+                )
+                .is_empty());
+        }
+        let swept_hero = hero_lru.sweep_to_capacity(10);
+        assert_eq!(hero_lru.len_ready(), MAX_HERO_TEXTURES);
+        assert_eq!(swept_hero.len(), 2);
+
+        let mut ambient_lru = BoundedTextureLru::with_capacity(MAX_AMBIENT_TEXTURES);
+        for i in 0..9 {
+            let img = decode_scaled_render_image(&png, 16, 9).unwrap();
+            assert!(ambient_lru
+                .insert_ready_variant(
+                    ImageVariant::Ambient,
+                    &format!("http://example/amb-{i}.jpg"),
+                    img,
+                    1,
+                )
+                .is_empty());
+        }
+        let swept_amb = ambient_lru.sweep_to_capacity(10);
+        assert_eq!(ambient_lru.len_ready(), MAX_AMBIENT_TEXTURES);
+        assert_eq!(swept_amb.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn trim_for_route_transition_evicts_all_five_lrus_and_queues_dropped_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        let png = sample_png_bytes(8, 8);
+        let ep = cache.begin_render_frame();
+
+        for i in 0..30 {
+            let img = decode_scaled_render_image(&png, 32, 48).unwrap();
+            assert!(cache
+                .inner
+                .decoded_lru
+                .lock()
+                .insert_ready_variant(ImageVariant::Poster, &format!("http://example/p-{i}.jpg"), img, ep)
+                .is_empty());
+        }
+        for i in 0..12 {
+            let img = decode_scaled_render_image(&png, 32, 18).unwrap();
+            assert!(cache
+                .inner
+                .still_lru
+                .lock()
+                .insert_ready_variant(ImageVariant::Still, &format!("http://example/s-{i}.jpg"), img, ep)
+                .is_empty());
+        }
+        for i in 0..12 {
+            let img = decode_scaled_render_image(&png, 16, 24).unwrap();
+            assert!(cache
+                .inner
+                .thumb_lru
+                .lock()
+                .insert_ready_variant(ImageVariant::Thumb, &format!("http://example/t-{i}.jpg"), img, ep)
+                .is_empty());
+        }
+        for i in 0..5 {
+            let img = decode_scaled_render_image(&png, 48, 27).unwrap();
+            assert!(cache
+                .inner
+                .ambient_lru
+                .lock()
+                .insert_ready_variant(ImageVariant::Ambient, &format!("http://example/a-{i}.jpg"), img, ep)
+                .is_empty());
+        }
+        for i in 0..2 {
+            let img = decode_scaled_render_image(&png, 64, 36).unwrap();
+            assert!(cache
+                .inner
+                .hero_lru
+                .lock()
+                .insert_ready_variant(ImageVariant::Hero, &format!("http://example/h-{i}.jpg"), img, ep)
+                .is_empty());
+        }
+
+        cache.trim_for_route_transition();
+        assert_eq!(cache.decoded_ready_count(), 24);
+        assert_eq!(cache.still_ready_count(), 8);
+        assert_eq!(cache.thumb_ready_count(), 8);
+        assert_eq!(cache.ambient_ready_count(), 2);
+        assert_eq!(cache.hero_ready_count(), 1);
+
+        let evicted = cache.drain_evicted_images();
+        assert_eq!(evicted.len(), (30 - 24) + (12 - 8) + (12 - 8) + (5 - 2) + (2 - 1));
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_sweeps_legacy_fbg1_and_sidecar_files_and_tracks_disk_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_a = dir.path().join("aa");
+        let shard_b = dir.path().join("bb");
+        let shard_c = dir.path().join("cc");
+        let shard_d = dir.path().join("dd");
+        std::fs::create_dir_all(&shard_a).unwrap();
+        std::fs::create_dir_all(&shard_b).unwrap();
+        std::fs::create_dir_all(&shard_c).unwrap();
+        std::fs::create_dir_all(&shard_d).unwrap();
+
+        let legacy_fbg1 = shard_a.join("old_entry.fbg1");
+        let legacy_sidecar_prefix = shard_b.join("sidecar_old_poster.bin");
+        let legacy_magic_bin = shard_c.join("0123456789abcdef0123456789abcdef.poster.bin");
+        let keep_jpg = shard_d.join("valid.poster.jpg");
+
+        std::fs::write(&legacy_fbg1, vec![0x11_u8; 4096]).unwrap();
+        std::fs::write(&legacy_sidecar_prefix, vec![0x22_u8; 2048]).unwrap();
+        let mut magic_payload = b"FBG1".to_vec();
+        magic_payload.extend(vec![0x33_u8; 8192]);
+        std::fs::write(&legacy_magic_bin, magic_payload).unwrap();
+        std::fs::write(&keep_jpg, vec![0x44_u8; 1536]).unwrap();
+
+        let cache = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        cache.wait_for_disk_maintenance().await;
+
+        assert!(!legacy_fbg1.exists());
+        assert!(!legacy_sidecar_prefix.exists());
+        assert!(!legacy_magic_bin.exists());
+        assert!(keep_jpg.exists());
+        assert_eq!(cache.disk_cache_usage_bytes(), 1536);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_usage_bytes_tracks_writes_and_clear_disk_cache_resets() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let poster_png = sample_png_bytes(320, 480);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0_u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    poster_png.len()
+                );
+                let _ = sock.write_all(header.as_bytes()).await;
+                let _ = sock.write_all(&poster_png).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PosterCache::new(dir.path().to_path_buf(), tokio::runtime::Handle::current());
+        assert_eq!(cache.disk_cache_usage_bytes(), 0);
+
+        let url = format!("http://{addr}/tracked-poster.png");
+        let rx = cache.wakeup_receiver();
+        assert!(cache.resolve_poster_image(&url).is_none());
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let written_path = variant_cache_path_for_url(dir.path(), &url, "poster");
+        let actual_len = std::fs::metadata(&written_path).unwrap().len();
+        assert!(actual_len > 0);
+        assert_eq!(cache.disk_cache_usage_bytes(), actual_len);
+
+        cache.clear_disk_cache();
+        assert_eq!(cache.disk_cache_usage_bytes(), 0);
+        assert!(!written_path.exists());
+        assert_eq!(measure_dir_bytes(dir.path()), 0);
     }
 }

@@ -1937,3 +1937,221 @@ async fn create_magnet_with_many_addon_and_wss_trackers_still_merges_all_curated
 
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn cold_magnet_initial_file_isolation_fallback_and_progress_snapshot() {
+    let seed_dir = TempDir::new().unwrap();
+    let pack_folder = seed_dir.path().join("ColdMagnet.S01");
+    tokio::fs::create_dir_all(&pack_folder).await.unwrap();
+
+    let readme_bytes = b"Readme".to_vec();
+    let ep0_bytes = deterministic_payload(8101, 256 * 1024);
+    let ep1_bytes = deterministic_payload(8102, 256 * 1024);
+    let ep2_bytes = deterministic_payload(8103, 384 * 1024);
+    tokio::fs::write(pack_folder.join("00_readme.txt"), &readme_bytes)
+        .await
+        .unwrap();
+    tokio::fs::write(pack_folder.join("01_S01E01.mkv"), &ep0_bytes)
+        .await
+        .unwrap();
+    tokio::fs::write(pack_folder.join("02_S01E02.mkv"), &ep1_bytes)
+        .await
+        .unwrap();
+    tokio::fs::write(pack_folder.join("03_S01E03.mkv"), &ep2_bytes)
+        .await
+        .unwrap();
+
+    let seeder_session = Session::new_with_opts(
+        seed_dir.path().to_path_buf(),
+        SessionOptions {
+            dht: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            listen: Some(ListenerOptions {
+                mode: ListenerMode::TcpOnly,
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                enable_upnp_port_forwarding: false,
+                ipv4_only: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let seeder_addr = seeder_session
+        .listen_addr()
+        .expect("seeder should bind TCP listener");
+    let (_pack_meta, pack_seed_handle) = seeder_session
+        .create_and_serve_torrent(
+            &pack_folder,
+            CreateTorrentOptions {
+                name: Some("ColdMagnet.S01"),
+                piece_length: Some(32 * 1024),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let pack_ih = pack_seed_handle.info_hash().0;
+    let pack_ih_hex = hex::encode(pack_ih);
+    let (ep0_idx, ep1_idx, ep2_idx) = pack_seed_handle
+        .with_metadata(|meta| {
+            let find = |needle: &str| {
+                meta.file_infos
+                    .iter()
+                    .position(|f| f.relative_filename.to_string_lossy().contains(needle))
+                    .unwrap()
+            };
+            (find("S01E01"), find("S01E02"), find("S01E03"))
+        })
+        .unwrap();
+
+    // Second single-file torrent served by the same seeder to verify out-of-range initial_file_idx fallback.
+    let single_folder = seed_dir.path().join("SingleOutOfRange");
+    tokio::fs::create_dir_all(&single_folder).await.unwrap();
+    let single_bytes = deterministic_payload(8104, 128 * 1024);
+    tokio::fs::write(single_folder.join("Movie.mkv"), &single_bytes)
+        .await
+        .unwrap();
+    let (_single_meta, single_seed_handle) = seeder_session
+        .create_and_serve_torrent(
+            &single_folder,
+            CreateTorrentOptions {
+                name: Some("SingleOutOfRange"),
+                piece_length: Some(32 * 1024),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let single_ih = single_seed_handle.info_hash().0;
+    let single_ih_hex = hex::encode(single_ih);
+
+    // Tiny mock BitTorrent HTTP tracker returning compact peer bytes for `seeder_addr`.
+    let SocketAddr::V4(v4_addr) = seeder_addr else {
+        panic!("expected IPv4 loopback seeder addr");
+    };
+    let mut compact_peer = [0u8; 6];
+    compact_peer[..4].copy_from_slice(&v4_addr.ip().octets());
+    compact_peer[4..6].copy_from_slice(&v4_addr.port().to_be_bytes());
+    let mut tracker_body = b"d8:intervali60e5:peers6:".to_vec();
+    tracker_body.extend_from_slice(&compact_peer);
+    tracker_body.push(b'e');
+
+    let tracker_app = Router::new().route(
+        "/announce",
+        get(move || {
+            let body = tracker_body.clone();
+            async move { (StatusCode::OK, body) }
+        }),
+    );
+    let tracker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tracker_addr = tracker_listener.local_addr().unwrap();
+    let tracker_task = tokio::spawn(async move {
+        axum::serve(tracker_listener, tracker_app).await.unwrap();
+    });
+    let tracker_url = format!("http://{tracker_addr}/announce");
+
+    let cache_dir = TempDir::new().unwrap();
+    let cfg = StreamEngineConfig {
+        bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        cache_dir: cache_dir.path().to_path_buf(),
+        enable_dht: false,
+        enable_trackers: true,
+        enable_lsd: false,
+        enable_peer_listener: true,
+        enable_upnp: false,
+        storage_mode: StorageMode::disk_lru(50 * 1024 * 1024),
+        metadata_timeout: Duration::from_secs(10),
+        first_byte_timeout: Duration::from_secs(10),
+        extra_trackers: Vec::new(),
+        ..Default::default()
+    };
+    let engine = StreamEngine::start(cfg).await.unwrap();
+    let base = engine.base_url();
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        engine.torrent_progress_snapshot(&pack_ih),
+        None,
+        "unmanaged torrent must return None from torrent_progress_snapshot"
+    );
+
+    // 1. Cold magnet stream targeting ep2 directly: must set only_files = [ep2_idx] from second 0.
+    let mut stream_url = base.join(&format!("{pack_ih_hex}/{ep2_idx}")).unwrap();
+    stream_url.query_pairs_mut().append_pair("tr", &tracker_url);
+    let ep2_resp = client.get(stream_url).send().await.unwrap();
+    assert_eq!(ep2_resp.status(), StatusCode::OK);
+    let got_ep2 = ep2_resp.bytes().await.unwrap();
+    assert_eq!(&got_ep2[..], &ep2_bytes[..]);
+
+    let managed_pack = engine
+        .session()
+        .get(librqbit::api::TorrentIdOrHash::Hash(
+            librqbit::dht::Id20::new(pack_ih),
+        ))
+        .expect("pack handle must be managed");
+    assert_eq!(managed_pack.only_files(), Some(vec![ep2_idx]));
+
+    let stats_pack = managed_pack.stats();
+    let ep0_have = stats_pack.file_progress.get(ep0_idx).copied().unwrap_or(0);
+    let ep1_have = stats_pack.file_progress.get(ep1_idx).copied().unwrap_or(0);
+    assert!(
+        ep0_have < 32 * 1024 && ep1_have < 32 * 1024,
+        "unselected episodes must not download exclusive pieces (ep0_have={ep0_have}, ep1_have={ep1_have})"
+    );
+
+    let (fetched, _live_peers, speed_bps) = engine
+        .torrent_progress_snapshot(&pack_ih)
+        .expect("managed torrent must report progress snapshot");
+    assert!(
+        fetched >= ep2_bytes.len() as u64,
+        "expected fetched >= {}, got {fetched}",
+        ep2_bytes.len()
+    );
+    assert!(speed_bps >= 0.0);
+
+    // 2. Out-of-range initial_file_idx (999) on cold magnet must safely retry without only_files
+    //    and return 404 Not Found from file selection (never 502/500).
+    let mut oob_url = base.join(&format!("{single_ih_hex}/999")).unwrap();
+    oob_url.query_pairs_mut().append_pair("tr", &tracker_url);
+    let oob_resp = client.get(oob_url).send().await.unwrap();
+    assert_eq!(oob_resp.status(), StatusCode::NOT_FOUND);
+
+    // 3. Release/hibernate and warm-restore offline with initial_file_idx isolation intact.
+    engine.release_playback_sessions().await;
+    assert_eq!(engine.torrent_progress_snapshot(&pack_ih), None);
+
+    seeder_session.cancellation_token().cancel();
+    tracker_task.abort();
+
+    engine.set_first_byte_timeout(Duration::from_millis(50));
+    let warm_tail_start = ep2_bytes.len() - 65_536;
+    let warm_resp = client
+        .get(base.join(&format!("{pack_ih_hex}/{ep2_idx}")).unwrap())
+        .header(header::RANGE, format!("bytes={warm_tail_start}-"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(warm_resp.status(), StatusCode::PARTIAL_CONTENT);
+    let warm_tail = warm_resp.bytes().await.unwrap();
+    assert_eq!(&warm_tail[..], &ep2_bytes[warm_tail_start..]);
+
+    let restored_pack = engine
+        .session()
+        .get(librqbit::api::TorrentIdOrHash::Hash(
+            librqbit::dht::Id20::new(pack_ih),
+        ))
+        .expect("restored pack handle must be managed");
+    assert_eq!(restored_pack.only_files(), Some(vec![ep2_idx]));
+
+    let (restored_progress, restored_peers, restored_speed) = engine
+        .torrent_progress_snapshot(&pack_ih)
+        .expect("warm-restored torrent must report progress snapshot");
+    assert!(restored_progress > 0);
+    assert_eq!(restored_peers, 0);
+    assert_eq!(restored_speed, 0.0);
+
+    engine.shutdown().await;
+}

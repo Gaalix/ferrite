@@ -1,15 +1,13 @@
 use gpui::{div, prelude::*, px, rgb, rgba, Context, FontWeight, MouseButton};
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{ToneMappingChoice, UpscaleChoice},
-    theme::{
-        glass_capsule_shadow, mono_font, ui_sans, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
-    },
+    theme::{mono_font, ui_sans},
 };
 
-use super::components::{SHEET_BG, SHEET_BORDER};
+use super::components::{player_glass_shadow, player_hud_palette};
 
 impl AppShell {
     pub(super) fn render_stats_for_nerds_card(
@@ -71,6 +69,7 @@ impl AppShell {
 
         let peers_str = peers_opt.map(|p| format!("{p} connected"));
 
+        let t = player_hud_palette();
         let stat_row = |label: &'static str, value: String| {
             div()
                 .w_full()
@@ -82,7 +81,7 @@ impl AppShell {
                     div()
                         .flex_shrink_0()
                         .text_size(px(12.5))
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(t.text_muted))
                         .child(label),
                 )
                 .child(
@@ -91,7 +90,7 @@ impl AppShell {
                         .min_w(px(0.0))
                         .font(mono_font())
                         .text_size(px(12.5))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(t.text_primary))
                         .text_right()
                         .truncate()
                         .child(value),
@@ -108,10 +107,10 @@ impl AppShell {
             .px(px(16.0))
             .py(px(14.0))
             .rounded(px(14.0))
-            .bg(rgba(SHEET_BG))
+            .bg(rgba(t.glass_sheet_bg))
             .border_1()
-            .border_color(rgba(SHEET_BORDER))
-            .shadow(glass_capsule_shadow())
+            .border_color(rgba(t.glass_border))
+            .shadow(player_glass_shadow())
             .flex()
             .flex_col()
             .gap(px(7.0))
@@ -128,7 +127,7 @@ impl AppShell {
                         div()
                             .font(ui_sans(FontWeight::MEDIUM))
                             .text_size(px(13.0))
-                            .text_color(rgb(TEXT_SECONDARY))
+                            .text_color(rgb(t.text_secondary))
                             .child("Playback stats"),
                     )
                     .child(
@@ -138,7 +137,7 @@ impl AppShell {
                             .w(px(22.0))
                             .h(px(22.0))
                             .rounded(px(6.0))
-                            .hover(|s| s.bg(rgba(0xFFFFFF14)))
+                            .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -149,7 +148,12 @@ impl AppShell {
                                     this.toggle_player_stats_for_nerds(cx);
                                 }),
                             )
-                            .child(svg_icon(IconName::X, 13.0, rgb(TEXT_MUTED))),
+                            .child(svg_icon_weighted(
+                                IconName::X,
+                                IconWeight::Regular,
+                                13.0,
+                                rgb(t.text_muted),
+                            )),
                     ),
             )
             .child(stat_row("Decoder", hwdec_str))

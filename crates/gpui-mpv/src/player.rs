@@ -4,9 +4,7 @@ use std::ffi::CString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[cfg(target_os = "windows")]
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -79,6 +77,9 @@ const PROP_VIDEO_FORMAT: u64 = 19;
 const PROP_IDLE_ACTIVE: u64 = 20;
 #[cfg(target_os = "windows")]
 const PROP_DISPLAY_SWAPCHAIN: u64 = 21;
+const PROP_SECONDARY_SID: u64 = 22;
+const PROP_SUB_TEXT: u64 = 23;
+const PROP_SECONDARY_SUB_TEXT: u64 = 24;
 #[cfg(target_os = "windows")]
 const REQ_D3D11_COMPOSITION_SIZE: u64 = 1;
 #[cfg(target_os = "windows")]
@@ -438,6 +439,7 @@ pub struct MediaTrack {
     pub external: bool,
     pub forced: bool,
     pub default: bool,
+    pub hearing_impaired: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -564,6 +566,501 @@ impl SubtitleStyle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum SecondaryForcedMode {
+    #[default]
+    Off = 0,
+    SmartFallback = 1,
+    AlwaysOverlay = 2,
+}
+
+impl SecondaryForcedMode {
+    fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::SmartFallback,
+            2 => Self::AlwaysOverlay,
+            _ => Self::Off,
+        }
+    }
+}
+
+fn strip_subtitle_markup(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut brace_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '<' if brace_depth == 0 => angle_depth = angle_depth.saturating_add(1),
+            '>' if brace_depth == 0 && angle_depth > 0 => {
+                angle_depth = angle_depth.saturating_sub(1)
+            }
+            '\\' if brace_depth == 0 && angle_depth == 0 => {
+                if matches!(chars.peek(), Some('N' | 'n')) {
+                    chars.next();
+                    out.push('\n');
+                } else {
+                    out.push(ch);
+                }
+            }
+            _ if brace_depth == 0 && angle_depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn is_single_line_foreign_placeholder(line: &str) -> bool {
+    let mut s = line.trim();
+    if let Some(rest) = s.strip_prefix('-').or_else(|| s.strip_prefix('–')) {
+        s = rest.trim();
+    }
+    let inner = if let Some(rest) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        rest.trim()
+    } else if let Some(rest) = s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        rest.trim()
+    } else {
+        return false;
+    };
+
+    if inner.is_empty() || inner.contains('[') || inner.contains(']') || inner.contains('(') || inner.contains(')') {
+        return false;
+    }
+
+    let normalized = inner
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if normalized.is_empty() {
+        return false;
+    }
+
+    // Explicit foreign phrases anywhere inside a standalone bracketed caption.
+    const EXPLICIT_FOREIGN_PHRASES: &[&str] = &[
+        "foreign language",
+        "foreign dialogue",
+        "foreign dialog",
+        "foreign speech",
+        "foreign tongue",
+        "non-english",
+        "non english",
+        "native tongue",
+        "native language",
+        "alien language",
+        "unknown language",
+        "another language",
+        "other language",
+    ];
+    if EXPLICIT_FOREIGN_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        return !normalized.contains("in english");
+    }
+
+    const SPEAKING_PREFIXES: &[&str] = &["speaking ", "speaks "];
+    for prefix in SPEAKING_PREFIXES {
+        if let Some(rest) = normalized.strip_prefix(prefix) {
+            return is_plausible_foreign_target(rest, true);
+        }
+    }
+
+    const VERB_IN_PREFIXES: &[&str] = &[
+        "in ",
+        "talking in ",
+        "conversing in ",
+        "dialogue in ",
+        "dialog in ",
+        "chanting in ",
+        "singing in ",
+        "shouting in ",
+        "yelling in ",
+        "screaming in ",
+        "whispering in ",
+        "muttering in ",
+        "mutters in ",
+        "arguing in ",
+        "spoken in ",
+    ];
+    for prefix in VERB_IN_PREFIXES {
+        if let Some(rest) = normalized.strip_prefix(prefix) {
+            return is_plausible_foreign_target(rest, false);
+        }
+    }
+
+    false
+}
+
+fn is_plausible_foreign_target(raw_target: &str, allow_in_prefix: bool) -> bool {
+    let mut target = raw_target
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-')
+        .trim();
+    if allow_in_prefix {
+        if let Some(after_in) = target.strip_prefix("in ") {
+            target = after_in.trim();
+        }
+    }
+    if target.is_empty() {
+        return false;
+    }
+
+    let words: Vec<&str> = target.split_whitespace().collect();
+    if words.is_empty() || words.len() > 3 {
+        return false;
+    }
+
+    // Exclude English itself and common non-language SDH manner/location modifiers.
+    const EXCLUDED_PHRASES: &[&str] = &[
+        "english",
+        "unison",
+        "background",
+        "the background",
+        "distance",
+        "the distance",
+        "pain",
+        "tears",
+        "shock",
+        "fear",
+        "panic",
+        "awe",
+        "wonder",
+        "anger",
+        "silence",
+        "whisper",
+        "a whisper",
+        "chorus",
+        "harmony",
+        "tongues",
+        "riddles",
+        "code",
+    ];
+    if EXCLUDED_PHRASES.contains(&target) {
+        return false;
+    }
+
+    const EXCLUDED_FIRST_WORDS: &[&str] = &[
+        "softly",
+        "quietly",
+        "loudly",
+        "slowly",
+        "quickly",
+        "fast",
+        "calmly",
+        "angrily",
+        "sadly",
+        "gently",
+        "coldly",
+        "firmly",
+        "urgently",
+        "nervously",
+        "weakly",
+        "faintly",
+        "hoarsely",
+        "harshly",
+        "brightly",
+        "excitedly",
+        "rapidly",
+        "briefly",
+        "indistinctly",
+        "inaudibly",
+        "overlapping",
+        "simultaneously",
+        "into",
+        "on",
+        "over",
+        "through",
+        "to",
+        "with",
+        "from",
+        "at",
+        "for",
+        "out",
+        "off",
+        "clearly",
+        "directly",
+    ];
+    if EXCLUDED_FIRST_WORDS.contains(&words[0]) {
+        return false;
+    }
+
+    if target.contains("phone")
+        || target.contains("radio")
+        || target.contains("speaker")
+        || target.contains("mic")
+        || target.contains("intercom")
+        || target.contains("walkie")
+        || target.contains("voiceover")
+        || target.contains("offscreen")
+        || target.contains("off-screen")
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Returns true when the entire subtitle cue is a generic untranslated foreign-speech
+/// placeholder (e.g. `[speaking Dothraki]`, `(in Japanese)`, `[foreign language]`),
+/// and false if it contains any real translated dialogue or ordinary sound effects.
+pub fn is_untranslated_foreign_placeholder(text: &str) -> bool {
+    let cleaned = strip_subtitle_markup(text);
+    let non_empty: Vec<&str> = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return false;
+    }
+    non_empty
+        .iter()
+        .all(|line| is_single_line_foreign_placeholder(line))
+}
+
+/// Decides `(primary_visible, secondary_visible)` for mpv's dual subtitle rendering.
+pub fn decide_smart_forced_visibility(
+    mode: SecondaryForcedMode,
+    primary_text: &str,
+    secondary_text: &str,
+) -> (bool, bool) {
+    match mode {
+        SecondaryForcedMode::Off => (true, false),
+        SecondaryForcedMode::AlwaysOverlay => (true, true),
+        SecondaryForcedMode::SmartFallback => {
+            if secondary_text.trim().is_empty() {
+                (true, false)
+            } else if primary_text.trim().is_empty() {
+                (true, true)
+            } else if is_untranslated_foreign_placeholder(primary_text) {
+                (false, true)
+            } else {
+                (true, false)
+            }
+        }
+    }
+}
+
+/// Returns `true` when the libmpv subtitle codec name identifies a bitmap/image subtitle format
+/// (PGS, VobSub/DVD, DVB, XSUB) whose text is unavailable to `sub-text` / `secondary-sub-text`.
+pub fn is_image_subtitle_codec_name(codec: Option<&str>) -> bool {
+    let Some(raw) = codec.map(str::trim).filter(|c| !c.is_empty()) else {
+        return false;
+    };
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("pgs")
+        || lower.contains("dvd_subtitle")
+        || lower.contains("dvdsub")
+        || lower.contains("vobsub")
+        || lower.contains("dvb_subtitle")
+        || lower.contains("dvbsub")
+        || lower.contains("xsub")
+}
+
+fn has_bitmap_smart_fallback_conflict(tracks: &[MediaTrack], secondary_track_id: i64) -> bool {
+    let primary_is_image = tracks.iter().any(|t| {
+        t.track_type == TrackType::Sub
+            && t.selected
+            && is_image_subtitle_codec_name(t.codec.as_deref())
+    });
+    let secondary_is_image = tracks.iter().any(|t| {
+        t.track_type == TrackType::Sub
+            && t.id == secondary_track_id
+            && is_image_subtitle_codec_name(t.codec.as_deref())
+    });
+    primary_is_image || secondary_is_image
+}
+
+fn resolve_effective_secondary_mode(
+    tracks: &[MediaTrack],
+    track_id: Option<i64>,
+    requested_mode: SecondaryForcedMode,
+) -> (Option<i64>, SecondaryForcedMode) {
+    let Some(sec_id) = track_id else {
+        return (None, SecondaryForcedMode::Off);
+    };
+    if requested_mode == SecondaryForcedMode::Off {
+        return (None, SecondaryForcedMode::Off);
+    }
+    if requested_mode == SecondaryForcedMode::SmartFallback
+        && has_bitmap_smart_fallback_conflict(tracks, sec_id)
+    {
+        return (None, SecondaryForcedMode::Off);
+    }
+    (Some(sec_id), requested_mode)
+}
+
+const SMART_FALLBACK_EMPTY_PRIMARY_GRACE: Duration = Duration::from_millis(120);
+const SMART_FALLBACK_RECENT_PRIMARY_GRACE: Duration = Duration::from_millis(180);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibilityUpdate {
+    primary: bool,
+    secondary: bool,
+    primary_changed: bool,
+    secondary_changed: bool,
+}
+
+/// Stateful visibility coordinator for `SecondaryForcedMode::SmartFallback`.
+///
+/// Prevents ~50–180ms start/end boundary flicker when both primary and secondary text tracks
+/// translate the same line with slightly staggered timestamps, while switching immediately (0ms)
+/// whenever primary shows an untranslated foreign placeholder such as `[speaking Dothraki]`.
+#[derive(Debug, Clone)]
+struct SmartFallbackTracker {
+    primary_visible: bool,
+    secondary_visible: bool,
+    primary_was_non_placeholder: bool,
+    last_non_placeholder_primary_ended_at: Option<Instant>,
+    pending_secondary_reveal_at: Option<Instant>,
+}
+
+impl SmartFallbackTracker {
+    fn new() -> Self {
+        Self {
+            primary_visible: true,
+            secondary_visible: false,
+            primary_was_non_placeholder: false,
+            last_non_placeholder_primary_ended_at: None,
+            pending_secondary_reveal_at: None,
+        }
+    }
+
+    fn reset(&mut self, secondary_visible: bool) {
+        self.primary_visible = true;
+        self.secondary_visible = secondary_visible;
+        self.primary_was_non_placeholder = false;
+        self.last_non_placeholder_primary_ended_at = None;
+        self.pending_secondary_reveal_at = None;
+    }
+
+    fn reset_primary(&mut self) {
+        self.primary_visible = true;
+        self.primary_was_non_placeholder = false;
+        self.last_non_placeholder_primary_ended_at = None;
+        self.pending_secondary_reveal_at = None;
+    }
+
+    fn reset_secondary(&mut self, secondary_visible: bool) {
+        self.primary_visible = true;
+        self.secondary_visible = secondary_visible;
+        self.pending_secondary_reveal_at = None;
+    }
+
+    fn transition(&mut self, want_p: bool, want_s: bool) -> VisibilityUpdate {
+        let primary_changed = want_p != self.primary_visible;
+        let secondary_changed = want_s != self.secondary_visible;
+        self.primary_visible = want_p;
+        self.secondary_visible = want_s;
+        VisibilityUpdate {
+            primary: want_p,
+            secondary: want_s,
+            primary_changed,
+            secondary_changed,
+        }
+    }
+
+    /// Returns the `mpv_wait_event` timeout in seconds: `-1.0` (infinite wait, zero idle CPU)
+    /// when no deferred empty-primary reveal is armed, or the remaining grace duration when armed.
+    fn wait_timeout_secs(&self, now: Instant) -> f64 {
+        match self.pending_secondary_reveal_at {
+            Some(deadline) => deadline
+                .saturating_duration_since(now)
+                .as_secs_f64()
+                .clamp(0.001, 0.25),
+            None => -1.0,
+        }
+    }
+
+    fn update_primary_presence(&mut self, primary_text: &str, now: Instant) {
+        let primary_is_non_placeholder = !primary_text.trim().is_empty()
+            && !is_untranslated_foreign_placeholder(primary_text);
+        if primary_is_non_placeholder {
+            self.primary_was_non_placeholder = true;
+            self.last_non_placeholder_primary_ended_at = None;
+        } else if self.primary_was_non_placeholder {
+            self.primary_was_non_placeholder = false;
+            self.last_non_placeholder_primary_ended_at = Some(now);
+        }
+    }
+
+    /// Evaluates desired `(primary_visible, secondary_visible)` in `SmartFallback` mode.
+    fn evaluate_smart_fallback(
+        &mut self,
+        primary_text: &str,
+        secondary_text: &str,
+        now: Instant,
+    ) -> VisibilityUpdate {
+        self.update_primary_presence(primary_text, now);
+
+        let secondary_empty = secondary_text.trim().is_empty();
+        let primary_empty = primary_text.trim().is_empty();
+
+        let (want_p, want_s) = if secondary_empty {
+            self.pending_secondary_reveal_at = None;
+            (true, false)
+        } else if primary_empty {
+            if self.secondary_visible {
+                // Already showing secondary (e.g. consecutive forced cues or placeholder just ended):
+                // keep secondary visible with zero blink.
+                self.pending_secondary_reveal_at = None;
+                (true, true)
+            } else if let Some(deadline) = self.pending_secondary_reveal_at {
+                if now >= deadline {
+                    self.pending_secondary_reveal_at = None;
+                    (true, true)
+                } else {
+                    (true, false)
+                }
+            } else {
+                let base_deadline = now + SMART_FALLBACK_EMPTY_PRIMARY_GRACE;
+                let deadline = match self.last_non_placeholder_primary_ended_at {
+                    Some(ended_at) => {
+                        base_deadline.max(ended_at + SMART_FALLBACK_RECENT_PRIMARY_GRACE)
+                    }
+                    None => base_deadline,
+                };
+                self.pending_secondary_reveal_at = Some(deadline);
+                (true, false)
+            }
+        } else if is_untranslated_foreign_placeholder(primary_text) {
+            // Immediate 0ms swap: hide placeholder and show forced translation.
+            self.pending_secondary_reveal_at = None;
+            (false, true)
+        } else {
+            // Primary has real translated text -> never show secondary.
+            self.pending_secondary_reveal_at = None;
+            (true, false)
+        };
+
+        self.transition(want_p, want_s)
+    }
+
+    /// Checks whether a deferred empty-primary secondary reveal deadline has elapsed.
+    fn poll_pending(
+        &mut self,
+        mode: SecondaryForcedMode,
+        primary_text: &str,
+        secondary_text: &str,
+        now: Instant,
+    ) -> Option<VisibilityUpdate> {
+        if mode != SecondaryForcedMode::SmartFallback {
+            self.pending_secondary_reveal_at = None;
+            return None;
+        }
+        let deadline = self.pending_secondary_reveal_at?;
+        if now >= deadline {
+            Some(self.evaluate_smart_fallback(primary_text, secondary_text, now))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerSnapshot {
     pub time_pos: f64,
@@ -581,6 +1078,8 @@ pub struct PlayerSnapshot {
     pub volume: f64,
     pub muted: bool,
     pub sub_delay: f64,
+    pub secondary_sub_id: Option<i64>,
+    pub secondary_forced_mode: SecondaryForcedMode,
     pub tracks: Vec<MediaTrack>,
     pub eof_reached: bool,
     pub speed: f64,
@@ -604,6 +1103,8 @@ impl Default for PlayerSnapshot {
             volume: 100.0,
             muted: false,
             sub_delay: 0.0,
+            secondary_sub_id: None,
+            secondary_forced_mode: SecondaryForcedMode::Off,
             tracks: Vec::new(),
             eof_reached: false,
             speed: 1.0,
@@ -738,6 +1239,7 @@ fn strip_parentheticals(input: &str) -> String {
 pub enum PlayerEvent {
     SnapshotChanged(PlayerSnapshot),
     FileLoaded,
+    UntranslatedForeignSubtitleDetected(String),
     EndFile {
         eof: bool,
         error: Option<String>,
@@ -793,6 +1295,10 @@ pub(crate) unsafe fn parse_track_list_node(node: &mpv_node) -> Vec<MediaTrack> {
             .map_get("default")
             .and_then(|n| n.as_bool())
             .unwrap_or(false);
+        let hearing_impaired = entry
+            .map_get("hearing-impaired")
+            .and_then(|n| n.as_bool())
+            .unwrap_or(false);
 
         tracks.push(MediaTrack {
             id,
@@ -804,6 +1310,7 @@ pub(crate) unsafe fn parse_track_list_node(node: &mpv_node) -> Vec<MediaTrack> {
             external,
             forced,
             default,
+            hearing_impaired,
         });
     }
     tracks
@@ -1007,6 +1514,9 @@ struct ObserverShared {
     watch_tx: watch::Sender<PlayerSnapshot>,
     event_tx: async_channel::Sender<PlayerEvent>,
     shutdown: AtomicBool,
+    secondary_forced_mode: AtomicU8,
+    sub_reset_seq: AtomicU64,
+    secondary_sub_reset_seq: AtomicU64,
 }
 
 static ACTIVE_MPV_INSTANCES: AtomicUsize = AtomicUsize::new(0);
@@ -1457,6 +1967,9 @@ impl MpvController {
                 watch_tx,
                 event_tx,
                 shutdown: AtomicBool::new(false),
+                secondary_forced_mode: AtomicU8::new(SecondaryForcedMode::Off as u8),
+                sub_reset_seq: AtomicU64::new(0),
+                secondary_sub_reset_seq: AtomicU64::new(0),
             });
             let viewport_cache = Arc::new(Mutex::new(ViewportState::default()));
             #[cfg(target_os = "windows")]
@@ -2151,6 +2664,8 @@ impl MpvController {
         sub_delay_secs: Option<f64>,
     ) -> Result<(), MpvError> {
         let clean_url = validate_stream_url(url_str)?;
+        self.clear_secondary_subtitle_state();
+        let _ = self.set_property_flag("sub-forced-events-only", false);
         {
             let mut q = self
                 .inner
@@ -2308,10 +2823,133 @@ impl MpvController {
     }
 
     pub fn select_subtitle_track(&self, track_id: Option<i64>) -> Result<(), MpvError> {
+        self.inner
+            .observer
+            .sub_reset_seq
+            .fetch_add(1, Ordering::AcqRel);
+        let _ = self.set_property_flag("sub-visibility", true);
         match track_id {
             Some(id) => self.set_property_i64("sid", id),
             None => self.set_property_string("sid", "no"),
         }
+    }
+
+    /// Toggles libmpv's `sub-forced-events-only` flag (renders only inline forced events from
+    /// Blu-ray PGS / DVD VobSub bitmap tracks when full subtitles are disabled).
+    pub fn set_sub_forced_events_only(&self, enabled: bool) -> Result<(), MpvError> {
+        self.set_property_flag("sub-forced-events-only", enabled)
+    }
+
+    fn clear_secondary_subtitle_state(&self) {
+        self.inner
+            .observer
+            .secondary_forced_mode
+            .store(SecondaryForcedMode::Off as u8, Ordering::Release);
+        self.inner
+            .observer
+            .secondary_sub_reset_seq
+            .fetch_add(1, Ordering::AcqRel);
+        let _ = self.set_property_string("secondary-sid", "no");
+        let _ = self.set_property_flag("sub-visibility", true);
+        let _ = self.set_property_flag("secondary-sub-visibility", true);
+        if let Ok(mut snap) = self.inner.observer.snapshot.write() {
+            if snap.secondary_sub_id.is_some()
+                || snap.secondary_forced_mode != SecondaryForcedMode::Off
+            {
+                snap.secondary_sub_id = None;
+                snap.secondary_forced_mode = SecondaryForcedMode::Off;
+                let cloned = snap.clone();
+                drop(snap);
+                let _ = self.inner.observer.watch_tx.send(cloned.clone());
+                let _ = self
+                    .inner
+                    .observer
+                    .event_tx
+                    .try_send(PlayerEvent::SnapshotChanged(cloned));
+            }
+        }
+    }
+
+    /// Configures mpv's `secondary-sid` track and visibility behavior (smart foreign fallback vs always-on top overlay).
+    ///
+    /// In `SecondaryForcedMode::SmartFallback`, refuses to arm whenever either the currently
+    /// selected primary subtitle track or `track_id` uses a bitmap/image codec (PGS/VobSub/DVB/XSUB),
+    /// forcing `SecondaryForcedMode::Off` and clearing `secondary-sid`.
+    pub fn set_secondary_subtitle_track(
+        &self,
+        track_id: Option<i64>,
+        mode: SecondaryForcedMode,
+    ) -> Result<(), MpvError> {
+        let (effective_track_id, effective_mode) = {
+            let snap = self
+                .inner
+                .observer
+                .snapshot
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            resolve_effective_secondary_mode(&snap.tracks, track_id, mode)
+        };
+        self.inner
+            .observer
+            .secondary_forced_mode
+            .store(effective_mode as u8, Ordering::Release);
+        self.inner
+            .observer
+            .secondary_sub_reset_seq
+            .fetch_add(1, Ordering::AcqRel);
+
+        let base_pos = self
+            .inner
+            .persisted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subtitle_style
+            .vertical_pos;
+        let smart_pos = f64::from(Self::effective_sub_pos(
+            base_pos,
+            self.is_osd_controls_visible(),
+        ));
+
+        match (effective_track_id, effective_mode) {
+            (Some(id), SecondaryForcedMode::SmartFallback) => {
+                self.set_property_double("secondary-sub-pos", smart_pos)?;
+                self.set_property_flag("sub-visibility", true)?;
+                self.set_property_flag("secondary-sub-visibility", false)?;
+                self.set_property_i64("secondary-sid", id)?;
+            }
+            (Some(id), SecondaryForcedMode::AlwaysOverlay) => {
+                self.set_property_double("secondary-sub-pos", 10.0)?;
+                self.set_property_flag("sub-visibility", true)?;
+                self.set_property_flag("secondary-sub-visibility", true)?;
+                self.set_property_i64("secondary-sid", id)?;
+            }
+            (None, _) | (_, SecondaryForcedMode::Off) => {
+                self.set_property_string("secondary-sid", "no")?;
+                self.set_property_flag("sub-visibility", true)?;
+                self.set_property_flag("secondary-sub-visibility", true)?;
+            }
+        }
+
+        if let Ok(mut snap) = self.inner.observer.snapshot.write() {
+            let next_id = if effective_mode == SecondaryForcedMode::Off {
+                None
+            } else {
+                effective_track_id
+            };
+            if snap.secondary_sub_id != next_id || snap.secondary_forced_mode != effective_mode {
+                snap.secondary_sub_id = next_id;
+                snap.secondary_forced_mode = effective_mode;
+                let cloned = snap.clone();
+                drop(snap);
+                let _ = self.inner.observer.watch_tx.send(cloned.clone());
+                let _ = self
+                    .inner
+                    .observer
+                    .event_tx
+                    .try_send(PlayerEvent::SnapshotChanged(cloned));
+            }
+        }
+        Ok(())
     }
 
     pub fn add_subtitle(
@@ -2496,10 +3134,17 @@ impl MpvController {
                 .unwrap_or_else(|e| e.into_inner())
                 .subtitle_style
                 .vertical_pos;
-            self.set_property_double(
-                "sub-pos",
-                f64::from(Self::effective_sub_pos(base_pos, visible)),
-            )?;
+            let pos = f64::from(Self::effective_sub_pos(base_pos, visible));
+            self.set_property_double("sub-pos", pos)?;
+            if SecondaryForcedMode::from_u8(
+                self.inner
+                    .observer
+                    .secondary_forced_mode
+                    .load(Ordering::Acquire),
+            ) == SecondaryForcedMode::SmartFallback
+            {
+                let _ = self.set_property_double("secondary-sub-pos", pos);
+            }
         }
         Ok(())
     }
@@ -2538,13 +3183,20 @@ impl MpvController {
 
     fn apply_subtitle_style(&self, style: &SubtitleStyle) -> Result<(), MpvError> {
         self.set_property_double("sub-font-size", f64::from(style.font_size))?;
-        self.set_property_double(
-            "sub-pos",
-            f64::from(Self::effective_sub_pos(
-                style.vertical_pos,
-                self.is_osd_controls_visible(),
-            )),
-        )?;
+        let pos = f64::from(Self::effective_sub_pos(
+            style.vertical_pos,
+            self.is_osd_controls_visible(),
+        ));
+        self.set_property_double("sub-pos", pos)?;
+        if SecondaryForcedMode::from_u8(
+            self.inner
+                .observer
+                .secondary_forced_mode
+                .load(Ordering::Acquire),
+        ) == SecondaryForcedMode::SmartFallback
+        {
+            let _ = self.set_property_double("secondary-sub-pos", pos);
+        }
         self.set_property_string("sub-color", &style.color_hex)?;
         self.set_property_string("sub-ass-override", style.ass_override.as_mpv_str())?;
 
@@ -3115,7 +3767,81 @@ unsafe fn observe_all_properties(mpv: *mut mpv_handle) -> Result<(), MpvError> {
             )));
         }
     }
+
+    let optional_specs: &[(u64, &CStr, c_int)] = &[
+        (PROP_SECONDARY_SID, c"secondary-sid", MPV_FORMAT_INT64),
+        (PROP_SUB_TEXT, c"sub-text", MPV_FORMAT_STRING),
+        (
+            PROP_SECONDARY_SUB_TEXT,
+            c"secondary-sub-text",
+            MPV_FORMAT_STRING,
+        ),
+    ];
+    for &(tag, name, fmt) in optional_specs {
+        let rc = mpv_observe_property(mpv, tag, name.as_ptr(), fmt);
+        if rc < 0 {
+            tracing::debug!(
+                target: "gpui_mpv::libmpv",
+                "optional mpv_observe_property({}) failed: {}",
+                name.to_string_lossy(),
+                error_to_string(rc)
+            );
+        }
+    }
     Ok(())
+}
+
+unsafe fn set_property_flag_raw(mpv: *mut mpv_handle, name: &CStr, value: bool) {
+    if mpv.is_null() {
+        return;
+    }
+    let mut flag: c_int = if value { 1 } else { 0 };
+    let rc = mpv_set_property_async(
+        mpv,
+        0,
+        name.as_ptr(),
+        MPV_FORMAT_FLAG,
+        &mut flag as *mut c_int as *mut c_void,
+    );
+    if rc < 0 {
+        tracing::debug!(
+            target: "gpui_mpv::libmpv",
+            "mpv_set_property_async({}) failed: {}",
+            name.to_string_lossy(),
+            error_to_string(rc)
+        );
+    }
+}
+
+unsafe fn set_property_string_raw(mpv: *mut mpv_handle, name: &CStr, value: &CStr) {
+    if mpv.is_null() {
+        return;
+    }
+    let mut ptr_val: *const c_char = value.as_ptr();
+    let rc = mpv_set_property_async(
+        mpv,
+        0,
+        name.as_ptr(),
+        MPV_FORMAT_STRING,
+        &mut ptr_val as *mut *const c_char as *mut c_void,
+    );
+    if rc < 0 {
+        tracing::debug!(
+            target: "gpui_mpv::libmpv",
+            "mpv_set_property_async({}) failed: {}",
+            name.to_string_lossy(),
+            error_to_string(rc)
+        );
+    }
+}
+
+unsafe fn apply_smart_visibility(mpv: *mut mpv_handle, upd: VisibilityUpdate) {
+    if upd.primary_changed {
+        set_property_flag_raw(mpv, c"sub-visibility", upd.primary);
+    }
+    if upd.secondary_changed {
+        set_property_flag_raw(mpv, c"secondary-sub-visibility", upd.secondary);
+    }
 }
 
 unsafe fn read_track_list_now(mpv: *mut mpv_handle) -> Vec<MediaTrack> {
@@ -3250,20 +3976,74 @@ fn run_event_loop(
 ) {
     let mut paused_for_cache = false;
     let mut seeking = false;
+    let mut primary_sub_text = String::new();
+    let mut secondary_sub_text = String::new();
+    let mut smart_tracker = SmartFallbackTracker::new();
+    let mut reported_untranslated_for_file = false;
+    let mut local_sub_reset_seq = observer.sub_reset_seq.load(Ordering::Acquire);
+    let mut local_secondary_reset_seq = observer.secondary_sub_reset_seq.load(Ordering::Acquire);
 
     loop {
         if observer.shutdown.load(Ordering::Acquire) {
             break;
         }
 
-        let ev_ptr = unsafe { mpv_wait_event(mpv.0, -1.0) };
+        let current_mode = SecondaryForcedMode::from_u8(
+            observer.secondary_forced_mode.load(Ordering::Acquire),
+        );
+        if let Some(upd) = smart_tracker.poll_pending(
+            current_mode,
+            &primary_sub_text,
+            &secondary_sub_text,
+            Instant::now(),
+        ) {
+            unsafe {
+                apply_smart_visibility(mpv.0, upd);
+            }
+        }
+
+        let wait_timeout = smart_tracker.wait_timeout_secs(Instant::now());
+        let ev_ptr = unsafe { mpv_wait_event(mpv.0, wait_timeout) };
         if observer.shutdown.load(Ordering::Acquire) || ev_ptr.is_null() {
             break;
         }
 
+        let seq_now = observer.sub_reset_seq.load(Ordering::Acquire);
+        if seq_now != local_sub_reset_seq {
+            local_sub_reset_seq = seq_now;
+            primary_sub_text.clear();
+            smart_tracker.reset_primary();
+            reported_untranslated_for_file = false;
+        }
+        let sec_seq_now = observer.secondary_sub_reset_seq.load(Ordering::Acquire);
+        if sec_seq_now != local_secondary_reset_seq {
+            local_secondary_reset_seq = sec_seq_now;
+            secondary_sub_text.clear();
+            smart_tracker.reset_secondary(
+                SecondaryForcedMode::from_u8(
+                    observer.secondary_forced_mode.load(Ordering::Acquire),
+                ) == SecondaryForcedMode::AlwaysOverlay,
+            );
+        }
+
         let ev = unsafe { *ev_ptr };
         match ev.event_id {
-            MPV_EVENT_NONE => continue,
+            MPV_EVENT_NONE => {
+                let mode_now = SecondaryForcedMode::from_u8(
+                    observer.secondary_forced_mode.load(Ordering::Acquire),
+                );
+                if let Some(upd) = smart_tracker.poll_pending(
+                    mode_now,
+                    &primary_sub_text,
+                    &secondary_sub_text,
+                    Instant::now(),
+                ) {
+                    unsafe {
+                        apply_smart_visibility(mpv.0, upd);
+                    }
+                }
+                continue;
+            }
             MPV_EVENT_SHUTDOWN => break,
             MPV_EVENT_LOG_MESSAGE => {
                 if !ev.data.is_null() {
@@ -3355,6 +4135,18 @@ fn run_event_loop(
                 if let Ok(mut q) = pending_media.lock() {
                     q.file_loaded = false;
                 }
+                primary_sub_text.clear();
+                secondary_sub_text.clear();
+                smart_tracker.reset(false);
+                reported_untranslated_for_file = false;
+                observer
+                    .secondary_forced_mode
+                    .store(SecondaryForcedMode::Off as u8, Ordering::Release);
+                unsafe {
+                    set_property_flag_raw(mpv.0, c"sub-visibility", true);
+                    set_property_flag_raw(mpv.0, c"secondary-sub-visibility", true);
+                    set_property_flag_raw(mpv.0, c"sub-forced-events-only", false);
+                }
                 let mut snap = observer
                     .snapshot
                     .write()
@@ -3363,6 +4155,8 @@ fn run_event_loop(
                 snap.buffering = true;
                 snap.cache_speed_bytes = 0;
                 snap.video_format.clear();
+                snap.secondary_sub_id = None;
+                snap.secondary_forced_mode = SecondaryForcedMode::Off;
                 snap.tracks.clear();
                 let cloned = snap.clone();
                 drop(snap);
@@ -3507,6 +4301,13 @@ fn run_event_loop(
                 if let Ok(mut q) = pending_media.lock() {
                     q.file_loaded = false;
                 }
+                primary_sub_text.clear();
+                secondary_sub_text.clear();
+                smart_tracker.reset(false);
+                reported_untranslated_for_file = false;
+                unsafe {
+                    set_property_flag_raw(mpv.0, c"sub-visibility", true);
+                }
                 #[cfg(target_os = "windows")]
                 if dcomp.mode() == DCompBackendMode::DirectSwapChainVisual {
                     let queried = unsafe { read_display_swapchain_ptr(mpv.0) };
@@ -3553,6 +4354,8 @@ fn run_event_loop(
                 }
                 let prop = unsafe { *(ev.data as *const mpv_event_property) };
                 let mut changed = false;
+                let mut sub_text_updated = false;
+                let mut disarm_smart_fallback = false;
                 #[cfg(target_os = "windows")]
                 let mut dcomp_resync = false;
 
@@ -3694,6 +4497,19 @@ fn run_event_loop(
                                     snap.tracks = tracks;
                                     changed = true;
                                 }
+                                let mode = SecondaryForcedMode::from_u8(
+                                    observer.secondary_forced_mode.load(Ordering::Acquire),
+                                );
+                                if mode == SecondaryForcedMode::SmartFallback {
+                                    if let Some(sec_id) = snap.secondary_sub_id {
+                                        if has_bitmap_smart_fallback_conflict(&snap.tracks, sec_id) {
+                                            disarm_smart_fallback = true;
+                                            snap.secondary_sub_id = None;
+                                            snap.secondary_forced_mode = SecondaryForcedMode::Off;
+                                            changed = true;
+                                        }
+                                    }
+                                }
                             }
                             PROP_EOF_REACHED => {
                                 let v = read_prop_bool(&prop).unwrap_or(false);
@@ -3730,6 +4546,27 @@ fn run_event_loop(
                                 snap.cache_speed_bytes = 0;
                                 changed = true;
                             }
+                            PROP_SECONDARY_SID => {
+                                let v = read_prop_i64(&prop).filter(|&id| id > 0);
+                                if snap.secondary_sub_id != v {
+                                    snap.secondary_sub_id = v;
+                                    changed = true;
+                                }
+                            }
+                            PROP_SUB_TEXT => {
+                                let v = read_prop_string(&prop).unwrap_or_default();
+                                if primary_sub_text != v {
+                                    primary_sub_text = v;
+                                    sub_text_updated = true;
+                                }
+                            }
+                            PROP_SECONDARY_SUB_TEXT => {
+                                let v = read_prop_string(&prop).unwrap_or_default();
+                                if secondary_sub_text != v {
+                                    secondary_sub_text = v;
+                                    sub_text_updated = true;
+                                }
+                            }
                             #[cfg(target_os = "windows")]
                             PROP_DISPLAY_SWAPCHAIN => {
                                 let ptr_val =
@@ -3757,6 +4594,59 @@ fn run_event_loop(
                             .try_send(PlayerEvent::SnapshotChanged(cloned));
                     } else {
                         drop(snap);
+                    }
+
+                    if disarm_smart_fallback {
+                        observer
+                            .secondary_forced_mode
+                            .store(SecondaryForcedMode::Off as u8, Ordering::Release);
+                        secondary_sub_text.clear();
+                        smart_tracker.reset(false);
+                        unsafe {
+                            set_property_string_raw(mpv.0, c"secondary-sid", c"no");
+                            set_property_flag_raw(mpv.0, c"sub-visibility", true);
+                            set_property_flag_raw(mpv.0, c"secondary-sub-visibility", true);
+                        }
+                    }
+
+                    if sub_text_updated {
+                        let mode = SecondaryForcedMode::from_u8(
+                            observer.secondary_forced_mode.load(Ordering::Acquire),
+                        );
+                        match mode {
+                            SecondaryForcedMode::SmartFallback => {
+                                let upd = smart_tracker.evaluate_smart_fallback(
+                                    &primary_sub_text,
+                                    &secondary_sub_text,
+                                    Instant::now(),
+                                );
+                                unsafe {
+                                    apply_smart_visibility(mpv.0, upd);
+                                }
+                            }
+                            SecondaryForcedMode::Off => {
+                                if !smart_tracker.primary_visible {
+                                    unsafe {
+                                        set_property_flag_raw(mpv.0, c"sub-visibility", true);
+                                    }
+                                    smart_tracker.primary_visible = true;
+                                }
+                                smart_tracker.pending_secondary_reveal_at = None;
+                                if !reported_untranslated_for_file
+                                    && is_untranslated_foreign_placeholder(&primary_sub_text)
+                                {
+                                    reported_untranslated_for_file = true;
+                                    let _ = observer.event_tx.try_send(
+                                        PlayerEvent::UntranslatedForeignSubtitleDetected(
+                                            primary_sub_text.clone(),
+                                        ),
+                                    );
+                                }
+                            }
+                            SecondaryForcedMode::AlwaysOverlay => {
+                                smart_tracker.pending_secondary_reveal_at = None;
+                            }
+                        }
                     }
 
                     #[cfg(target_os = "windows")]
@@ -4207,6 +5097,19 @@ fn decode_pcm_s16le_bytes(bytes: &[u8]) -> Vec<i16> {
     out
 }
 
+fn configure_hidden_command(cmd: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = cmd;
+    }
+}
+
 fn extract_audio_pcm_via_ffmpeg(
     clean_url: &str,
     start_secs: f64,
@@ -4215,7 +5118,9 @@ fn extract_audio_pcm_via_ffmpeg(
     const FFMPEG_PROBE_WALL_TIMEOUT: Duration = Duration::from_secs(6);
     let start_arg = format!("{start_secs:.2}");
     let dur_arg = format!("{duration_secs:.2}");
-    let mut child = Command::new("ffmpeg")
+    let mut cmd = Command::new("ffmpeg");
+    configure_hidden_command(&mut cmd);
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -4436,6 +5341,145 @@ pub fn extract_audio_pcm_s16le_8khz(
             })
         }
     }
+}
+
+const MAX_EMBEDDED_SUBTITLE_WINDOW_BYTES: usize = 2 * 1024 * 1024;
+const FFMPEG_SUBTITLE_WINDOW_WALL_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Extracts a bounded SRT window from an embedded text subtitle stream inside a validated
+/// media URL using `ffmpeg`, preserving original container timestamps via `-copyts`.
+///
+/// Uses input seeking (`-ss <start_secs>` before `-i`) combined with `-copyts` and `-to <end_secs>`
+/// so HTTP/MKV range requests only read the targeted byte window while keeping exact original
+/// MKV cue timestamps for reference alignment.
+pub fn extract_embedded_text_subtitle_window(
+    stream_url: &str,
+    subtitle_stream_ordinal: usize,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Result<String, MpvError> {
+    let clean_url = validate_stream_url(stream_url)?;
+    if clean_url.starts_with('-') {
+        return Err(MpvError::Command(
+            "rejected stream URL starting with '-'".into(),
+        ));
+    }
+    let clean_start = if start_secs.is_finite() {
+        start_secs.max(0.0)
+    } else {
+        0.0
+    };
+    let clean_duration = if duration_secs.is_finite() {
+        duration_secs.clamp(5.0, 300.0)
+    } else {
+        120.0
+    };
+    let end_secs = clean_start + clean_duration;
+
+    let start_arg = format!("{clean_start:.2}");
+    let end_arg = format!("{end_secs:.2}");
+    let map_arg = format!("0:s:{subtitle_stream_ordinal}");
+    let is_http = strip_ascii_prefix_ignore_case(clean_url, "http://").is_some()
+        || strip_ascii_prefix_ignore_case(clean_url, "https://").is_some();
+
+    let mut args: Vec<&str> = Vec::with_capacity(20);
+    args.extend(["-v", "error", "-nostdin", "-copyts"]);
+    if is_http {
+        args.extend(["-rw_timeout", "5000000"]);
+    }
+    args.extend([
+        "-ss",
+        &start_arg,
+        "-i",
+        clean_url,
+        "-to",
+        &end_arg,
+        "-vn",
+        "-an",
+        "-dn",
+        "-map",
+        &map_arg,
+        "-f",
+        "srt",
+        "pipe:1",
+    ]);
+
+    let mut cmd = Command::new("ffmpeg");
+    configure_hidden_command(&mut cmd);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .args(&args)
+        .spawn()
+        .map_err(|err| {
+            MpvError::Command(format!("ffmpeg subtitle window spawn failed: {err}"))
+        })?;
+
+    let stdout = child.stdout.take();
+    let deadline = Instant::now() + FFMPEG_SUBTITLE_WINDOW_WALL_TIMEOUT;
+    let mut timed_out = false;
+    let mut exit_status = None;
+    let raw_bytes = thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(stdout) = stdout {
+                let _ = stdout
+                    .take(MAX_EMBEDDED_SUBTITLE_WINDOW_BYTES as u64)
+                    .read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exit_status = Some(status);
+                    break;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        timed_out = true;
+                        let _ = child.kill();
+                        exit_status = child.wait().ok();
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(15));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    exit_status = child.wait().ok();
+                    break;
+                }
+            }
+        }
+
+        reader.join().unwrap_or_default()
+    });
+
+    if timed_out {
+        return Err(MpvError::Command(
+            "ffmpeg subtitle window extraction timed out after 6s".into(),
+        ));
+    }
+    match exit_status {
+        Some(status) if status.success() => {}
+        other => {
+            return Err(MpvError::Command(format!(
+                "ffmpeg subtitle window extraction failed (exit={other:?})"
+            )));
+        }
+    }
+
+    let srt = String::from_utf8_lossy(&raw_bytes)
+        .trim_start_matches('\u{feff}')
+        .to_owned();
+    if srt.trim().is_empty() {
+        return Err(MpvError::Command(
+            "ffmpeg subtitle window extraction returned empty SRT".into(),
+        ));
+    }
+    Ok(srt)
 }
 
 #[cfg(test)]
@@ -4787,6 +5831,7 @@ mod tests {
                     external: false,
                     forced: false,
                     default: false,
+                    hearing_impaired: false,
                 }]
             );
         }
@@ -5687,5 +6732,623 @@ mod tests {
         stop_flag.store(true, Ordering::Relaxed);
         let _ = server_thread.join();
         let _ = std::fs::remove_dir_all(&sub_dir);
+    }
+
+    #[test]
+    fn foreign_placeholder_detection_handles_universal_captions_without_false_positives() {
+        assert!(is_untranslated_foreign_placeholder("[speaking Dothraki]"));
+        assert!(is_untranslated_foreign_placeholder("(SPEAKING VALYRIAN)"));
+        assert!(is_untranslated_foreign_placeholder("[in Japanese]"));
+        assert!(is_untranslated_foreign_placeholder("(in foreign language)"));
+        assert!(is_untranslated_foreign_placeholder("[speaking Spanish]"));
+        assert!(is_untranslated_foreign_placeholder("(speaking Chakobsa)"));
+        assert!(is_untranslated_foreign_placeholder("[chanting in Latin]"));
+        assert!(is_untranslated_foreign_placeholder("<i>[Foreign Dialogue]</i>"));
+        assert!(is_untranslated_foreign_placeholder("{\\i1}(speaks French){\\i0}"));
+
+        // Mixed cue with actual translated dialogue must NEVER be hidden.
+        assert!(!is_untranslated_foreign_placeholder(
+            "[speaking Dothraki]\nKill the dragon."
+        ));
+        assert!(!is_untranslated_foreign_placeholder("Where is the king?"));
+
+        // Normal SDH sound effects & manner descriptors must NEVER match.
+        assert!(!is_untranslated_foreign_placeholder("[door creaks]"));
+        assert!(!is_untranslated_foreign_placeholder("[music playing]"));
+        assert!(!is_untranslated_foreign_placeholder("[speaking softly]"));
+        assert!(!is_untranslated_foreign_placeholder("[whispering quietly]"));
+        assert!(!is_untranslated_foreign_placeholder("(in the distance)"));
+        assert!(!is_untranslated_foreign_placeholder("[in English]"));
+        assert!(!is_untranslated_foreign_placeholder("[speaking on phone]"));
+    }
+
+    #[test]
+    fn smart_forced_visibility_prevents_duplicates_and_hides_untranslated_placeholders() {
+        assert_eq!(
+            decide_smart_forced_visibility(SecondaryForcedMode::Off, "[speaking Dothraki]", "Ride!"),
+            (true, false)
+        );
+        assert_eq!(
+            decide_smart_forced_visibility(SecondaryForcedMode::AlwaysOverlay, "Hello", "Ride!"),
+            (true, true)
+        );
+        assert_eq!(
+            decide_smart_forced_visibility(SecondaryForcedMode::SmartFallback, "Hello", ""),
+            (true, false)
+        );
+        // Primary already translates foreign speech -> do not duplicate secondary line.
+        assert_eq!(
+            decide_smart_forced_visibility(
+                SecondaryForcedMode::SmartFallback,
+                "Ride to the sea!",
+                "Ride to the sea!"
+            ),
+            (true, false)
+        );
+        // Primary has blank gap during foreign speech -> show forced translation.
+        assert_eq!(
+            decide_smart_forced_visibility(SecondaryForcedMode::SmartFallback, "", "Ride!"),
+            (true, true)
+        );
+        // Primary has untranslated placeholder -> hide placeholder and show forced translation.
+        assert_eq!(
+            decide_smart_forced_visibility(
+                SecondaryForcedMode::SmartFallback,
+                "[speaking Dothraki]",
+                "Ride!"
+            ),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn secondary_subtitle_track_sets_and_clears_observed_secondary_sid() {
+        let sub_dir = std::env::temp_dir().join(format!(
+            "gpui_mpv_sec_sid_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let full_srt = sub_dir.join("full.srt");
+        let forced_srt = sub_dir.join("forced.srt");
+        std::fs::write(&full_srt, "1\n00:00:00,050 --> 00:00:00,800\n[speaking Dothraki]\n").unwrap();
+        std::fs::write(&forced_srt, "1\n00:00:00,050 --> 00:00:00,800\nRide!\n").unwrap();
+
+        let ctrl = MpvController::with_extra_options(&[("vo", "null"), ("ao", "null")])
+            .expect("headless mpv controller");
+        ctrl.load_file("av://lavfi:color=c=black:s=160x90:d=1.0:r=25", None)
+            .expect("load lavfi clip");
+        ctrl.add_local_subtitle_file_selected(&full_srt, Some("English"), Some("eng"), true)
+            .expect("queue full sub");
+        ctrl.add_local_subtitle_file_selected(
+            &forced_srt,
+            Some("English Forced"),
+            Some("eng"),
+            false,
+        )
+        .expect("queue forced sub");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut forced_id = None;
+        while std::time::Instant::now() < deadline {
+            let snap = ctrl.snapshot();
+            if let Some(tr) = snap
+                .tracks
+                .iter()
+                .find(|t| t.track_type == TrackType::Sub && t.title.as_deref() == Some("English Forced"))
+            {
+                forced_id = Some(tr.id);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        let forced_id = forced_id.expect("expected forced track to register in track-list");
+        ctrl.set_secondary_subtitle_track(Some(forced_id), SecondaryForcedMode::SmartFallback)
+            .expect("enable smart fallback");
+
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut observed = false;
+        while std::time::Instant::now() < deadline2 {
+            let snap = ctrl.snapshot();
+            if snap.secondary_sub_id == Some(forced_id)
+                && snap.secondary_forced_mode == SecondaryForcedMode::SmartFallback
+            {
+                observed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(observed, "expected secondary_sub_id == Some({forced_id})");
+
+        ctrl.set_secondary_subtitle_track(None, SecondaryForcedMode::Off)
+            .expect("clear secondary sub");
+        let deadline3 = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut cleared = false;
+        while std::time::Instant::now() < deadline3 {
+            let snap = ctrl.snapshot();
+            if snap.secondary_sub_id.is_none()
+                && snap.secondary_forced_mode == SecondaryForcedMode::Off
+            {
+                cleared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(cleared, "expected secondary_sub_id to clear to None");
+
+        ctrl.shutdown_blocking();
+        let _ = std::fs::remove_dir_all(&sub_dir);
+    }
+
+    #[test]
+    fn parse_track_list_node_reads_hearing_impaired_true_and_false() {
+        unsafe {
+            let mut k_id = b"id\0".to_vec();
+            let mut k_type = b"type\0".to_vec();
+            let mut k_lang = b"lang\0".to_vec();
+            let mut k_codec = b"codec\0".to_vec();
+            let mut k_hi = b"hearing-impaired\0".to_vec();
+
+            let mut v_sub = b"sub\0".to_vec();
+            let mut v_lang = b"eng\0".to_vec();
+            let mut v_codec = b"subrip\0".to_vec();
+
+            let mut keys1 = [
+                k_id.as_mut_ptr() as *mut c_char,
+                k_type.as_mut_ptr() as *mut c_char,
+                k_lang.as_mut_ptr() as *mut c_char,
+                k_codec.as_mut_ptr() as *mut c_char,
+                k_hi.as_mut_ptr() as *mut c_char,
+            ];
+            let mut vals1 = [
+                mpv_node {
+                    u: mpv_node_union { int64: 3 },
+                    format: MPV_FORMAT_INT64,
+                },
+                mpv_node {
+                    u: mpv_node_union {
+                        string: v_sub.as_mut_ptr() as *mut c_char,
+                    },
+                    format: MPV_FORMAT_STRING,
+                },
+                mpv_node {
+                    u: mpv_node_union {
+                        string: v_lang.as_mut_ptr() as *mut c_char,
+                    },
+                    format: MPV_FORMAT_STRING,
+                },
+                mpv_node {
+                    u: mpv_node_union {
+                        string: v_codec.as_mut_ptr() as *mut c_char,
+                    },
+                    format: MPV_FORMAT_STRING,
+                },
+                mpv_node {
+                    u: mpv_node_union { flag: 1 },
+                    format: MPV_FORMAT_FLAG,
+                },
+            ];
+            let mut map_list1 = mpv_node_list {
+                num: 5,
+                values: vals1.as_mut_ptr(),
+                keys: keys1.as_mut_ptr(),
+            };
+
+            let mut keys2 = [
+                k_id.as_mut_ptr() as *mut c_char,
+                k_type.as_mut_ptr() as *mut c_char,
+                k_hi.as_mut_ptr() as *mut c_char,
+            ];
+            let mut vals2 = [
+                mpv_node {
+                    u: mpv_node_union { int64: 4 },
+                    format: MPV_FORMAT_INT64,
+                },
+                mpv_node {
+                    u: mpv_node_union {
+                        string: v_sub.as_mut_ptr() as *mut c_char,
+                    },
+                    format: MPV_FORMAT_STRING,
+                },
+                mpv_node {
+                    u: mpv_node_union { flag: 0 },
+                    format: MPV_FORMAT_FLAG,
+                },
+            ];
+            let mut map_list2 = mpv_node_list {
+                num: 3,
+                values: vals2.as_mut_ptr(),
+                keys: keys2.as_mut_ptr(),
+            };
+
+            let mut map_nodes = [
+                mpv_node {
+                    u: mpv_node_union {
+                        list: &mut map_list1,
+                    },
+                    format: MPV_FORMAT_NODE_MAP,
+                },
+                mpv_node {
+                    u: mpv_node_union {
+                        list: &mut map_list2,
+                    },
+                    format: MPV_FORMAT_NODE_MAP,
+                },
+            ];
+            let mut root_list = mpv_node_list {
+                num: 2,
+                values: map_nodes.as_mut_ptr(),
+                keys: ptr::null_mut(),
+            };
+            let root = mpv_node {
+                u: mpv_node_union {
+                    list: &mut root_list,
+                },
+                format: MPV_FORMAT_NODE_ARRAY,
+            };
+
+            let parsed = parse_track_list_node(&root);
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].id, 3);
+            assert!(parsed[0].hearing_impaired);
+            assert_eq!(parsed[1].id, 4);
+            assert!(!parsed[1].hearing_impaired);
+        }
+    }
+
+    #[test]
+    fn image_subtitle_codec_detection_and_smart_fallback_bitmap_guard() {
+        assert!(is_image_subtitle_codec_name(Some("hdmv_pgs_subtitle")));
+        assert!(is_image_subtitle_codec_name(Some("pgs")));
+        assert!(is_image_subtitle_codec_name(Some("dvd_subtitle")));
+        assert!(is_image_subtitle_codec_name(Some("vobsub")));
+        assert!(is_image_subtitle_codec_name(Some("dvb_subtitle")));
+        assert!(is_image_subtitle_codec_name(Some("xsub")));
+
+        assert!(!is_image_subtitle_codec_name(Some("subrip")));
+        assert!(!is_image_subtitle_codec_name(Some("ass")));
+        assert!(!is_image_subtitle_codec_name(Some("webvtt")));
+        assert!(!is_image_subtitle_codec_name(Some("hdmv_text_subtitle")));
+        assert!(!is_image_subtitle_codec_name(None));
+
+        let make_sub = |id: i64, codec: &str, selected: bool, forced: bool| MediaTrack {
+            id,
+            track_type: TrackType::Sub,
+            title: None,
+            lang: Some("eng".into()),
+            codec: Some(codec.into()),
+            selected,
+            external: false,
+            forced,
+            default: false,
+            hearing_impaired: false,
+        };
+
+        // Primary is PGS, secondary is SRT -> SmartFallback refused!
+        let pgs_primary = vec![
+            make_sub(1, "hdmv_pgs_subtitle", true, false),
+            make_sub(2, "subrip", false, true),
+        ];
+        assert_eq!(
+            resolve_effective_secondary_mode(
+                &pgs_primary,
+                Some(2),
+                SecondaryForcedMode::SmartFallback
+            ),
+            (None, SecondaryForcedMode::Off)
+        );
+
+        // Primary is SRT, secondary is VobSub -> SmartFallback refused!
+        let vobsub_secondary = vec![
+            make_sub(1, "subrip", true, false),
+            make_sub(2, "dvd_subtitle", false, true),
+        ];
+        assert_eq!(
+            resolve_effective_secondary_mode(
+                &vobsub_secondary,
+                Some(2),
+                SecondaryForcedMode::SmartFallback
+            ),
+            (None, SecondaryForcedMode::Off)
+        );
+
+        // Both text -> SmartFallback allowed!
+        let both_text = vec![
+            make_sub(1, "subrip", true, false),
+            make_sub(2, "ass", false, true),
+        ];
+        assert_eq!(
+            resolve_effective_secondary_mode(
+                &both_text,
+                Some(2),
+                SecondaryForcedMode::SmartFallback
+            ),
+            (Some(2), SecondaryForcedMode::SmartFallback)
+        );
+
+        // Verify live MpvController refuses SmartFallback on bitmap tracks and clears secondary-sid.
+        let ctrl = MpvController::with_extra_options(&[("vo", "null"), ("ao", "null")])
+            .expect("headless mpv controller");
+        {
+            let mut snap = ctrl
+                .inner
+                .observer
+                .snapshot
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            snap.tracks = pgs_primary;
+        }
+        ctrl.set_secondary_subtitle_track(Some(2), SecondaryForcedMode::SmartFallback)
+            .expect("set_secondary_subtitle_track should succeed by forcing Off");
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.secondary_sub_id, None);
+        assert_eq!(snap.secondary_forced_mode, SecondaryForcedMode::Off);
+        assert_eq!(
+            SecondaryForcedMode::from_u8(
+                ctrl.inner
+                    .observer
+                    .secondary_forced_mode
+                    .load(Ordering::Acquire),
+            ),
+            SecondaryForcedMode::Off
+        );
+        ctrl.shutdown_blocking();
+    }
+
+    #[test]
+    fn smart_fallback_tracker_prevents_boundary_flicker_and_switches_placeholders_immediately() {
+        let mut tracker = SmartFallbackTracker::new();
+        let t0 = Instant::now();
+
+        // Idle: wait_timeout_secs returns -1.0 (zero idle CPU polling).
+        assert_eq!(tracker.wait_timeout_secs(t0), -1.0);
+
+        // 1. Start-boundary mismatch (~80ms): secondary arrives slightly before primary.
+        let upd = tracker.evaluate_smart_fallback("", "Ride!", t0);
+        assert_eq!((upd.primary, upd.secondary), (true, false));
+        assert!(
+            tracker.wait_timeout_secs(t0) > 0.0 && tracker.wait_timeout_secs(t0) <= 0.13,
+            "pending grace timer should schedule short wait"
+        );
+        // Primary arrives 80ms later with real translation -> cancels pending reveal, ZERO flicker!
+        let t1 = t0 + Duration::from_millis(80);
+        assert!(tracker
+            .poll_pending(SecondaryForcedMode::SmartFallback, "", "Ride!", t1)
+            .is_none());
+        let upd = tracker.evaluate_smart_fallback("Ride!", "Ride!", t1);
+        assert_eq!((upd.primary, upd.secondary), (true, false));
+        assert_eq!(tracker.wait_timeout_secs(t1), -1.0);
+
+        // 2. End-boundary mismatch (~150ms): primary ends at t2, secondary lingers until t2+150ms.
+        let t2 = t1 + Duration::from_secs(2);
+        let upd = tracker.evaluate_smart_fallback("", "Ride!", t2);
+        assert_eq!((upd.primary, upd.secondary), (true, false));
+        // At +140ms (within 180ms recent-primary grace), secondary must still NOT flash!
+        let t3 = t2 + Duration::from_millis(140);
+        assert!(tracker
+            .poll_pending(SecondaryForcedMode::SmartFallback, "", "Ride!", t3)
+            .is_none());
+        // Secondary clears at +150ms -> ZERO flicker and back to idle wait (-1.0)!
+        let t4 = t2 + Duration::from_millis(150);
+        let upd = tracker.evaluate_smart_fallback("", "", t4);
+        assert_eq!((upd.primary, upd.secondary), (true, false));
+        assert_eq!(tracker.wait_timeout_secs(t4), -1.0);
+
+        // 3. Genuine blank-gap foreign dialogue in secondary -> reveals after 120ms grace.
+        let t5 = t4 + Duration::from_secs(2);
+        let upd = tracker.evaluate_smart_fallback("", "Valar morghulis.", t5);
+        assert_eq!((upd.primary, upd.secondary), (true, false));
+        assert!(tracker
+            .poll_pending(
+                SecondaryForcedMode::SmartFallback,
+                "",
+                "Valar morghulis.",
+                t5 + Duration::from_millis(100)
+            )
+            .is_none());
+        let reveal = tracker
+            .poll_pending(
+                SecondaryForcedMode::SmartFallback,
+                "",
+                "Valar morghulis.",
+                t5 + Duration::from_millis(125),
+            )
+            .expect("secondary should reveal after 120ms empty-primary grace");
+        assert_eq!((reveal.primary, reveal.secondary), (true, true));
+        assert!(reveal.secondary_changed);
+        assert_eq!(
+            tracker.wait_timeout_secs(t5 + Duration::from_millis(125)),
+            -1.0
+        );
+
+        // Secondary clears -> hides again.
+        let t6 = t5 + Duration::from_secs(2);
+        let upd = tracker.evaluate_smart_fallback("", "", t6);
+        assert_eq!((upd.primary, upd.secondary), (true, false));
+        assert!(upd.secondary_changed);
+
+        // 4. Untranslated foreign placeholder -> IMMEDIATE 0ms switch (hide primary, show secondary).
+        let t7 = t6 + Duration::from_secs(1);
+        let upd = tracker.evaluate_smart_fallback("[speaking Dothraki]", "Crown for a king.", t7);
+        assert_eq!((upd.primary, upd.secondary), (false, true));
+        assert!(upd.primary_changed);
+        assert!(upd.secondary_changed);
+        assert_eq!(tracker.wait_timeout_secs(t7), -1.0);
+
+        // Placeholder ends slightly before secondary -> keep secondary visible with zero blink.
+        let t8 = t7 + Duration::from_secs(2);
+        let upd = tracker.evaluate_smart_fallback("", "Crown for a king.", t8);
+        assert_eq!((upd.primary, upd.secondary), (true, true));
+        assert!(upd.primary_changed);
+        assert!(!upd.secondary_changed);
+    }
+
+    #[test]
+    fn set_sub_forced_events_only_toggles_and_resets_on_load_file() {
+        let ctrl = MpvController::with_extra_options(&[("vo", "null"), ("ao", "null")])
+            .expect("headless mpv controller");
+
+        let read_forced_events_only = || -> Option<bool> {
+            let mpv_guard = ctrl
+                .inner
+                .mpv_slot
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let mpv_raw = (*mpv_guard)?;
+            let mut flag: c_int = 0;
+            let rc = unsafe {
+                mpv_get_property(
+                    mpv_raw.0,
+                    c"sub-forced-events-only".as_ptr(),
+                    MPV_FORMAT_FLAG,
+                    &mut flag as *mut c_int as *mut c_void,
+                )
+            };
+            if rc >= 0 {
+                Some(flag != 0)
+            } else {
+                None
+            }
+        };
+
+        let wait_for_flag = |expected: bool| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                if read_forced_events_only() == Some(expected) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            false
+        };
+
+        assert!(
+            wait_for_flag(false),
+            "sub-forced-events-only should default to false"
+        );
+
+        ctrl.set_sub_forced_events_only(true)
+            .expect("enable sub-forced-events-only");
+        assert!(
+            wait_for_flag(true),
+            "expected sub-forced-events-only == true after enabling"
+        );
+
+        // Loading a new file must automatically reset sub-forced-events-only back to false.
+        ctrl.load_file("av://lavfi:color=c=black:s=160x90:d=0.5:r=25", None)
+            .expect("load_file");
+        assert!(
+            wait_for_flag(false),
+            "expected sub-forced-events-only to reset to false on load_file"
+        );
+
+        ctrl.shutdown_blocking();
+    }
+
+    #[test]
+    fn extract_embedded_text_subtitle_window_validates_url_and_preserves_timestamps() {
+        // Reject invalid schemes / option injection.
+        assert!(extract_embedded_text_subtitle_window("file:///etc/passwd", 0, 0.0, 30.0).is_err());
+        assert!(extract_embedded_text_subtitle_window("-i", 0, 0.0, 30.0).is_err());
+        assert!(
+            extract_embedded_text_subtitle_window("https://example.com/a\nb.mkv", 0, 0.0, 30.0)
+                .is_err()
+        );
+
+        // If ffmpeg is installed on this host, verify real windowed MKV extraction preserves original timestamps.
+        if Command::new("ffmpeg")
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            let dir = std::env::temp_dir().join(format!(
+                "gpui_mpv_sub_win_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let srt_path = dir.join("subs.srt");
+            let mkv_path = dir.join("sample.mkv");
+
+            let mut srt_content = String::new();
+            for i in 1..=16 {
+                let t0 = i * 5;
+                let t1 = t0 + 2;
+                srt_content.push_str(&format!(
+                    "{i}\n00:00:{t0:02},100 --> 00:00:{t1:02},400\nLine {i} at {t0}s\n\n"
+                ));
+            }
+            std::fs::write(&srt_path, srt_content).unwrap();
+
+            let mux_ok = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=s=64x64:d=90:r=5",
+                    "-i",
+                    srt_path.to_str().unwrap(),
+                    "-c:v",
+                    "libx264",
+                    "-g",
+                    "25",
+                    "-keyint_min",
+                    "25",
+                    "-preset",
+                    "ultrafast",
+                    "-c:s",
+                    "srt",
+                    mkv_path.to_str().unwrap(),
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if mux_ok {
+                // Seek to 30s (> duration 20s) and extract 20s window: must preserve 00:00:30..00:00:45 timestamps!
+                let extracted = extract_embedded_text_subtitle_window(
+                    mkv_path.to_str().unwrap(),
+                    0,
+                    30.0,
+                    20.0,
+                )
+                .expect("expected valid SRT window from MKV");
+                assert!(
+                    extracted.contains("00:00:35,100 --> 00:00:37,400"),
+                    "expected preserved original MKV timestamp at 35s, got:\n{extracted}"
+                );
+                assert!(
+                    extracted.contains("Line 7 at 35s"),
+                    "expected line 7 in extracted window, got:\n{extracted}"
+                );
+                assert!(
+                    !extracted.contains("Line 1 at 5s"),
+                    "did not expect early cue before seek window, got:\n{extracted}"
+                );
+                assert!(
+                    !extracted.contains("Line 15 at 75s"),
+                    "did not expect late cue after duration window, got:\n{extracted}"
+                );
+
+                // Non-existent subtitle stream ordinal must return Err cleanly.
+                assert!(extract_embedded_text_subtitle_window(
+                    mkv_path.to_str().unwrap(),
+                    5,
+                    30.0,
+                    20.0,
+                )
+                .is_err());
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

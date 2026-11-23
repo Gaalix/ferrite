@@ -554,6 +554,14 @@ impl ProgressGraceState {
     }
 }
 
+fn effective_first_byte_timeout(base_timeout: Duration, start_offset: u64) -> Duration {
+    if start_offset > 0 {
+        base_timeout.max(Duration::from_secs(20))
+    } else {
+        base_timeout
+    }
+}
+
 fn sample_torrent_progress(handle: &librqbit::ManagedTorrent) -> (u64, u32) {
     let stats = handle.stats();
     if let Some(ref live) = stats.live {
@@ -623,8 +631,9 @@ async fn stream_torrent_file(
     }
     let normalized_trackers = extract_trackers_from_sources(&query_trackers);
 
+    let initial_file_idx = usize::try_from(file_idx).ok();
     let handle = state
-        .ensure_torrent_resolved(info_hash, normalized_trackers)
+        .ensure_torrent_resolved_with_file_idx(info_hash, normalized_trackers, initial_file_idx)
         .await?;
 
     let (resolved_idx, file_len, rel_path) = handle
@@ -716,7 +725,7 @@ async fn stream_torrent_file(
         info_hash,
     };
 
-    let first_byte_timeout = state.first_byte_timeout();
+    let first_byte_timeout = effective_first_byte_timeout(state.first_byte_timeout(), start_offset);
     let initial_cap = (64 * 1024).min(content_len) as usize;
     let mut initial_buf = vec![0u8; initial_cap];
     let first_read = read_initial_bytes_with_progress_grace(
@@ -1105,5 +1114,29 @@ mod tests {
         assert!(!mid_stall.should_timeout(t0 + Duration::from_secs(2), base, 16_384, 1));
         assert!(!mid_stall.should_timeout(t0 + Duration::from_secs(13), base, 16_384, 1));
         assert!(mid_stall.should_timeout(t0 + Duration::from_secs(14), base, 16_384, 1));
+    }
+
+    #[test]
+    fn seek_and_tail_offsets_enforce_minimum_20s_first_byte_timeout() {
+        assert_eq!(
+            effective_first_byte_timeout(Duration::from_secs(5), 0),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            effective_first_byte_timeout(Duration::from_secs(25), 0),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            effective_first_byte_timeout(Duration::from_secs(5), 1),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            effective_first_byte_timeout(Duration::from_secs(12), 1_048_576),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            effective_first_byte_timeout(Duration::from_secs(25), 1_048_576),
+            Duration::from_secs(25)
+        );
     }
 }

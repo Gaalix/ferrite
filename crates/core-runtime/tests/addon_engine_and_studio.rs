@@ -14,9 +14,11 @@ use stremio_core::{
     types::addon::{Descriptor, DescriptorFlags, Manifest, ManifestResource, Version},
 };
 use stremio_core_runtime::{
-    addon_configure_url, classify_descriptor_categories, curated_addon_directory,
-    detect_clipboard_addon_url, normalize_addon_url, AddonCategory, AddonHealthStatus,
-    CoreController, DesktopEnv, DesktopEnvConfig, DesktopModelField,
+    addon_configure_url,
+    addon_engine::{CIRCUIT_BREAKER_FAILURE_THRESHOLD, DEGRADED_FAILURE_THRESHOLD},
+    classify_descriptor_categories, curated_addon_directory, detect_clipboard_addon_url,
+    normalize_addon_url, AddonCategory, AddonHealthStatus, CoreController, DesktopEnv,
+    DesktopEnvConfig, DesktopModelField,
 };
 use tempfile::tempdir;
 use tokio::{
@@ -309,7 +311,7 @@ async fn ttl_cache_and_singleflight_coalescing_deduplicate_identical_gets() {
 }
 
 #[tokio::test]
-async fn soft_circuit_breaker_trips_after_three_failures_fast_fails_and_resets() {
+async fn soft_circuit_breaker_trips_after_four_failures_fast_fails_and_resets() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("circuit_breaker.db");
     let mock = spawn_mock_addon_server(Duration::from_millis(25)).await;
@@ -325,8 +327,10 @@ async fn soft_circuit_breaker_trips_after_three_failures_fast_fails_and_resets()
 
     DesktopEnv::run_isolated(config, async move {
         let controller = CoreController::from_initialized_env().await.unwrap();
+        assert_eq!(DEGRADED_FAILURE_THRESHOLD, 2);
+        assert_eq!(CIRCUIT_BREAKER_FAILURE_THRESHOLD, 4);
 
-        for attempt in 1..=3 {
+        for attempt in 1..=CIRCUIT_BREAKER_FAILURE_THRESHOLD {
             let req = Request::get(&endpoint).body(()).unwrap();
             let err = DesktopEnv::fetch::<(), MockStreamPayload>(req)
                 .await
@@ -337,7 +341,10 @@ async fn soft_circuit_breaker_trips_after_three_failures_fast_fails_and_resets()
             if let Some(ref last_err) = snap.last_error {
                 assert!(!last_err.contains("rd_secret_key_xyz"));
             }
-            if attempt < 3 {
+            if attempt < DEGRADED_FAILURE_THRESHOLD {
+                assert_ne!(snap.status, AddonHealthStatus::Degraded);
+                assert!(!matches!(snap.status, AddonHealthStatus::CircuitOpen { .. }));
+            } else if attempt < CIRCUIT_BREAKER_FAILURE_THRESHOLD {
                 assert_eq!(snap.status, AddonHealthStatus::Degraded);
             } else {
                 assert!(matches!(
@@ -346,11 +353,11 @@ async fn soft_circuit_breaker_trips_after_three_failures_fast_fails_and_resets()
                 ));
             }
         }
-        assert_eq!(mock.request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(mock.request_count.load(Ordering::SeqCst), 4);
 
         let start = Instant::now();
-        let req4 = Request::get(&endpoint).body(()).unwrap();
-        let fast_err = DesktopEnv::fetch::<(), MockStreamPayload>(req4)
+        let req5 = Request::get(&endpoint).body(()).unwrap();
+        let fast_err = DesktopEnv::fetch::<(), MockStreamPayload>(req5)
             .await
             .expect_err("open circuit must fast-fail");
         assert!(
@@ -362,7 +369,7 @@ async fn soft_circuit_breaker_trips_after_three_failures_fast_fails_and_resets()
         assert!(!fast_err.to_string().contains("rd_secret_key_xyz"));
         assert_eq!(
             mock.request_count.load(Ordering::SeqCst),
-            3,
+            4,
             "open circuit must not hit upstream server"
         );
 
@@ -597,6 +604,245 @@ async fn in_place_upgrade_reordering_and_soft_mute_persist_across_reopen() {
             comet_url,
             "unmuting must restore secret config URL at its preferred priority slot"
         );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn not_found_does_not_degrade_while_429_degrades_and_live_probe_recovers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url: Url = format!("http://{addr}/").parse().unwrap();
+    let saw_default_accept = Arc::new(AtomicBool::new(false));
+    let saw_custom_accept = Arc::new(AtomicBool::new(false));
+    let manifest_calls = Arc::new(AtomicUsize::new(0));
+
+    let saw_def_clone = Arc::clone(&saw_default_accept);
+    let saw_cust_clone = Arc::clone(&saw_custom_accept);
+    let manifest_calls_clone = Arc::clone(&manifest_calls);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let saw_def = Arc::clone(&saw_def_clone);
+            let saw_cust = Arc::clone(&saw_cust_clone);
+            let manifest_calls = Arc::clone(&manifest_calls_clone);
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req_text = String::from_utf8_lossy(&buf[..n]);
+                let lower = req_text.to_ascii_lowercase();
+                let path = req_text
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let (status, body) = if path == "/custom-accept" {
+                    if lower.contains("accept: application/vnd.custom+json") {
+                        saw_cust.store(true, Ordering::SeqCst);
+                    }
+                    ("200 OK", r#"{"streams":[]}"#.to_owned())
+                } else if path.contains("/not-found") {
+                    if lower.contains("accept: application/json, text/plain, */*") {
+                        saw_def.store(true, Ordering::SeqCst);
+                    }
+                    ("404 Not Found", r#"{"err":"no match"}"#.to_owned())
+                } else if path.contains("/rate-limit") {
+                    ("429 Too Many Requests", r#"{"err":"slow down"}"#.to_owned())
+                } else if path.ends_with("/manifest.json") {
+                    manifest_calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "id": "org.probe.test",
+                            "version": "1.0.0",
+                            "name": "Probe Test",
+                            "resources": ["stream"],
+                            "types": ["movie"],
+                            "catalogs": []
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    ("200 OK", r#"{"streams":[]}"#.to_owned())
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("probe_recover.db");
+    let dummy_ss: Url = "http://127.0.0.1:1/".parse().unwrap();
+    let config = DesktopEnvConfig::with_storage_path(&db_path)
+        .with_streaming_server_url(dummy_ss)
+        .with_loopback_addon_cache_and_circuit(true);
+
+    DesktopEnv::run_isolated(config, async move {
+        let controller = CoreController::from_initialized_env().await.unwrap();
+
+        // 1. Default Accept header is attached when omitted; custom Accept is preserved.
+        let req_404_a = Request::get(format!("{base_url}stream/movie/not-found-1.json"))
+            .body(())
+            .unwrap();
+        let _ = DesktopEnv::fetch::<(), MockStreamPayload>(req_404_a)
+            .await
+            .expect_err("404 should return Err");
+        let req_404_b = Request::get(format!("{base_url}stream/movie/not-found-2.json"))
+            .body(())
+            .unwrap();
+        let _ = DesktopEnv::fetch::<(), MockStreamPayload>(req_404_b)
+            .await
+            .expect_err("404 should return Err");
+
+        assert!(saw_default_accept.load(Ordering::SeqCst));
+        let snap_after_404 = controller.addon_telemetry_for(&base_url);
+        assert_eq!(snap_after_404.consecutive_failures, 0);
+        assert_ne!(snap_after_404.status, AddonHealthStatus::Degraded);
+
+        let custom_req = Request::get(format!("{base_url}custom-accept"))
+            .header(http::header::ACCEPT, "application/vnd.custom+json")
+            .body(())
+            .unwrap();
+        let _: MockStreamPayload = DesktopEnv::fetch(custom_req).await.unwrap();
+        assert!(saw_custom_accept.load(Ordering::SeqCst));
+
+        // 2. Two 429 rate-limit failures push status to Degraded (not 1).
+        let req_429_a = Request::get(format!("{base_url}stream/movie/rate-limit-1.json"))
+            .body(())
+            .unwrap();
+        let _ = DesktopEnv::fetch::<(), MockStreamPayload>(req_429_a)
+            .await
+            .expect_err("429 should fail");
+        assert_eq!(
+            controller.addon_telemetry_for(&base_url).status,
+            AddonHealthStatus::Healthy
+        );
+
+        let req_429_b = Request::get(format!("{base_url}stream/movie/rate-limit-2.json"))
+            .body(())
+            .unwrap();
+        let _ = DesktopEnv::fetch::<(), MockStreamPayload>(req_429_b)
+            .await
+            .expect_err("second 429 should fail");
+        let snap_degraded = controller.addon_telemetry_for(&base_url);
+        assert_eq!(snap_degraded.status, AddonHealthStatus::Degraded);
+        assert!(snap_degraded
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("429")));
+
+        // 3. Reset + live manifest probe recovers immediately back to Healthy.
+        let manifest_url = format!("{base_url}manifest.json");
+        assert!(controller.reset_addon_circuit(&manifest_url));
+        let probed = controller
+            .probe_addon_health_async(&manifest_url)
+            .await
+            .expect("live manifest probe must succeed");
+        assert_eq!(probed.status, AddonHealthStatus::Healthy);
+        assert_eq!(probed.consecutive_failures, 0);
+        assert_eq!(manifest_calls.load(Ordering::SeqCst), 1);
+
+        // Second probe with bypass_cache=true hits the server again (never served from cache).
+        let _ = controller
+            .probe_addon_health_async(&manifest_url)
+            .await
+            .expect("second live manifest probe must succeed");
+        assert_eq!(manifest_calls.load(Ordering::SeqCst), 2);
+
+        // Fire-and-forget probe_addon_health triggers live GET and emits InstalledAddons NewState.
+        let mut events_rx = controller.subscribe();
+        controller.probe_addon_health(&manifest_url);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let ev = tokio::time::timeout(remaining, events_rx.recv())
+                .await
+                .expect("timed out waiting for probe_addon_health event")
+                .expect("broadcast channel must stay open");
+            if matches!(ev.as_ref(), RuntimeEvent::NewState(fields) if fields.contains(&DesktopModelField::InstalledAddons))
+            {
+                break;
+            }
+        }
+        assert_eq!(manifest_calls.load(Ordering::SeqCst), 3);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn timeout_and_connect_errors_record_actionable_redacted_last_error() {
+    // Bind and immediately drop a listener to get a guaranteed refused localhost port.
+    let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_addr = closed_listener.local_addr().unwrap();
+    drop(closed_listener);
+    let closed_url: Url = format!("http://{closed_addr}/").parse().unwrap();
+
+    // Slow server that never responds before short timeout_override.
+    let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow_addr = slow_listener.local_addr().unwrap();
+    let slow_url: Url = format!("http://{slow_addr}/").parse().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((_sock, _)) = slow_listener.accept().await else {
+                break;
+            };
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("network_errors.db");
+    let dummy_ss: Url = "http://127.0.0.1:1/".parse().unwrap();
+    let config = DesktopEnvConfig::with_storage_path(&db_path)
+        .with_streaming_server_url(dummy_ss)
+        .with_loopback_addon_cache_and_circuit(true)
+        .with_timeout_override(Duration::from_millis(80));
+
+    DesktopEnv::run_isolated(config, async move {
+        let controller = CoreController::from_initialized_env().await.unwrap();
+
+        let connect_req = Request::get(format!("{closed_url}secret_token_abc/manifest.json"))
+            .body(())
+            .unwrap();
+        let _ = DesktopEnv::fetch::<(), serde_json::Value>(connect_req)
+            .await
+            .expect_err("refused port must fail");
+        let connect_snap = controller.addon_telemetry_for(&closed_url);
+        let connect_err = connect_snap.last_error.as_deref().unwrap_or_default();
+        assert!(
+            connect_err.contains("Connection failed"),
+            "expected clear connect cause, got: {connect_err}"
+        );
+        assert!(!connect_err.contains("secret_token_abc"));
+
+        let timeout_req = Request::get(format!("{slow_url}secret_token_xyz/manifest.json"))
+            .body(())
+            .unwrap();
+        let _ = DesktopEnv::fetch::<(), serde_json::Value>(timeout_req)
+            .await
+            .expect_err("slow socket must time out");
+        let timeout_snap = controller.addon_telemetry_for(&slow_url);
+        let timeout_err = timeout_snap.last_error.as_deref().unwrap_or_default();
+        assert!(
+            timeout_err.contains("Request timed out"),
+            "expected clear timeout cause, got: {timeout_err}"
+        );
+        assert!(!timeout_err.contains("secret_token_xyz"));
     })
     .await
     .unwrap();

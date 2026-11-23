@@ -3,12 +3,12 @@ use gpui::{div, prelude::*, px, rgb, rgba, Context, FontWeight};
 use crate::{
     shell::AppShell,
     state::{PlayerPopover, ShaderPresetChoice, ToneMappingChoice, UpscaleChoice},
-    theme::{ui_sans, TEXT_SECONDARY},
+    theme::ui_sans,
 };
 
 use super::components::{
-    drilldown_row, player_sheet_card, section_eyebrow, segmented_item, segmented_trough,
-    selectable_row, sheet_header_back, sheet_header_close, toggle_switch_row,
+    drilldown_row, player_hud_palette, player_sheet_card, section_eyebrow, segmented_item,
+    segmented_trough, selectable_row, sheet_header_back, sheet_header_close, toggle_switch_row,
 };
 
 const PLAYBACK_SPEEDS: [(f64, &str); 5] = [
@@ -75,6 +75,7 @@ impl AppShell {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let t = player_hud_palette();
         let prefs = &self.preferences;
         let exp = prefs.experimental_video;
         let upscaler_label = upscaler_display_label(prefs.upscale_mode);
@@ -158,10 +159,10 @@ impl AppShell {
                                             .py(px(2.0))
                                             .rounded(px(999.0))
                                             .border_1()
-                                            .border_color(rgba(0xFFFFFF18))
+                                            .border_color(rgba(t.glass_border))
                                             .font(ui_sans(FontWeight::MEDIUM))
                                             .text_size(px(11.0))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_color(rgb(t.text_secondary))
                                             .child("Off by default"),
                                     ),
                             )

@@ -5,19 +5,19 @@ use gpui::{
 use stremio_core_runtime::stremio_core::models::common::Loadable;
 
 use crate::{
-    icons::IconName,
+    icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{FocusedInput, SidebarTab, ToastKind},
     theme::{
-        editorial_serif, mono_font, semantic_status_pill, ui_sans, ACCENT, ACCENT_HOVER,
-        ACCENT_ROSE, BG_ELEVATED, BG_INPUT, BG_OBSIDIAN, BG_SURFACE, BORDER_POSTER_HOVER,
-        BORDER_STRONG, BORDER_SUBTLE, STATUS_WATCHED, STATUS_WATCHING, TEXT_MUTED, TEXT_PRIMARY,
-        TEXT_SECONDARY,
+        active_theme, editorial_serif, mono_font, semantic_status_pill, sp, tabular_nums, ui_sans,
+        ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL,
     },
+    ui_components::{primary_accent_button, secondary_glass_button},
 };
 
 impl AppShell {
     pub fn render_auth_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = active_theme();
         let (auth_user, addon_count, library_count, has_trakt, link_code_state, link_data_state) =
             self.core.with_model(|m| {
                 let user = m
@@ -51,6 +51,14 @@ impl AppShell {
                 )
             });
 
+        let side_pad = if self.viewport_size_px.0.is_finite() && self.viewport_size_px.0 > 0.0 {
+            (self.viewport_size_px.0 * 0.03).clamp(24.0, 56.0)
+        } else {
+            32.0
+        };
+        let pill_border_alpha = if t.is_light { 0x59 } else { 0x4d };
+        let pill_bg_alpha = if t.is_light { 0x1f } else { 0x1c };
+
         div()
             .id("auth-view-scroll")
             .size_full()
@@ -58,36 +66,38 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(1080.0))
+                    .max_w(px(1120.0))
                     .mx_auto()
-                    .px(px(32.0))
-                    .pt(px(32.0))
-                    .pb(px(72.0))
+                    .px(px(side_pad))
+                    .pt(sp(16.0))
+                    .pb(sp(72.0))
                     .flex()
                     .flex_col()
-                    .gap(px(28.0))
+                    .gap(sp(24.0))
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_end()
                             .justify_between()
-                            .gap(px(20.0))
+                            .gap(sp(16.0))
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(4.0))
+                                    .gap(sp(4.0))
                                     .child(
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(px(56.0))
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .text_size(sp(38.0))
+                                            .line_height(gpui::relative(1.06))
+                                            .text_color(rgb(t.text_primary))
                                             .child("Account"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(14.5))
-                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .text_size(sp(13.5))
+                                            .text_color(rgb(t.text_secondary))
                                             .child(
                                                 "Sync your Stremio library, watch progress, and installed addons across devices.",
                                             ),
@@ -97,17 +107,17 @@ impl AppShell {
                                 semantic_status_pill(
                                     IconName::Check,
                                     "Cloud sync active",
-                                    STATUS_WATCHED,
-                                    0x4ade804d,
-                                    0x4ade801c,
+                                    t.status_watched,
+                                    (t.status_watched << 8) | pill_border_alpha,
+                                    (t.status_watched << 8) | pill_bg_alpha,
                                 )
                             } else {
                                 semantic_status_pill(
                                     IconName::User,
                                     "Guest profile",
-                                    STATUS_WATCHING,
-                                    0x60a5fa4d,
-                                    0x60a5fa1c,
+                                    t.status_watching,
+                                    (t.status_watching << 8) | pill_border_alpha,
+                                    (t.status_watching << 8) | pill_bg_alpha,
                                 )
                             }),
                     )
@@ -115,18 +125,30 @@ impl AppShell {
                         div()
                             .grid()
                             .grid_cols(3)
-                            .gap(px(16.0))
+                            .gap(sp(14.0))
                             .child(render_auth_stat_card(
+                                IconName::Layers,
+                                IconWeight::Regular,
                                 "Installed addons",
                                 format!("{addon_count}"),
                                 "Synced via Stremio API & SQLite WAL",
+                                t,
                             ))
                             .child(render_auth_stat_card(
+                                IconName::Bookmark,
+                                IconWeight::Fill,
                                 "Library titles",
                                 format!("{library_count}"),
                                 "Watched bitfields & resume offsets persisted",
+                                t,
                             ))
                             .child(render_auth_stat_card(
+                                IconName::Sparkles,
+                                if has_trakt {
+                                    IconWeight::Fill
+                                } else {
+                                    IconWeight::Regular
+                                },
                                 "Trakt scrobbling",
                                 if has_trakt {
                                     "Connected".to_owned()
@@ -134,13 +156,13 @@ impl AppShell {
                                     "Not linked".to_owned()
                                 },
                                 "Automatic play & completion scrobbling",
+                                t,
                             )),
                     )
                     .child(if let Some((email, user_id)) = auth_user {
-                        Self::render_authenticated_panel(email, user_id, cx)
-                            .into_any_element()
+                        Self::render_authenticated_panel(email, user_id, t, cx).into_any_element()
                     } else {
-                        self.render_unauthenticated_panels(link_code_state, link_data_state, cx)
+                        self.render_unauthenticated_panels(link_code_state, link_data_state, t, cx)
                             .into_any_element()
                     }),
             )
@@ -149,6 +171,7 @@ impl AppShell {
     fn render_authenticated_panel(
         email: String,
         user_id: String,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let initial = email
@@ -157,53 +180,57 @@ impl AppShell {
             .unwrap_or('S')
             .to_ascii_uppercase()
             .to_string();
+        let rose_bg = (t.accent_rose << 8) | if t.is_light { 0x1a } else { 0x1c };
+        let rose_hover = (t.accent_rose << 8) | if t.is_light { 0x2b } else { 0x30 };
+        let rose_border = (t.accent_rose << 8) | 0x59;
 
         div()
-            .p(px(24.0))
-            .rounded(px(10.0))
-            .bg(rgb(BG_SURFACE))
+            .p(sp(24.0))
+            .rounded(px(RADIUS_CARD))
+            .bg(rgba(t.glass_card_bg))
             .border_1()
-            .border_color(rgba(BORDER_SUBTLE))
+            .border_color(rgba(t.glass_border))
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
-            .gap(px(20.0))
+            .gap(sp(20.0))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(16.0))
+                    .gap(sp(16.0))
                     .child(
                         div()
-                            .w(px(52.0))
-                            .h(px(52.0))
-                            .rounded(px(999.0))
-                            .bg(rgb(ACCENT))
+                            .w(sp(52.0))
+                            .h(sp(52.0))
+                            .rounded(px(RADIUS_PILL))
+                            .bg(rgb(t.accent))
                             .flex()
                             .items_center()
                             .justify_center()
                             .font(ui_sans(FontWeight::BOLD))
-                            .text_size(px(20.0))
-                            .text_color(rgb(BG_OBSIDIAN))
+                            .text_size(sp(20.0))
+                            .text_color(rgb(t.cta_on_accent))
                             .child(initial),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(4.0))
+                            .gap(sp(4.0))
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(px(17.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(17.0))
+                                    .text_color(rgb(t.text_primary))
                                     .child(email),
                             )
                             .child(
                                 div()
                                     .font(mono_font())
                                     .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(rgb(t.text_muted))
                                     .child(format!("UID {user_id}")),
                             ),
                     ),
@@ -212,46 +239,32 @@ impl AppShell {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .id("btn-auth-manage-addons")
-                            .cursor_pointer()
-                            .h(px(40.0))
-                            .px(px(18.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(BG_ELEVATED))
-                            .border_1()
-                            .border_color(rgba(BORDER_SUBTLE))
-                            .hover(|s| s.border_color(rgba(BORDER_STRONG)))
-                            .flex()
-                            .items_center()
-                            .font(ui_sans(FontWeight::MEDIUM))
-                            .text_size(px(13.5))
-                            .text_color(rgb(TEXT_PRIMARY))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.navigate_tab(SidebarTab::Addons, cx);
-                                }),
-                            )
-                            .child("Manage addons"),
-                    )
+                    .gap(sp(10.0))
+                    .child(secondary_glass_button(
+                        "btn-auth-manage-addons",
+                        Some(IconName::Layers),
+                        "Manage addons",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.navigate_tab(SidebarTab::Addons, cx);
+                        }),
+                    ))
                     .child(
                         div()
                             .id("btn-auth-logout")
                             .cursor_pointer()
-                            .h(px(40.0))
-                            .px(px(18.0))
-                            .rounded(px(6.0))
-                            .bg(rgba(0xf871711a))
+                            .h(sp(40.0))
+                            .px(sp(18.0))
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(rgba(rose_bg))
                             .border_1()
-                            .border_color(rgba(0xf8717155))
+                            .border_color(rgba(rose_border))
+                            .hover(move |s| s.bg(rgba(rose_hover)))
                             .flex()
                             .items_center()
                             .font(ui_sans(FontWeight::MEDIUM))
-                            .text_size(px(13.5))
-                            .text_color(rgb(ACCENT_ROSE))
+                            .text_size(sp(13.5))
+                            .text_color(rgb(t.accent_rose))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -279,6 +292,7 @@ impl AppShell {
                 stremio_core_runtime::stremio_core::models::link::LinkError,
             >,
         >,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let email_focused = self.focused_input == Some(FocusedInput::AuthEmail);
@@ -312,33 +326,33 @@ impl AppShell {
         div()
             .grid()
             .grid_cols(2)
-            .gap(px(20.0))
+            .gap(sp(20.0))
             .child(
                 div()
-                    .p(px(24.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(BG_SURFACE))
+                    .p(sp(24.0))
+                    .rounded(px(RADIUS_CARD))
+                    .bg(rgba(t.glass_card_bg))
                     .border_1()
-                    .border_color(rgba(BORDER_SUBTLE))
+                    .border_color(rgba(t.glass_border))
                     .flex()
                     .flex_col()
-                    .gap(px(16.0))
+                    .gap(sp(16.0))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(4.0))
+                            .gap(sp(4.0))
                             .child(
                                 div()
                                     .font(editorial_serif())
-                                    .text_size(px(28.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(26.0))
+                                    .text_color(rgb(t.text_primary))
                                     .child("Sign in with email"),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(rgb(t.text_secondary))
                                     .child(
                                         "Direct authentication against api.strem.io (click a field to type or Ctrl V paste).",
                                     ),
@@ -348,35 +362,35 @@ impl AppShell {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(6.0))
+                            .gap(sp(6.0))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(rgb(t.text_secondary))
                                     .child("Email address"),
                             )
                             .child(
                                 div()
                                     .id("input-auth-email")
                                     .cursor_text()
-                                    .h(px(40.0))
-                                    .px(px(12.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(BG_INPUT))
+                                    .h(sp(40.0))
+                                    .px(sp(12.0))
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(rgba(t.glass_trough_bg))
                                     .border_1()
                                     .border_color(if email_focused {
-                                        rgba(BORDER_POSTER_HOVER)
+                                        rgba(t.border_poster_hover)
                                     } else {
-                                        rgba(BORDER_SUBTLE)
+                                        rgba(t.glass_border)
                                     })
                                     .flex()
                                     .items_center()
-                                    .text_size(px(13.5))
+                                    .text_size(sp(13.5))
                                     .text_color(
                                         if self.auth_email_input.is_empty() && !email_focused {
-                                            rgb(TEXT_MUTED)
+                                            rgb(t.text_muted)
                                         } else {
-                                            rgb(TEXT_PRIMARY)
+                                            rgb(t.text_primary)
                                         },
                                     )
                                     .on_mouse_down(
@@ -393,36 +407,36 @@ impl AppShell {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(6.0))
+                            .gap(sp(6.0))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_color(rgb(t.text_secondary))
                                     .child("Password"),
                             )
                             .child(
                                 div()
                                     .id("input-auth-password")
                                     .cursor_text()
-                                    .h(px(40.0))
-                                    .px(px(12.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(BG_INPUT))
+                                    .h(sp(40.0))
+                                    .px(sp(12.0))
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(rgba(t.glass_trough_bg))
                                     .border_1()
                                     .border_color(if pass_focused {
-                                        rgba(BORDER_POSTER_HOVER)
+                                        rgba(t.border_poster_hover)
                                     } else {
-                                        rgba(BORDER_SUBTLE)
+                                        rgba(t.glass_border)
                                     })
                                     .flex()
                                     .items_center()
                                     .font(mono_font())
-                                    .text_size(px(13.5))
+                                    .text_size(sp(13.5))
                                     .text_color(
                                         if self.auth_password_input.is_empty() && !pass_focused {
-                                            rgb(TEXT_MUTED)
+                                            rgb(t.text_muted)
                                         } else {
-                                            rgb(TEXT_PRIMARY)
+                                            rgb(t.text_primary)
                                         },
                                     )
                                     .on_mouse_down(
@@ -436,30 +450,19 @@ impl AppShell {
                             ),
                     )
                     .child(
-                        div()
-                            .id("btn-submit-password-login")
-                            .cursor_pointer()
-                            .mt(px(4.0))
-                            .h(px(42.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(ACCENT))
-                            .hover(|s| s.bg(rgb(ACCENT_HOVER)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font(ui_sans(FontWeight::SEMIBOLD))
-                            .text_size(px(14.0))
-                            .text_color(rgb(BG_OBSIDIAN))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.submit_password_login(cx);
-                                }),
-                            )
-                            .child("Sign in & sync library"),
+                        primary_accent_button(
+                            "btn-submit-password-login",
+                            Some(IconName::User),
+                            "Sign in & sync library",
+                            cx.listener(|this, _, _, cx| {
+                                this.submit_password_login(cx);
+                            }),
+                        )
+                        .mt(sp(4.0))
+                        .w_full(),
                     ),
             )
-            .child(self.render_link_auth_card(link_code_state, link_data_state, cx))
+            .child(self.render_link_auth_card(link_code_state, link_data_state, t, cx))
     }
 
     fn render_link_auth_card(
@@ -476,34 +479,38 @@ impl AppShell {
                 stremio_core_runtime::stremio_core::models::link::LinkError,
             >,
         >,
+        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let accent_ink = if t.is_light { t.accent_press } else { t.accent };
+        let rose_bg = (t.accent_rose << 8) | if t.is_light { 0x1a } else { 0x1c };
+
         div()
-            .p(px(24.0))
-            .rounded(px(10.0))
-            .bg(rgb(BG_SURFACE))
+            .p(sp(24.0))
+            .rounded(px(RADIUS_CARD))
+            .bg(rgba(t.glass_card_bg))
             .border_1()
-            .border_color(rgba(BORDER_SUBTLE))
+            .border_color(rgba(t.glass_border))
             .flex()
             .flex_col()
             .justify_between()
-            .gap(px(16.0))
+            .gap(sp(16.0))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(4.0))
+                    .gap(sp(4.0))
                     .child(
                         div()
                             .font(editorial_serif())
-                            .text_size(px(28.0))
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_size(sp(26.0))
+                            .text_color(rgb(t.text_primary))
                             .child("QR / link code sign-in"),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(TEXT_SECONDARY))
+                            .text_color(rgb(t.text_secondary))
                             .child(
                                 "Approve login from your phone or browser at stremio.com/link.",
                             ),
@@ -511,28 +518,28 @@ impl AppShell {
             )
             .child(match link_code_state {
                 None => div()
-                    .py(px(28.0))
+                    .py(sp(28.0))
                     .flex()
                     .justify_center()
-                    .text_size(px(13.5))
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .text_size(sp(13.5))
+                    .text_color(rgb(t.text_secondary))
                     .child("Generate a one-time 4-character code to link your account.")
                     .into_any_element(),
                 Some(Loadable::Loading) => div()
-                    .py(px(28.0))
+                    .py(sp(28.0))
                     .flex()
                     .justify_center()
                     .font(mono_font())
                     .text_xs()
-                    .text_color(rgb(ACCENT))
+                    .text_color(rgb(accent_ink))
                     .child("Requesting link code from link.stremio.com...")
                     .into_any_element(),
                 Some(Loadable::Err(err)) => div()
-                    .p(px(12.0))
-                    .rounded(px(6.0))
-                    .bg(rgba(0xf871711a))
+                    .p(sp(12.0))
+                    .rounded(px(RADIUS_CONTROL))
+                    .bg(rgba(rose_bg))
                     .text_xs()
-                    .text_color(rgb(ACCENT_ROSE))
+                    .text_color(rgb(t.accent_rose))
                     .child(format!("Link code request failed: {err}"))
                     .into_any_element(),
                 Some(Loadable::Ready(resp)) => {
@@ -547,22 +554,24 @@ impl AppShell {
                     };
 
                     div()
-                        .p(px(16.0))
-                        .rounded(px(8.0))
-                        .bg(rgb(BG_INPUT))
+                        .p(sp(16.0))
+                        .rounded(px(RADIUS_CONTROL))
+                        .bg(rgba(t.glass_trough_bg))
                         .border_1()
-                        .border_color(rgb(ACCENT))
+                        .border_color(rgba(t.border_accent))
                         .flex()
                         .items_center()
-                        .gap(px(16.0))
+                        .gap(sp(16.0))
                         .when_some(qr_tex, |el, tex| {
                             el.child(
                                 div()
-                                    .w(px(96.0))
-                                    .h(px(96.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(TEXT_PRIMARY))
-                                    .p(px(4.0))
+                                    .w(sp(96.0))
+                                    .h(sp(96.0))
+                                    .rounded(px(8.0))
+                                    .bg(rgb(0xFFFFFF))
+                                    .border_1()
+                                    .border_color(rgba(t.glass_border))
+                                    .p(sp(4.0))
                                     .child(img(tex).size_full().object_fit(gpui::ObjectFit::Contain)),
                             )
                         })
@@ -570,29 +579,32 @@ impl AppShell {
                             div()
                                 .flex()
                                 .flex_col()
-                                .gap(px(6.0))
+                                .gap(sp(6.0))
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_SECONDARY))
+                                        .text_color(rgb(t.text_secondary))
                                         .child("Link code"),
                                 )
                                 .child(
                                     div()
                                         .font(mono_font())
                                         .font_weight(FontWeight::BOLD)
-                                        .text_size(px(26.0))
-                                        .text_color(rgb(ACCENT))
+                                        .text_size(sp(26.0))
+                                        .text_color(rgb(accent_ink))
                                         .child(code_str),
                                 )
                                 .child(
                                     div()
                                         .id("btn-copy-link-url")
                                         .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .gap(sp(5.0))
                                         .font(mono_font())
                                         .text_xs()
-                                        .text_color(rgb(TEXT_PRIMARY))
-                                        .hover(|s| s.text_color(rgb(ACCENT)))
+                                        .text_color(rgb(t.text_primary))
+                                        .hover(move |s| s.text_color(rgb(accent_ink)))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -607,12 +619,18 @@ impl AppShell {
                                                 );
                                             }),
                                         )
+                                        .child(svg_icon_weighted(
+                                            IconName::Clipboard,
+                                            IconWeight::Regular,
+                                            11.5 * t.ui_scale,
+                                            rgb(t.text_muted),
+                                        ))
                                         .child(format!("{} (copy)", resp.link)),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(t.text_muted))
                                         .child(poll_status),
                                 ),
                         )
@@ -623,85 +641,87 @@ impl AppShell {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.0))
+                    .gap(sp(10.0))
                     .child(
-                        div()
-                            .id("btn-start-link-auth")
-                            .cursor_pointer()
-                            .flex_1()
-                            .h(px(42.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(BG_ELEVATED))
-                            .border_1()
-                            .border_color(rgba(BORDER_SUBTLE))
-                            .hover(|s| s.border_color(rgb(ACCENT)).text_color(rgb(ACCENT)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .font(ui_sans(FontWeight::SEMIBOLD))
-                            .text_size(px(13.5))
-                            .text_color(rgb(TEXT_PRIMARY))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.begin_link_auth(cx);
-                                }),
-                            )
-                            .child(if self.link_poll_active {
+                        secondary_glass_button(
+                            "btn-start-link-auth",
+                            Some(IconName::RefreshCw),
+                            if self.link_poll_active {
                                 "Refresh link code"
                             } else {
                                 "Generate QR / link code"
+                            },
+                            false,
+                            cx.listener(|this, _, _, cx| {
+                                this.begin_link_auth(cx);
                             }),
+                        )
+                        .flex_1(),
                     )
                     .when(self.link_poll_active, |el| {
-                        el.child(
-                            div()
-                                .id("btn-poll-now")
-                                .cursor_pointer()
-                                .h(px(42.0))
-                                .px(px(14.0))
-                                .rounded(px(6.0))
-                                .bg(rgb(BG_ELEVATED))
-                                .border_1()
-                                .border_color(rgba(BORDER_SUBTLE))
-                                .flex()
-                                .items_center()
-                                .text_size(px(13.5))
-                                .text_color(rgb(TEXT_PRIMARY))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, _cx| {
-                                        this.core.poll_link_auth();
-                                    }),
-                                )
-                                .child("Check now"),
-                        )
+                        el.child(secondary_glass_button(
+                            "btn-poll-now",
+                            None,
+                            "Check now",
+                            false,
+                            cx.listener(|this, _, _, _cx| {
+                                this.core.poll_link_auth();
+                            }),
+                        ))
                     }),
             )
     }
 }
 
 fn render_auth_stat_card(
+    icon: IconName,
+    icon_weight: IconWeight,
     label: &'static str,
     value: String,
     caption: &'static str,
+    t: ThemePalette,
 ) -> impl IntoElement {
+    let accent_ink = if t.is_light { t.accent_press } else { t.accent };
     div()
-        .p(px(20.0))
-        .rounded(px(10.0))
-        .bg(rgb(BG_SURFACE))
+        .p(sp(18.0))
+        .rounded(px(RADIUS_CARD))
+        .bg(rgba(t.glass_card_bg))
         .border_1()
-        .border_color(rgba(BORDER_SUBTLE))
+        .border_color(rgba(t.glass_border))
         .flex()
         .flex_col()
-        .gap(px(4.0))
-        .child(div().text_xs().text_color(rgb(TEXT_SECONDARY)).child(label))
+        .gap(sp(6.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(sp(6.0))
+                .child(svg_icon_weighted(
+                    icon,
+                    icon_weight,
+                    13.0 * t.ui_scale,
+                    rgb(accent_ink),
+                ))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(t.text_secondary))
+                        .child(label),
+                ),
+        )
         .child(
             div()
                 .font(editorial_serif())
-                .text_size(px(36.0))
-                .text_color(rgb(TEXT_PRIMARY))
+                .font_features(tabular_nums())
+                .text_size(sp(34.0))
+                .line_height(gpui::relative(1.05))
+                .text_color(rgb(t.text_primary))
                 .child(value),
         )
-        .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(caption))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(t.text_muted))
+                .child(caption),
+        )
 }

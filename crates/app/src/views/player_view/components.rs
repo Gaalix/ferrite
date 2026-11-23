@@ -1,20 +1,54 @@
 use gpui::{
-    div, prelude::*, px, rgb, rgba, AnyElement, App, Div, ElementId, FontWeight, MouseButton,
-    MouseDownEvent, SharedString, Stateful, Window,
+    div, prelude::*, px, rgb, rgba, AnyElement, App, BoxShadow, Div, ElementId, FontWeight,
+    MouseButton, MouseDownEvent, SharedString, Stateful, Window,
 };
 
-use crate::icons::{svg_icon, IconName};
+use crate::icons::{svg_icon_weighted, IconName, IconWeight};
 use crate::theme::{
-    glass_capsule_shadow, tabular_nums, ui_sans, ACCENT, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    active_theme, build_palette, tabular_nums, ui_sans, ThemePalette, ThemePreset,
 };
 
 pub(super) const SHEET_WIDTH: f32 = 388.0;
-pub(super) use crate::theme::{
-    GLASS_BORDER as SHEET_BORDER, GLASS_DIVIDER as SHEET_DIVIDER,
-    GLASS_ROW_HOVER_BG as ROW_HOVER_BG, GLASS_ROW_SELECTED_BG as ROW_SELECTED_BG,
-    GLASS_SHEET_BG as SHEET_BG, GLASS_TROUGH_BG as TROUGH_BG, SEGMENT_ACTIVE_BG,
-    SEGMENT_ACTIVE_TEXT,
-};
+const FALLBACK_SUBTITLE_COLOR: u32 = 0xF5F1E8;
+
+/// Resolves a dark-cinematic HUD palette from any runtime theme palette.
+/// When `LightMist` is active, glass surfaces and ink stay dark-cinematic
+/// (Ethereal Dark) so the player OSD and floating sheets never turn blinding
+/// white over live video playback, while preserving the user's chosen accent,
+/// ambient bleed, UI scale, and density tokens.
+pub(super) const fn cinema_hud_palette_from(t: ThemePalette) -> ThemePalette {
+    if t.is_light {
+        build_palette(
+            ThemePreset::EtherealDark,
+            t.accent_choice,
+            t.ambient_bleed,
+            t.ui_scale,
+            t.density,
+        )
+    } else {
+        t
+    }
+}
+
+#[inline]
+pub(super) fn player_hud_palette() -> ThemePalette {
+    cinema_hud_palette_from(active_theme())
+}
+
+pub(super) fn player_glass_shadow() -> Vec<BoxShadow> {
+    vec![
+        BoxShadow::new(px(0.0), px(12.0), rgba(0x00000080).into()).blur_radius(px(32.0)),
+        BoxShadow::new(px(0.0), px(2.0), rgba(0x0000004d).into()).blur_radius(px(6.0)),
+    ]
+}
+
+pub(super) fn player_meta_divider(t: &ThemePalette) -> Div {
+    div()
+        .w(px(1.0))
+        .h(px(11.0))
+        .flex_shrink_0()
+        .bg(rgba(t.glass_divider))
+}
 
 pub(super) const SUBTITLE_SWATCHES: &[(&str, &str)] = &[
     ("#F5F1E8", "Warm cream"),
@@ -27,13 +61,13 @@ pub(super) const SUBTITLE_SWATCHES: &[(&str, &str)] = &[
 pub(super) fn parse_hex_rgb(hex: &str) -> u32 {
     let clean = hex.trim().trim_start_matches('#');
     if clean.len() == 6 {
-        u32::from_str_radix(clean, 16).unwrap_or(TEXT_PRIMARY)
+        u32::from_str_radix(clean, 16).unwrap_or(FALLBACK_SUBTITLE_COLOR)
     } else if clean.len() == 8 {
         u32::from_str_radix(clean, 16)
             .map(|v| v & 0x00FF_FFFF)
-            .unwrap_or(TEXT_PRIMARY)
+            .unwrap_or(FALLBACK_SUBTITLE_COLOR)
     } else {
-        TEXT_PRIMARY
+        FALLBACK_SUBTITLE_COLOR
     }
 }
 
@@ -58,14 +92,15 @@ pub(super) fn subtitle_color_short_name(hex: &str) -> String {
 
 /// Outer frosted card container shared by all right-anchored player floating sheets.
 pub(super) fn player_sheet_card(id: impl Into<ElementId>) -> Stateful<Div> {
+    let t = player_hud_palette();
     div()
         .id(id)
         .w(px(SHEET_WIDTH))
         .rounded(px(16.0))
-        .bg(rgba(SHEET_BG))
+        .bg(rgba(t.glass_sheet_bg))
         .border_1()
-        .border_color(rgba(SHEET_BORDER))
-        .shadow(glass_capsule_shadow())
+        .border_color(rgba(t.glass_border))
+        .shadow(player_glass_shadow())
         .overflow_hidden()
         .flex()
         .flex_col()
@@ -77,12 +112,13 @@ pub(super) fn sheet_header_close(
     close_id: &'static str,
     on_close: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
+    let t = player_hud_palette();
     div()
         .w_full()
         .px(px(20.0))
         .py(px(15.0))
         .border_b_1()
-        .border_color(rgba(SHEET_DIVIDER))
+        .border_color(rgba(t.glass_divider))
         .flex()
         .items_center()
         .justify_between()
@@ -91,7 +127,7 @@ pub(super) fn sheet_header_close(
             div()
                 .font(ui_sans(FontWeight::SEMIBOLD))
                 .text_size(px(15.0))
-                .text_color(rgb(TEXT_PRIMARY))
+                .text_color(rgb(t.text_primary))
                 .child(title.into()),
         )
         .child(
@@ -104,12 +140,17 @@ pub(super) fn sheet_header_close(
                 .flex()
                 .items_center()
                 .justify_center()
-                .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+                .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
                     on_close(ev, window, cx);
                 })
-                .child(svg_icon(IconName::X, 15.0, rgb(TEXT_SECONDARY))),
+                .child(svg_icon_weighted(
+                    IconName::X,
+                    IconWeight::Regular,
+                    15.0,
+                    rgb(t.text_secondary),
+                )),
         )
 }
 
@@ -119,12 +160,13 @@ pub(super) fn sheet_header_back(
     on_back: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     right_slot: Option<AnyElement>,
 ) -> Div {
+    let t = player_hud_palette();
     div()
         .w_full()
         .px(px(18.0))
         .py(px(15.0))
         .border_b_1()
-        .border_color(rgba(SHEET_DIVIDER))
+        .border_color(rgba(t.glass_divider))
         .flex()
         .items_center()
         .justify_between()
@@ -139,17 +181,22 @@ pub(super) fn sheet_header_back(
                 .flex()
                 .items_center()
                 .gap(px(6.0))
-                .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+                .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
                     on_back(ev, window, cx);
                 })
-                .child(svg_icon(IconName::ChevronLeft, 16.0, rgb(TEXT_SECONDARY)))
+                .child(svg_icon_weighted(
+                    IconName::ChevronLeft,
+                    IconWeight::Regular,
+                    16.0,
+                    rgb(t.text_secondary),
+                ))
                 .child(
                     div()
                         .font(ui_sans(FontWeight::SEMIBOLD))
                         .text_size(px(15.0))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(t.text_primary))
                         .child(title.into()),
                 ),
         )
@@ -157,19 +204,21 @@ pub(super) fn sheet_header_back(
 }
 
 pub(super) fn section_eyebrow(label: impl Into<SharedString>) -> Div {
+    let t = player_hud_palette();
     div()
         .font(ui_sans(FontWeight::MEDIUM))
         .text_size(px(12.0))
-        .text_color(rgb(TEXT_MUTED))
+        .text_color(rgb(t.text_muted))
         .child(label.into())
 }
 
 pub(super) fn segmented_trough() -> Div {
+    let t = player_hud_palette();
     div()
         .w_full()
         .p(px(3.0))
         .rounded(px(10.0))
-        .bg(rgba(TROUGH_BG))
+        .bg(rgba(t.glass_trough_bg))
         .flex()
         .items_center()
         .gap(px(2.0))
@@ -181,6 +230,7 @@ pub(super) fn segmented_item(
     active: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let t = player_hud_palette();
     let base = div()
         .id(id)
         .flex_1()
@@ -198,14 +248,14 @@ pub(super) fn segmented_item(
             on_click(ev, window, cx);
         });
     if active {
-        base.bg(rgb(SEGMENT_ACTIVE_BG))
+        base.bg(rgb(t.accent))
             .font(ui_sans(FontWeight::SEMIBOLD))
-            .text_color(rgb(SEGMENT_ACTIVE_TEXT))
+            .text_color(rgb(t.cta_on_accent))
     } else {
         base.bg(rgba(0x00000000))
-            .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+            .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
             .font(ui_sans(FontWeight::MEDIUM))
-            .text_color(rgb(TEXT_SECONDARY))
+            .text_color(rgb(t.text_secondary))
     }
     .child(label.into())
 }
@@ -217,6 +267,7 @@ pub(super) fn selectable_row(
     selected: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let t = player_hud_palette();
     div()
         .id(id)
         .w_full()
@@ -226,11 +277,23 @@ pub(super) fn selectable_row(
         .rounded(px(10.0))
         .cursor_pointer()
         .bg(if selected {
-            rgba(ROW_SELECTED_BG)
+            rgba(t.accent_soft)
         } else {
             rgba(0x00000000)
         })
-        .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+        .border_1()
+        .border_color(if selected {
+            rgba(t.border_accent)
+        } else {
+            rgba(0x00000000)
+        })
+        .hover(move |s| {
+            if selected {
+                s
+            } else {
+                s.bg(rgba(t.glass_row_hover_bg))
+            }
+        })
         .flex()
         .items_center()
         .justify_between()
@@ -250,7 +313,7 @@ pub(super) fn selectable_row(
                     div()
                         .font(ui_sans(FontWeight::MEDIUM))
                         .text_size(px(13.5))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(t.text_primary))
                         .truncate()
                         .child(primary.into()),
                 )
@@ -259,14 +322,19 @@ pub(super) fn selectable_row(
                         div()
                             .font(ui_sans(FontWeight::NORMAL))
                             .text_size(px(12.0))
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(rgb(t.text_muted))
                             .truncate()
                             .child(sec),
                     )
                 }),
         )
         .when(selected, |d| {
-            d.child(svg_icon(IconName::Check, 15.0, rgb(ACCENT)))
+            d.child(svg_icon_weighted(
+                IconName::Check,
+                IconWeight::Fill,
+                15.0,
+                rgb(t.accent),
+            ))
         })
 }
 
@@ -276,6 +344,7 @@ pub(super) fn drilldown_row(
     value: impl Into<SharedString>,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let t = player_hud_palette();
     div()
         .id(id)
         .w_full()
@@ -283,7 +352,7 @@ pub(super) fn drilldown_row(
         .px(px(4.0))
         .rounded(px(8.0))
         .cursor_pointer()
-        .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
         .flex()
         .items_center()
         .justify_between()
@@ -296,7 +365,7 @@ pub(super) fn drilldown_row(
             div()
                 .font(ui_sans(FontWeight::MEDIUM))
                 .text_size(px(13.5))
-                .text_color(rgb(TEXT_PRIMARY))
+                .text_color(rgb(t.text_primary))
                 .child(label.into()),
         )
         .child(
@@ -308,10 +377,15 @@ pub(super) fn drilldown_row(
                     div()
                         .font(ui_sans(FontWeight::NORMAL))
                         .text_size(px(13.0))
-                        .text_color(rgb(TEXT_SECONDARY))
+                        .text_color(rgb(t.text_secondary))
                         .child(value.into()),
                 )
-                .child(svg_icon(IconName::ChevronRight, 14.0, rgb(TEXT_MUTED))),
+                .child(svg_icon_weighted(
+                    IconName::ChevronRight,
+                    IconWeight::Regular,
+                    14.0,
+                    rgb(t.text_muted),
+                )),
         )
 }
 
@@ -326,6 +400,7 @@ pub(super) fn stepper_row(
     on_reset: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_plus: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
+    let t = player_hud_palette();
     div()
         .w_full()
         .flex()
@@ -336,7 +411,7 @@ pub(super) fn stepper_row(
             div()
                 .font(ui_sans(FontWeight::MEDIUM))
                 .text_size(px(13.5))
-                .text_color(rgb(TEXT_PRIMARY))
+                .text_color(rgb(t.text_primary))
                 .child(label.into()),
         )
         .child(
@@ -344,7 +419,7 @@ pub(super) fn stepper_row(
                 .h(px(34.0))
                 .min_w(px(114.0))
                 .rounded_full()
-                .bg(rgba(TROUGH_BG))
+                .bg(rgba(t.glass_trough_bg))
                 .px(px(6.0))
                 .flex()
                 .items_center()
@@ -360,12 +435,17 @@ pub(super) fn stepper_row(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+                        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                             cx.stop_propagation();
                             on_minus(ev, window, cx);
                         })
-                        .child(svg_icon(IconName::Minus, 13.0, rgb(TEXT_SECONDARY))),
+                        .child(svg_icon_weighted(
+                            IconName::Minus,
+                            IconWeight::Regular,
+                            13.0,
+                            rgb(t.text_secondary),
+                        )),
                 )
                 .child(
                     div()
@@ -379,11 +459,11 @@ pub(super) fn stepper_row(
                         .items_center()
                         .justify_center()
                         .whitespace_nowrap()
-                        .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+                        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                         .font(ui_sans(FontWeight::MEDIUM))
                         .font_features(tabular_nums())
                         .text_size(px(12.5))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(t.text_primary))
                         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                             cx.stop_propagation();
                             on_reset(ev, window, cx);
@@ -400,12 +480,17 @@ pub(super) fn stepper_row(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+                        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                             cx.stop_propagation();
                             on_plus(ev, window, cx);
                         })
-                        .child(svg_icon(IconName::Plus, 13.0, rgb(TEXT_SECONDARY))),
+                        .child(svg_icon_weighted(
+                            IconName::Plus,
+                            IconWeight::Regular,
+                            13.0,
+                            rgb(t.text_secondary),
+                        )),
                 ),
         )
 }
@@ -417,6 +502,7 @@ pub(super) fn toggle_switch_row(
     enabled: bool,
     on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
+    let t = player_hud_palette();
     div()
         .id(id)
         .w_full()
@@ -424,7 +510,7 @@ pub(super) fn toggle_switch_row(
         .px(px(2.0))
         .rounded(px(8.0))
         .cursor_pointer()
-        .hover(|s| s.bg(rgba(ROW_HOVER_BG)))
+        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
         .flex()
         .items_center()
         .justify_between()
@@ -444,7 +530,7 @@ pub(super) fn toggle_switch_row(
                     div()
                         .font(ui_sans(FontWeight::MEDIUM))
                         .text_size(px(13.5))
-                        .text_color(rgb(TEXT_PRIMARY))
+                        .text_color(rgb(t.text_primary))
                         .child(label.into()),
                 )
                 .when_some(description, |d, desc| {
@@ -452,7 +538,7 @@ pub(super) fn toggle_switch_row(
                         div()
                             .font(ui_sans(FontWeight::NORMAL))
                             .text_size(px(11.5))
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(rgb(t.text_muted))
                             .child(desc),
                     )
                 }),
@@ -466,8 +552,10 @@ pub(super) fn toggle_switch_row(
                 .p(px(2.0))
                 .flex()
                 .items_center()
-                .when(enabled, |s| s.bg(rgb(ACCENT)).justify_end())
-                .when(!enabled, |s| s.bg(rgba(0xFFFFFF1E)).justify_start())
+                .when(enabled, |s| s.bg(rgb(t.accent)).justify_end())
+                .when(!enabled, |s| {
+                    s.bg(rgba(t.glass_border_strong)).justify_start()
+                })
                 .child(
                     div()
                         .w(px(18.0))
@@ -481,13 +569,42 @@ pub(super) fn toggle_switch_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{AccentChoice, CardDensityChoice, UiScaleChoice};
 
     #[test]
     fn parse_hex_rgb_parses_rgb_and_falls_back_cleanly() {
         assert_eq!(parse_hex_rgb("#F5F1E8"), 0xF5F1E8);
         assert_eq!(parse_hex_rgb("fde68a"), 0xFDE68A);
         assert_eq!(parse_hex_rgb("#FFBAE6FD"), 0xBAE6FD);
-        assert_eq!(parse_hex_rgb("not-hex"), TEXT_PRIMARY);
+        assert_eq!(parse_hex_rgb("not-hex"), FALLBACK_SUBTITLE_COLOR);
+    }
+
+    #[test]
+    fn cinema_hud_palette_stays_dark_under_light_mist_and_syncs_all_accents() {
+        for preset in ThemePreset::ALL {
+            for accent in AccentChoice::ALL {
+                let raw = build_palette(
+                    preset,
+                    accent,
+                    true,
+                    UiScaleChoice::S100.factor(),
+                    CardDensityChoice::Comfortable,
+                );
+                let hud = cinema_hud_palette_from(raw);
+                assert!(!hud.is_light, "player HUD must remain dark-cinematic");
+                assert_eq!(hud.accent_choice, accent);
+                assert_eq!(hud.accent, accent.hex());
+                assert_eq!(hud.accent_hover, accent.hover_hex());
+                assert_eq!(hud.cta_on_accent, accent.on_accent_hex());
+                if preset.is_light() {
+                    assert_eq!(hud.preset, ThemePreset::EtherealDark);
+                    assert_ne!(hud.glass_sheet_bg, raw.glass_sheet_bg);
+                } else {
+                    assert_eq!(hud.preset, preset);
+                    assert_eq!(hud.glass_sheet_bg, raw.glass_sheet_bg);
+                }
+            }
+        }
     }
 
     #[test]

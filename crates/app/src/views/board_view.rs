@@ -1,13 +1,15 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     ops::Range,
     sync::Arc,
+    time::Duration,
 };
 
 use gpui::{
-    div, img, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, AnyElement,
-    Context, ElementId, FontWeight, MouseButton, MouseDownEvent, ObjectFit, ScrollDelta,
-    ScrollEvent, ScrollHandle, SharedString,
+    div, img, linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, rgba,
+    AnyElement, AsyncApp, BoxShadow, Context, ElementId, FontWeight, MouseButton, MouseDownEvent,
+    ObjectFit, RenderImage, ScrollDelta, ScrollEvent, ScrollHandle, SharedString, WeakEntity,
 };
 use stremio_core_runtime::{
     stremio_core::{
@@ -24,33 +26,67 @@ use stremio_core_runtime::{
 };
 
 use crate::{
-    icons::{svg_icon, IconName},
+    icons::{svg_icon, svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
     state::{
         extract_genres, extract_imdb_rating, format_movietracker_episode_code, scroll_near_bottom,
-        AppRoute, BrowsingContextMenu, KbFocusableCard, LibraryStatusTab, PlaybackCandidate,
-        SidebarTab,
+        AppRoute, BrowsingContextMenu, KbFocusableCard, LibraryFilterTab, LibraryStatusTab,
+        PlaybackCandidate, QuickPeekTarget, SidebarTab, ToastKind,
     },
     theme::{
-        editorial_serif, meta_divider, mono_font, placeholder_tint_for_id, sentence_case_label,
-        ui_sans, ACCENT, ACCENT_AMBER, ACCENT_SOFT, BG_ELEVATED, BORDER_ACCENT, GLASS_BORDER,
-        GLASS_BORDER_STRONG, GLASS_CARD_BG, GLASS_ROW_HOVER_BG, GLASS_SHEET_BG, GLASS_TROUGH_BG,
-        RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER, RADIUS_SHEET, TEXT_MUTED,
-        TEXT_PRIMARY, TEXT_SECONDARY,
+        active_theme, editorial_serif, glass_capsule_shadow, mono_font, placeholder_tint_for_id,
+        sentence_case_label, sp, tabular_nums, ui_sans, CardDensityChoice, ThemePalette,
+        RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER, RADIUS_SHEET,
     },
     ui_components::{
-        primary_accent_button, render_poster_card, secondary_glass_button, PosterCardProps,
+        format_notification_badge_label, primary_accent_button, render_poster_card,
+        secondary_glass_button, PosterCardProps,
     },
+    views::preview_drawer::build_quick_peek_fallback_preview,
     virtual_grid::PosterAspect,
 };
 
-const SHELF_CARD_GAP_PX: f32 = 18.0;
 const SHELF_HEADER_HEIGHT_PX: f32 = 40.0;
 const SHELF_HEADER_GAP_PX: f32 = 14.0;
 const SHELF_BOTTOM_GAP_PX: f32 = 36.0;
 const CARD_METADATA_HEIGHT_PX: f32 = 44.0;
 const VERTICAL_OVERSCAN_PX: f32 = 650.0;
 const HORIZONTAL_OVERSCAN_CARDS: usize = 2;
+const HERO_MIN_HEIGHT_PX: f32 = 460.0;
+const HERO_MAX_HEIGHT_PX: f32 = 640.0;
+const HERO_HOVER_DEBOUNCE_MS: u64 = 120;
+const MAX_CW_FILMSTRIP_ITEMS: usize = 16;
+const MAX_FEATURED_CANDIDATES: usize = 8;
+const CW_FILMSTRIP_SCROLL_KEY: usize = usize::MAX;
+const FEATURED_DOCK_SCROLL_KEY: usize = usize::MAX - 1;
+
+// Crisp cinema-scrim ink tokens for the full-bleed Hero Stage (ensures contrast on Dark + LightMist).
+const HERO_INK_PRIMARY: u32 = 0xF7F5F0;
+const HERO_INK_SECONDARY: u32 = 0xD4D7E0;
+const HERO_INK_MUTED: u32 = 0x9EA3B2;
+const HERO_GLASS_BG: u32 = 0x10131CB8;
+const HERO_GLASS_HOVER_BG: u32 = 0x1B202EE0;
+const HERO_GLASS_TROUGH_BG: u32 = 0x0B0D14BF;
+const HERO_GLASS_BORDER: u32 = 0xFFFFFF26;
+const HERO_GLASS_BORDER_STRONG: u32 = 0xFFFFFF48;
+const HERO_DIVIDER: u32 = 0xFFFFFF36;
+const HERO_STAR_GOLD: u32 = 0xFBBF24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeroStageMode {
+    ContinueWatching,
+    Featured,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoardSnapshotKey {
+    board_state_rev: u64,
+    library_state_rev: u64,
+    shelf_limit: usize,
+    pinned_hash: u64,
+    hidden_hash: u64,
+    want_spotlight: bool,
+}
 
 #[derive(Clone)]
 struct HomeSpotlightCandidate {
@@ -66,8 +102,10 @@ struct HomeSpotlightCandidate {
     genres: Vec<String>,
     backdrop_url: Option<String>,
     logo_url: Option<String>,
+    poster_url: Option<String>,
     trailer_youtube_key: Option<String>,
     trailer_streams: Vec<Stream>,
+    preview: Option<MetaItemPreview>,
 }
 
 #[derive(Clone)]
@@ -76,11 +114,17 @@ enum SpotlightTrailerTarget {
     YouTubeUrl(String),
 }
 
+#[derive(Clone)]
 struct ContinueWatchingCard {
     library_item: LibraryItem,
     notification_count: usize,
     backdrop_url: Option<String>,
+    logo_url: Option<String>,
     imdb_rating: Option<String>,
+    year: Option<String>,
+    description: Option<String>,
+    genres: Vec<String>,
+    trailer_streams: Vec<Stream>,
     preview: Option<MetaItemPreview>,
 }
 
@@ -98,12 +142,9 @@ struct BoardShelfMeta {
     is_pinned: bool,
 }
 
-struct BoardRowSnapshot {
+struct CachedBoardShelf {
     meta: BoardShelfMeta,
-    visible_range: Range<usize>,
-    visible_items: Vec<MetaItemPreview>,
-    shelf_total_h: f32,
-    is_visible_y: bool,
+    items: Arc<[MetaItemPreview]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,8 +154,90 @@ struct HiddenShelfInfo {
     subtitle: Option<String>,
 }
 
+struct BoardViewSnapshot {
+    key: BoardSnapshotKey,
+    cw_cards: Arc<[ContinueWatchingCard]>,
+    cw_total_count: usize,
+    featured_candidates: Arc<[HomeSpotlightCandidate]>,
+    shelves: Arc<[CachedBoardShelf]>,
+    hidden_shelves: Arc<[HiddenShelfInfo]>,
+    total_board_catalogs: usize,
+    pinned_indices_to_load: Arc<[usize]>,
+}
+
+struct VisibleShelfLayout<'a> {
+    shelf: &'a CachedBoardShelf,
+    visible_range: Range<usize>,
+    shelf_total_h: f32,
+    is_visible_y: bool,
+}
+
+struct ActiveHeroDisplay {
+    id: String,
+    r#type: String,
+    name: String,
+    video_id: Option<String>,
+    primary_cta_label: String,
+    eyebrow: String,
+    description: Option<String>,
+    year: Option<String>,
+    imdb_rating: Option<String>,
+    genres: Vec<String>,
+    backdrop_url: Option<String>,
+    logo_url: Option<String>,
+    poster_url: Option<String>,
+    trailer_youtube_key: Option<String>,
+    trailer_streams: Vec<Stream>,
+    preview: Option<MetaItemPreview>,
+    in_library: bool,
+}
+
 impl AppShell {
+    fn cached_board_snapshot(
+        &self,
+        shelf_limit: usize,
+        want_spotlight: bool,
+    ) -> Arc<BoardViewSnapshot> {
+        let pinned_hash = hash_string_slice(&self.preferences.pinned_board_shelves);
+        let hidden_hash = hash_string_slice(&self.preferences.hidden_board_shelves);
+        let key = BoardSnapshotKey {
+            board_state_rev: self.board_state_rev,
+            library_state_rev: self.library_state_rev,
+            shelf_limit,
+            pinned_hash,
+            hidden_hash,
+            want_spotlight,
+        };
+
+        {
+            let guard = self.memoized_board_cache.lock();
+            if let Some(any_arc) = guard.as_ref() {
+                if let Ok(cached) = Arc::clone(any_arc).downcast::<BoardViewSnapshot>() {
+                    if cached.key == key {
+                        return cached;
+                    }
+                }
+            }
+        }
+
+        let pinned_prefs = &self.preferences.pinned_board_shelves;
+        let hidden_prefs = &self.preferences.hidden_board_shelves;
+
+        let snapshot = self.core.with_model(|model| {
+            build_board_view_snapshot(model, key, pinned_prefs, hidden_prefs)
+        });
+        let arc_snap = Arc::new(snapshot);
+
+        {
+            let mut guard = self.memoized_board_cache.lock();
+            *guard = Some(Arc::clone(&arc_snap) as Arc<dyn std::any::Any + Send + Sync>);
+        }
+
+        arc_snap
+    }
+
     pub fn render_board_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active_theme();
         let viewport_w = if self.viewport_size_px.0 > 100.0 && self.viewport_size_px.0.is_finite()
         {
             self.viewport_size_px.0
@@ -128,303 +251,17 @@ impl AppShell {
             900.0
         };
         let scroll_y = (-self.board_scroll_handle.offset().y / px(1.0)).max(0.0);
-        let container_w = (viewport_w.min(1440.0) - 64.0).max(360.0);
+        let side_pad = fluid_side_padding_px(viewport_w);
+        let container_w = (viewport_w - side_pad * 2.0).max(360.0);
+        let gap_px = theme.density.grid_gap_px();
 
         let shelf_limit = self.visible_board_shelves.max(INITIAL_BOARD_SHELVES);
         let want_spotlight = self.preferences.show_home_spotlight;
-        let pinned_prefs = self.preferences.pinned_board_shelves.clone();
-        let hidden_prefs = self.preferences.hidden_board_shelves.clone();
-        let shelf_scroll_x: HashMap<usize, f32> = self
-            .board_shelf_scrolls
-            .iter()
-            .map(|(&idx, h)| (idx, (-h.offset().x / px(1.0)).max(0.0)))
-            .collect();
 
         let library_statuses = self.cached_library_statuses();
+        let snapshot = self.cached_board_snapshot(shelf_limit, want_spotlight);
 
-        let (
-            cw_cards,
-            cw_total_count,
-            catalog_rows,
-            hidden_shelves,
-            total_board_catalogs,
-            spotlight_candidates,
-            pinned_indices_to_load,
-        ) = self.core.with_model(|model| {
-            let cw: Vec<ContinueWatchingCard> = model
-                .continue_watching_preview
-                .items
-                .iter()
-                .take(6)
-                .map(|cw_item| {
-                    let li = &cw_item.library_item;
-                    let preview_ref = find_preview_ref_in_model(model, &li.id);
-                    ContinueWatchingCard {
-                        library_item: li.clone(),
-                        notification_count: cw_item.notifications,
-                        backdrop_url: preview_ref
-                            .and_then(|p| p.background.as_ref().map(|u| u.to_string())),
-                        imdb_rating: preview_ref.and_then(extract_imdb_rating),
-                        preview: preview_ref.cloned(),
-                    }
-                })
-                .collect();
-            let cw_total = model.continue_watching_preview.items.len();
-
-            let total_catalogs = model.board.catalogs.len();
-            let mut sortable_metas: Vec<(Option<usize>, BoardShelfMeta)> = Vec::new();
-            let mut hidden_list: Vec<HiddenShelfInfo> = Vec::new();
-            let mut seen_hidden_keys: HashSet<String> = HashSet::new();
-            let mut to_load: Vec<usize> = Vec::new();
-
-            for (idx, cat) in model.board.catalogs.iter().enumerate() {
-                let Some(first_page) = cat.first() else {
-                    continue;
-                };
-                let raw_type = first_page.request.path.r#type.as_str();
-                let raw_id = first_page.request.path.id.as_str();
-                let shelf_key = build_shelf_key(first_page.request.base.as_str(), raw_type, raw_id);
-
-                let matched_mc = model
-                    .ctx
-                    .profile
-                    .addons
-                    .iter()
-                    .find(|a| a.transport_url == first_page.request.base)
-                    .and_then(|a| {
-                        a.manifest
-                            .catalogs
-                            .iter()
-                            .find(|mc| mc.id == raw_id && mc.r#type == raw_type)
-                    });
-                let addon_cat_name = matched_mc.and_then(|mc| mc.name.as_deref());
-                let supports_skip = matched_mc.is_some_and(|mc| {
-                    mc.extra
-                        .iter()
-                        .any(|extra| extra.name.eq_ignore_ascii_case("skip"))
-                });
-
-                let (section_title, section_sub) = editorialize_shelf_heading(
-                    idx,
-                    addon_cat_name.unwrap_or(raw_id),
-                    raw_type,
-                );
-
-                if hidden_prefs.iter().any(|k| k == &shelf_key) {
-                    if seen_hidden_keys.insert(shelf_key.clone()) {
-                        hidden_list.push(HiddenShelfInfo {
-                            shelf_key,
-                            title: section_title,
-                            subtitle: section_sub,
-                        });
-                    }
-                    continue;
-                }
-
-                let pin_pos = pinned_prefs.iter().position(|k| k == &shelf_key);
-                let is_pinned = pin_pos.is_some();
-                if idx >= shelf_limit && !is_pinned {
-                    continue;
-                }
-
-                let needs_initial_load = first_page.content.is_none();
-                if is_pinned && needs_initial_load {
-                    to_load.push(idx);
-                }
-
-                let mut total_items = 0_usize;
-                let mut is_loading = false;
-                let mut first_shape: Option<PosterShape> = None;
-
-                for page in cat {
-                    match &page.content {
-                        Some(Loadable::Ready(items)) => {
-                            if first_shape.is_none() {
-                                if let Some(first) = items.first() {
-                                    first_shape = Some(first.poster_shape.clone());
-                                }
-                            }
-                            total_items += items.len();
-                        }
-                        Some(Loadable::Loading) => is_loading = true,
-                        _ => {}
-                    }
-                }
-
-                if total_items == 0 && !is_loading && !(is_pinned && needs_initial_load) {
-                    continue;
-                }
-
-                let can_load_more = supports_skip
-                    && !is_loading
-                    && cat.last().is_some_and(|p| {
-                        matches!(&p.content, Some(Loadable::Ready(items)) if !items.is_empty())
-                    });
-
-                let see_all_request = strip_skip_extra(&first_page.request);
-                let aspect = first_shape
-                    .as_ref()
-                    .map(PosterAspect::from_stremio_poster_shape)
-                    .unwrap_or(PosterAspect::Portrait2x3);
-
-                sortable_metas.push((
-                    pin_pos,
-                    BoardShelfMeta {
-                        raw_index: idx,
-                        shelf_key,
-                        title: section_title,
-                        subtitle: section_sub,
-                        see_all_request,
-                        aspect,
-                        total_items,
-                        is_loading: is_loading || (is_pinned && needs_initial_load),
-                        can_load_more,
-                        is_pinned,
-                    },
-                ));
-            }
-
-            for key in &hidden_prefs {
-                if seen_hidden_keys.insert(key.clone()) {
-                    hidden_list.push(HiddenShelfInfo {
-                        shelf_key: key.clone(),
-                        title: fallback_hidden_shelf_title(key),
-                        subtitle: None,
-                    });
-                }
-            }
-
-            let ordered_metas = order_board_shelves(sortable_metas);
-
-            let mut spots: Vec<HomeSpotlightCandidate> = Vec::new();
-            if want_spotlight {
-                let mut seen_spot = HashSet::new();
-                if let Some(first_cw) = model.continue_watching_preview.items.first() {
-                    let li = &first_cw.library_item;
-                    if seen_spot.insert(li.id.clone()) {
-                        let cached = find_preview_ref_in_model(model, &li.id);
-                        spots.push(HomeSpotlightCandidate {
-                            id: li.id.clone(),
-                            r#type: li.r#type.clone(),
-                            name: li.name.clone(),
-                            video_id: li.state.video_id.clone(),
-                            is_resume: true,
-                            eyebrow: "CONTINUE WATCHING".to_owned(),
-                            description: cached.and_then(|c| c.description.clone()),
-                            year: cached
-                                .and_then(|c| c.release_info.clone())
-                                .map(|s| s.trim().to_owned())
-                                .filter(|s| !s.is_empty()),
-                            imdb_rating: cached.and_then(extract_imdb_rating),
-                            genres: cached.map(|c| extract_genres(c, 3)).unwrap_or_default(),
-                            backdrop_url: cached
-                                .and_then(|c| c.background.as_ref().map(|u| u.to_string())),
-                            logo_url: cached.and_then(|c| c.logo.as_ref().map(|u| u.to_string())),
-                            trailer_youtube_key: None,
-                            trailer_streams: cached
-                                .map(|c| c.trailer_streams.clone())
-                                .unwrap_or_default(),
-                        });
-                    }
-                }
-
-                for meta in &ordered_metas {
-                    if spots.len() >= 6 {
-                        break;
-                    }
-                    if let Some(cat) = model.board.catalogs.get(meta.raw_index) {
-                        for item in iter_catalog_items(cat).take(3) {
-                            if spots.len() >= 6 {
-                                break;
-                            }
-                            if seen_spot.insert(item.id.clone()) {
-                                spots.push(HomeSpotlightCandidate {
-                                    id: item.id.clone(),
-                                    r#type: item.r#type.clone(),
-                                    name: item.name.clone(),
-                                    video_id: None,
-                                    is_resume: false,
-                                    eyebrow: format!(
-                                        "FEATURED · {}",
-                                        meta.title.to_ascii_uppercase()
-                                    ),
-                                    description: item.description.clone(),
-                                    year: item
-                                        .release_info
-                                        .clone()
-                                        .map(|s| s.trim().to_owned())
-                                        .filter(|s| !s.is_empty()),
-                                    imdb_rating: extract_imdb_rating(item),
-                                    genres: extract_genres(item, 3),
-                                    backdrop_url: item.background.as_ref().map(|u| u.to_string()),
-                                    logo_url: item.logo.as_ref().map(|u| u.to_string()),
-                                    trailer_youtube_key: None,
-                                    trailer_streams: item.trailer_streams.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            let cw_cols = cw_column_count(container_w);
-            let cw_rows = if cw.is_empty() {
-                0
-            } else {
-                cw.len().div_ceil(cw_cols)
-            };
-            let cw_card_w = cw_card_width_px(container_w, cw_cols);
-            let cw_img_h = (cw_card_w * PosterAspect::Landscape16x9.height_over_width()).ceil();
-            let cw_card_h = cw_img_h + CARD_METADATA_HEIGHT_PX;
-            let has_spotlight = want_spotlight && !spots.is_empty();
-
-            let mut y_cursor = initial_shelves_top_y(has_spotlight, cw_rows, cw_card_h);
-            let mut rows = Vec::with_capacity(ordered_metas.len());
-
-            for meta in ordered_metas {
-                let (card_w, _img_h, card_h) = shelf_card_dimensions(meta.aspect);
-                let shelf_total_h = shelf_total_height_px(card_h);
-                let shelf_top = y_cursor;
-                let shelf_bottom = shelf_top + shelf_total_h;
-                y_cursor = shelf_bottom;
-
-                let is_visible_y = shelf_bottom >= (scroll_y - VERTICAL_OVERSCAN_PX)
-                    && shelf_top <= (scroll_y + viewport_h + VERTICAL_OVERSCAN_PX);
-
-                let (visible_range, visible_items) = if is_visible_y {
-                    let sx = shelf_scroll_x.get(&meta.raw_index).copied().unwrap_or(0.0);
-                    let range = compute_horizontal_window(
-                        meta.total_items,
-                        sx,
-                        container_w,
-                        card_w,
-                        SHELF_CARD_GAP_PX,
-                        HORIZONTAL_OVERSCAN_CARDS,
-                    );
-                    let items = model
-                        .board
-                        .catalogs
-                        .get(meta.raw_index)
-                        .map(|cat| slice_catalog_items(cat, range.clone()))
-                        .unwrap_or_default();
-                    (range, items)
-                } else {
-                    (0..0, Vec::new())
-                };
-
-                rows.push(BoardRowSnapshot {
-                    meta,
-                    visible_range,
-                    visible_items,
-                    shelf_total_h,
-                    is_visible_y,
-                });
-            }
-
-            (cw, cw_total, rows, hidden_list, total_catalogs, spots, to_load)
-        });
-
-        for idx in pinned_indices_to_load {
+        for &idx in snapshot.pinned_indices_to_load.iter() {
             if let std::collections::hash_map::Entry::Vacant(e) = self.board_shelf_scrolls.entry(idx)
             {
                 e.insert(ScrollHandle::new());
@@ -432,117 +269,127 @@ impl AppShell {
             }
         }
 
-        let mut visible_shelf_handles: HashMap<usize, ScrollHandle> = HashMap::new();
-        for row in &catalog_rows {
-            if row.is_visible_y {
-                let handle = self
-                    .board_shelf_scrolls
-                    .entry(row.meta.raw_index)
-                    .or_default()
-                    .clone();
-                visible_shelf_handles.insert(row.meta.raw_index, handle);
-            }
-        }
-
-        let spotlight_el = if want_spotlight && !spotlight_candidates.is_empty() {
-            let spot_count = spotlight_candidates.len();
-            let active_idx = self.board_spotlight_idx % spot_count;
-            let mut active = spotlight_candidates[active_idx].clone();
-            self.request_background_enrichment_if_needed(&active.r#type, &active.id, cx);
-            if let Some(enr) = self.core.cached_enriched_meta(&active.id) {
-                if active.logo_url.is_none() {
-                    active.logo_url = enr.logo_url;
-                }
-                if active.backdrop_url.is_none() {
-                    active.backdrop_url = enr.backdrop_url;
-                }
-                if active.description.is_none() {
-                    active.description = enr.overview;
-                }
-                if active.year.is_none() {
-                    active.year = enr.year;
-                }
-                if active.imdb_rating.is_none() {
-                    active.imdb_rating = enr.imdb_rating;
-                }
-                if active.genres.is_empty() {
-                    active.genres = enr.genres;
-                }
-                if active.trailer_youtube_key.is_none() {
-                    active.trailer_youtube_key = enr.trailer_youtube_key;
-                }
-            }
-
-            if spot_count > 1 {
-                let next_idx = (active_idx + 1) % spot_count;
-                let next_spot = &spotlight_candidates[next_idx];
-                let next_bg = next_spot
-                    .backdrop_url
-                    .clone()
-                    .or_else(|| {
-                        self.core
-                            .cached_enriched_meta(&next_spot.id)
-                            .and_then(|e| e.backdrop_url)
-                    })
-                    .or_else(|| {
-                        next_spot.id.starts_with("tt").then(|| {
-                            format!(
-                                "https://images.metahub.space/background/medium/{}/img",
-                                next_spot.id
-                            )
-                        })
-                    });
-                if let Some(next_bg_url) = next_bg.as_deref() {
-                    self.poster_cache.prefetch_hero_backdrop(next_bg_url);
-                }
-            }
-
-            Some(self.render_home_spotlight_banner(&active, active_idx, spot_count, cx))
-        } else {
-            None
-        };
+        let has_cw = !snapshot.cw_cards.is_empty();
+        let has_featured = want_spotlight && !snapshot.featured_candidates.is_empty();
+        let show_hero_stage = has_cw || has_featured;
+        let hero_mode =
+            resolve_hero_stage_mode(self.board_hero_mode_featured, has_cw, has_featured);
+        let hero_height = show_hero_stage.then(|| hero_stage_height_px(viewport_h));
 
         let mut kb_cards: Vec<KbFocusableCard> = Vec::new();
-        let cw_cols = cw_column_count(container_w);
-        let cw_rows = if cw_cards.is_empty() {
-            0
-        } else {
-            cw_cards.len().div_ceil(cw_cols)
-        };
+        let hero_stage_el = if let Some(hero_h) = hero_height {
+            let cw_scroll = self
+                .board_shelf_scrolls
+                .entry(CW_FILMSTRIP_SCROLL_KEY)
+                .or_default()
+                .clone();
+            let featured_scroll = self
+                .board_shelf_scrolls
+                .entry(FEATURED_DOCK_SCROLL_KEY)
+                .or_default()
+                .clone();
 
-        let cw_section_el = if !cw_cards.is_empty() {
-            Some(self.render_continue_watching_section(
-                &cw_cards,
-                cw_total_count,
+            Some(self.render_hero_stage(
+                &snapshot,
+                hero_mode,
+                has_cw && has_featured,
+                hero_h,
+                side_pad,
                 container_w,
+                &cw_scroll,
+                &featured_scroll,
                 &library_statuses,
                 &mut kb_cards,
+                &theme,
                 cx,
             ))
         } else {
             None
         };
 
-        let total_shelves_rendered = catalog_rows.len();
-        let mut mounted_shelves_count = 0_usize;
-        let mut shelf_elements = Vec::with_capacity(catalog_rows.len());
+        let shelf_scroll_x: HashMap<usize, f32> = self
+            .board_shelf_scrolls
+            .iter()
+            .filter(|(&idx, _)| idx != CW_FILMSTRIP_SCROLL_KEY && idx != FEATURED_DOCK_SCROLL_KEY)
+            .map(|(&idx, h)| (idx, (-h.offset().x / px(1.0)).max(0.0)))
+            .collect();
 
-        for (shelf_pos, row) in catalog_rows.into_iter().enumerate() {
-            if row.is_visible_y {
+        let mut y_cursor = initial_shelves_top_y(hero_height, theme.ui_scale);
+        let mut shelf_layouts: Vec<VisibleShelfLayout<'_>> =
+            Vec::with_capacity(snapshot.shelves.len());
+
+        for shelf in snapshot.shelves.iter() {
+            let (card_w, _img_h, card_h) =
+                shelf_card_dimensions(shelf.meta.aspect, theme.density, theme.ui_scale);
+            let shelf_total_h = shelf_total_height_px(card_h, theme.ui_scale);
+            let shelf_top = y_cursor;
+            let shelf_bottom = shelf_top + shelf_total_h;
+            y_cursor = shelf_bottom;
+
+            let is_visible_y = shelf_bottom >= (scroll_y - VERTICAL_OVERSCAN_PX)
+                && shelf_top <= (scroll_y + viewport_h + VERTICAL_OVERSCAN_PX);
+
+            let visible_range = if is_visible_y {
+                let sx = shelf_scroll_x
+                    .get(&shelf.meta.raw_index)
+                    .copied()
+                    .unwrap_or(0.0);
+                compute_horizontal_window(
+                    shelf.meta.total_items,
+                    sx,
+                    container_w,
+                    card_w,
+                    gap_px,
+                    HORIZONTAL_OVERSCAN_CARDS,
+                )
+            } else {
+                0..0
+            };
+
+            shelf_layouts.push(VisibleShelfLayout {
+                shelf,
+                visible_range,
+                shelf_total_h,
+                is_visible_y,
+            });
+        }
+
+        let mut visible_shelf_handles: HashMap<usize, ScrollHandle> = HashMap::new();
+        for layout in &shelf_layouts {
+            if layout.is_visible_y {
+                let handle = self
+                    .board_shelf_scrolls
+                    .entry(layout.shelf.meta.raw_index)
+                    .or_default()
+                    .clone();
+                visible_shelf_handles.insert(layout.shelf.meta.raw_index, handle);
+            }
+        }
+
+        let kb_row_offset = usize::from(show_hero_stage);
+        let total_shelves_rendered = shelf_layouts.len();
+        let mut mounted_shelves_count = 0_usize;
+        let mut shelf_elements = Vec::with_capacity(shelf_layouts.len());
+
+        for (shelf_pos, layout) in shelf_layouts.into_iter().enumerate() {
+            if layout.is_visible_y {
                 mounted_shelves_count += 1;
                 let scroll_handle = visible_shelf_handles
-                    .get(&row.meta.raw_index)
+                    .get(&layout.shelf.meta.raw_index)
                     .cloned()
                     .unwrap_or_default();
-                let row_coord = cw_rows + shelf_pos;
+                let row_coord = kb_row_offset + shelf_pos;
                 shelf_elements.push(
                     self.render_editorial_shelf(
-                        row,
+                        layout.shelf,
+                        layout.visible_range,
+                        layout.shelf_total_h,
                         container_w,
                         scroll_handle,
                         &library_statuses,
                         row_coord,
                         &mut kb_cards,
+                        &theme,
                         cx,
                     )
                     .into_any_element(),
@@ -550,20 +397,27 @@ impl AppShell {
             } else {
                 shelf_elements.push(
                     div()
-                        .id(("board-shelf-spacer", row.meta.raw_index))
+                        .id(("board-shelf-spacer", layout.shelf.meta.raw_index))
                         .w_full()
-                        .h(px(row.shelf_total_h))
+                        .h(px(layout.shelf_total_h))
                         .into_any_element(),
                 );
             }
         }
 
         let has_virtualized_shelves = total_shelves_rendered > mounted_shelves_count;
-        let has_any_content = !cw_cards.is_empty() || total_shelves_rendered > 0;
+        let has_any_content = has_cw || total_shelves_rendered > 0;
+        let total_board_catalogs = snapshot.total_board_catalogs;
         let has_more_shelves = shelf_limit < total_board_catalogs;
         let remaining_shelves = total_board_catalogs.saturating_sub(shelf_limit);
 
         self.set_kb_focus_items(kb_cards);
+
+        let shelves_top_pad = if show_hero_stage {
+            px(24.0)
+        } else {
+            sp(88.0)
+        };
 
         div()
             .id("board-view-scroll")
@@ -598,121 +452,223 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(1440.0))
-                    .mx_auto()
-                    .px(px(32.0))
-                    .pt(px(28.0))
-                    .pb(px(72.0))
                     .flex()
                     .flex_col()
-                    .when(!has_any_content, |el| {
-                        el.child(Self::render_empty_board_banner(cx))
-                    })
-                    .when_some(spotlight_el, |el, banner| {
-                        el.child(div().mb(px(40.0)).child(banner))
-                    })
-                    .when_some(cw_section_el, |el, cw_sec| {
-                        el.child(div().mb(px(40.0)).child(cw_sec))
-                    })
-                    .children(shelf_elements)
-                    .when(has_more_shelves, |el| {
-                        el.child(
-                            div()
-                                .pt(px(4.0))
-                                .mb(px(16.0))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(16.0))
-                                .child(
+                    .when_some(hero_stage_el, |el, hero| el.child(hero))
+                    .child(
+                        div()
+                            .w_full()
+                            .px(px(side_pad))
+                            .pt(shelves_top_pad)
+                            .pb(px(72.0))
+                            .flex()
+                            .flex_col()
+                            .when(!has_any_content, |el| {
+                                el.child(Self::render_empty_board_banner(&theme, cx))
+                            })
+                            .children(shelf_elements)
+                            .when(has_more_shelves, |el| {
+                                el.child(
                                     div()
-                                        .font(mono_font())
-                                        .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .child(format!(
-                                            "Showing {} of {total_board_catalogs} shelves",
-                                            shelf_limit.min(total_board_catalogs)
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .id("btn-board-show-more-shelves")
-                                        .cursor_pointer()
-                                        .h(px(36.0))
-                                        .px(px(16.0))
-                                        .rounded(px(RADIUS_PILL))
-                                        .bg(rgba(GLASS_TROUGH_BG))
-                                        .border_1()
-                                        .border_color(rgba(GLASS_BORDER))
-                                        .hover(|s| {
-                                            s.bg(rgba(GLASS_ROW_HOVER_BG))
-                                                .border_color(rgba(GLASS_BORDER_STRONG))
-                                                .text_color(rgb(TEXT_PRIMARY))
-                                        })
+                                        .pt(px(4.0))
+                                        .mb(px(16.0))
                                         .flex()
                                         .items_center()
-                                        .gap(px(6.0))
-                                        .font(ui_sans(FontWeight::MEDIUM))
-                                        .text_size(px(13.0))
-                                        .text_color(rgb(TEXT_SECONDARY))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                let old = this
-                                                    .visible_board_shelves
-                                                    .max(INITIAL_BOARD_SHELVES);
-                                                let next = (old + INITIAL_BOARD_SHELVES)
-                                                    .min(total_board_catalogs);
-                                                if next > old {
-                                                    this.visible_board_shelves = next;
-                                                    this.core.load_board_range(old..next);
-                                                    cx.notify();
-                                                }
-                                            }),
+                                        .justify_between()
+                                        .gap(px(16.0))
+                                        .child(
+                                            div()
+                                                .font(mono_font())
+                                                .text_xs()
+                                                .text_color(rgb(theme.text_muted))
+                                                .child(format!(
+                                                    "Showing {} of {total_board_catalogs} shelves",
+                                                    shelf_limit.min(total_board_catalogs)
+                                                )),
                                         )
-                                        .child(format!(
-                                            "Show {} more shelves",
-                                            remaining_shelves.min(INITIAL_BOARD_SHELVES)
-                                        ))
-                                        .child(svg_icon(
-                                            IconName::ChevronDown,
-                                            13.0,
-                                            rgb(TEXT_MUTED),
-                                        )),
-                                ),
-                        )
-                    })
-                    .when(!hidden_shelves.is_empty(), |el| {
-                        el.child(self.render_hidden_shelves_drawer(&hidden_shelves, cx))
-                    }),
+                                        .child(
+                                            div()
+                                                .id("btn-board-show-more-shelves")
+                                                .cursor_pointer()
+                                                .h(sp(36.0))
+                                                .px(sp(16.0))
+                                                .rounded(px(RADIUS_PILL))
+                                                .bg(rgba(theme.glass_trough_bg))
+                                                .border_1()
+                                                .border_color(rgba(theme.glass_border))
+                                                .hover(move |s| {
+                                                    s.bg(rgba(theme.glass_row_hover_bg))
+                                                        .border_color(rgba(
+                                                            theme.glass_border_strong,
+                                                        ))
+                                                        .text_color(rgb(theme.text_primary))
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(6.0))
+                                                .font(ui_sans(FontWeight::MEDIUM))
+                                                .text_size(sp(13.0))
+                                                .text_color(rgb(theme.text_secondary))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        let old = this
+                                                            .visible_board_shelves
+                                                            .max(INITIAL_BOARD_SHELVES);
+                                                        let next = (old + INITIAL_BOARD_SHELVES)
+                                                            .min(total_board_catalogs);
+                                                        if next > old {
+                                                            this.visible_board_shelves = next;
+                                                            this.core.load_board_range(old..next);
+                                                            cx.notify();
+                                                        }
+                                                    }),
+                                                )
+                                                .child(format!(
+                                                    "Show {} more shelves",
+                                                    remaining_shelves.min(INITIAL_BOARD_SHELVES)
+                                                ))
+                                                .child(svg_icon(
+                                                    IconName::ChevronDown,
+                                                    13.0 * theme.ui_scale,
+                                                    rgb(theme.text_muted),
+                                                )),
+                                        ),
+                                )
+                            })
+                            .when(!snapshot.hidden_shelves.is_empty(), |el| {
+                                el.child(self.render_hidden_shelves_drawer(
+                                    &snapshot.hidden_shelves,
+                                    &theme,
+                                    cx,
+                                ))
+                            }),
+                    ),
             )
     }
 
-    fn render_home_spotlight_banner(
-        &self,
-        spot: &HomeSpotlightCandidate,
-        active_idx: usize,
-        spot_count: usize,
+    #[allow(clippy::too_many_arguments)]
+    fn render_hero_stage(
+        &mut self,
+        snapshot: &BoardViewSnapshot,
+        mode: HeroStageMode,
+        show_mode_switcher: bool,
+        hero_height_px: f32,
+        side_pad: f32,
+        container_w: f32,
+        cw_scroll: &ScrollHandle,
+        featured_scroll: &ScrollHandle,
+        library_statuses: &HashMap<String, LibraryStatusTab>,
+        kb_cards: &mut Vec<KbFocusableCard>,
+        theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let metahub_bg = spot
-            .id
-            .starts_with("tt")
-            .then(|| format!("https://images.metahub.space/background/medium/{}/img", spot.id));
-        let metahub_logo = spot
-            .id
-            .starts_with("tt")
-            .then(|| format!("https://images.metahub.space/logo/medium/{}/img", spot.id));
+        let active_cw_idx = if snapshot.cw_cards.is_empty() {
+            0
+        } else {
+            self.board_active_cw_idx
+                .min(snapshot.cw_cards.len().saturating_sub(1))
+        };
+        let active_spot_idx = if snapshot.featured_candidates.is_empty() {
+            0
+        } else {
+            self.board_spotlight_idx % snapshot.featured_candidates.len()
+        };
 
-        let hero_urls: Vec<&str> = spot
+        let mut active = match mode {
+            HeroStageMode::ContinueWatching => {
+                let cw = &snapshot.cw_cards[active_cw_idx];
+                self.build_hero_display_from_cw(cw, library_statuses)
+            }
+            HeroStageMode::Featured => {
+                let spot = &snapshot.featured_candidates[active_spot_idx];
+                self.build_hero_display_from_spotlight(spot, library_statuses)
+            }
+        };
+
+        self.request_background_enrichment_if_needed(&active.r#type, &active.id, cx);
+        if let Some(enr) = self.core.cached_enriched_meta(&active.id) {
+            if active.logo_url.is_none() {
+                active.logo_url = enr.logo_url;
+            }
+            if active.backdrop_url.is_none() {
+                active.backdrop_url = enr.backdrop_url;
+            }
+            if active.description.is_none() {
+                active.description = enr.overview;
+            }
+            if active.year.is_none() {
+                active.year = enr.year;
+            }
+            if active.imdb_rating.is_none() {
+                active.imdb_rating = enr.imdb_rating;
+            }
+            if active.genres.is_empty() {
+                active.genres = enr.genres;
+            }
+            if active.trailer_youtube_key.is_none() {
+                active.trailer_youtube_key = enr.trailer_youtube_key;
+            }
+            if active.poster_url.is_none() {
+                active.poster_url = enr.poster_url;
+            }
+        }
+
+        // Prefetch the adjacent candidate's hero backdrop for instant transitions.
+        match mode {
+            HeroStageMode::ContinueWatching if snapshot.cw_cards.len() > 1 => {
+                let next_idx = (active_cw_idx + 1) % snapshot.cw_cards.len();
+                let next_cw = &snapshot.cw_cards[next_idx];
+                if let Some(next_bg) = self.resolve_cw_backdrop_url(next_cw) {
+                    self.poster_cache.prefetch_hero_backdrop(&next_bg);
+                }
+            }
+            HeroStageMode::Featured if snapshot.featured_candidates.len() > 1 => {
+                let next_idx = (active_spot_idx + 1) % snapshot.featured_candidates.len();
+                let next_spot = &snapshot.featured_candidates[next_idx];
+                if let Some(next_bg) = self.resolve_spotlight_backdrop_url(next_spot) {
+                    self.poster_cache.prefetch_hero_backdrop(&next_bg);
+                }
+            }
+            _ => {}
+        }
+
+        let metahub_bg = active.id.starts_with("tt").then(|| {
+            format!(
+                "https://images.metahub.space/background/medium/{}/img",
+                active.id
+            )
+        });
+        let metahub_logo = active.id.starts_with("tt").then(|| {
+            format!(
+                "https://images.metahub.space/logo/medium/{}/img",
+                active.id
+            )
+        });
+
+        let resolved_ambient_bg = active
+            .backdrop_url
+            .clone()
+            .or_else(|| metahub_bg.clone())
+            .or_else(|| active.poster_url.clone());
+        if resolved_ambient_bg.is_some() {
+            self.ambient_hero_backdrop_url = resolved_ambient_bg;
+        }
+
+        let hero_urls: Vec<&str> = active
             .backdrop_url
             .as_deref()
             .into_iter()
             .chain(metahub_bg.as_deref())
+            .chain(active.poster_url.as_deref())
             .collect();
-        let backdrop_tex = self.poster_cache.resolve_first_available_hero(hero_urls);
+        let backdrop_tex = if hero_urls.len() == 1 {
+            self.poster_cache.resolve_hero_backdrop_image(hero_urls[0])
+        } else {
+            self.poster_cache.resolve_first_available_hero(hero_urls)
+        };
 
-        let logo_urls: Vec<&str> = spot
+        let logo_urls: Vec<&str> = active
             .logo_url
             .as_deref()
             .into_iter()
@@ -720,26 +676,90 @@ impl AppShell {
             .collect();
         let logo_tex = self.poster_cache.resolve_first_available_logo(logo_urls);
 
-        let trailer_target = resolve_spotlight_trailer_target(spot);
+        let trailer_target =
+            resolve_trailer_target(&active.trailer_streams, active.trailer_youtube_key.as_deref());
 
-        let play_type = spot.r#type.clone();
-        let play_id = spot.id.clone();
-        let play_vid = spot.video_id.clone();
-        let is_resume = spot.is_resume;
-        let det_type = spot.r#type.clone();
-        let det_id = spot.id.clone();
-        let det_vid = spot.video_id.clone();
+        let play_type = active.r#type.clone();
+        let play_id = active.id.clone();
+        let play_vid = active.video_id.clone();
+
+        let det_type = active.r#type.clone();
+        let det_id = active.id.clone();
+        let det_vid = active.video_id.clone();
+
+        let peek_type = active.r#type.clone();
+        let peek_id = active.id.clone();
+        let peek_vid = active.video_id.clone();
+        let peek_title = active.name.clone();
+        let peek_preview = active.preview.clone();
+
+        let lib_id = active.id.clone();
+        let lib_in = active.in_library;
+        let lib_preview = active.preview.clone().unwrap_or_else(|| {
+            build_quick_peek_fallback_preview(
+                &active.id,
+                &active.r#type,
+                &active.name,
+                active.poster_url.as_deref(),
+                active.backdrop_url.as_deref(),
+                active.logo_url.as_deref(),
+                active.year.as_deref(),
+                None,
+                active.description.as_deref(),
+                active.imdb_rating.as_deref(),
+                &active.genres,
+            )
+        });
+
+        let tr_type = active.r#type.clone();
+        let tr_id = active.id.clone();
+        let tr_name = active.name.clone();
+
+        let dock_el = match mode {
+            HeroStageMode::ContinueWatching => self
+                .render_hero_cw_dock(
+                    &snapshot.cw_cards,
+                    snapshot.cw_total_count,
+                    active_cw_idx,
+                    show_mode_switcher,
+                    container_w,
+                    cw_scroll,
+                    library_statuses,
+                    kb_cards,
+                    theme,
+                    cx,
+                )
+                .into_any_element(),
+            HeroStageMode::Featured => self
+                .render_hero_featured_dock(
+                    &snapshot.featured_candidates,
+                    active_spot_idx,
+                    show_mode_switcher,
+                    container_w,
+                    featured_scroll,
+                    library_statuses,
+                    kb_cards,
+                    theme,
+                    cx,
+                )
+                .into_any_element(),
+        };
+
+        let scrim_layers = render_hero_scrim_layers(theme);
+        let accent = theme.accent;
+        let accent_hover = theme.accent_hover;
+        let cta_on_accent = theme.cta_on_accent;
+        let ui_scale = theme.ui_scale;
+        let border_accent = theme.border_accent;
+        let accent_soft = theme.accent_soft;
 
         div()
-            .id("home-editorial-spotlight")
+            .id("home-hero-stage")
             .w_full()
-            .h(px(336.0))
-            .rounded(px(14.0))
-            .overflow_hidden()
+            .h(px(hero_height_px))
             .relative()
-            .bg(rgb(placeholder_tint_for_id(&spot.id)))
-            .border_1()
-            .border_color(rgba(GLASS_BORDER))
+            .overflow_hidden()
+            .bg(rgb(placeholder_tint_for_id(&active.id)))
             .when_some(backdrop_tex, |el, tex| {
                 el.child(
                     img(tex)
@@ -749,308 +769,376 @@ impl AppShell {
                         .object_fit(ObjectFit::Cover),
                 )
             })
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .bg(linear_gradient(
-                        180.0,
-                        linear_color_stop(rgba(0x0b0b0d2e), 0.1),
-                        linear_color_stop(rgba(0x0b0b0df2), 1.0),
-                    )),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .bg(linear_gradient(
-                        90.0,
-                        linear_color_stop(rgba(0x0b0b0de8), 0.25),
-                        linear_color_stop(rgba(0x0b0b0d1f), 0.95),
-                    )),
-            )
+            .children(scrim_layers)
             .child(
                 div()
                     .relative()
                     .size_full()
-                    .p(px(32.0))
+                    .px(px(side_pad))
+                    .pt(sp(84.0))
+                    .pb(px(18.0))
                     .flex()
-                    .items_end()
+                    .flex_col()
                     .justify_between()
-                    .gap(px(24.0))
+                    .gap(px(14.0))
                     .child(
+                        // Lower-left focal content column anchored above the docked strip.
                         div()
-                            .max_w(px(640.0))
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .w_full()
                             .flex()
-                            .flex_col()
-                            .items_start()
-                            .gap(px(12.0))
+                            .items_end()
+                            .justify_between()
+                            .gap(px(24.0))
                             .child(
                                 div()
+                                    .max_w(px(680.0))
                                     .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .font(mono_font())
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .flex_col()
+                                    .items_start()
+                                    .gap(px(10.0))
+                                    // Eyebrow + metadata row.
                                     .child(
                                         div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(ACCENT))
-                                            .child(spot.eyebrow.clone()),
-                                    )
-                                    .when_some(spot.year.clone(), |el, yr| {
-                                        el.child(meta_divider()).child(yr)
-                                    })
-                                    .when_some(spot.imdb_rating.clone(), |el, r| {
-                                        el.child(meta_divider()).child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(4.0))
-                                                .text_color(rgb(TEXT_PRIMARY))
-                                                .child(svg_icon(
-                                                    IconName::Star,
-                                                    11.5,
-                                                    rgb(ACCENT_AMBER),
-                                                ))
-                                                .child(r),
-                                        )
-                                    })
-                                    .when(!spot.genres.is_empty(), |el| {
-                                        el.child(meta_divider()).child(spot.genres.join(" · "))
-                                    }),
-                            )
-                            .child(if let Some(ltex) = logo_tex {
-                                img(ltex)
-                                    .h(px(78.0))
-                                    .max_w(px(380.0))
-                                    .object_fit(ObjectFit::Contain)
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .font(editorial_serif())
-                                    .text_size(px(46.0))
-                                    .line_height(gpui::relative(1.04))
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .truncate()
-                                    .child(spot.name.clone())
-                                    .into_any_element()
-                            })
-                            .when_some(spot.description.clone(), |el, desc| {
-                                el.child(
-                                    div()
-                                        .max_w(px(560.0))
-                                        .text_size(px(14.0))
-                                        .text_color(rgb(TEXT_SECONDARY))
-                                        .max_h(px(42.0))
-                                        .overflow_hidden()
-                                        .child(desc),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .mt(px(4.0))
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(px(10.0))
-                                    .child(
-                                        primary_accent_button(
-                                            "spotlight-primary-btn",
-                                            Some(IconName::Play),
-                                            if is_resume { "Resume" } else { "Watch" },
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.quick_resume_or_open(
-                                                    play_type.clone(),
-                                                    play_id.clone(),
-                                                    play_vid.clone(),
-                                                    cx,
-                                                );
+                                            .flex()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .font(mono_font())
+                                            .text_size(sp(11.5))
+                                            .text_color(rgb(HERO_INK_SECONDARY))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(6.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(accent))
+                                                    .child(
+                                                        div()
+                                                            .w(px(6.0))
+                                                            .h(px(6.0))
+                                                            .rounded_full()
+                                                            .bg(rgb(accent)),
+                                                    )
+                                                    .child(active.eyebrow.clone()),
+                                            )
+                                            .when_some(active.year.clone(), |el, yr| {
+                                                el.child(hero_meta_divider()).child(yr)
+                                            })
+                                            .when_some(active.imdb_rating.clone(), |el, r| {
+                                                el.child(hero_meta_divider()).child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(4.0))
+                                                        .text_color(rgb(HERO_INK_PRIMARY))
+                                                        .child(svg_icon_weighted(
+                                                            IconName::Star,
+                                                            IconWeight::Fill,
+                                                            11.5 * ui_scale,
+                                                            rgb(HERO_STAR_GOLD),
+                                                        ))
+                                                        .child(r),
+                                                )
+                                            })
+                                            .when(!active.genres.is_empty(), |el| {
+                                                el.child(hero_meta_divider())
+                                                    .child(active.genres.join(" · "))
                                             }),
-                                        )
-                                        .px(px(20.0))
-                                        .rounded(px(RADIUS_PILL)),
                                     )
-                                    .when_some(trailer_target, |row, target| {
-                                        let tr_type = spot.r#type.clone();
-                                        let tr_id = spot.id.clone();
-                                        let tr_name = spot.name.clone();
-                                        row.child(
-                                            secondary_glass_button(
-                                                "spotlight-trailer-btn",
-                                                Some(IconName::Clapperboard),
-                                                "Trailer",
-                                                false,
-                                                cx.listener(move |this, _, _, cx| match &target {
-                                                    SpotlightTrailerTarget::DirectStream(
-                                                        stream,
-                                                    ) => {
-                                                        let addons = this.core.with_model(|m| {
-                                                            m.ctx.profile.addons.clone()
-                                                        });
-                                                        let cand =
-                                                            PlaybackCandidate::from_stream_and_request(
-                                                                stream.as_ref().clone(),
-                                                                None,
-                                                                &addons,
+                                    // Title logo or display typography.
+                                    .child(if let Some(ltex) = logo_tex {
+                                        img(ltex)
+                                            .h(px(64.0))
+                                            .max_w(px(360.0))
+                                            .object_fit(ObjectFit::Contain)
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .font(editorial_serif())
+                                            .text_size(sp(44.0))
+                                            .line_height(relative(1.04))
+                                            .text_color(rgb(HERO_INK_PRIMARY))
+                                            .truncate()
+                                            .child(active.name.clone())
+                                            .into_any_element()
+                                    })
+                                    // Concise 2-line synopsis.
+                                    .when_some(active.description.clone(), |el, desc| {
+                                        el.child(
+                                            div()
+                                                .max_w(px(560.0))
+                                                .text_size(sp(13.5))
+                                                .line_height(sp(19.5))
+                                                .text_color(rgb(HERO_INK_SECONDARY))
+                                                .max_h(sp(40.0))
+                                                .overflow_hidden()
+                                                .child(desc),
+                                        )
+                                    })
+                                    // Primary & secondary action pills.
+                                    .child(
+                                        div()
+                                            .mt(px(4.0))
+                                            .flex()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap(px(10.0))
+                                            .child(
+                                                div()
+                                                    .id("hero-primary-play-btn")
+                                                    .cursor_pointer()
+                                                    .h(sp(38.0))
+                                                    .px(sp(20.0))
+                                                    .rounded(px(RADIUS_PILL))
+                                                    .bg(rgb(accent))
+                                                    .hover(move |s| s.bg(rgb(accent_hover)))
+                                                    .shadow(glass_capsule_shadow())
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .gap(sp(8.0))
+                                                    .font(ui_sans(FontWeight::SEMIBOLD))
+                                                    .font_features(tabular_nums())
+                                                    .text_size(sp(13.5))
+                                                    .text_color(rgb(cta_on_accent))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.quick_resume_or_open(
+                                                                play_type.clone(),
+                                                                play_id.clone(),
+                                                                play_vid.clone(),
+                                                                cx,
                                                             );
-                                                        this.start_playback_session(
-                                                            tr_type.clone(),
-                                                            tr_id.clone(),
-                                                            tr_id.clone(),
-                                                            format!("{tr_name} · Trailer"),
-                                                            Some("Trailer".to_owned()),
+                                                        }),
+                                                    )
+                                                    .child(svg_icon_weighted(
+                                                        IconName::Play,
+                                                        IconWeight::Fill,
+                                                        14.5 * ui_scale,
+                                                        rgb(cta_on_accent),
+                                                    ))
+                                                    .child(active.primary_cta_label),
+                                            )
+                                            .child(render_hero_glass_pill(
+                                                "hero-details-btn",
+                                                IconName::Info,
+                                                IconWeight::Regular,
+                                                "Details",
+                                                false,
+                                                accent,
+                                                accent_soft,
+                                                border_accent,
+                                                ui_scale,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_meta_details(
+                                                        det_type.clone(),
+                                                        det_id.clone(),
+                                                        det_vid.clone(),
+                                                        cx,
+                                                    );
+                                                }),
+                                            ))
+                                            .when_some(trailer_target, |row, target| {
+                                                row.child(render_hero_glass_pill(
+                                                    "hero-trailer-btn",
+                                                    IconName::Clapperboard,
+                                                    IconWeight::Regular,
+                                                    "Trailer",
+                                                    false,
+                                                    accent,
+                                                    accent_soft,
+                                                    border_accent,
+                                                    ui_scale,
+                                                    cx.listener(move |this, _, _, cx| match &target
+                                                    {
+                                                        SpotlightTrailerTarget::DirectStream(
+                                                            stream,
+                                                        ) => {
+                                                            let addons = this.core.with_model(
+                                                                |m| m.ctx.profile.addons.clone(),
+                                                            );
+                                                            let cand =
+                                                                PlaybackCandidate::from_stream_and_request(
+                                                                    stream.as_ref().clone(),
+                                                                    None,
+                                                                    &addons,
+                                                                );
+                                                            this.start_playback_session(
+                                                                tr_type.clone(),
+                                                                tr_id.clone(),
+                                                                tr_id.clone(),
+                                                                format!("{tr_name} · Trailer"),
+                                                                Some("Trailer".to_owned()),
+                                                                None,
+                                                                None,
+                                                                Arc::new(vec![cand]),
+                                                                0,
+                                                                None,
+                                                                cx,
+                                                            );
+                                                        }
+                                                        SpotlightTrailerTarget::YouTubeUrl(url) => {
+                                                            cx.open_url(url);
+                                                        }
+                                                    }),
+                                                ))
+                                            })
+                                            .child(render_hero_glass_pill(
+                                                "hero-library-btn",
+                                                IconName::Bookmark,
+                                                if lib_in {
+                                                    IconWeight::Fill
+                                                } else {
+                                                    IconWeight::Regular
+                                                },
+                                                if lib_in { "In Library" } else { "+ Library" },
+                                                lib_in,
+                                                accent,
+                                                accent_soft,
+                                                border_accent,
+                                                ui_scale,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    if lib_in {
+                                                        this.core
+                                                            .remove_from_library(lib_id.clone());
+                                                        this.push_toast(
+                                                            ToastKind::Info,
+                                                            "Removed from library",
                                                             None,
-                                                            None,
-                                                            Arc::new(vec![cand]),
-                                                            0,
+                                                            cx,
+                                                        );
+                                                    } else {
+                                                        this.core.toggle_library_item(
+                                                            lib_preview.clone(),
+                                                        );
+                                                        this.push_toast(
+                                                            ToastKind::Success,
+                                                            "Added to library",
                                                             None,
                                                             cx,
                                                         );
                                                     }
-                                                    SpotlightTrailerTarget::YouTubeUrl(url) => {
-                                                        cx.open_url(url);
-                                                    }
+                                                    cx.notify();
                                                 }),
-                                            )
-                                            .rounded(px(RADIUS_PILL)),
-                                        )
-                                    })
-                                    .child(
-                                        secondary_glass_button(
-                                            "spotlight-details-btn",
-                                            Some(IconName::Info),
-                                            "Details",
-                                            false,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.open_meta_details(
-                                                    det_type.clone(),
-                                                    det_id.clone(),
-                                                    det_vid.clone(),
-                                                    cx,
-                                                );
-                                            }),
-                                        )
-                                        .rounded(px(RADIUS_PILL)),
+                                            ))
+                                            .child(render_hero_glass_pill(
+                                                "hero-quick-peek-btn",
+                                                IconName::Eye,
+                                                IconWeight::Regular,
+                                                "Quick Peek",
+                                                false,
+                                                accent,
+                                                accent_soft,
+                                                border_accent,
+                                                ui_scale,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_quick_peek(
+                                                        QuickPeekTarget {
+                                                            type_name: peek_type.clone(),
+                                                            id: peek_id.clone(),
+                                                            video_id: peek_vid.clone(),
+                                                            title: peek_title.clone(),
+                                                            preview: peek_preview.clone(),
+                                                        },
+                                                        cx,
+                                                    );
+                                                }),
+                                            )),
                                     ),
                             ),
                     )
-                    .when(spot_count > 1, |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(
-                                    div()
-                                        .id("spotlight-prev")
-                                        .cursor_pointer()
-                                        .w(px(32.0))
-                                        .h(px(32.0))
-                                        .rounded(px(RADIUS_PILL))
-                                        .bg(rgba(0x141417cc))
-                                        .border_1()
-                                        .border_color(rgba(GLASS_BORDER))
-                                        .hover(|s| {
-                                            s.bg(rgb(BG_ELEVATED))
-                                                .border_color(rgba(GLASS_BORDER_STRONG))
-                                        })
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.board_spotlight_idx =
-                                                    (this.board_spotlight_idx + spot_count - 1)
-                                                        % spot_count;
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(svg_icon(
-                                            IconName::ChevronLeft,
-                                            14.0,
-                                            rgb(TEXT_PRIMARY),
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .px(px(6.0))
-                                        .font(mono_font())
-                                        .text_xs()
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .child(format!("{}/{}", active_idx + 1, spot_count)),
-                                )
-                                .child(
-                                    div()
-                                        .id("spotlight-next")
-                                        .cursor_pointer()
-                                        .w(px(32.0))
-                                        .h(px(32.0))
-                                        .rounded(px(RADIUS_PILL))
-                                        .bg(rgba(0x141417cc))
-                                        .border_1()
-                                        .border_color(rgba(GLASS_BORDER))
-                                        .hover(|s| {
-                                            s.bg(rgb(BG_ELEVATED))
-                                                .border_color(rgba(GLASS_BORDER_STRONG))
-                                        })
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.board_spotlight_idx =
-                                                    (this.board_spotlight_idx + 1) % spot_count;
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child(svg_icon(
-                                            IconName::ChevronRight,
-                                            14.0,
-                                            rgb(TEXT_PRIMARY),
-                                        )),
-                                ),
-                        )
-                    }),
+                    .child(dock_el),
             )
     }
 
-    fn render_continue_watching_section(
+    #[allow(clippy::too_many_arguments)]
+    fn handle_hero_dock_card_hover(
+        &mut self,
+        idx: usize,
+        is_featured: bool,
+        item_count: usize,
+        item_type: &str,
+        item_id: &str,
+        hover_bg: Option<&str>,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_card_hover_prefetch(item_type, item_id, hover_bg, hovered, cx);
+        if hovered {
+            let cur_idx = if is_featured {
+                self.board_spotlight_idx % item_count.max(1)
+            } else {
+                self.board_active_cw_idx
+            };
+            if cur_idx != idx {
+                self.board_hover_debounce_seq = self.board_hover_debounce_seq.wrapping_add(1);
+                let seq = self.board_hover_debounce_seq;
+                let prefetch_bg = hover_bg.map(str::to_owned);
+                let enr_type = item_type.to_owned();
+                let enr_id = item_id.to_owned();
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(HERO_HOVER_DEBOUNCE_MS))
+                        .await;
+                    let _ = this.update(cx, |shell, cx| {
+                        if shell.board_hover_debounce_seq != seq {
+                            return;
+                        }
+                        if is_featured {
+                            shell.board_spotlight_idx = idx;
+                        } else {
+                            shell.board_active_cw_idx = idx;
+                        }
+                        if let Some(bg_url) = prefetch_bg.as_deref() {
+                            shell.poster_cache.prefetch_hero_backdrop(bg_url);
+                        }
+                        shell.request_background_enrichment_if_needed(&enr_type, &enr_id, cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        } else if self.hover_prefetch_target.is_none() {
+            // Cursor left the strip onto empty space: cancel any pending switch.
+            self.board_hover_debounce_seq = self.board_hover_debounce_seq.wrapping_add(1);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_hero_cw_dock(
         &self,
-        items: &[ContinueWatchingCard],
-        total_cw_count: usize,
+        cw_cards: &[ContinueWatchingCard],
+        cw_total_count: usize,
+        active_cw_idx: usize,
+        show_mode_switcher: bool,
         container_w: f32,
+        cw_scroll: &ScrollHandle,
         library_statuses: &HashMap<String, LibraryStatusTab>,
         kb_cards: &mut Vec<KbFocusableCard>,
+        theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let cols = cw_column_count(container_w);
-        let card_w = cw_card_width_px(container_w, cols);
-        let img_h = (card_w * PosterAspect::Landscape16x9.height_over_width()).ceil();
+        let dims = hero_dock_dimensions(HeroStageMode::ContinueWatching, theme.density, theme.ui_scale);
+        let step_px = (container_w * 0.65).max((dims.card_w + dims.card_gap) * 2.0);
+        let scroll_prev = cw_scroll.clone();
+        let scroll_next = cw_scroll.clone();
+        let accent = theme.accent;
+        let accent_hover = theme.accent_hover;
+        let cta_on_accent = theme.cta_on_accent;
+        let ui_scale = theme.ui_scale;
+        let active_glow = hero_active_card_glow(accent);
+        let cw_count = cw_cards.len();
 
-        let mut cw_els: Vec<AnyElement> = Vec::with_capacity(items.len());
-        for (idx, cw) in items.iter().enumerate() {
+        let mut filmstrip_els: Vec<AnyElement> = Vec::with_capacity(cw_count);
+        for (idx, cw) in cw_cards.iter().enumerate() {
             let li = &cw.library_item;
-            let enr = if cw.backdrop_url.is_none() || cw.imdb_rating.is_none() {
-                self.core.cached_enriched_meta(&li.id)
-            } else {
-                None
-            };
-            let metahub_bg = li.id.starts_with("tt").then(|| {
-                format!(
-                    "https://images.metahub.space/background/medium/{}/img",
-                    li.id
-                )
-            });
-            let wide_url = cw
-                .backdrop_url
-                .clone()
-                .or_else(|| enr.as_ref().and_then(|e| e.backdrop_url.clone()))
-                .or(metahub_bg);
+            let is_active = idx == active_cw_idx;
+            let wide_url = self.resolve_cw_backdrop_url(cw);
             let wide_tex = self.poster_cache.resolve_widescreen_or_poster(
                 wide_url.as_deref(),
                 li.poster.as_ref().map(|u| u.as_str()),
@@ -1058,42 +1146,45 @@ impl AppShell {
 
             let ep_code = format_movietracker_episode_code(li.state.video_id.as_deref());
             let pct = li.progress().clamp(0.0, 100.0) as f32;
-            let progress_fraction = if li.state.time_offset > 0 {
-                Some((pct / 100.0).max(0.02))
+            let progress_frac = if li.state.time_offset > 0 {
+                Some((pct / 100.0).clamp(0.03, 1.0))
             } else {
                 None
             };
-            let subtitle =
-                format_cw_subtitle(li, ep_code.as_deref(), cw.notification_count, pct);
+            let status_sub = format_cw_remaining_or_status(li, cw.notification_count, pct);
+            let notif_label = format_notification_badge_label(cw.notification_count);
 
-            let lib_status = library_statuses.get(&li.id).copied();
-            let in_library = !li.removed && !li.temp;
+            let in_library =
+                library_statuses.contains_key(&li.id) || (!li.removed && !li.temp);
             let is_watched = li.watched();
-            let imdb_rating = cw
-                .imdb_rating
-                .clone()
-                .or_else(|| enr.as_ref().and_then(|e| e.imdb_rating.clone()))
-                .map(SharedString::from);
 
             let kb_idx = kb_cards.len();
-            let is_focused = self.kb_focus_index == Some(kb_idx);
+            let is_kb_focused = self.kb_focus_index == Some(kb_idx);
             kb_cards.push(KbFocusableCard {
                 route: AppRoute::MetaDetails {
                     type_name: li.r#type.clone(),
                     id: li.id.clone(),
                     video_id: li.state.video_id.clone(),
                 },
-                row: idx / cols,
-                col: idx % cols,
+                row: 0,
+                col: idx,
             });
 
-            let det_type = li.r#type.clone();
-            let det_id = li.id.clone();
-            let det_vid = li.state.video_id.clone();
+            let grp: SharedString = format!("cw-filmstrip-grp-{idx}").into();
+
+            let open_type = li.r#type.clone();
+            let open_id = li.id.clone();
+            let open_vid = li.state.video_id.clone();
 
             let play_type = li.r#type.clone();
             let play_id = li.id.clone();
             let play_vid = li.state.video_id.clone();
+
+            let peek_type = li.r#type.clone();
+            let peek_id = li.id.clone();
+            let peek_vid = li.state.video_id.clone();
+            let peek_title = li.name.clone();
+            let peek_preview = cw.preview.clone();
 
             let ctx_type = li.r#type.clone();
             let ctx_id = li.id.clone();
@@ -1104,36 +1195,35 @@ impl AppShell {
             let hover_type = li.r#type.clone();
             let hover_id = li.id.clone();
             let hover_bg = wide_url;
+            let is_highlighted = is_active || is_kb_focused;
 
-            cw_els.push(render_poster_card(
-                PosterCardProps::new(("cw-card", idx), li.name.clone(), li.id.clone())
-                    .subtitle(Some(SharedString::from(subtitle)))
-                    .image(wide_tex)
-                    .aspect(PosterAspect::Landscape16x9)
-                    .image_height_px(Some(img_h))
-                    .status_tab(lib_status)
-                    .notification_count(cw.notification_count)
-                    .imdb_rating(imdb_rating)
-                    .progress_fraction(progress_fraction)
-                    .in_library(in_library)
-                    .is_focused(is_focused)
-                    .on_open(cx.listener(move |this, _, _, cx| {
+            let card = hero_dock_card_frame(is_highlighted, accent, &active_glow)
+                .id(("hero-cw-card", idx))
+                .group(grp.clone())
+                .cursor_pointer()
+                .w(px(dims.card_w))
+                .h(px(dims.card_h))
+                .flex_shrink_0()
+                .rounded(px(RADIUS_CARD))
+                .overflow_hidden()
+                .relative()
+                .bg(rgb(placeholder_tint_for_id(&li.id)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.board_active_cw_idx = idx;
                         this.open_meta_details(
-                            det_type.clone(),
-                            det_id.clone(),
-                            det_vid.clone(),
+                            open_type.clone(),
+                            open_id.clone(),
+                            open_vid.clone(),
                             cx,
                         );
-                    }))
-                    .on_quick_play(cx.listener(move |this, _, _, cx| {
-                        this.quick_resume_or_open(
-                            play_type.clone(),
-                            play_id.clone(),
-                            play_vid.clone(),
-                            cx,
-                        );
-                    }))
-                    .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
                         this.open_browsing_context_menu(
                             BrowsingContextMenu::new(
                                 ev.position,
@@ -1148,91 +1238,724 @@ impl AppShell {
                             .can_rewind_cw(true),
                             cx,
                         );
-                    }))
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        this.on_card_hover_prefetch(
-                            &hover_type,
-                            &hover_id,
-                            hover_bg.as_deref(),
-                            *hovered,
+                    }),
+                )
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.handle_hero_dock_card_hover(
+                        idx,
+                        false,
+                        cw_count,
+                        &hover_type,
+                        &hover_id,
+                        hover_bg.as_deref(),
+                        *hovered,
+                        cx,
+                    );
+                }))
+                .children(hero_dock_backdrop_layers(
+                    &li.id,
+                    wide_tex,
+                    is_highlighted,
+                    accent,
+                ))
+                // New-episode pill badge (top-left).
+                .when_some(notif_label, |el, label| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(7.0))
+                            .left(px(7.0))
+                            .h(px(18.0))
+                            .px(px(6.5))
+                            .rounded(px(RADIUS_PILL))
+                            .bg(rgb(accent))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .font(mono_font())
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(9.5))
+                            .text_color(rgb(cta_on_accent))
+                            .child(label),
+                    )
+                })
+                // Hover quick action buttons (top-right: Quick Peek + Instant Play).
+                .child(render_hero_dock_quick_actions(
+                    ("cw-card-peek", idx),
+                    ("cw-card-play", idx),
+                    grp,
+                    is_active,
+                    accent,
+                    accent_hover,
+                    cta_on_accent,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_quick_peek(
+                            QuickPeekTarget {
+                                type_name: peek_type.clone(),
+                                id: peek_id.clone(),
+                                video_id: peek_vid.clone(),
+                                title: peek_title.clone(),
+                                preview: peek_preview.clone(),
+                            },
                             cx,
                         );
-                    })),
-            ));
+                    }),
+                    cx.listener(move |this, _, _, cx| {
+                        this.quick_resume_or_open(
+                            play_type.clone(),
+                            play_id.clone(),
+                            play_vid.clone(),
+                            cx,
+                        );
+                    }),
+                ))
+                // Card title + episode badge + remaining time anchored above progress bar.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(10.0))
+                        .right(px(10.0))
+                        .bottom(px(9.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .font(ui_sans(FontWeight::SEMIBOLD))
+                                .text_size(sp(12.5))
+                                .text_color(rgb(HERO_INK_PRIMARY))
+                                .truncate()
+                                .child(li.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .font(mono_font())
+                                .text_size(px(10.5))
+                                .text_color(rgb(HERO_INK_SECONDARY))
+                                .when_some(ep_code, |row, code| {
+                                    row.child(
+                                        div()
+                                            .px(px(5.0))
+                                            .py(px(1.0))
+                                            .rounded(px(4.0))
+                                            .bg(rgba(0xFFFFFF1C))
+                                            .text_color(rgb(HERO_INK_PRIMARY))
+                                            .child(code),
+                                    )
+                                })
+                                .child(div().truncate().child(status_sub)),
+                        ),
+                )
+                // Bottom playback progress bar.
+                .when_some(progress_frac, |el, frac| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(3.0))
+                            .bg(rgba(0xFFFFFF2E))
+                            .child(div().h_full().w(relative(frac)).bg(rgb(accent))),
+                    )
+                });
+
+            filmstrip_els.push(card.into_any_element());
         }
 
         div()
+            .w_full()
             .flex()
             .flex_col()
-            .gap(px(16.0))
-            .child(
-                div()
-                    .h(px(40.0))
-                    .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(px(32.0))
-                            .text_color(rgb(TEXT_PRIMARY))
-                            .child("Pick up where you left off"),
-                    )
-                    .child(
-                        div()
-                            .id("cw-open-library")
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .text_size(px(13.0))
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.library_status_tab = LibraryStatusTab::Watching;
-                                    this.navigate_tab(SidebarTab::Library, cx);
-                                }),
-                            )
-                            .child(format!("{total_cw_count} in progress"))
-                            .child(svg_icon(IconName::ChevronRight, 13.0, rgb(TEXT_MUTED))),
-                    ),
-            )
+            .gap(px(dims.dock_gap))
             .child(
                 div()
                     .w_full()
-                    .grid()
-                    .grid_cols(cols as u16)
-                    .gap(px(SHELF_CARD_GAP_PX))
-                    .children(cw_els),
+                    .h(px(dims.header_h))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .font(ui_sans(FontWeight::SEMIBOLD))
+                                    .text_size(sp(13.0))
+                                    .text_color(rgb(HERO_INK_PRIMARY))
+                                    .child("Continue Watching"),
+                            )
+                            .child(
+                                div()
+                                    .id("hero-cw-view-all")
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .px(px(8.0))
+                                    .py(px(3.0))
+                                    .rounded(px(RADIUS_PILL))
+                                    .hover(|s| {
+                                        s.bg(rgba(HERO_GLASS_BG))
+                                            .text_color(rgb(HERO_INK_PRIMARY))
+                                    })
+                                    .font(ui_sans(FontWeight::MEDIUM))
+                                    .font_features(tabular_nums())
+                                    .text_size(sp(12.0))
+                                    .text_color(rgb(HERO_INK_SECONDARY))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.library_filter_tab = LibraryFilterTab::Watching;
+                                            this.library_status_tab = LibraryStatusTab::Watching;
+                                            this.navigate_tab(SidebarTab::Library, cx);
+                                        }),
+                                    )
+                                    .child(format!("View all ({cw_total_count})"))
+                                    .child(svg_icon(
+                                        IconName::ArrowRight,
+                                        12.0 * ui_scale,
+                                        rgb(HERO_INK_SECONDARY),
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .when(cw_count > 3, |row| {
+                                row.child(render_hero_dock_chevron(
+                                    "hero-cw-prev",
+                                    IconName::ChevronLeft,
+                                    ui_scale,
+                                    cx.listener(move |_, _, _, cx| {
+                                        let cur_x = (-scroll_prev.offset().x / px(1.0)).max(0.0);
+                                        let next_x = (cur_x - step_px).max(0.0);
+                                        scroll_prev.set_offset(point(px(-next_x), px(0.0)));
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(render_hero_dock_chevron(
+                                    "hero-cw-next",
+                                    IconName::ChevronRight,
+                                    ui_scale,
+                                    cx.listener(move |_, _, _, cx| {
+                                        let max_x =
+                                            (scroll_next.max_offset().x / px(1.0)).max(0.0);
+                                        let cur_x = (-scroll_next.offset().x / px(1.0)).max(0.0);
+                                        let next_x = (cur_x + step_px).min(max_x);
+                                        scroll_next.set_offset(point(px(-next_x), px(0.0)));
+                                        cx.notify();
+                                    }),
+                                ))
+                            })
+                            .when(show_mode_switcher, |row| {
+                                row.child(render_hero_stage_mode_switcher(
+                                    HeroStageMode::ContinueWatching,
+                                    ui_scale,
+                                    cx,
+                                ))
+                            }),
+                    ),
             )
+            .child(render_hero_dock_scroll_strip(
+                "hero-cw-filmstrip",
+                dims,
+                cw_scroll,
+                filmstrip_els,
+            ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_hero_featured_dock(
+        &self,
+        candidates: &[HomeSpotlightCandidate],
+        active_idx: usize,
+        show_mode_switcher: bool,
+        container_w: f32,
+        featured_scroll: &ScrollHandle,
+        library_statuses: &HashMap<String, LibraryStatusTab>,
+        kb_cards: &mut Vec<KbFocusableCard>,
+        theme: &ThemePalette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let dims = hero_dock_dimensions(HeroStageMode::Featured, theme.density, theme.ui_scale);
+        let spot_count = candidates.len();
+        let scroll_prev = featured_scroll.clone();
+        let scroll_next = featured_scroll.clone();
+        let accent = theme.accent;
+        let accent_hover = theme.accent_hover;
+        let cta_on_accent = theme.cta_on_accent;
+        let ui_scale = theme.ui_scale;
+        let active_glow = hero_active_card_glow(accent);
+
+        let mut card_els: Vec<AnyElement> = Vec::with_capacity(spot_count);
+        for (idx, spot) in candidates.iter().enumerate() {
+            let is_active = idx == active_idx;
+            let enriched = self.core.cached_enriched_meta(&spot.id);
+            let wide_url = self.resolve_spotlight_backdrop_url(spot);
+            let thumb_tex = self.poster_cache.resolve_widescreen_or_poster(
+                wide_url.as_deref(),
+                spot.poster_url.as_deref(),
+            );
+
+            let year = spot
+                .year
+                .clone()
+                .or_else(|| enriched.as_ref().and_then(|e| e.year.clone()));
+            let imdb_rating = spot
+                .imdb_rating
+                .clone()
+                .or_else(|| enriched.as_ref().and_then(|e| e.imdb_rating.clone()));
+            let genre = spot
+                .genres
+                .first()
+                .cloned()
+                .or_else(|| enriched.as_ref().and_then(|e| e.genres.first().cloned()));
+            let clean_rating = imdb_rating
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let meta_lead = format_featured_card_meta_lead(
+                year.as_deref(),
+                genre.as_deref(),
+                &spot.r#type,
+                clean_rating.is_some(),
+            );
+
+            let lib_status = library_statuses.get(&spot.id).copied();
+            let in_library = lib_status.is_some();
+            let is_watched = matches!(lib_status, Some(LibraryStatusTab::Watched));
+
+            let kb_idx = kb_cards.len();
+            let is_kb_focused = self.kb_focus_index == Some(kb_idx);
+            kb_cards.push(KbFocusableCard {
+                route: AppRoute::MetaDetails {
+                    type_name: spot.r#type.clone(),
+                    id: spot.id.clone(),
+                    video_id: spot.video_id.clone(),
+                },
+                row: 0,
+                col: idx,
+            });
+
+            let grp: SharedString = format!("featured-dock-grp-{idx}").into();
+
+            let open_type = spot.r#type.clone();
+            let open_id = spot.id.clone();
+            let open_vid = spot.video_id.clone();
+
+            let play_type = spot.r#type.clone();
+            let play_id = spot.id.clone();
+            let play_vid = spot.video_id.clone();
+
+            let peek_type = spot.r#type.clone();
+            let peek_id = spot.id.clone();
+            let peek_vid = spot.video_id.clone();
+            let peek_title = spot.name.clone();
+            let peek_preview = spot.preview.clone();
+
+            let ctx_type = spot.r#type.clone();
+            let ctx_id = spot.id.clone();
+            let ctx_vid = spot.video_id.clone();
+            let ctx_title = spot.name.clone();
+            let ctx_preview = spot.preview.clone();
+
+            let hover_type = spot.r#type.clone();
+            let hover_id = spot.id.clone();
+            let hover_bg = wide_url;
+            let is_highlighted = is_active || is_kb_focused;
+
+            let card = hero_dock_card_frame(is_highlighted, accent, &active_glow)
+                .id(("hero-featured-card", idx))
+                .group(grp.clone())
+                .cursor_pointer()
+                .w(px(dims.card_w))
+                .h(px(dims.card_h))
+                .flex_shrink_0()
+                .rounded(px(RADIUS_CARD))
+                .overflow_hidden()
+                .relative()
+                .bg(rgb(placeholder_tint_for_id(&spot.id)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.board_spotlight_idx = idx;
+                        this.open_meta_details(
+                            open_type.clone(),
+                            open_id.clone(),
+                            open_vid.clone(),
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_browsing_context_menu(
+                            BrowsingContextMenu::new(
+                                ev.position,
+                                ctx_type.clone(),
+                                ctx_id.clone(),
+                                ctx_title.clone(),
+                            )
+                            .video_id(ctx_vid.clone())
+                            .preview(ctx_preview.clone())
+                            .is_in_library(in_library)
+                            .is_watched(is_watched),
+                            cx,
+                        );
+                    }),
+                )
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.handle_hero_dock_card_hover(
+                        idx,
+                        true,
+                        spot_count,
+                        &hover_type,
+                        &hover_id,
+                        hover_bg.as_deref(),
+                        *hovered,
+                        cx,
+                    );
+                }))
+                .children(hero_dock_backdrop_layers(
+                    &spot.id,
+                    thumb_tex,
+                    is_highlighted,
+                    accent,
+                ))
+                // Hover quick action buttons (top-right: Quick Peek + Instant Watch).
+                .child(render_hero_dock_quick_actions(
+                    ("featured-card-peek", idx),
+                    ("featured-card-play", idx),
+                    grp,
+                    is_active,
+                    accent,
+                    accent_hover,
+                    cta_on_accent,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_quick_peek(
+                            QuickPeekTarget {
+                                type_name: peek_type.clone(),
+                                id: peek_id.clone(),
+                                video_id: peek_vid.clone(),
+                                title: peek_title.clone(),
+                                preview: peek_preview.clone(),
+                            },
+                            cx,
+                        );
+                    }),
+                    cx.listener(move |this, _, _, cx| {
+                        this.quick_resume_or_open(
+                            play_type.clone(),
+                            play_id.clone(),
+                            play_vid.clone(),
+                            cx,
+                        );
+                    }),
+                ))
+                // Bottom-left title + crisp mono metadata line.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(10.0))
+                        .right(px(10.0))
+                        .bottom(px(9.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .font(ui_sans(FontWeight::SEMIBOLD))
+                                .text_size(sp(12.5))
+                                .text_color(rgb(HERO_INK_PRIMARY))
+                                .truncate()
+                                .child(spot.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .overflow_hidden()
+                                .font(mono_font())
+                                .text_size(px(10.5))
+                                .text_color(rgb(HERO_INK_SECONDARY))
+                                .child(div().truncate().child(meta_lead))
+                                .when_some(clean_rating, |row, rating| {
+                                    row.child(div().text_color(rgb(HERO_INK_MUTED)).child("·"))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(3.0))
+                                                .flex_shrink_0()
+                                                .text_color(rgb(HERO_INK_PRIMARY))
+                                                .child(svg_icon_weighted(
+                                                    IconName::Star,
+                                                    IconWeight::Fill,
+                                                    10.0,
+                                                    rgb(HERO_STAR_GOLD),
+                                                ))
+                                                .child(rating),
+                                        )
+                                }),
+                        ),
+                );
+
+            card_els.push(card.into_any_element());
+        }
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(dims.dock_gap))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(dims.header_h))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .font(ui_sans(FontWeight::SEMIBOLD))
+                                    .text_size(sp(13.0))
+                                    .text_color(rgb(HERO_INK_PRIMARY))
+                                    .child("Featured Picks"),
+                            )
+                            .when(spot_count > 1, |row| {
+                                row.child(
+                                    div()
+                                        .font(mono_font())
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(HERO_INK_MUTED))
+                                        .child(format!("{} / {spot_count}", active_idx + 1)),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .when(spot_count > 1, |row| {
+                                row.child(render_hero_dock_chevron(
+                                    "spotlight-prev",
+                                    IconName::ChevronLeft,
+                                    ui_scale,
+                                    cx.listener(move |this, _, _, cx| {
+                                        let next_idx = (this.board_spotlight_idx % spot_count
+                                            + spot_count
+                                            - 1)
+                                            % spot_count;
+                                        this.board_spotlight_idx = next_idx;
+                                        ensure_dock_card_visible(
+                                            &scroll_prev,
+                                            next_idx,
+                                            dims.card_w,
+                                            dims.card_gap,
+                                            container_w,
+                                        );
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(render_hero_dock_chevron(
+                                    "spotlight-next",
+                                    IconName::ChevronRight,
+                                    ui_scale,
+                                    cx.listener(move |this, _, _, cx| {
+                                        let next_idx =
+                                            (this.board_spotlight_idx % spot_count + 1) % spot_count;
+                                        this.board_spotlight_idx = next_idx;
+                                        ensure_dock_card_visible(
+                                            &scroll_next,
+                                            next_idx,
+                                            dims.card_w,
+                                            dims.card_gap,
+                                            container_w,
+                                        );
+                                        cx.notify();
+                                    }),
+                                ))
+                            })
+                            .when(show_mode_switcher, |row| {
+                                row.child(render_hero_stage_mode_switcher(
+                                    HeroStageMode::Featured,
+                                    ui_scale,
+                                    cx,
+                                ))
+                            }),
+                    ),
+            )
+            .child(render_hero_dock_scroll_strip(
+                "hero-featured-dock",
+                dims,
+                featured_scroll,
+                card_els,
+            ))
+    }
+
+    fn build_hero_display_from_cw(
+        &self,
+        cw: &ContinueWatchingCard,
+        library_statuses: &HashMap<String, LibraryStatusTab>,
+    ) -> ActiveHeroDisplay {
+        let li = &cw.library_item;
+        let ep_code = format_movietracker_episode_code(li.state.video_id.as_deref());
+        let pct = li.progress().clamp(0.0, 100.0) as f32;
+        let eyebrow = format_hero_cw_eyebrow(li, ep_code.as_deref(), cw.notification_count, pct);
+        let primary_cta_label = match ep_code.as_deref() {
+            Some(code) if li.state.time_offset > 0 => format!("Resume {code}"),
+            Some(code) => format!("Watch {code}"),
+            None if li.state.time_offset > 0 => "Resume".to_owned(),
+            None => "Watch".to_owned(),
+        };
+        let in_library =
+            library_statuses.contains_key(&li.id) || (!li.removed && !li.temp);
+
+        ActiveHeroDisplay {
+            id: li.id.clone(),
+            r#type: li.r#type.clone(),
+            name: li.name.clone(),
+            video_id: li.state.video_id.clone(),
+            primary_cta_label,
+            eyebrow,
+            description: cw.description.clone(),
+            year: cw.year.clone(),
+            imdb_rating: cw.imdb_rating.clone(),
+            genres: cw.genres.clone(),
+            backdrop_url: cw.backdrop_url.clone(),
+            logo_url: cw.logo_url.clone(),
+            poster_url: li.poster.as_ref().map(|u| u.to_string()),
+            trailer_youtube_key: None,
+            trailer_streams: cw.trailer_streams.clone(),
+            preview: cw.preview.clone(),
+            in_library,
+        }
+    }
+
+    fn build_hero_display_from_spotlight(
+        &self,
+        spot: &HomeSpotlightCandidate,
+        library_statuses: &HashMap<String, LibraryStatusTab>,
+    ) -> ActiveHeroDisplay {
+        let in_library = library_statuses.contains_key(&spot.id);
+        ActiveHeroDisplay {
+            id: spot.id.clone(),
+            r#type: spot.r#type.clone(),
+            name: spot.name.clone(),
+            video_id: spot.video_id.clone(),
+            primary_cta_label: if spot.is_resume {
+                "Resume".to_owned()
+            } else {
+                "Watch".to_owned()
+            },
+            eyebrow: spot.eyebrow.clone(),
+            description: spot.description.clone(),
+            year: spot.year.clone(),
+            imdb_rating: spot.imdb_rating.clone(),
+            genres: spot.genres.clone(),
+            backdrop_url: spot.backdrop_url.clone(),
+            logo_url: spot.logo_url.clone(),
+            poster_url: spot.poster_url.clone(),
+            trailer_youtube_key: spot.trailer_youtube_key.clone(),
+            trailer_streams: spot.trailer_streams.clone(),
+            preview: spot.preview.clone(),
+            in_library,
+        }
+    }
+
+    fn resolve_cw_backdrop_url(&self, cw: &ContinueWatchingCard) -> Option<String> {
+        let li = &cw.library_item;
+        cw.backdrop_url
+            .clone()
+            .or_else(|| {
+                self.core
+                    .cached_enriched_meta(&li.id)
+                    .and_then(|e| e.backdrop_url)
+            })
+            .or_else(|| {
+                li.id.starts_with("tt").then(|| {
+                    format!(
+                        "https://images.metahub.space/background/medium/{}/img",
+                        li.id
+                    )
+                })
+            })
+    }
+
+    fn resolve_spotlight_backdrop_url(&self, spot: &HomeSpotlightCandidate) -> Option<String> {
+        spot.backdrop_url
+            .clone()
+            .or_else(|| {
+                self.core
+                    .cached_enriched_meta(&spot.id)
+                    .and_then(|e| e.backdrop_url)
+            })
+            .or_else(|| {
+                spot.id.starts_with("tt").then(|| {
+                    format!(
+                        "https://images.metahub.space/background/medium/{}/img",
+                        spot.id
+                    )
+                })
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn render_editorial_shelf(
         &self,
-        row: BoardRowSnapshot,
+        shelf: &CachedBoardShelf,
+        visible_range: Range<usize>,
+        shelf_total_h: f32,
         container_w: f32,
         shelf_scroll: ScrollHandle,
         library_statuses: &HashMap<String, LibraryStatusTab>,
         kb_row: usize,
         kb_cards: &mut Vec<KbFocusableCard>,
+        theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let meta = row.meta;
+        let meta = &shelf.meta;
         let raw_index = meta.raw_index;
         let total_items = meta.total_items;
         let can_load_more = meta.can_load_more;
         let is_loading = meta.is_loading;
         let is_pinned = meta.is_pinned;
+        let gap_px = theme.density.grid_gap_px();
+        let accent_ink = if theme.is_light {
+            theme.accent_press
+        } else {
+            theme.accent
+        };
 
-        let (card_w, img_h, card_h) = shelf_card_dimensions(meta.aspect);
-        let stride = card_w + SHELF_CARD_GAP_PX;
+        let (card_w, img_h, card_h) =
+            shelf_card_dimensions(meta.aspect, theme.density, theme.ui_scale);
+        let stride = card_w + gap_px;
         let step_px = (container_w * 0.72).max(stride * 2.0);
 
-        let vis_start = row.visible_range.start.min(total_items);
-        let vis_end = row.visible_range.end.min(total_items);
+        let vis_start = visible_range.start.min(shelf.items.len());
+        let vis_end = visible_range.end.min(shelf.items.len());
         let left_pad = vis_start as f32 * stride;
         let right_pad = if total_items > vis_end {
             total_items.saturating_sub(vis_end) as f32 * stride
@@ -1255,21 +1978,22 @@ impl AppShell {
                 .overflow_hidden()
                 .flex()
                 .items_start()
-                .gap(px(SHELF_CARD_GAP_PX))
+                .gap(px(gap_px))
                 .children((0..7).map(|_| {
                     div()
                         .w(px(card_w))
                         .h(px(img_h))
                         .flex_shrink_0()
                         .rounded(px(RADIUS_POSTER))
-                        .bg(rgba(GLASS_CARD_BG))
+                        .bg(rgba(theme.glass_card_bg))
                         .border_1()
-                        .border_color(rgba(GLASS_BORDER))
+                        .border_color(rgba(theme.glass_border))
                 }))
                 .into_any_element()
         } else {
-            let mut card_els: Vec<AnyElement> = Vec::with_capacity(row.visible_items.len());
-            for (rel_idx, item) in row.visible_items.into_iter().enumerate() {
+            let visible_slice = &shelf.items[vis_start..vis_end];
+            let mut card_els: Vec<AnyElement> = Vec::with_capacity(visible_slice.len());
+            for (rel_idx, item) in visible_slice.iter().enumerate() {
                 let item_idx = vis_start + rel_idx;
                 let item_aspect = PosterAspect::from_stremio_poster_shape(&item.poster_shape);
                 let lib_status = library_statuses.get(&item.id).copied();
@@ -1285,16 +2009,16 @@ impl AppShell {
                     self.poster_cache.resolve_poster_url(item.poster.as_ref())
                 };
 
-                let rating = extract_imdb_rating(&item).map(SharedString::from);
-                let genres = extract_genres(&item, 1);
+                let rating = extract_imdb_rating(item).map(SharedString::from);
+                let genres = extract_genres(item, 1);
                 let year = item
                     .release_info
-                    .clone()
-                    .map(|s| s.trim().to_owned())
+                    .as_deref()
+                    .map(str::trim)
                     .filter(|s| !s.is_empty());
                 let subtitle = format_preview_subtitle(
                     &item.r#type,
-                    year.as_deref(),
+                    year,
                     genres.first().map(String::as_str),
                 );
 
@@ -1315,6 +2039,10 @@ impl AppShell {
                 let play_type = item.r#type.clone();
                 let play_id = item.id.clone();
                 let toggle_preview = item.clone();
+                let peek_type = item.r#type.clone();
+                let peek_id = item.id.clone();
+                let peek_title = item.name.clone();
+                let peek_preview = item.clone();
                 let ctx_type = item.r#type.clone();
                 let ctx_id = item.id.clone();
                 let ctx_title = item.name.clone();
@@ -1325,8 +2053,8 @@ impl AppShell {
 
                 let mut props = PosterCardProps::new(
                     ("board-poster", raw_index * 10_000 + item_idx),
-                    item.name,
-                    item.id,
+                    item.name.clone(),
+                    item.id.clone(),
                 )
                 .subtitle(Some(SharedString::from(subtitle)))
                 .image(image_tex)
@@ -1345,6 +2073,18 @@ impl AppShell {
                 .on_toggle_library(cx.listener(move |this, _, _, cx| {
                     this.core.toggle_library_item(toggle_preview.clone());
                     cx.notify();
+                }))
+                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    this.open_quick_peek(
+                        QuickPeekTarget {
+                            type_name: peek_type.clone(),
+                            id: peek_id.clone(),
+                            video_id: None,
+                            title: peek_title.clone(),
+                            preview: Some(peek_preview.clone()),
+                        },
+                        cx,
+                    );
                 }))
                 .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     this.open_browsing_context_menu(
@@ -1408,7 +2148,7 @@ impl AppShell {
                         .h_full()
                         .flex()
                         .items_start()
-                        .gap(px(SHELF_CARD_GAP_PX))
+                        .gap(px(gap_px))
                         .pl(px(left_pad))
                         .pr(px(right_pad))
                         .children(card_els)
@@ -1419,26 +2159,30 @@ impl AppShell {
                                     .h(px(img_h))
                                     .flex_shrink_0()
                                     .rounded(px(RADIUS_POSTER))
-                                    .bg(rgba(GLASS_CARD_BG))
+                                    .bg(rgba(theme.glass_card_bg))
                                     .border_1()
-                                    .border_color(rgba(GLASS_BORDER)),
+                                    .border_color(rgba(theme.glass_border)),
                             )
                         }),
                 )
                 .into_any_element()
         };
 
+        let glass_row_hover = theme.glass_row_hover_bg;
+        let glass_border_strong = theme.glass_border_strong;
+        let text_primary = theme.text_primary;
+
         div()
             .id(("board-shelf", raw_index))
             .w_full()
-            .h(px(row.shelf_total_h))
+            .h(px(shelf_total_h))
             .pb(px(SHELF_BOTTOM_GAP_PX))
             .flex()
             .flex_col()
             .gap(px(SHELF_HEADER_GAP_PX))
             .child(
                 div()
-                    .h(px(SHELF_HEADER_HEIGHT_PX))
+                    .h(sp(SHELF_HEADER_HEIGHT_PX))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1452,16 +2196,16 @@ impl AppShell {
                             .child(
                                 div()
                                     .font(editorial_serif())
-                                    .text_size(px(30.0))
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_size(sp(28.0))
+                                    .text_color(rgb(theme.text_primary))
                                     .truncate()
-                                    .child(meta.title),
+                                    .child(meta.title.clone()),
                             )
-                            .when_some(meta.subtitle, |el, sub| {
+                            .when_some(meta.subtitle.clone(), |el, sub| {
                                 el.child(
                                     div()
-                                        .text_size(px(13.0))
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_size(sp(13.0))
+                                        .text_color(rgb(theme.text_muted))
                                         .truncate()
                                         .child(sub),
                                 )
@@ -1472,12 +2216,12 @@ impl AppShell {
                                         .px(px(8.0))
                                         .py(px(2.0))
                                         .rounded(px(RADIUS_PILL))
-                                        .bg(rgba(ACCENT_SOFT))
+                                        .bg(rgba(theme.accent_soft))
                                         .border_1()
-                                        .border_color(rgba(BORDER_ACCENT))
+                                        .border_color(rgba(theme.border_accent))
                                         .font(mono_font())
                                         .text_size(px(10.5))
-                                        .text_color(rgb(ACCENT))
+                                        .text_color(rgb(accent_ink))
                                         .child("Pinned"),
                                 )
                             }),
@@ -1491,7 +2235,9 @@ impl AppShell {
                             .child(render_shelf_icon_button(
                                 ("shelf-prev", raw_index),
                                 IconName::ChevronLeft,
+                                IconWeight::Regular,
                                 false,
+                                theme,
                                 cx.listener(move |_, _, _, cx| {
                                     let cur_x = (-scroll_prev.offset().x / px(1.0)).max(0.0);
                                     let next_x = (cur_x - step_px).max(0.0);
@@ -1502,7 +2248,9 @@ impl AppShell {
                             .child(render_shelf_icon_button(
                                 ("shelf-next", raw_index),
                                 IconName::ChevronRight,
+                                IconWeight::Regular,
                                 false,
+                                theme,
                                 cx.listener(move |this, _, _, cx| {
                                     let max_x =
                                         (scroll_next.max_offset().x / px(1.0)).max(0.0);
@@ -1521,7 +2269,13 @@ impl AppShell {
                             .child(render_shelf_icon_button(
                                 ("shelf-pin", raw_index),
                                 IconName::Pin,
+                                if is_pinned {
+                                    IconWeight::Fill
+                                } else {
+                                    IconWeight::Regular
+                                },
                                 is_pinned,
+                                theme,
                                 cx.listener(move |this, _, _, cx| {
                                     this.toggle_pin_board_shelf(pin_key.clone(), cx);
                                 }),
@@ -1529,7 +2283,9 @@ impl AppShell {
                             .child(render_shelf_icon_button(
                                 ("shelf-hide", raw_index),
                                 IconName::EyeOff,
+                                IconWeight::Regular,
                                 false,
+                                theme,
                                 cx.listener(move |this, _, _, cx| {
                                     this.toggle_hide_board_shelf(hide_key.clone(), cx);
                                 }),
@@ -1538,24 +2294,24 @@ impl AppShell {
                                 div()
                                     .id(("shelf-see-all", raw_index))
                                     .cursor_pointer()
-                                    .h(px(30.0))
-                                    .px(px(11.0))
+                                    .h(sp(30.0))
+                                    .px(sp(11.0))
                                     .ml(px(4.0))
                                     .rounded(px(RADIUS_PILL))
-                                    .bg(rgba(GLASS_TROUGH_BG))
+                                    .bg(rgba(theme.glass_trough_bg))
                                     .border_1()
-                                    .border_color(rgba(GLASS_BORDER))
-                                    .hover(|s| {
-                                        s.bg(rgba(GLASS_ROW_HOVER_BG))
-                                            .border_color(rgba(GLASS_BORDER_STRONG))
-                                            .text_color(rgb(TEXT_PRIMARY))
+                                    .border_color(rgba(theme.glass_border))
+                                    .hover(move |s| {
+                                        s.bg(rgba(glass_row_hover))
+                                            .border_color(rgba(glass_border_strong))
+                                            .text_color(rgb(text_primary))
                                     })
                                     .flex()
                                     .items_center()
                                     .gap(px(4.0))
                                     .font(ui_sans(FontWeight::MEDIUM))
-                                    .text_size(px(12.5))
-                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .text_size(sp(12.5))
+                                    .text_color(rgb(theme.text_secondary))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
@@ -1570,8 +2326,8 @@ impl AppShell {
                                     .child("See all")
                                     .child(svg_icon(
                                         IconName::ChevronRight,
-                                        12.5,
-                                        rgb(TEXT_MUTED),
+                                        12.5 * theme.ui_scale,
+                                        rgb(theme.text_muted),
                                     )),
                             ),
                     ),
@@ -1582,10 +2338,18 @@ impl AppShell {
     fn render_hidden_shelves_drawer(
         &self,
         hidden_shelves: &[HiddenShelfInfo],
+        theme: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let count = hidden_shelves.len();
         let is_open = self.board_hidden_drawer_open;
+        let glass_row_hover = theme.glass_row_hover_bg;
+        let glass_border_strong = theme.glass_border_strong;
+        let accent_ink = if theme.is_light {
+            theme.accent_press
+        } else {
+            theme.accent
+        };
 
         div()
             .pt(px(8.0))
@@ -1602,29 +2366,29 @@ impl AppShell {
                         div()
                             .id("btn-board-hidden-drawer")
                             .cursor_pointer()
-                            .h(px(36.0))
-                            .px(px(14.0))
+                            .h(sp(36.0))
+                            .px(sp(14.0))
                             .rounded(px(RADIUS_PILL))
-                            .bg(rgba(GLASS_TROUGH_BG))
+                            .bg(rgba(theme.glass_trough_bg))
                             .border_1()
                             .border_color(if is_open {
-                                rgba(BORDER_ACCENT)
+                                rgba(theme.border_accent)
                             } else {
-                                rgba(GLASS_BORDER)
+                                rgba(theme.glass_border)
                             })
-                            .hover(|s| {
-                                s.bg(rgba(GLASS_ROW_HOVER_BG))
-                                    .border_color(rgba(GLASS_BORDER_STRONG))
+                            .hover(move |s| {
+                                s.bg(rgba(glass_row_hover))
+                                    .border_color(rgba(glass_border_strong))
                             })
                             .flex()
                             .items_center()
                             .gap(px(8.0))
                             .font(ui_sans(FontWeight::MEDIUM))
-                            .text_size(px(13.0))
+                            .text_size(sp(13.0))
                             .text_color(if is_open {
-                                rgb(TEXT_PRIMARY)
+                                rgb(theme.text_primary)
                             } else {
-                                rgb(TEXT_SECONDARY)
+                                rgb(theme.text_secondary)
                             })
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -1639,14 +2403,18 @@ impl AppShell {
                                 } else {
                                     IconName::EyeOff
                                 },
-                                13.5,
-                                rgb(TEXT_MUTED),
+                                13.5 * theme.ui_scale,
+                                rgb(theme.text_muted),
                             ))
                             .child(format!("Hidden shelves ({count})"))
                             .child(svg_icon(
-                                IconName::ChevronDown,
-                                13.0,
-                                rgb(TEXT_MUTED),
+                                if is_open {
+                                    IconName::CaretUp
+                                } else {
+                                    IconName::ChevronDown
+                                },
+                                13.0 * theme.ui_scale,
+                                rgb(theme.text_muted),
                             )),
                     )
                     .when(is_open, |row| {
@@ -1660,7 +2428,7 @@ impl AppShell {
                                     this.restore_all_hidden_shelves(cx);
                                 }),
                             )
-                            .h(px(34.0))
+                            .h(sp(34.0))
                             .rounded(px(RADIUS_PILL)),
                         )
                     }),
@@ -1671,9 +2439,9 @@ impl AppShell {
                         .w_full()
                         .p(px(16.0))
                         .rounded(px(RADIUS_SHEET))
-                        .bg(rgba(GLASS_SHEET_BG))
+                        .bg(rgba(theme.glass_sheet_bg))
                         .border_1()
-                        .border_color(rgba(GLASS_BORDER))
+                        .border_color(rgba(theme.glass_border))
                         .flex()
                         .flex_wrap()
                         .gap(px(10.0))
@@ -1686,57 +2454,64 @@ impl AppShell {
                             div()
                                 .id(("btn-board-restore-shelf", idx))
                                 .cursor_pointer()
-                                .h(px(34.0))
-                                .px(px(12.0))
+                                .h(sp(34.0))
+                                .px(sp(12.0))
                                 .rounded(px(RADIUS_CONTROL))
-                                .bg(rgba(GLASS_CARD_BG))
+                                .bg(rgba(theme.glass_card_bg))
                                 .border_1()
-                                .border_color(rgba(GLASS_BORDER))
-                                .hover(|s| {
-                                    s.bg(rgba(GLASS_ROW_HOVER_BG))
-                                        .border_color(rgba(GLASS_BORDER_STRONG))
+                                .border_color(rgba(theme.glass_border))
+                                .hover(move |s| {
+                                    s.bg(rgba(glass_row_hover))
+                                        .border_color(rgba(glass_border_strong))
                                 })
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
                                 .font(ui_sans(FontWeight::MEDIUM))
-                                .text_size(px(12.5))
-                                .text_color(rgb(TEXT_PRIMARY))
+                                .text_size(sp(12.5))
+                                .text_color(rgb(theme.text_primary))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, _, cx| {
                                         this.toggle_hide_board_shelf(restore_key.clone(), cx);
                                     }),
                                 )
-                                .child(svg_icon(IconName::Eye, 13.0, rgb(ACCENT)))
+                                .child(svg_icon(
+                                    IconName::Eye,
+                                    13.0 * theme.ui_scale,
+                                    rgb(accent_ink),
+                                ))
                                 .child(label)
                         })),
                 )
             })
     }
 
-    fn render_empty_board_banner(cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_empty_board_banner(
+        theme: &ThemePalette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .p(px(36.0))
             .rounded(px(RADIUS_SHEET))
-            .bg(rgba(GLASS_SHEET_BG))
+            .bg(rgba(theme.glass_sheet_bg))
             .border_1()
-            .border_color(rgba(GLASS_BORDER))
+            .border_color(rgba(theme.glass_border))
             .flex()
             .flex_col()
             .gap(px(12.0))
             .child(
                 div()
                     .font(editorial_serif())
-                    .text_size(px(34.0))
-                    .text_color(rgb(TEXT_PRIMARY))
+                    .text_size(sp(34.0))
+                    .text_color(rgb(theme.text_primary))
                     .child("Setting the projection room"),
             )
             .child(
                 div()
                     .max_w(px(540.0))
-                    .text_size(px(14.0))
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .text_size(sp(14.0))
+                    .text_color(rgb(theme.text_secondary))
                     .child(
                         "Sign in to sync your Stremio library and addons, or press Ctrl K to search any film or series immediately.",
                     ),
@@ -1809,6 +2584,10 @@ impl AppShell {
         let open_type = item.r#type.clone();
         let open_id = item.id.clone();
         let toggle_preview = item.clone();
+        let peek_type = item.r#type.clone();
+        let peek_id = item.id.clone();
+        let peek_title = item.name.clone();
+        let peek_preview = item.clone();
         let ctx_type = item.r#type.clone();
         let ctx_id = item.id.clone();
         let ctx_title = item.name.clone();
@@ -1833,6 +2612,18 @@ impl AppShell {
                 .on_toggle_library(cx.listener(move |this, _, _, cx| {
                     this.core.toggle_library_item(toggle_preview.clone());
                     cx.notify();
+                }))
+                .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                    this.open_quick_peek(
+                        QuickPeekTarget {
+                            type_name: peek_type.clone(),
+                            id: peek_id.clone(),
+                            video_id: None,
+                            title: peek_title.clone(),
+                            preview: Some(peek_preview.clone()),
+                        },
+                        cx,
+                    );
                 }))
                 .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     this.open_browsing_context_menu(
@@ -1861,39 +2652,565 @@ impl AppShell {
     }
 }
 
-fn render_shelf_icon_button(
+fn build_board_view_snapshot(
+    model: &DesktopModel,
+    key: BoardSnapshotKey,
+    pinned_prefs: &[String],
+    hidden_prefs: &[String],
+) -> BoardViewSnapshot {
+    let cw_cards: Vec<ContinueWatchingCard> = model
+        .continue_watching_preview
+        .items
+        .iter()
+        .take(MAX_CW_FILMSTRIP_ITEMS)
+        .map(|cw_item| {
+            let li = &cw_item.library_item;
+            let preview_ref = find_preview_ref_in_model(model, &li.id);
+            ContinueWatchingCard {
+                library_item: li.clone(),
+                notification_count: cw_item.notifications,
+                backdrop_url: preview_ref
+                    .and_then(|p| p.background.as_ref().map(|u| u.to_string())),
+                logo_url: preview_ref.and_then(|p| p.logo.as_ref().map(|u| u.to_string())),
+                imdb_rating: preview_ref.and_then(extract_imdb_rating),
+                year: preview_ref
+                    .and_then(|p| p.release_info.clone())
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty()),
+                description: preview_ref.and_then(|p| p.description.clone()),
+                genres: preview_ref
+                    .map(|p| extract_genres(p, 3))
+                    .unwrap_or_default(),
+                trailer_streams: preview_ref
+                    .map(|p| p.trailer_streams.clone())
+                    .unwrap_or_default(),
+                preview: preview_ref.cloned(),
+            }
+        })
+        .collect();
+    let cw_total_count = model.continue_watching_preview.items.len();
+
+    let total_board_catalogs = model.board.catalogs.len();
+    let mut sortable_metas: Vec<(Option<usize>, BoardShelfMeta)> = Vec::new();
+    let mut hidden_list: Vec<HiddenShelfInfo> = Vec::new();
+    let mut seen_hidden_keys: HashSet<String> = HashSet::new();
+    let mut pinned_to_load: Vec<usize> = Vec::new();
+
+    for (idx, cat) in model.board.catalogs.iter().enumerate() {
+        let Some(first_page) = cat.first() else {
+            continue;
+        };
+        let raw_type = first_page.request.path.r#type.as_str();
+        let raw_id = first_page.request.path.id.as_str();
+        let shelf_key = build_shelf_key(first_page.request.base.as_str(), raw_type, raw_id);
+
+        let matched_mc = model
+            .ctx
+            .profile
+            .addons
+            .iter()
+            .find(|a| a.transport_url == first_page.request.base)
+            .and_then(|a| {
+                a.manifest
+                    .catalogs
+                    .iter()
+                    .find(|mc| mc.id == raw_id && mc.r#type == raw_type)
+            });
+        let addon_cat_name = matched_mc.and_then(|mc| mc.name.as_deref());
+        let supports_skip = matched_mc.is_some_and(|mc| {
+            mc.extra
+                .iter()
+                .any(|extra| extra.name.eq_ignore_ascii_case("skip"))
+        });
+
+        let (section_title, section_sub) =
+            editorialize_shelf_heading(idx, addon_cat_name.unwrap_or(raw_id), raw_type);
+
+        if hidden_prefs.iter().any(|k| k == &shelf_key) {
+            if seen_hidden_keys.insert(shelf_key.clone()) {
+                hidden_list.push(HiddenShelfInfo {
+                    shelf_key,
+                    title: section_title,
+                    subtitle: section_sub,
+                });
+            }
+            continue;
+        }
+
+        let pin_pos = pinned_prefs.iter().position(|k| k == &shelf_key);
+        let is_pinned = pin_pos.is_some();
+        if idx >= key.shelf_limit && !is_pinned {
+            continue;
+        }
+
+        let needs_initial_load = first_page.content.is_none();
+        if is_pinned && needs_initial_load {
+            pinned_to_load.push(idx);
+        }
+
+        let mut total_items = 0_usize;
+        let mut is_loading = false;
+        let mut first_shape: Option<PosterShape> = None;
+
+        for page in cat {
+            match &page.content {
+                Some(Loadable::Ready(items)) => {
+                    if first_shape.is_none() {
+                        if let Some(first) = items.first() {
+                            first_shape = Some(first.poster_shape.clone());
+                        }
+                    }
+                    total_items += items.len();
+                }
+                Some(Loadable::Loading) => is_loading = true,
+                _ => {}
+            }
+        }
+
+        if total_items == 0 && !is_loading && !(is_pinned && needs_initial_load) {
+            continue;
+        }
+
+        let can_load_more = supports_skip
+            && !is_loading
+            && cat.last().is_some_and(|p| {
+                matches!(&p.content, Some(Loadable::Ready(items)) if !items.is_empty())
+            });
+
+        let see_all_request = strip_skip_extra(&first_page.request);
+        let aspect = first_shape
+            .as_ref()
+            .map(PosterAspect::from_stremio_poster_shape)
+            .unwrap_or(PosterAspect::Portrait2x3);
+
+        sortable_metas.push((
+            pin_pos,
+            BoardShelfMeta {
+                raw_index: idx,
+                shelf_key,
+                title: section_title,
+                subtitle: section_sub,
+                see_all_request,
+                aspect,
+                total_items,
+                is_loading: is_loading || (is_pinned && needs_initial_load),
+                can_load_more,
+                is_pinned,
+            },
+        ));
+    }
+
+    for hidden_key in hidden_prefs {
+        if seen_hidden_keys.insert(hidden_key.clone()) {
+            hidden_list.push(HiddenShelfInfo {
+                shelf_key: hidden_key.clone(),
+                title: fallback_hidden_shelf_title(hidden_key),
+                subtitle: None,
+            });
+        }
+    }
+
+    let ordered_metas = order_board_shelves(sortable_metas);
+
+    let mut shelves = Vec::with_capacity(ordered_metas.len());
+    for meta in ordered_metas {
+        let items: Vec<MetaItemPreview> = model
+            .board
+            .catalogs
+            .get(meta.raw_index)
+            .map(|cat| iter_catalog_items(cat).cloned().collect())
+            .unwrap_or_default();
+        shelves.push(CachedBoardShelf {
+            meta,
+            items: Arc::from(items),
+        });
+    }
+
+    let mut featured_candidates: Vec<HomeSpotlightCandidate> = Vec::new();
+    if key.want_spotlight {
+        let mut seen_spot = HashSet::new();
+        for shelf in &shelves {
+            if featured_candidates.len() >= MAX_FEATURED_CANDIDATES {
+                break;
+            }
+            for item in shelf.items.iter().take(3) {
+                if featured_candidates.len() >= MAX_FEATURED_CANDIDATES {
+                    break;
+                }
+                if seen_spot.insert(item.id.clone()) {
+                    featured_candidates.push(HomeSpotlightCandidate {
+                        id: item.id.clone(),
+                        r#type: item.r#type.clone(),
+                        name: item.name.clone(),
+                        video_id: None,
+                        is_resume: false,
+                        eyebrow: format!("FEATURED · {}", shelf.meta.title.to_ascii_uppercase()),
+                        description: item.description.clone(),
+                        year: item
+                            .release_info
+                            .clone()
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty()),
+                        imdb_rating: extract_imdb_rating(item),
+                        genres: extract_genres(item, 3),
+                        backdrop_url: item.background.as_ref().map(|u| u.to_string()),
+                        logo_url: item.logo.as_ref().map(|u| u.to_string()),
+                        poster_url: item.poster.as_ref().map(|u| u.to_string()),
+                        trailer_youtube_key: None,
+                        trailer_streams: item.trailer_streams.clone(),
+                        preview: Some(item.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    BoardViewSnapshot {
+        key,
+        cw_cards: Arc::from(cw_cards),
+        cw_total_count,
+        featured_candidates: Arc::from(featured_candidates),
+        shelves: Arc::from(shelves),
+        hidden_shelves: Arc::from(hidden_list),
+        total_board_catalogs,
+        pinned_indices_to_load: Arc::from(pinned_to_load),
+    }
+}
+
+fn render_hero_scrim_layers(theme: &ThemePalette) -> Vec<AnyElement> {
+    if theme.is_light {
+        // Refined dark cinema scrim on LightMist so crisp white hero ink stays high-contrast,
+        // with a soft bottom edge feather into the daylight canvas.
+        vec![
+            div()
+                .absolute()
+                .inset_0()
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgba(0x0B0D1480), 0.0),
+                    linear_color_stop(rgba(0x0B0D1400), 0.30),
+                ))
+                .into_any_element(),
+            div()
+                .absolute()
+                .inset_0()
+                .bg(linear_gradient(
+                    90.0,
+                    linear_color_stop(rgba(0x0B0D14E0), 0.0),
+                    linear_color_stop(rgba(0x0B0D1418), 0.78),
+                ))
+                .into_any_element(),
+            div()
+                .absolute()
+                .inset_0()
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgba(0x0B0D1414), 0.14),
+                    linear_color_stop(rgba(0x0B0D14EB), 0.90),
+                ))
+                .into_any_element(),
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(px(16.0))
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgba(theme.bg_canvas << 8), 0.0),
+                    linear_color_stop(rgb(theme.bg_canvas), 1.0),
+                ))
+                .into_any_element(),
+        ]
+    } else {
+        let c = theme.bg_canvas;
+        let transparent_c = c << 8;
+        vec![
+            div()
+                .absolute()
+                .inset_0()
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgba((c << 8) | 0xA8), 0.0),
+                    linear_color_stop(rgba(transparent_c), 0.34),
+                ))
+                .into_any_element(),
+            div()
+                .absolute()
+                .inset_0()
+                .bg(linear_gradient(
+                    90.0,
+                    linear_color_stop(rgba((c << 8) | 0xEC), 0.0),
+                    linear_color_stop(rgba(transparent_c), 0.72),
+                ))
+                .into_any_element(),
+            div()
+                .absolute()
+                .inset_0()
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgba(transparent_c), 0.14),
+                    linear_color_stop(rgba((c << 8) | 0xD9), 0.74),
+                ))
+                .into_any_element(),
+            div()
+                .absolute()
+                .inset_0()
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgba(transparent_c), 0.62),
+                    linear_color_stop(rgb(c), 1.0),
+                ))
+                .into_any_element(),
+        ]
+    }
+}
+
+fn hero_meta_divider() -> gpui::Div {
+    div()
+        .w(px(1.0))
+        .h(px(11.0))
+        .flex_shrink_0()
+        .bg(rgba(HERO_DIVIDER))
+}
+
+fn hero_active_card_glow(accent_hex: u32) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow::new(px(0.0), px(6.0), rgba(0x0000007A).into()).blur_radius(px(16.0)),
+        BoxShadow::new(
+            px(0.0),
+            px(0.0),
+            rgba((accent_hex << 8) | 0x55).into(),
+        )
+        .blur_radius(px(14.0))
+        .spread_radius(px(1.0)),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_hero_glass_pill(
     id: impl Into<ElementId>,
     icon: IconName,
+    weight: IconWeight,
+    label: impl Into<SharedString>,
     active: bool,
+    accent: u32,
+    accent_soft: u32,
+    border_accent: u32,
+    ui_scale: f32,
+    on_click: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let fg = if active { accent } else { HERO_INK_PRIMARY };
+    div()
+        .id(id)
+        .cursor_pointer()
+        .h(px(38.0 * ui_scale))
+        .px(px(15.0 * ui_scale))
+        .rounded(px(RADIUS_PILL))
+        .bg(if active {
+            rgba(accent_soft)
+        } else {
+            rgba(HERO_GLASS_BG)
+        })
+        .border_1()
+        .border_color(if active {
+            rgba(border_accent)
+        } else {
+            rgba(HERO_GLASS_BORDER)
+        })
+        .hover(move |s| {
+            s.bg(if active {
+                rgba(accent_soft)
+            } else {
+                rgba(HERO_GLASS_HOVER_BG)
+            })
+            .border_color(if active {
+                rgb(accent)
+            } else {
+                rgba(HERO_GLASS_BORDER_STRONG)
+            })
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(7.0 * ui_scale))
+        .font(ui_sans(FontWeight::MEDIUM))
+        .text_size(px(13.0 * ui_scale))
+        .text_color(rgb(fg))
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
+        .child(svg_icon_weighted(icon, weight, 14.0 * ui_scale, rgb(fg)))
+        .child(label.into())
+}
+
+fn render_hero_dock_chevron(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    ui_scale: f32,
     on_click: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
     div()
         .id(id)
         .cursor_pointer()
-        .w(px(30.0))
-        .h(px(30.0))
+        .w(px(28.0 * ui_scale))
+        .h(px(28.0 * ui_scale))
+        .rounded(px(RADIUS_PILL))
+        .bg(rgba(HERO_GLASS_TROUGH_BG))
+        .border_1()
+        .border_color(rgba(HERO_GLASS_BORDER))
+        .hover(|s| {
+            s.bg(rgba(HERO_GLASS_HOVER_BG))
+                .border_color(rgba(HERO_GLASS_BORDER_STRONG))
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            on_click(ev, window, cx);
+        })
+        .child(svg_icon(icon, 13.0 * ui_scale, rgb(HERO_INK_PRIMARY)))
+}
+
+fn render_hero_stage_mode_switcher(
+    active_mode: HeroStageMode,
+    ui_scale: f32,
+    cx: &mut Context<AppShell>,
+) -> impl IntoElement {
+    let is_cw = active_mode == HeroStageMode::ContinueWatching;
+    let is_feat = active_mode == HeroStageMode::Featured;
+
+    div()
+        .id("hero-stage-mode-switcher")
+        .p(px(3.0))
+        .rounded(px(RADIUS_PILL))
+        .bg(rgba(HERO_GLASS_TROUGH_BG))
+        .border_1()
+        .border_color(rgba(HERO_GLASS_BORDER))
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .child(
+            div()
+                .id("hero-mode-cw")
+                .cursor_pointer()
+                .h(px(26.0 * ui_scale))
+                .px(px(11.0 * ui_scale))
+                .rounded(px(RADIUS_PILL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.5 * ui_scale))
+                .when(is_cw, |el| {
+                    el.bg(rgb(0xF5F5F7))
+                        .font(ui_sans(FontWeight::SEMIBOLD))
+                        .text_color(rgb(0x0B0B0D))
+                })
+                .when(!is_cw, |el| {
+                    el.font(ui_sans(FontWeight::MEDIUM))
+                        .text_color(rgb(HERO_INK_SECONDARY))
+                        .hover(|s| {
+                            s.bg(rgba(0xFFFFFF18))
+                                .text_color(rgb(HERO_INK_PRIMARY))
+                        })
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        if this.board_hero_mode_featured {
+                            this.board_hero_mode_featured = false;
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child("Continue Watching"),
+        )
+        .child(
+            div()
+                .id("hero-mode-featured")
+                .cursor_pointer()
+                .h(px(26.0 * ui_scale))
+                .px(px(11.0 * ui_scale))
+                .rounded(px(RADIUS_PILL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.5 * ui_scale))
+                .when(is_feat, |el| {
+                    el.bg(rgb(0xF5F5F7))
+                        .font(ui_sans(FontWeight::SEMIBOLD))
+                        .text_color(rgb(0x0B0B0D))
+                })
+                .when(!is_feat, |el| {
+                    el.font(ui_sans(FontWeight::MEDIUM))
+                        .text_color(rgb(HERO_INK_SECONDARY))
+                        .hover(|s| {
+                            s.bg(rgba(0xFFFFFF18))
+                                .text_color(rgb(HERO_INK_PRIMARY))
+                        })
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        if !this.board_hero_mode_featured {
+                            this.board_hero_mode_featured = true;
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child("Featured"),
+        )
+}
+
+fn render_shelf_icon_button(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    weight: IconWeight,
+    active: bool,
+    theme: &ThemePalette,
+    on_click: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let accent_ink = if theme.is_light {
+        theme.accent_press
+    } else {
+        theme.accent
+    };
+    let accent = theme.accent;
+    let accent_soft = theme.accent_soft;
+    let glass_row_hover = theme.glass_row_hover_bg;
+    let glass_border_strong = theme.glass_border_strong;
+
+    div()
+        .id(id)
+        .cursor_pointer()
+        .w(px(30.0 * theme.ui_scale))
+        .h(px(30.0 * theme.ui_scale))
         .rounded(px(RADIUS_PILL))
         .bg(if active {
-            rgba(ACCENT_SOFT)
+            rgba(accent_soft)
         } else {
-            rgba(GLASS_TROUGH_BG)
+            rgba(theme.glass_trough_bg)
         })
         .border_1()
         .border_color(if active {
-            rgba(BORDER_ACCENT)
+            rgba(theme.border_accent)
         } else {
-            rgba(GLASS_BORDER)
+            rgba(theme.glass_border)
         })
-        .hover(|s| {
+        .hover(move |s| {
             s.bg(if active {
-                rgba(ACCENT_SOFT)
+                rgba(accent_soft)
             } else {
-                rgba(GLASS_ROW_HOVER_BG)
+                rgba(glass_row_hover)
             })
             .border_color(if active {
-                rgb(ACCENT)
+                rgb(accent)
             } else {
-                rgba(GLASS_BORDER_STRONG)
+                rgba(glass_border_strong)
             })
         })
         .flex()
@@ -1903,15 +3220,313 @@ fn render_shelf_icon_button(
             cx.stop_propagation();
             on_click(ev, window, cx);
         })
-        .child(svg_icon(
+        .child(svg_icon_weighted(
             icon,
-            13.0,
+            weight,
+            13.0 * theme.ui_scale,
             if active {
-                rgb(ACCENT)
+                rgb(accent_ink)
             } else {
-                rgb(TEXT_SECONDARY)
+                rgb(theme.text_secondary)
             },
         ))
+}
+
+#[inline]
+fn hash_string_slice(items: &[String]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    items.len().hash(&mut hasher);
+    for s in items {
+        s.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[inline]
+fn hero_stage_height_px(viewport_h: f32) -> f32 {
+    if !viewport_h.is_finite() || viewport_h <= 0.0 {
+        return 540.0;
+    }
+    (viewport_h * 0.60).clamp(HERO_MIN_HEIGHT_PX, HERO_MAX_HEIGHT_PX)
+}
+
+#[inline]
+fn fluid_side_padding_px(viewport_w: f32) -> f32 {
+    if !viewport_w.is_finite() || viewport_w <= 0.0 {
+        return 32.0;
+    }
+    (viewport_w * 0.03).clamp(24.0, 56.0)
+}
+
+#[inline]
+fn resolve_hero_stage_mode(
+    board_hero_mode_featured: bool,
+    has_cw: bool,
+    has_featured: bool,
+) -> HeroStageMode {
+    if !has_cw || (board_hero_mode_featured && has_featured) {
+        HeroStageMode::Featured
+    } else {
+        HeroStageMode::ContinueWatching
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeroDockDimensions {
+    card_w: f32,
+    card_h: f32,
+    card_gap: f32,
+    scroll_h: f32,
+    header_h: f32,
+    dock_gap: f32,
+}
+
+#[inline]
+fn cw_filmstrip_card_width_px(density: CardDensityChoice) -> f32 {
+    match density {
+        CardDensityChoice::Compact => 192.0,
+        CardDensityChoice::Comfortable => 214.0,
+        CardDensityChoice::Cinema => 240.0,
+    }
+}
+
+#[inline]
+fn hero_dock_dimensions(
+    _mode: HeroStageMode,
+    density: CardDensityChoice,
+    ui_scale: f32,
+) -> HeroDockDimensions {
+    let card_w = cw_filmstrip_card_width_px(density);
+    let card_h = (card_w * PosterAspect::Landscape16x9.height_over_width()).ceil();
+    let card_gap = 12.0_f32;
+    let scroll_h = card_h + 6.0;
+    // Matches `render_hero_stage_mode_switcher` (26px * ui_scale inner + 6px padding + 2px border).
+    let header_h = (26.0 * ui_scale + 8.0).ceil();
+    let dock_gap = 10.0_f32;
+    HeroDockDimensions {
+        card_w,
+        card_h,
+        card_gap,
+        scroll_h,
+        header_h,
+        dock_gap,
+    }
+}
+
+fn hero_dock_card_frame(
+    is_highlighted: bool,
+    accent: u32,
+    active_glow: &[BoxShadow],
+) -> gpui::Div {
+    if is_highlighted {
+        div()
+            .border_2()
+            .border_color(rgb(accent))
+            .shadow(active_glow.to_vec())
+    } else {
+        div()
+            .border_1()
+            .border_color(rgba(HERO_GLASS_BORDER))
+            .hover(|s| s.border_color(rgba(HERO_GLASS_BORDER_STRONG)))
+    }
+}
+
+fn hero_dock_backdrop_layers(
+    item_id: &str,
+    thumb_tex: Option<Arc<RenderImage>>,
+    show_hairline: bool,
+    accent: u32,
+) -> Vec<AnyElement> {
+    let mut layers = Vec::with_capacity(if show_hairline { 3 } else { 2 });
+    layers.push(if let Some(tex) = thumb_tex {
+        img(tex)
+            .size_full()
+            .absolute()
+            .inset_0()
+            .object_fit(ObjectFit::Cover)
+            .into_any_element()
+    } else {
+        div()
+            .size_full()
+            .absolute()
+            .inset_0()
+            .bg(rgb(placeholder_tint_for_id(item_id)))
+            .into_any_element()
+    });
+    // Bottom readability scrim inside card.
+    layers.push(
+        div()
+            .absolute()
+            .inset_0()
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(rgba(0x0B0D1418), 0.0),
+                linear_color_stop(rgba(0x0B0D14E6), 1.0),
+            ))
+            .into_any_element(),
+    );
+    if show_hairline {
+        layers.push(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(2.0))
+                .bg(rgb(accent))
+                .into_any_element(),
+        );
+    }
+    layers
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_hero_dock_quick_actions(
+    peek_id: impl Into<ElementId>,
+    play_id: impl Into<ElementId>,
+    grp: SharedString,
+    is_active: bool,
+    accent: u32,
+    accent_hover: u32,
+    cta_on_accent: u32,
+    on_peek: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    on_play: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(7.0))
+        .right(px(7.0))
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .opacity(if is_active { 0.92 } else { 0.0 })
+        .group_hover(grp, |s| s.opacity(1.0))
+        .child(
+            div()
+                .id(peek_id)
+                .cursor_pointer()
+                .w(px(26.0))
+                .h(px(26.0))
+                .rounded(px(RADIUS_PILL))
+                .bg(rgba(HERO_GLASS_TROUGH_BG))
+                .border_1()
+                .border_color(rgba(HERO_GLASS_BORDER))
+                .hover(|s| {
+                    s.bg(rgba(HERO_GLASS_HOVER_BG))
+                        .border_color(rgba(HERO_GLASS_BORDER_STRONG))
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                    cx.stop_propagation();
+                    on_peek(ev, window, cx);
+                })
+                .child(svg_icon(IconName::Info, 12.5, rgb(HERO_INK_PRIMARY))),
+        )
+        .child(
+            div()
+                .id(play_id)
+                .cursor_pointer()
+                .w(px(26.0))
+                .h(px(26.0))
+                .rounded(px(RADIUS_PILL))
+                .bg(rgb(accent))
+                .hover(move |s| s.bg(rgb(accent_hover)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                    cx.stop_propagation();
+                    on_play(ev, window, cx);
+                })
+                .child(svg_icon_weighted(
+                    IconName::Play,
+                    IconWeight::Fill,
+                    11.5,
+                    rgb(cta_on_accent),
+                )),
+        )
+}
+
+fn render_hero_dock_scroll_strip(
+    id: impl Into<ElementId>,
+    dims: HeroDockDimensions,
+    scroll_handle: &ScrollHandle,
+    cards: Vec<AnyElement>,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .w_full()
+        .h(px(dims.scroll_h))
+        .overflow_x_scroll()
+        .track_scroll(scroll_handle)
+        .child(
+            div()
+                .h_full()
+                .py(px(2.0))
+                .flex()
+                .items_center()
+                .gap(px(dims.card_gap))
+                .children(cards),
+        )
+}
+
+#[inline]
+fn compute_dock_scroll_target_x(
+    cur_x: f32,
+    max_x: f32,
+    viewport_w: f32,
+    idx: usize,
+    card_w: f32,
+    card_gap: f32,
+) -> Option<f32> {
+    if !max_x.is_finite() || max_x <= 0.0 || !viewport_w.is_finite() || viewport_w <= 0.0 {
+        return None;
+    }
+    let item_left = idx as f32 * (card_w + card_gap);
+    let item_right = item_left + card_w;
+    if item_left < cur_x {
+        Some(item_left.clamp(0.0, max_x))
+    } else if item_right > cur_x + viewport_w {
+        Some((item_right - viewport_w).clamp(0.0, max_x))
+    } else {
+        None
+    }
+}
+
+fn ensure_dock_card_visible(
+    scroll: &ScrollHandle,
+    idx: usize,
+    card_w: f32,
+    card_gap: f32,
+    viewport_w: f32,
+) {
+    let max_x = (scroll.max_offset().x / px(1.0)).max(0.0);
+    let cur_x = (-scroll.offset().x / px(1.0)).max(0.0);
+    if let Some(target_x) =
+        compute_dock_scroll_target_x(cur_x, max_x, viewport_w, idx, card_w, card_gap)
+    {
+        scroll.set_offset(point(px(-target_x), px(0.0)));
+    }
+}
+
+fn format_featured_card_meta_lead(
+    year: Option<&str>,
+    genre: Option<&str>,
+    raw_type: &str,
+    has_rating: bool,
+) -> String {
+    let clean_year = year.map(str::trim).filter(|s| !s.is_empty());
+    let clean_genre = genre.map(str::trim).filter(|s| !s.is_empty());
+    if has_rating {
+        clean_year
+            .map(str::to_owned)
+            .or_else(|| clean_genre.map(str::to_owned))
+            .unwrap_or_else(|| sentence_case_label(raw_type))
+    } else {
+        format_preview_subtitle(raw_type, clean_year, clean_genre)
+    }
 }
 
 fn find_preview_ref_in_model<'a>(
@@ -1947,7 +3562,9 @@ fn find_preview_ref_in_model<'a>(
 }
 
 fn iter_catalog_items(
-    cat: &[stremio_core_runtime::stremio_core::models::common::ResourceLoadable<Vec<MetaItemPreview>>],
+    cat: &[stremio_core_runtime::stremio_core::models::common::ResourceLoadable<
+        Vec<MetaItemPreview>,
+    >],
 ) -> impl Iterator<Item = &MetaItemPreview> {
     cat.iter().flat_map(|page| match &page.content {
         Some(Loadable::Ready(items)) => items.as_slice(),
@@ -1955,24 +3572,12 @@ fn iter_catalog_items(
     })
 }
 
-fn slice_catalog_items(
-    cat: &[stremio_core_runtime::stremio_core::models::common::ResourceLoadable<Vec<MetaItemPreview>>],
-    range: Range<usize>,
-) -> Vec<MetaItemPreview> {
-    if range.start >= range.end {
-        return Vec::new();
-    }
-    let count = range.end - range.start;
-    iter_catalog_items(cat)
-        .skip(range.start)
-        .take(count)
-        .cloned()
-        .collect()
-}
-
 fn strip_skip_extra(req: &ResourceRequest) -> ResourceRequest {
     let mut cloned = req.clone();
-    cloned.path.extra.retain(|ExtraValue { name, .. }| !name.eq_ignore_ascii_case("skip"));
+    cloned
+        .path
+        .extra
+        .retain(|ExtraValue { name, .. }| !name.eq_ignore_ascii_case("skip"));
     cloned
 }
 
@@ -1986,7 +3591,11 @@ fn fallback_hidden_shelf_title(shelf_key: &str) -> String {
     let raw_type = parts.next().unwrap_or("");
     let raw_id = parts.next().unwrap_or(shelf_key);
     let clean = sentence_case_label(raw_id);
-    if raw_type.is_empty() || clean.to_ascii_lowercase().contains(&raw_type.to_ascii_lowercase()) {
+    if raw_type.is_empty()
+        || clean
+            .to_ascii_lowercase()
+            .contains(&raw_type.to_ascii_lowercase())
+    {
         clean
     } else {
         format!("{clean} {}", raw_type.to_ascii_lowercase())
@@ -2030,69 +3639,60 @@ fn compute_horizontal_window(
 }
 
 #[inline]
-fn cw_column_count(container_w: f32) -> usize {
-    if container_w < 700.0 {
-        2
-    } else {
-        3
-    }
-}
-
-#[inline]
-fn cw_card_width_px(container_w: f32, cols: usize) -> f32 {
-    let c = cols.max(1) as f32;
-    ((container_w - SHELF_CARD_GAP_PX * (c - 1.0)) / c).max(160.0)
-}
-
-#[inline]
-fn shelf_card_dimensions(aspect: PosterAspect) -> (f32, f32, f32) {
+fn shelf_card_dimensions(
+    aspect: PosterAspect,
+    density: CardDensityChoice,
+    ui_scale: f32,
+) -> (f32, f32, f32) {
+    let base_w = density.target_poster_width_px();
     let card_w = match aspect {
-        PosterAspect::Portrait2x3 => 176.0,
-        PosterAspect::Square1x1 => 196.0,
-        PosterAspect::Landscape16x9 => 272.0,
+        PosterAspect::Portrait2x3 => base_w,
+        PosterAspect::Square1x1 => (base_w * 1.12).round(),
+        PosterAspect::Landscape16x9 => (base_w * 1.54).round(),
     };
     let img_h = (card_w * aspect.height_over_width()).ceil();
-    let card_h = img_h + CARD_METADATA_HEIGHT_PX;
+    let meta_h = (CARD_METADATA_HEIGHT_PX * ui_scale).ceil();
+    let card_h = img_h + meta_h;
     (card_w, img_h, card_h)
 }
 
 #[inline]
-fn shelf_total_height_px(card_h: f32) -> f32 {
-    SHELF_HEADER_HEIGHT_PX + SHELF_HEADER_GAP_PX + (card_h + 4.0) + SHELF_BOTTOM_GAP_PX
+fn shelf_total_height_px(card_h: f32, ui_scale: f32) -> f32 {
+    (SHELF_HEADER_HEIGHT_PX * ui_scale).ceil()
+        + SHELF_HEADER_GAP_PX
+        + (card_h + 4.0)
+        + SHELF_BOTTOM_GAP_PX
 }
 
 #[inline]
-fn initial_shelves_top_y(has_spotlight: bool, cw_rows: usize, cw_card_h: f32) -> f32 {
-    let mut y = 28.0_f32;
-    if has_spotlight {
-        y += 336.0 + 40.0;
+fn initial_shelves_top_y(hero_height: Option<f32>, ui_scale: f32) -> f32 {
+    match hero_height {
+        Some(h) => h + 24.0,
+        None => 88.0 * ui_scale,
     }
-    if cw_rows > 0 {
-        let cw_grid_h =
-            cw_rows as f32 * cw_card_h + (cw_rows.saturating_sub(1)) as f32 * SHELF_CARD_GAP_PX;
-        y += 40.0 + 16.0 + cw_grid_h + 40.0;
-    }
-    y
 }
 
-fn resolve_spotlight_trailer_target(spot: &HomeSpotlightCandidate) -> Option<SpotlightTrailerTarget> {
-    if let Some(direct) = spot.trailer_streams.iter().find(|s| {
+fn resolve_trailer_target(
+    trailer_streams: &[Stream],
+    trailer_youtube_key: Option<&str>,
+) -> Option<SpotlightTrailerTarget> {
+    if let Some(direct) = trailer_streams.iter().find(|s| {
         matches!(
             &s.source,
             StreamSource::Url { url } if url.scheme() == "http" || url.scheme() == "https"
         )
     }) {
-        return Some(SpotlightTrailerTarget::DirectStream(Box::new(direct.clone())));
+        return Some(SpotlightTrailerTarget::DirectStream(Box::new(
+            direct.clone(),
+        )));
     }
 
-    let yt_key = spot
-        .trailer_youtube_key
-        .as_deref()
+    let yt_key = trailer_youtube_key
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .map(str::to_owned)
         .or_else(|| {
-            spot.trailer_streams.iter().find_map(|s| match &s.source {
+            trailer_streams.iter().find_map(|s| match &s.source {
                 StreamSource::YouTube { yt_id } if !yt_id.trim().is_empty() => {
                     Some(yt_id.trim().to_owned())
                 }
@@ -2115,24 +3715,36 @@ fn format_preview_subtitle(raw_type: &str, year: Option<&str>, genre: Option<&st
     }
 }
 
-fn format_cw_subtitle(
-    li: &LibraryItem,
-    ep_code: Option<&str>,
-    notification_count: usize,
-    pct: f32,
-) -> String {
-    let status = if li.state.time_offset > 0 {
+fn format_cw_remaining_or_status(li: &LibraryItem, notification_count: usize, pct: f32) -> String {
+    if li.state.time_offset > 0 {
         format_cw_remaining(li, pct.max(2.0))
     } else if notification_count > 0 {
         "New episode".to_owned()
     } else {
         sentence_case_label(&li.r#type)
-    };
-
-    match ep_code {
-        Some(code) => format!("{code} · {status}"),
-        None => status,
     }
+}
+
+fn format_hero_cw_eyebrow(
+    li: &LibraryItem,
+    ep_code: Option<&str>,
+    notification_count: usize,
+    pct: f32,
+) -> String {
+    let mut parts: Vec<String> = vec!["CONTINUE WATCHING".to_owned()];
+    if let Some(code) = ep_code {
+        parts.push(code.to_owned());
+    }
+    if li.state.time_offset > 0 {
+        parts.push(format_cw_remaining(li, pct.max(2.0)));
+    } else if notification_count > 0 {
+        parts.push(if notification_count == 1 {
+            "NEW EPISODE".to_owned()
+        } else {
+            format!("{notification_count} NEW EPISODES")
+        });
+    }
+    parts.join(" · ")
 }
 
 fn format_cw_remaining(li: &LibraryItem, pct: f32) -> String {
@@ -2207,6 +3819,7 @@ fn editorialize_shelf_heading(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stremio_core_runtime::stremio_core::types::library::LibraryItemState;
     use url::Url;
 
     #[test]
@@ -2267,17 +3880,14 @@ mod tests {
             compute_horizontal_window(0, 0.0, 1200.0, 176.0, 18.0, 2),
             0..0
         );
-        // stride = 194px; at scroll_x=0, viewport=1200 -> first=0, last_excl=7 -> 0..9
         assert_eq!(
             compute_horizontal_window(50, 0.0, 1200.0, 176.0, 18.0, 2),
             0..9
         );
-        // at scroll_x=1940 (item 10), first=10, last_excl=17 -> 8..19
         assert_eq!(
             compute_horizontal_window(50, 1940.0, 1200.0, 176.0, 18.0, 2),
             8..19
         );
-        // near tail
         assert_eq!(
             compute_horizontal_window(20, 3500.0, 1200.0, 176.0, 18.0, 2),
             16..20
@@ -2286,31 +3896,15 @@ mod tests {
 
     #[test]
     fn spotlight_trailer_prefers_direct_http_stream_over_youtube() {
-        let mut spot = HomeSpotlightCandidate {
-            id: "tt15239678".to_owned(),
-            r#type: "movie".to_owned(),
-            name: "Dune: Part Two".to_owned(),
-            video_id: None,
-            is_resume: false,
-            eyebrow: "FEATURED".to_owned(),
-            description: None,
-            year: None,
-            imdb_rating: None,
-            genres: vec![],
-            backdrop_url: None,
-            logo_url: None,
-            trailer_youtube_key: Some("Way9Dexny3w".to_owned()),
-            trailer_streams: vec![],
-        };
-
-        match resolve_spotlight_trailer_target(&spot) {
+        let mut streams = Vec::new();
+        match resolve_trailer_target(&streams, Some("Way9Dexny3w")) {
             Some(SpotlightTrailerTarget::YouTubeUrl(url)) => {
                 assert_eq!(url, "https://www.youtube.com/watch?v=Way9Dexny3w");
             }
             _ => panic!("expected YouTube trailer URL"),
         }
 
-        spot.trailer_streams.push(Stream {
+        streams.push(Stream {
             source: StreamSource::Url {
                 url: Url::parse("https://cdn.example/trailer.mp4").unwrap(),
             },
@@ -2322,8 +3916,159 @@ mod tests {
         });
 
         assert!(matches!(
-            resolve_spotlight_trailer_target(&spot),
+            resolve_trailer_target(&streams, Some("Way9Dexny3w")),
             Some(SpotlightTrailerTarget::DirectStream(_))
         ));
+    }
+
+    #[test]
+    fn hero_stage_height_and_fluid_padding_clamp_cleanly() {
+        assert_eq!(hero_stage_height_px(600.0), 460.0);
+        assert_eq!(hero_stage_height_px(900.0), 540.0);
+        assert_eq!(hero_stage_height_px(1440.0), 640.0);
+        assert_eq!(hero_stage_height_px(f32::NAN), 540.0);
+
+        assert_eq!(fluid_side_padding_px(640.0), 24.0);
+        assert_eq!(fluid_side_padding_px(1200.0), 36.0);
+        assert_eq!(fluid_side_padding_px(2560.0), 56.0);
+        assert_eq!(fluid_side_padding_px(f32::NAN), 32.0);
+    }
+
+    #[test]
+    fn hero_stage_mode_defaults_to_featured_when_cw_is_empty() {
+        assert_eq!(
+            resolve_hero_stage_mode(false, false, true),
+            HeroStageMode::Featured
+        );
+        assert_eq!(
+            resolve_hero_stage_mode(false, true, true),
+            HeroStageMode::ContinueWatching
+        );
+        assert_eq!(
+            resolve_hero_stage_mode(true, true, true),
+            HeroStageMode::Featured
+        );
+        assert_eq!(
+            resolve_hero_stage_mode(true, true, false),
+            HeroStageMode::ContinueWatching
+        );
+    }
+
+    #[test]
+    fn shelf_card_dimensions_adapt_to_card_density() {
+        let (w_compact, _, _) =
+            shelf_card_dimensions(PosterAspect::Portrait2x3, CardDensityChoice::Compact, 1.0);
+        let (w_comfy, _, _) =
+            shelf_card_dimensions(PosterAspect::Portrait2x3, CardDensityChoice::Comfortable, 1.0);
+        let (w_cinema, _, _) =
+            shelf_card_dimensions(PosterAspect::Portrait2x3, CardDensityChoice::Cinema, 1.0);
+
+        assert_eq!(w_compact, CardDensityChoice::Compact.target_poster_width_px());
+        assert_eq!(
+            w_comfy,
+            CardDensityChoice::Comfortable.target_poster_width_px()
+        );
+        assert_eq!(w_cinema, CardDensityChoice::Cinema.target_poster_width_px());
+        assert!(w_compact < w_comfy && w_comfy < w_cinema);
+    }
+
+    #[test]
+    fn board_snapshot_key_and_cw_eyebrow_behave_as_expected() {
+        let h1 = hash_string_slice(&["a".to_owned(), "b".to_owned()]);
+        let h2 = hash_string_slice(&["a".to_owned(), "b".to_owned()]);
+        let h3 = hash_string_slice(&["b".to_owned(), "a".to_owned()]);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+
+        let li = LibraryItem {
+            id: "tt0903747".to_owned(),
+            r#type: "series".to_owned(),
+            name: "Breaking Bad".to_owned(),
+            poster: None,
+            poster_shape: PosterShape::Poster,
+            removed: false,
+            temp: false,
+            ctime: None,
+            mtime: Default::default(),
+            state: LibraryItemState {
+                time_offset: 20 * 60_000,
+                duration: 50 * 60_000,
+                video_id: Some("tt0903747:1:1".to_owned()),
+                ..Default::default()
+            },
+            behavior_hints: Default::default(),
+        };
+        let eyebrow = format_hero_cw_eyebrow(&li, Some("S1 E1"), 0, 40.0);
+        assert_eq!(eyebrow, "CONTINUE WATCHING · S1 E1 · 30m left");
+    }
+
+    #[test]
+    fn hero_cw_and_featured_dock_dimensions_match_across_all_densities() {
+        for ui_scale in [1.0_f32, 1.15, 1.25] {
+            let mut prev_w = 0.0_f32;
+            for density in [
+                CardDensityChoice::Compact,
+                CardDensityChoice::Comfortable,
+                CardDensityChoice::Cinema,
+            ] {
+                let cw_dims =
+                    hero_dock_dimensions(HeroStageMode::ContinueWatching, density, ui_scale);
+                let featured_dims =
+                    hero_dock_dimensions(HeroStageMode::Featured, density, ui_scale);
+
+                assert_eq!(cw_dims, featured_dims);
+                assert_eq!(cw_dims.card_w, cw_filmstrip_card_width_px(density));
+                assert_eq!(cw_dims.card_h, (cw_dims.card_w * 9.0 / 16.0).ceil());
+                assert_eq!(cw_dims.scroll_h, cw_dims.card_h + 6.0);
+                assert_eq!(featured_dims.scroll_h, featured_dims.card_h + 6.0);
+                assert!(cw_dims.header_h >= 26.0 * ui_scale + 8.0);
+                assert_eq!(
+                    cw_dims.header_h + cw_dims.dock_gap + cw_dims.scroll_h,
+                    featured_dims.header_h + featured_dims.dock_gap + featured_dims.scroll_h
+                );
+                assert!(cw_dims.card_w > prev_w);
+                prev_w = cw_dims.card_w;
+            }
+        }
+    }
+
+    #[test]
+    fn featured_card_meta_lead_and_dock_scroll_target_behave_cleanly() {
+        assert_eq!(
+            format_featured_card_meta_lead(Some("2024"), Some("Sci-Fi"), "movie", true),
+            "2024"
+        );
+        assert_eq!(
+            format_featured_card_meta_lead(None, Some("Sci-Fi"), "movie", true),
+            "Sci-Fi"
+        );
+        assert_eq!(
+            format_featured_card_meta_lead(None, None, "series", true),
+            "Series"
+        );
+        assert_eq!(
+            format_featured_card_meta_lead(Some("2024"), Some("Drama"), "movie", false),
+            "2024 · Drama"
+        );
+        assert_eq!(
+            format_featured_card_meta_lead(None, None, "movie", false),
+            "Movie"
+        );
+
+        // Card already visible -> no scroll needed.
+        assert_eq!(
+            compute_dock_scroll_target_x(0.0, 800.0, 900.0, 2, 214.0, 12.0),
+            None
+        );
+        // Card beyond right edge -> scrolls right enough to reveal card.
+        assert_eq!(
+            compute_dock_scroll_target_x(0.0, 800.0, 600.0, 3, 214.0, 12.0),
+            Some(292.0)
+        );
+        // Card to the left of viewport -> scrolls back to card start.
+        assert_eq!(
+            compute_dock_scroll_target_x(300.0, 800.0, 600.0, 1, 214.0, 12.0),
+            Some(226.0)
+        );
     }
 }
