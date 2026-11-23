@@ -1812,7 +1812,7 @@ impl AppShell {
                     .get(item_idx)
                     .map(|c| (c.in_library, c.watched))
                     .unwrap_or((false, false));
-                let _ = shell.update(cx, |this, cx| match action {
+                shell.update(cx, |this, cx| match action {
                     PosterCardAction::Open | PosterCardAction::MiddleClick => {
                         this.open_meta_details(item.r#type.clone(), item.id.clone(), None, cx);
                     }

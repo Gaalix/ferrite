@@ -1960,7 +1960,7 @@ fn build_library_card_dispatcher(
             .as_ref()
             .and_then(|urls| urls.get(idx))
             .and_then(|u| u.as_deref());
-        let _ = shell.update(cx, |this, cx| match action {
+        shell.update(cx, |this, cx| match action {
             PosterCardAction::Open | PosterCardAction::MiddleClick => {
                 this.open_meta_details(
                     li.r#type.clone(),
@@ -2036,7 +2036,7 @@ fn build_library_toggle_watched_dispatcher(
         };
         let is_watched = cards_for_watch.get(idx).is_some_and(|c| c.watched);
         let next_watched = !is_watched;
-        let _ = shell.update(cx, |this, cx| {
+        shell.update(cx, |this, cx| {
             this.core
                 .mark_library_item_watched(li.id.clone(), next_watched);
             this.push_toast(

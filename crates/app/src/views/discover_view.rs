@@ -32,7 +32,7 @@ use stremio_core_runtime::{
 
 use crate::{
     icons::{svg_icon, svg_icon_weighted, IconName, IconWeight},
-    shell::AppShell,
+    shell::{AppShell, DiscoverUnwatchedCacheEntry},
     state::{
         extract_genres, extract_imdb_rating, AppRoute, BrowsingContextMenu, DiscoverCatalogOption,
         DiscoverDropdown, DiscoverViewMode, DiscoverViewSnapshot, FocusedInput, KbFocusableCard,
@@ -1908,9 +1908,11 @@ impl AppShell {
         let lib_rev = self.library_state_rev;
         let cached = {
             let guard = self.memoized_discover_unwatched.lock();
-            guard.as_ref().and_then(|(dr, lr, hw, indices, hidden)| {
-                (*dr == disc_rev && *lr == lib_rev && *hw == hide_watched)
-                    .then(|| (Arc::clone(indices), *hidden))
+            guard.as_ref().and_then(|entry| {
+                (entry.discover_rev == disc_rev
+                    && entry.library_rev == lib_rev
+                    && entry.hide_watched == hide_watched)
+                    .then(|| (Arc::clone(&entry.indices), entry.hidden_count))
             })
         };
         let (indices_arc, hidden) = match cached {
@@ -1918,8 +1920,13 @@ impl AppShell {
             None => {
                 let (indices, hidden) = filter_unwatched_indices(raw_items_arc, statuses_arc);
                 let indices_arc = Arc::new(indices);
-                *self.memoized_discover_unwatched.lock() =
-                    Some((disc_rev, lib_rev, hide_watched, Arc::clone(&indices_arc), hidden));
+                *self.memoized_discover_unwatched.lock() = Some(DiscoverUnwatchedCacheEntry {
+                    discover_rev: disc_rev,
+                    library_rev: lib_rev,
+                    hide_watched,
+                    indices: Arc::clone(&indices_arc),
+                    hidden_count: hidden,
+                });
                 (indices_arc, hidden)
             }
         };
@@ -2176,7 +2183,7 @@ impl AppShell {
                     let in_library = cards_for_dispatch
                         .get(item_idx)
                         .is_some_and(|c| c.in_library);
-                    let _ = shell.update(cx, |this, cx| match action {
+                    shell.update(cx, |this, cx| match action {
                         PosterCardAction::Open | PosterCardAction::MiddleClick => {
                             this.open_meta_details(it.r#type.clone(), it.id.clone(), None, cx);
                         }

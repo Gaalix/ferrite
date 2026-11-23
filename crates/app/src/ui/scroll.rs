@@ -350,8 +350,10 @@ impl Element for ScrollbarElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut style = Style::default();
-        style.position = Position::Absolute;
+        let style = Style {
+            position: Position::Absolute,
+            ..Default::default()
+        };
         let layout_id = window.request_layout(style, [], cx);
         (layout_id, ())
     }

@@ -303,6 +303,16 @@ impl Render for BackToTopView {
     }
 }
 
+/// Cached unwatched item index filter for the Discover grid.
+#[derive(Clone, Debug)]
+pub struct DiscoverUnwatchedCacheEntry {
+    pub discover_rev: u64,
+    pub library_rev: u64,
+    pub hide_watched: bool,
+    pub indices: Arc<Vec<usize>>,
+    pub hidden_count: usize,
+}
+
 pub struct AppShell {
     pub focus_handle: FocusHandle,
     pub tokio_handle: tokio::runtime::Handle,
@@ -353,8 +363,7 @@ pub struct AppShell {
     pub memoized_library_statuses: parking_lot::Mutex<(u64, Arc<HashMap<String, LibraryStatusTab>>)>,
     pub memoized_enriched_streams: Option<MemoizedEnrichedStreams>,
     pub memoized_discover_catalog: parking_lot::Mutex<Option<(u64, DiscoverViewSnapshot)>>,
-    pub memoized_discover_unwatched:
-        parking_lot::Mutex<Option<(u64, u64, bool, Arc<Vec<usize>>, usize)>>,
+    pub memoized_discover_unwatched: parking_lot::Mutex<Option<DiscoverUnwatchedCacheEntry>>,
     pub memoized_discover_cards: parking_lot::Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     pub discover_last_next_page_len: Cell<Option<usize>>,
     pub memoized_library_items: parking_lot::Mutex<Option<MemoizedLibraryView>>,

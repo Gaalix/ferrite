@@ -576,7 +576,7 @@ impl AppShell {
             });
 
         let preview_for_toggle = meta.preview.clone();
-        let resume_secs = resume_offset_for_library_item(library_item.as_ref(), &active_video_id);
+        let resume_secs = resume_offset_for_library_item(library_item.as_ref(), active_video_id);
         let lib_status = library_item.as_ref().and_then(classify_library_item_status);
         let is_watched = library_item
             .as_ref()
@@ -615,10 +615,10 @@ impl AppShell {
                     meta_preview: meta.preview.clone(),
                     meta_request: meta_request.clone(),
                     in_library,
-                    seasons: &seasons,
+                    seasons,
                     active_season,
                     episodes: season_episodes,
-                    active_video_id: &active_video_id,
+                    active_video_id,
                     series_runtime: runtime_display.as_deref(),
                     library_item: library_item.as_ref(),
                     watched: watched.as_ref(),
