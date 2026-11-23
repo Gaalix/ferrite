@@ -1,23 +1,40 @@
-use std::{cmp::Reverse, collections::HashSet, ops::Range, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
-use gpui::{div, img, prelude::*, px, rgb, rgba, Context, FontWeight, MouseButton, SharedString};
+use gpui::{
+    div, img, prelude::*, px, rgb, rgba, AnyElement, Context, ElementId, FontWeight, MouseButton,
+    MouseDownEvent, SharedString,
+};
 use stremio_core_runtime::{EditorialMediaHit, PersonFilmography};
 
 use crate::{
     icons::{svg_icon_weighted, IconName, IconWeight},
     shell::AppShell,
-    state::{AppRoute, KbFocusableCard, PersonDeptFilter},
-    theme::{
-        active_theme, editorial_serif, meta_divider, mono_font, neutral_chip, poster_card_shadow,
-        sentence_case_label, sp, ui_sans, RADIUS_CARD, RADIUS_PILL, RADIUS_POSTER,
+    state::{
+        AppRoute, BrowsingContextMenu, KbFocusableCard, LibraryStatusTab, PersonDeptFilter,
+        QuickPeekTarget,
     },
-    ui_components::{glass_back_button, glass_segmented_bar, glass_segmented_item},
-    views::search_view::{hit_target_id, person_initials},
-    virtual_grid::{compute_dynamic_grid_metrics, slice_row_items, PosterAspect},
+    theme::{
+        active_theme, editorial_serif, mono_font, poster_card_shadow, sentence_case_label, sp,
+        ui_sans, RADIUS_CARD, RADIUS_PILL, RADIUS_POSTER,
+    },
+    ui::{
+        choice_pill, compute_app_grid_metrics, glass_segmented_bar, glass_segmented_item,
+        meta_divider, neutral_chip, page_container, render_empty_state, render_page_header,
+        render_poster_card, render_section_header, EmptyStateProps, PageHeader, PageWidth,
+        PosterCardProps, PosterMetrics, SectionHeader,
+    },
+    views::search_view::{
+        editorial_hit_to_meta_preview, hit_library_status, hit_target_id, person_initials,
+    },
+    virtual_grid::{slice_row_items, PosterAspect},
 };
 
 const BIO_COLLAPSE_CHARS: usize = 340;
-const GRID_METADATA_HEIGHT_PX: f32 = 52.0;
 
 fn truncate_bio_at_word_boundary(bio: &str, max_chars: usize) -> (String, bool) {
     let trimmed = bio.trim();
@@ -181,6 +198,100 @@ fn filter_and_sort_person_credits(
 }
 
 impl AppShell {
+    #[allow(clippy::too_many_arguments)]
+    fn render_person_credit_card(
+        &self,
+        element_id: impl Into<ElementId>,
+        hit: &EditorialMediaHit,
+        subtitle: Option<SharedString>,
+        image_height_px: f32,
+        library_statuses: &HashMap<String, LibraryStatusTab>,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let target_id = hit_target_id(hit);
+        let lib_status = hit_library_status(hit, library_statuses);
+        let in_library = lib_status.is_some();
+        let is_watched = lib_status == Some(LibraryStatusTab::Watched);
+        let poster_tex = hit
+            .poster_url
+            .as_deref()
+            .and_then(|u| self.poster_cache.resolve_poster_image(u));
+        let preview = editorial_hit_to_meta_preview(hit);
+
+        let open_type = hit.media_type.clone();
+        let open_id = target_id.clone();
+        let play_type = hit.media_type.clone();
+        let play_id = target_id.clone();
+        let toggle_preview = preview.clone();
+        let peek_type = hit.media_type.clone();
+        let peek_id = target_id.clone();
+        let peek_title = hit.title.clone();
+        let peek_preview = preview.clone();
+        let ctx_type = hit.media_type.clone();
+        let ctx_id = target_id.clone();
+        let ctx_title = hit.title.clone();
+        let ctx_preview = preview;
+        let hover_type = hit.media_type.clone();
+        let hover_id = target_id.clone();
+        let hover_bg = hit.backdrop_url.clone();
+
+        let props = PosterCardProps::new(element_id, hit.title.clone(), target_id)
+            .subtitle(subtitle)
+            .image(poster_tex)
+            .aspect(PosterAspect::Portrait2x3)
+            .image_height_px(Some(image_height_px))
+            .status_tab(lib_status)
+            .imdb_rating(hit.imdb_rating.clone().map(SharedString::from))
+            .in_library(in_library)
+            .is_focused(is_focused)
+            .on_open(cx.listener(move |this, _, _, cx| {
+                this.open_editorial_media_hit(open_type.clone(), open_id.clone(), None, cx);
+            }))
+            .on_quick_play(cx.listener(move |this, _, _, cx| {
+                this.trigger_editorial_quick_play(play_type.clone(), play_id.clone(), cx);
+            }))
+            .on_toggle_library(cx.listener(move |this, _, _, cx| {
+                this.core.toggle_library_item(toggle_preview.clone());
+                cx.notify();
+            }))
+            .on_quick_peek(cx.listener(move |this, _, _, cx| {
+                this.open_quick_peek(
+                    QuickPeekTarget {
+                        type_name: peek_type.clone(),
+                        id: peek_id.clone(),
+                        video_id: None,
+                        title: peek_title.clone(),
+                        preview: Some(peek_preview.clone()),
+                    },
+                    cx,
+                );
+            }))
+            .on_context_menu(cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                let menu = BrowsingContextMenu::new(
+                    ev.position,
+                    ctx_type.clone(),
+                    ctx_id.clone(),
+                    ctx_title.clone(),
+                )
+                .preview(Some(ctx_preview.clone()))
+                .is_in_library(in_library)
+                .is_watched(is_watched);
+                this.open_browsing_context_menu(menu, cx);
+            }))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.on_card_hover_prefetch(
+                    &hover_type,
+                    &hover_id,
+                    hover_bg.as_deref(),
+                    *hovered,
+                    cx,
+                );
+            }));
+
+        render_poster_card(props)
+    }
+
     pub fn render_person_view(
         &mut self,
         _route_person_key: &str,
@@ -243,23 +354,14 @@ impl AppShell {
 
         let total_credits = credits.len();
         let viewport_w = self.viewport_size_px.0;
-        let side_pad = if viewport_w.is_finite() && viewport_w > 0.0 {
-            (viewport_w * 0.03).clamp(24.0, 56.0)
-        } else {
-            32.0
-        };
-        let grid_gap = t.density.grid_gap_px() * t.ui_scale;
-        let metrics = compute_dynamic_grid_metrics(
+        let poster = PosterMetrics::from_theme(&t);
+        let grid_gap = poster.gap_px;
+        let metrics = compute_app_grid_metrics(
             total_credits,
             viewport_w,
             0.0,
-            side_pad * 2.0,
-            None,
-            t.density.target_poster_width_px() * t.ui_scale,
-            grid_gap,
-            grid_gap,
-            GRID_METADATA_HEIGHT_PX * t.ui_scale,
             PosterAspect::Portrait2x3,
+            &t,
         );
         let columns = metrics.columns;
         let row_count = metrics.layout.row_count;
@@ -297,36 +399,38 @@ impl AppShell {
             format!("{total_credits} credits")
         };
 
+        let raw_credit_badge = (total_raw_credits > 0).then(|| {
+            SharedString::from(if total_raw_credits == 1 {
+                "1 credit".to_owned()
+            } else {
+                format!("{total_raw_credits} credits")
+            })
+        });
+
         div()
             .id("person-view-scroll")
             .track_scroll(&self.person_scroll_handle)
             .size_full()
             .overflow_y_scroll()
             .child(
-                div()
-                    .w_full()
-                    .px(px(side_pad))
-                    .pt(sp(16.0))
-                    .pb(sp(72.0))
-                    .flex()
-                    .flex_col()
-                    .gap(sp(28.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(glass_back_button(
+                page_container(PageWidth::Wide, viewport_w)
+                    .child(render_page_header(
+                        PageHeader::new(display_name.clone())
+                            .back_button(
                                 "person-view-back",
                                 "Back",
                                 cx.listener(|this, _, _, cx| {
                                     this.navigate_back(cx);
                                 }),
-                            ))
-                            .when(self.person_loading, |el| {
-                                el.child(neutral_chip("Loading filmography..."))
-                            }),
-                    )
+                            )
+                            .count_badge(raw_credit_badge)
+                            .subtitle(Some(department.clone().into()))
+                            .right_slot(
+                                self.person_loading.then(|| {
+                                    neutral_chip("Loading filmography...").into_any_element()
+                                }),
+                            ),
+                    ))
                     .child(
                         div()
                             .p(sp(24.0))
@@ -372,14 +476,6 @@ impl AppShell {
                                     .flex()
                                     .flex_col()
                                     .gap(sp(10.0))
-                                    .child(
-                                        div()
-                                            .font(editorial_serif())
-                                            .text_size(sp(40.0))
-                                            .line_height(gpui::relative(1.06))
-                                            .text_color(rgb(t.text_primary))
-                                            .child(display_name.clone()),
-                                    )
                                     .child(
                                         div()
                                             .flex()
@@ -478,97 +574,72 @@ impl AppShell {
                             ),
                     )
                     .when(total_raw_credits > 0, |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .justify_between()
-                                .gap(sp(14.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_baseline()
-                                        .gap(sp(12.0))
-                                        .child(
-                                            div()
-                                                .font(editorial_serif())
-                                                .text_size(sp(26.0))
-                                                .text_color(rgb(t.text_primary))
-                                                .child("Filmography"),
-                                        )
-                                        .child(neutral_chip(credit_count_label)),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .gap(sp(10.0))
-                                        .child(glass_segmented_bar("person-dept-filter").children(
-                                            PersonDeptFilter::ALL.into_iter().enumerate().map(
-                                                |(idx, dept)| {
-                                                    glass_segmented_item(
-                                                        ("person-dept-item", idx),
-                                                        dept.label(),
-                                                        dept_filter == dept,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            if this.person_department_filter != dept
-                                                            {
-                                                                this.person_department_filter =
-                                                                    dept;
-                                                                this.kb_focus_index = None;
-                                                                this.person_credits_scroll
-                                                                    .scroll_to_item(
-                                                                        0,
-                                                                        gpui::ScrollStrategy::Top,
-                                                                    );
-                                                                cx.notify();
-                                                            }
-                                                        }),
-                                                    )
-                                                },
-                                            ),
-                                        ))
-                                        .child(
-                                            glass_segmented_bar("person-sort-bar")
-                                                .child(glass_segmented_item(
-                                                    "person-sort-popularity",
-                                                    "Popularity",
-                                                    !sort_recent,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        if this.person_sort_recent {
-                                                            this.person_sort_recent = false;
-                                                            this.kb_focus_index = None;
-                                                            this.person_credits_scroll
-                                                                .scroll_to_item(
-                                                                    0,
-                                                                    gpui::ScrollStrategy::Top,
-                                                                );
-                                                            cx.notify();
-                                                        }
-                                                    }),
-                                                ))
-                                                .child(glass_segmented_item(
-                                                    "person-sort-newest",
-                                                    "Newest",
-                                                    sort_recent,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        if !this.person_sort_recent {
-                                                            this.person_sort_recent = true;
-                                                            this.kb_focus_index = None;
-                                                            this.person_credits_scroll
-                                                                .scroll_to_item(
-                                                                    0,
-                                                                    gpui::ScrollStrategy::Top,
-                                                                );
-                                                            cx.notify();
-                                                        }
-                                                    }),
-                                                )),
-                                        ),
-                                ),
-                        )
+                        let filmography_controls = div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(sp(10.0))
+                            .child(glass_segmented_bar("person-dept-filter").children(
+                                PersonDeptFilter::ALL.into_iter().enumerate().map(|(idx, dept)| {
+                                    glass_segmented_item(
+                                        ("person-dept-item", idx),
+                                        dept.label(),
+                                        dept_filter == dept,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if this.person_department_filter != dept {
+                                                this.person_department_filter = dept;
+                                                this.kb_focus_index = None;
+                                                this.person_credits_scroll.scroll_to_item(
+                                                    0,
+                                                    gpui::ScrollStrategy::Top,
+                                                );
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                                }),
+                            ))
+                            .child(
+                                glass_segmented_bar("person-sort-bar")
+                                    .child(glass_segmented_item(
+                                        "person-sort-popularity",
+                                        "Popularity",
+                                        !sort_recent,
+                                        cx.listener(|this, _, _, cx| {
+                                            if this.person_sort_recent {
+                                                this.person_sort_recent = false;
+                                                this.kb_focus_index = None;
+                                                this.person_credits_scroll.scroll_to_item(
+                                                    0,
+                                                    gpui::ScrollStrategy::Top,
+                                                );
+                                                cx.notify();
+                                            }
+                                        }),
+                                    ))
+                                    .child(glass_segmented_item(
+                                        "person-sort-newest",
+                                        "Newest",
+                                        sort_recent,
+                                        cx.listener(|this, _, _, cx| {
+                                            if !this.person_sort_recent {
+                                                this.person_sort_recent = true;
+                                                this.kb_focus_index = None;
+                                                this.person_credits_scroll.scroll_to_item(
+                                                    0,
+                                                    gpui::ScrollStrategy::Top,
+                                                );
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )),
+                            );
+
+                        el.child(render_section_header(
+                            SectionHeader::new("Filmography")
+                                .count_badge(Some(credit_count_label.into()))
+                                .right_slot(Some(filmography_controls.into_any_element())),
+                        ))
                     })
                     .when(total_credits > 0, |el| {
                         el.child(
@@ -615,7 +686,7 @@ impl AppShell {
                                                                     .min_w(px(0.0))
                                                                     .h_full()
                                                                     .child(
-                                                                        this.render_editorial_poster_card(
+                                                                        this.render_person_credit_card(
                                                                             ("person-credit-card", item_idx),
                                                                             hit,
                                                                             sub,
@@ -642,80 +713,37 @@ impl AppShell {
                         )
                     })
                     .when(total_credits == 0 && total_raw_credits > 0, |el| {
-                        el.child(
-                            div()
-                                .p(sp(28.0))
-                                .rounded(px(RADIUS_CARD))
-                                .bg(rgba(t.glass_card_bg))
-                                .border_1()
-                                .border_color(rgba(t.glass_border))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(sp(16.0))
-                                .child(
-                                    div()
-                                        .text_size(sp(14.0))
-                                        .text_color(rgb(t.text_secondary))
-                                        .child(format!(
-                                            "No {} credits matched for {}.",
-                                            dept_filter.label().to_ascii_lowercase(),
-                                            display_name
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .id("person-filter-reset")
-                                        .cursor_pointer()
-                                        .h(sp(32.0))
-                                        .px(sp(14.0))
-                                        .rounded(px(RADIUS_PILL))
-                                        .bg(rgba(t.glass_trough_bg))
-                                        .border_1()
-                                        .border_color(rgba(t.glass_border))
-                                        .hover(move |s| {
-                                            s.bg(rgba(t.glass_row_hover_bg))
-                                                .border_color(rgba(t.glass_border_strong))
-                                        })
-                                        .flex()
-                                        .items_center()
-                                        .font(ui_sans(FontWeight::MEDIUM))
-                                        .text_size(sp(12.5))
-                                        .text_color(rgb(t.text_primary))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.person_department_filter =
-                                                    PersonDeptFilter::All;
-                                                this.kb_focus_index = None;
-                                                this.person_credits_scroll.scroll_to_item(
-                                                    0,
-                                                    gpui::ScrollStrategy::Top,
-                                                );
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .child("Show all credits"),
-                                ),
-                        )
+                        let dept_lower = dept_filter.label().to_ascii_lowercase();
+                        el.child(render_empty_state(
+                            EmptyStateProps::new(
+                                IconName::Sliders,
+                                format!("No {dept_lower} credits"),
+                                format!("No {dept_lower} credits matched for {display_name}."),
+                            )
+                            .action(choice_pill(
+                                "person-filter-reset",
+                                "Show all credits",
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.person_department_filter = PersonDeptFilter::All;
+                                    this.kb_focus_index = None;
+                                    this.person_credits_scroll
+                                        .scroll_to_item(0, gpui::ScrollStrategy::Top);
+                                    cx.notify();
+                                }),
+                            )),
+                        ))
                     })
                     .when(!self.person_loading && total_raw_credits == 0, |el| {
-                        el.child(
-                            div()
-                                .p(sp(28.0))
-                                .rounded(px(RADIUS_CARD))
-                                .bg(rgba(t.glass_card_bg))
-                                .border_1()
-                                .border_color(rgba(t.glass_border))
-                                .text_size(sp(14.0))
-                                .text_color(rgb(t.text_secondary))
-                                .child(if has_tmdb {
-                                    "No filmography credits returned for this person."
-                                } else {
-                                    "No cached titles matched locally yet. Filmographies populate automatically from browsed catalogs, or configure a TMDB API key in Settings -> Integrations & Keys for complete credits."
-                                }),
-                        )
+                        el.child(render_empty_state(EmptyStateProps::new(
+                            IconName::Film,
+                            "No filmography credits",
+                            if has_tmdb {
+                                "No filmography credits returned for this person."
+                            } else {
+                                "No cached titles matched locally yet. Filmographies populate automatically from browsed catalogs, or configure a TMDB API key in Settings -> Integrations & Keys for complete credits."
+                            },
+                        )))
                     }),
             )
     }

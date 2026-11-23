@@ -39,15 +39,17 @@ use crate::{
     theme::{
         active_theme, compact_audio_badge, compact_codec_badge, compact_hdr_badge, editorial_serif,
         estimate_bitrate_mbps, format_bitrate_mbps, format_episode_air_date,
-        format_timestamp_secs, glass_capsule_shadow, mono_font, parse_runtime_minutes,
-        placeholder_tint_for_id, poster_card_shadow, semantic_status_pill, sentence_case_label, sp,
-        summarize_stream_for_humans, tabular_nums, ui_sans, ThemePalette, RADIUS_CARD,
-        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        format_timestamp_secs, mono_font, parse_runtime_minutes, placeholder_tint_for_id,
+        poster_card_shadow, sentence_case_label, sp, summarize_stream_for_humans, tabular_nums,
+        ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
-    ui_components::{
-        glass_back_button, glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar,
-        glass_segmented_item, primary_accent_button, render_poster_card, render_stream_source_row,
-        secondary_glass_button, PosterCardProps, StreamSourceRowProps,
+    ui::{
+        dropdown_trigger, glass_back_button, glass_dropdown_option, glass_dropdown_panel,
+        glass_segmented_bar, glass_segmented_item, page_gutter_px, primary_accent_button,
+        render_empty_state, render_poster_card, render_section_header, render_stream_source_row,
+        secondary_glass_button, semantic_status_pill, DropdownTriggerProps, EmptyStateProps,
+        PosterCardProps, PosterMetrics, SectionHeader, StreamSourceRowProps,
+        PAGE_PADDING_BOTTOM_PX, PAGE_SECTION_GAP_PX,
     },
     views::search_view::person_initials,
     virtual_grid::PosterAspect,
@@ -67,14 +69,6 @@ const HERO_GLASS_HOVER_BG: u32 = 0xFFFFFF24;
 const HERO_GLASS_BORDER: u32 = 0xFFFFFF26;
 const HERO_GLASS_BORDER_STRONG: u32 = 0xFFFFFF42;
 const HERO_DIVIDER: u32 = 0xFFFFFF24;
-
-#[inline]
-fn meta_side_padding_px(viewport_w: f32) -> f32 {
-    if !viewport_w.is_finite() || viewport_w <= 0.0 {
-        return 32.0;
-    }
-    (viewport_w * 0.03).clamp(24.0, 56.0)
-}
 
 struct MetaDetailsSnapshot {
     meta: MetaItem,
@@ -407,7 +401,7 @@ impl AppShell {
             .collect();
 
         let t = active_theme();
-        let side_pad = meta_side_padding_px(self.viewport_size_px.0);
+        let side_pad = page_gutter_px(self.viewport_size_px.0);
 
         let ResolvedMetaHeroImages {
             preblurred_backdrop,
@@ -912,10 +906,10 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .pb(sp(72.0))
+                    .pb(sp(PAGE_PADDING_BOTTOM_PX))
                     .flex()
                     .flex_col()
-                    .gap(sp(36.0))
+                    .gap(sp(PAGE_SECTION_GAP_PX))
                     .child(Self::render_hero_backdrop_shell(
                         &meta.preview.id,
                         preblurred_backdrop,
@@ -1146,25 +1140,11 @@ impl AppShell {
             .flex()
             .flex_col()
             .gap(sp(14.0))
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(sp(26.0))
-                            .text_color(rgb(t.text_primary))
-                            .child("Cast & Crew"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(t.text_muted))
-                            .child("Click any person for filmography"),
-                    ),
-            )
+            .child(render_section_header(
+                SectionHeader::new("Cast & Crew").subtitle(Some(SharedString::new_static(
+                    "Click any person for filmography",
+                ))),
+            ))
             .child(
                 div()
                     .id("meta-cast-rail")
@@ -1298,26 +1278,11 @@ impl AppShell {
                     .flex()
                     .flex_col()
                     .gap(sp(12.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .font(editorial_serif())
-                                    .text_size(sp(26.0))
-                                    .text_color(rgb(t.text_primary))
-                                    .child(heading),
-                            )
-                            .child(
-                                div()
-                                    .font(mono_font())
-                                    .text_xs()
-                                    .text_color(rgb(t.text_muted))
-                                    .child("Loading collection..."),
-                            ),
-                    )
+                    .child(render_section_header(
+                        SectionHeader::new(heading).count_badge(Some(SharedString::new_static(
+                            "Loading collection...",
+                        ))),
+                    ))
                     .into_any_element(),
             );
         }
@@ -1354,9 +1319,10 @@ impl AppShell {
         t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let card_w = (t.density.target_poster_width_px() * 0.94 * t.ui_scale).clamp(136.0, 224.0);
-        let card_h = card_w * 1.5;
-        let rail_gap = t.density.grid_gap_px() * t.ui_scale;
+        let poster_metrics = PosterMetrics::from_theme(&t);
+        let card_w = poster_metrics.card_width_px;
+        let card_h = poster_metrics.image_height_px(PosterAspect::Portrait2x3);
+        let rail_gap = poster_metrics.gap_px;
 
         div()
             .id(section_id)
@@ -1366,29 +1332,9 @@ impl AppShell {
             .flex()
             .flex_col()
             .gap(sp(14.0))
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .gap(sp(12.0))
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(sp(26.0))
-                            .text_color(rgb(t.text_primary))
-                            .child(heading),
-                    )
-                    .when_some(right_badge, |el, badge| {
-                        el.child(
-                            div()
-                                .font(mono_font())
-                                .text_xs()
-                                .text_color(rgb(t.text_muted))
-                                .child(badge),
-                        )
-                    }),
-            )
+            .child(render_section_header(
+                SectionHeader::new(heading).count_badge(right_badge),
+            ))
             .child(
                 div()
                     .id(rail_id)
@@ -1527,11 +1473,22 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = active_theme();
-        let side_pad = meta_side_padding_px(self.viewport_size_px.0);
+        let side_pad = page_gutter_px(self.viewport_size_px.0);
         let status_text = if is_meta_loading {
             format!("Loading details and streams for {route_type}...")
         } else {
             format!("No metadata addon returned details for {route_id}.")
+        };
+
+        let empty_icon = if is_meta_loading {
+            IconName::Sparkles
+        } else {
+            IconName::Info
+        };
+        let empty_title = if is_meta_loading {
+            "Loading title details"
+        } else {
+            "Details unavailable"
         };
 
         let Some(preview) = cached_preview else {
@@ -1544,10 +1501,10 @@ impl AppShell {
                         .w_full()
                         .px(px(side_pad))
                         .pt(sp(84.0))
-                        .pb(sp(32.0))
+                        .pb(sp(PAGE_PADDING_BOTTOM_PX))
                         .flex()
                         .flex_col()
-                        .gap(sp(20.0))
+                        .gap(sp(PAGE_SECTION_GAP_PX))
                         .child(div().flex().child(glass_back_button(
                             "btn-details-back",
                             "Back",
@@ -1555,18 +1512,11 @@ impl AppShell {
                                 this.navigate_back(cx);
                             }),
                         )))
-                        .child(
-                            div()
-                                .p(sp(32.0))
-                                .rounded(px(RADIUS_CARD))
-                                .bg(rgba(t.glass_card_bg))
-                                .border_1()
-                                .border_color(rgba(t.glass_border))
-                                .font(editorial_serif())
-                                .text_size(sp(28.0))
-                                .text_color(rgb(t.text_secondary))
-                                .child(status_text),
-                        ),
+                        .child(render_empty_state(EmptyStateProps::new(
+                            empty_icon,
+                            empty_title,
+                            status_text,
+                        ))),
                 )
                 .into_any_element();
         };
@@ -1688,10 +1638,10 @@ impl AppShell {
             .child(
                 div()
                     .w_full()
-                    .pb(sp(72.0))
+                    .pb(sp(PAGE_PADDING_BOTTOM_PX))
                     .flex()
                     .flex_col()
-                    .gap(sp(36.0))
+                    .gap(sp(PAGE_SECTION_GAP_PX))
                     .child(Self::render_hero_backdrop_shell(
                         &preview.id,
                         preblurred_backdrop,
@@ -1708,18 +1658,11 @@ impl AppShell {
                             .w_full()
                             .flex_shrink_0()
                             .px(px(side_pad))
-                            .child(
-                                div()
-                                    .p(sp(32.0))
-                                    .rounded(px(RADIUS_CARD))
-                                    .bg(rgba(t.glass_card_bg))
-                                    .border_1()
-                                    .border_color(rgba(t.glass_border))
-                                    .font(editorial_serif())
-                                    .text_size(sp(24.0))
-                                    .text_color(rgb(t.text_secondary))
-                                    .child(status_text),
-                            ),
+                            .child(render_empty_state(EmptyStateProps::new(
+                                empty_icon,
+                                empty_title,
+                                status_text,
+                            ))),
                     ),
             )
             .into_any_element()
@@ -1804,56 +1747,39 @@ impl AppShell {
             panel = panel.w_full();
         }
 
-        panel
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap(sp(12.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .gap(sp(10.0))
-                            .child(
-                                div()
-                                    .font(editorial_serif())
-                                    .text_size(sp(30.0))
-                                    .text_color(rgb(t.text_primary))
-                                    .child(season_heading),
-                            )
-                            .child(
-                                div()
-                                    .font(mono_font())
-                                    .text_xs()
-                                    .text_color(rgb(t.text_muted))
-                                    .child(format!("{ep_count} episodes")),
-                            ),
-                    )
-                    .when_some(active_season.filter(|_| ep_count > 0), |hdr, season_num| {
-                        hdr.child(secondary_glass_button(
-                            "meta-btn-mark-season-watched",
-                            Some(if all_season_watched {
-                                IconName::Check
-                            } else {
-                                IconName::Eye
-                            }),
-                            if all_season_watched {
-                                "Season watched"
-                            } else {
-                                "Mark season watched"
-                            },
-                            all_season_watched,
-                            cx.listener(move |this, _, _, cx| {
-                                this.core
-                                    .mark_season_watched(season_num, !all_season_watched);
-                                cx.notify();
-                            }),
-                        ))
-                    }),
+        let ep_badge = SharedString::from(format!(
+            "{ep_count} {}",
+            if ep_count == 1 { "episode" } else { "episodes" }
+        ));
+        let mark_season_btn = active_season.filter(|_| ep_count > 0).map(|season_num| {
+            secondary_glass_button(
+                "meta-btn-mark-season-watched",
+                Some(if all_season_watched {
+                    IconName::Check
+                } else {
+                    IconName::Eye
+                }),
+                if all_season_watched {
+                    "Season watched"
+                } else {
+                    "Mark season watched"
+                },
+                all_season_watched,
+                cx.listener(move |this, _, _, cx| {
+                    this.core
+                        .mark_season_watched(season_num, !all_season_watched);
+                    cx.notify();
+                }),
             )
+            .into_any_element()
+        });
+
+        panel
+            .child(render_section_header(
+                SectionHeader::new(season_heading)
+                    .count_badge(Some(ep_badge))
+                    .right_slot(mark_season_btn),
+            ))
             .child(
                 div()
                     .id("season-pills-scroll")
@@ -1890,19 +1816,11 @@ impl AppShell {
                     ),
             )
             .child(if ep_count == 0 {
-                div()
-                    .w_full()
-                    .h(px(list_height_px))
-                    .rounded(px(RADIUS_CARD))
-                    .bg(rgba(t.glass_card_bg))
-                    .border_1()
-                    .border_color(rgba(t.glass_border))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .text_color(rgb(t.text_muted))
-                    .child("No episodes listed for this season.")
+                render_empty_state(EmptyStateProps::new(
+                    IconName::Tv,
+                    "No episodes listed",
+                    "No episodes were returned for this season.",
+                ))
                     .into_any_element()
             } else {
                 div()
@@ -2501,382 +2419,269 @@ impl AppShell {
         let addon_filter_active = !self.stream_filter.selected_addons.is_empty();
         let addon_dropdown_open = self.meta_addon_dropdown_open;
 
+        let ep_inline_badge = episode_label.clone().map(|ep| {
+            div()
+                .flex_shrink_0()
+                .px(sp(8.0))
+                .py(sp(2.5))
+                .rounded(px(RADIUS_PILL))
+                .bg(rgba(t.accent_soft))
+                .border_1()
+                .border_color(rgba(t.border_accent))
+                .font(mono_font())
+                .text_size(sp(11.5))
+                .text_color(rgb(accent_ink))
+                .child(ep)
+                .into_any_element()
+        });
+        let streams_count_badge = SharedString::from(format!(
+            "{filtered_total} of {total_unfiltered} ({addons_ready}/{addons_total} addons)"
+        ));
+
+        let stream_controls_bar = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(sp(8.0))
+            .child(
+                glass_segmented_bar("meta-stream-filter-bar")
+                    .child(glass_segmented_item(
+                        "stream-filter-all",
+                        "All",
+                        all_res_active,
+                        cx.listener(|this, _, _, cx| {
+                            this.stream_filter.resolutions.clear();
+                            this.stream_filter.hdr_only = false;
+                            this.expanded_stream_rows.clear();
+                            this.visible_stream_limit = STREAM_PAGE_SIZE;
+                            cx.notify();
+                        }),
+                    ))
+                    .children(StreamResolutionChoice::ALL.into_iter().enumerate().map(
+                        |(idx, res)| {
+                            let active = !self.stream_filter.hdr_only
+                                && self.stream_filter.resolutions.len() == 1
+                                && self.stream_filter.resolutions.contains(&res);
+                            glass_segmented_item(
+                                ("stream-filter-res", idx),
+                                res.label(),
+                                active,
+                                cx.listener(move |this, _, _, cx| {
+                                    let is_sole_active = !this.stream_filter.hdr_only
+                                        && this.stream_filter.resolutions.len() == 1
+                                        && this.stream_filter.resolutions.contains(&res);
+                                    if is_sole_active {
+                                        this.stream_filter.resolutions.clear();
+                                    } else {
+                                        this.stream_filter.resolutions.clear();
+                                        this.stream_filter.resolutions.insert(res);
+                                        this.stream_filter.hdr_only = false;
+                                    }
+                                    this.expanded_stream_rows.clear();
+                                    this.visible_stream_limit = STREAM_PAGE_SIZE;
+                                    cx.notify();
+                                }),
+                            )
+                        },
+                    ))
+                    .child(glass_segmented_item(
+                        "stream-filter-hdr",
+                        "HDR",
+                        self.stream_filter.hdr_only,
+                        cx.listener(|this, _, _, cx| {
+                            this.stream_filter.hdr_only = !this.stream_filter.hdr_only;
+                            if this.stream_filter.hdr_only {
+                                this.stream_filter.resolutions.clear();
+                            }
+                            this.expanded_stream_rows.clear();
+                            this.visible_stream_limit = STREAM_PAGE_SIZE;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .when(has_debrid, |bar| {
+                bar.child(render_compact_glass_toggle(
+                    "stream-filter-cached",
+                    "Cached",
+                    Some((
+                        IconName::Zap,
+                        if self.stream_filter.cached_only {
+                            IconWeight::Fill
+                        } else {
+                            IconWeight::Regular
+                        },
+                    )),
+                    self.stream_filter.cached_only,
+                    t,
+                    cx.listener(|this, _, _, cx| {
+                        this.stream_filter.cached_only = !this.stream_filter.cached_only;
+                        this.expanded_stream_rows.clear();
+                        this.visible_stream_limit = STREAM_PAGE_SIZE;
+                        cx.notify();
+                    }),
+                ))
+            })
+            .when(!available_addons_arc.is_empty(), |bar| {
+                let addons_for_menu = Arc::clone(&available_addons_arc);
+                bar.child(
+                    div()
+                        .relative()
+                        .child(dropdown_trigger(
+                            DropdownTriggerProps::new(
+                                "stream-addon-dropdown-btn",
+                                addon_label,
+                                addon_dropdown_open,
+                                cx.listener(|this, _, _, cx| {
+                                    this.meta_addon_dropdown_open = !this.meta_addon_dropdown_open;
+                                    cx.notify();
+                                }),
+                            )
+                            .leading_icon(Some(IconName::Layers))
+                            .is_active(addon_filter_active),
+                        ))
+                        .when(addon_dropdown_open, |wrap| {
+                            wrap.child(
+                                gpui::deferred(
+                                    glass_dropdown_panel("stream-addon-dropdown-menu", 292.0)
+                                        .absolute()
+                                        .top(sp(42.0))
+                                        .right_0()
+                                        .child(
+                                            div()
+                                                .id("stream-addon-dropdown-scroll")
+                                                .w_full()
+                                                .max_h(sp(320.0))
+                                                .overflow_y_scroll()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(sp(2.0))
+                                                .child(glass_dropdown_option(
+                                                    "stream-addon-opt-all",
+                                                    "All addons",
+                                                    Some(SharedString::from(format!(
+                                                        "{total_unfiltered} streams"
+                                                    ))),
+                                                    !addon_filter_active,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.stream_filter.selected_addons.clear();
+                                                        this.expanded_stream_rows.clear();
+                                                        this.visible_stream_limit =
+                                                            STREAM_PAGE_SIZE;
+                                                        this.meta_addon_dropdown_open = false;
+                                                        cx.notify();
+                                                    }),
+                                                ))
+                                                .children(
+                                                    addons_for_menu
+                                                        .iter()
+                                                        .cloned()
+                                                        .enumerate()
+                                                        .map(|(a_idx, (a_key, a_name, count))| {
+                                                            let selected = self
+                                                                .stream_filter
+                                                                .is_addon_selected(&a_key);
+                                                            glass_dropdown_option(
+                                                                ("stream-addon-opt", a_idx),
+                                                                a_name,
+                                                                Some(SharedString::from(format!(
+                                                                    "{count} streams"
+                                                                ))),
+                                                                selected,
+                                                                cx.listener(move |this, _, _, cx| {
+                                                                    this.stream_filter
+                                                                        .toggle_addon(&a_key);
+                                                                    this.expanded_stream_rows
+                                                                        .clear();
+                                                                    this.visible_stream_limit =
+                                                                        STREAM_PAGE_SIZE;
+                                                                    cx.notify();
+                                                                }),
+                                                            )
+                                                        }),
+                                                ),
+                                        ),
+                                )
+                                .with_priority(10),
+                            )
+                        }),
+                )
+            })
+            .when(!is_unfiltered, |bar| {
+                bar.child(render_compact_glass_toggle(
+                    "stream-filter-reset",
+                    "Reset",
+                    Some((IconName::X, IconWeight::Regular)),
+                    false,
+                    t,
+                    cx.listener(|this, _, _, cx| {
+                        this.stream_filter.reset();
+                        this.meta_addon_dropdown_open = false;
+                        this.expanded_stream_rows.clear();
+                        this.visible_stream_limit = STREAM_PAGE_SIZE;
+                        cx.notify();
+                    }),
+                ))
+            });
+
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap(sp(16.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap(sp(12.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_baseline()
-                            .gap(sp(10.0))
-                            .child(
-                                div()
-                                    .font(editorial_serif())
-                                    .text_size(sp(30.0))
-                                    .text_color(rgb(t.text_primary))
-                                    .child("Sources"),
-                            )
-                            .when_some(episode_label.clone(), |el, ep| {
-                                el.child(
-                                    div()
-                                        .font(mono_font())
-                                        .text_xs()
-                                        .text_color(rgb(accent_ink))
-                                        .child(ep),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .font(mono_font())
-                                    .font_features(tabular_nums())
-                                    .text_xs()
-                                    .text_color(rgb(t.text_muted))
-                                    .child(format!(
-                                        "{filtered_total} of {total_unfiltered} ({addons_ready}/{addons_total} addons)"
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(sp(8.0))
-                            .child(
-                                glass_segmented_bar("meta-stream-filter-bar")
-                                    .child(glass_segmented_item(
-                                        "stream-filter-all",
-                                        "All",
-                                        all_res_active,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.stream_filter.resolutions.clear();
-                                            this.stream_filter.hdr_only = false;
-                                            this.expanded_stream_rows.clear();
-                                            this.visible_stream_limit = STREAM_PAGE_SIZE;
-                                            cx.notify();
-                                        }),
-                                    ))
-                                    .children(StreamResolutionChoice::ALL.into_iter().enumerate().map(
-                                        |(idx, res)| {
-                                            let active = !self.stream_filter.hdr_only
-                                                && self.stream_filter.resolutions.len() == 1
-                                                && self.stream_filter.resolutions.contains(&res);
-                                            glass_segmented_item(
-                                                ("stream-filter-res", idx),
-                                                res.label(),
-                                                active,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    let is_sole_active = !this
-                                                        .stream_filter
-                                                        .hdr_only
-                                                        && this.stream_filter.resolutions.len()
-                                                            == 1
-                                                        && this
-                                                            .stream_filter
-                                                            .resolutions
-                                                            .contains(&res);
-                                                    if is_sole_active {
-                                                        this.stream_filter.resolutions.clear();
-                                                    } else {
-                                                        this.stream_filter.resolutions.clear();
-                                                        this.stream_filter.resolutions.insert(res);
-                                                        this.stream_filter.hdr_only = false;
-                                                    }
-                                                    this.expanded_stream_rows.clear();
-                                                    this.visible_stream_limit = STREAM_PAGE_SIZE;
-                                                    cx.notify();
-                                                }),
-                                            )
-                                        },
-                                    ))
-                                    .child(glass_segmented_item(
-                                        "stream-filter-hdr",
-                                        "HDR",
-                                        self.stream_filter.hdr_only,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.stream_filter.hdr_only =
-                                                !this.stream_filter.hdr_only;
-                                            if this.stream_filter.hdr_only {
-                                                this.stream_filter.resolutions.clear();
-                                            }
-                                            this.expanded_stream_rows.clear();
-                                            this.visible_stream_limit = STREAM_PAGE_SIZE;
-                                            cx.notify();
-                                        }),
-                                    )),
-                            )
-                            .when(has_debrid, |bar| {
-                                bar.child(render_compact_glass_toggle(
-                                    "stream-filter-cached",
-                                    "Cached",
-                                    Some((
-                                        IconName::Zap,
-                                        if self.stream_filter.cached_only {
-                                            IconWeight::Fill
-                                        } else {
-                                            IconWeight::Regular
-                                        },
-                                    )),
-                                    self.stream_filter.cached_only,
-                                    t,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.stream_filter.cached_only =
-                                            !this.stream_filter.cached_only;
-                                        this.expanded_stream_rows.clear();
-                                        this.visible_stream_limit = STREAM_PAGE_SIZE;
-                                        cx.notify();
-                                    }),
-                                ))
-                            })
-                            .when(!available_addons_arc.is_empty(), |bar| {
-                                let addons_for_menu = Arc::clone(&available_addons_arc);
-                                let dropdown_active = addon_filter_active || addon_dropdown_open;
-                                bar.child(
-                                    div()
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .id("stream-addon-dropdown-btn")
-                                                .cursor_pointer()
-                                                .h(sp(38.0))
-                                                .px(sp(12.0))
-                                                .rounded(px(RADIUS_CONTROL))
-                                                .bg(if dropdown_active {
-                                                    rgba(t.accent_soft)
-                                                } else {
-                                                    rgba(t.glass_trough_bg)
-                                                })
-                                                .border_1()
-                                                .border_color(if dropdown_active {
-                                                    rgba(t.border_accent)
-                                                } else {
-                                                    rgba(t.glass_border)
-                                                })
-                                                .hover(move |s| {
-                                                    s.bg(rgba(t.glass_row_hover_bg)).border_color(
-                                                        if dropdown_active {
-                                                            rgb(t.accent)
-                                                        } else {
-                                                            rgba(t.glass_border_strong)
-                                                        },
-                                                    )
-                                                })
-                                                .flex()
-                                                .items_center()
-                                                .gap(sp(6.0))
-                                                .font(ui_sans(FontWeight::MEDIUM))
-                                                .text_size(sp(12.5))
-                                                .text_color(if dropdown_active {
-                                                    rgb(accent_ink)
-                                                } else {
-                                                    rgb(t.text_secondary)
-                                                })
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.meta_addon_dropdown_open =
-                                                            !this.meta_addon_dropdown_open;
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                                .child(svg_icon_weighted(
-                                                    IconName::Layers,
-                                                    IconWeight::Regular,
-                                                    12.0 * t.ui_scale,
-                                                    if dropdown_active {
-                                                        rgb(accent_ink)
-                                                    } else {
-                                                        rgb(t.text_secondary)
-                                                    },
-                                                ))
-                                                .child(addon_label)
-                                                .child(svg_icon_weighted(
-                                                    IconName::ChevronDown,
-                                                    IconWeight::Regular,
-                                                    12.0 * t.ui_scale,
-                                                    if dropdown_active {
-                                                        rgb(accent_ink)
-                                                    } else {
-                                                        rgb(t.text_muted)
-                                                    },
-                                                )),
-                                        )
-                                        .when(addon_dropdown_open, |wrap| {
-                                            wrap.child(
-                                                gpui::deferred(
-                                                    glass_dropdown_panel(
-                                                        "stream-addon-dropdown-menu",
-                                                        292.0,
-                                                    )
-                                                    .absolute()
-                                                    .top(sp(44.0))
-                                                    .right_0()
-                                                    .shadow(glass_capsule_shadow())
-                                                    .child(
-                                                        div()
-                                                            .id("stream-addon-dropdown-scroll")
-                                                            .w_full()
-                                                            .max_h(sp(320.0))
-                                                            .overflow_y_scroll()
-                                                            .flex()
-                                                            .flex_col()
-                                                            .gap(sp(2.0))
-                                                            .child(glass_dropdown_option(
-                                                                "stream-addon-opt-all",
-                                                                "All addons",
-                                                                Some(SharedString::from(format!(
-                                                                    "{total_unfiltered} streams"
-                                                                ))),
-                                                                !addon_filter_active,
-                                                                cx.listener(|this, _, _, cx| {
-                                                                    this.stream_filter
-                                                                        .selected_addons
-                                                                        .clear();
-                                                                    this.expanded_stream_rows
-                                                                        .clear();
-                                                                    this.visible_stream_limit =
-                                                                        STREAM_PAGE_SIZE;
-                                                                    this.meta_addon_dropdown_open =
-                                                                        false;
-                                                                    cx.notify();
-                                                                }),
-                                                            ))
-                                                            .children(
-                                                                addons_for_menu
-                                                                    .iter()
-                                                                    .cloned()
-                                                                    .enumerate()
-                                                                    .map(
-                                                                        |(
-                                                                            a_idx,
-                                                                            (a_key, a_name, count),
-                                                                        )| {
-                                                                            let selected = self
-                                                                                .stream_filter
-                                                                                .is_addon_selected(
-                                                                                    &a_key,
-                                                                                );
-                                                                            glass_dropdown_option(
-                                                                                (
-                                                                                    "stream-addon-opt",
-                                                                                    a_idx,
-                                                                                ),
-                                                                                a_name,
-                                                                                Some(SharedString::from(format!("{count} streams"))),
-                                                                                selected,
-                                                                                cx.listener(move |this, _, _, cx| {
-                                                                                    this.stream_filter.toggle_addon(&a_key);
-                                                                                    this.expanded_stream_rows.clear();
-                                                                                    this.visible_stream_limit = STREAM_PAGE_SIZE;
-                                                                                    cx.notify();
-                                                                                }),
-                                                                            )
-                                                                        },
-                                                                    ),
-                                                            ),
-                                                    ),
-                                                )
-                                                .with_priority(10),
-                                            )
-                                        }),
-                                )
-                            })
-                            .when(!is_unfiltered, |bar| {
-                                bar.child(render_compact_glass_toggle(
-                                    "stream-filter-reset",
-                                    "Reset",
-                                    Some((IconName::X, IconWeight::Regular)),
-                                    false,
-                                    t,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.stream_filter.reset();
-                                        this.meta_addon_dropdown_open = false;
-                                        this.expanded_stream_rows.clear();
-                                        this.visible_stream_limit = STREAM_PAGE_SIZE;
-                                        cx.notify();
-                                    }),
-                                ))
-                            }),
-                    ),
-            )
+            .child(render_section_header(
+                SectionHeader::new("Sources")
+                    .inline_badge(ep_inline_badge)
+                    .count_badge(Some(streams_count_badge))
+                    .right_slot(Some(stream_controls_bar.into_any_element())),
+            ))
             .child(if filtered_indices.is_empty() {
                 let is_querying = addons_ready < addons_total
                     || self.prowlarr_fallback_loading
                     || (!has_stream_request && has_stream_addons);
-                let (empty_heading, empty_sub) = if is_querying {
+                let (empty_icon, empty_heading, empty_sub) = if is_querying {
                     (
+                        IconName::Sparkles,
                         "Querying stream addons...",
                         "Fetching available streams for this title...",
                     )
                 } else if total_unfiltered > 0 {
                     (
+                        IconName::Sliders,
                         "No streams match this filter",
                         "Reset filters to view every available stream.",
                     )
                 } else if has_stream_addons {
                     (
+                        IconName::Layers,
                         "No streams found",
                         "Connected stream addons returned no playable sources for this title.",
                     )
                 } else {
                     (
+                        IconName::Layers,
                         "No streams found",
                         "Install a stream addon in Addons or sign into your Stremio account.",
                     )
                 };
 
-                div()
-                    .p(sp(36.0))
-                    .rounded(px(RADIUS_CARD))
-                    .bg(rgba(t.glass_card_bg))
-                    .border_1()
-                    .border_color(rgba(t.glass_border))
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap(sp(8.0))
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(sp(24.0))
-                            .text_color(rgb(t.text_primary))
-                            .child(empty_heading),
-                    )
-                    .child(
-                        div()
-                            .text_size(sp(13.5))
-                            .text_color(rgb(t.text_secondary))
-                            .child(empty_sub),
-                    )
-                    .when(!is_querying && total_unfiltered > 0 && !is_unfiltered, |el| {
-                        el.child(
-                            div().pt(sp(6.0)).child(secondary_glass_button(
-                                "btn-streams-empty-reset",
-                                Some(IconName::RotateCcw),
-                                "Reset filters",
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.stream_filter.reset();
-                                    this.meta_addon_dropdown_open = false;
-                                    this.expanded_stream_rows.clear();
-                                    this.visible_stream_limit = STREAM_PAGE_SIZE;
-                                    cx.notify();
-                                }),
-                            )),
-                        )
-                    })
-                    .into_any_element()
+                let mut empty_props = EmptyStateProps::new(empty_icon, empty_heading, empty_sub);
+                if !is_querying && total_unfiltered > 0 && !is_unfiltered {
+                    empty_props = empty_props.action(secondary_glass_button(
+                        "btn-streams-empty-reset",
+                        Some(IconName::RotateCcw),
+                        "Reset filters",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.stream_filter.reset();
+                            this.meta_addon_dropdown_open = false;
+                            this.expanded_stream_rows.clear();
+                            this.visible_stream_limit = STREAM_PAGE_SIZE;
+                            cx.notify();
+                        }),
+                    ));
+                }
+
+                render_empty_state(empty_props).into_any_element()
             } else {
                 let page_slice = &filtered_indices[page_start..page_end];
                 div()
@@ -3555,7 +3360,7 @@ fn render_compact_glass_toggle(
     div()
         .id(id.into())
         .cursor_pointer()
-        .h(sp(38.0))
+        .h(sp(36.0))
         .px(sp(12.0))
         .rounded(px(RADIUS_CONTROL))
         .bg(if active {

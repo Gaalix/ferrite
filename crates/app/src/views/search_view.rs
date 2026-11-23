@@ -21,17 +21,19 @@ use crate::{
         QuickPeekTarget,
     },
     theme::{
-        active_theme, editorial_serif, mono_font, neutral_chip, placeholder_tint_for_id,
-        poster_card_shadow, sentence_case_label, sp, ui_sans, ThemePalette, RADIUS_CARD,
-        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        active_theme, editorial_serif, mono_font, placeholder_tint_for_id, poster_card_shadow,
+        sentence_case_label, sp, ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL,
+        RADIUS_POSTER,
     },
-    ui_components::{
-        glass_back_button, primary_accent_button, render_poster_card, PosterCardProps,
+    ui::{
+        compute_app_grid_metrics, neutral_chip, page_container, page_gutter_px,
+        primary_accent_button, render_empty_state, render_page_header, render_poster_card,
+        render_section_header, search_field, secondary_glass_button, EmptyStateProps, PageHeader,
+        PageWidth, PosterCardProps, PosterMetrics, SearchFieldProps, SectionHeader,
     },
     virtual_grid::{compute_dynamic_grid_metrics, slice_row_items, PosterAspect},
 };
 
-const GRID_METADATA_HEIGHT_PX: f32 = 52.0;
 const PEOPLE_MIN_CARD_WIDTH_PX: f32 = 270.0;
 const PEOPLE_GAP_PX: f32 = 16.0;
 
@@ -267,16 +269,7 @@ impl AppShell {
         let focused = self.focused_input == Some(FocusedInput::FullSearchInput);
         let q = self.full_search_query.clone();
         let q_empty = q.trim().is_empty();
-        let search_display: SharedString = if q.is_empty() {
-            if focused {
-                "|".into()
-            } else {
-                "Search movies, series, directors, actors...".into()
-            }
-        } else {
-            self.format_input_with_caret(FocusedInput::FullSearchInput, &q)
-                .into()
-        };
+        let search_display = self.format_input_with_caret(FocusedInput::FullSearchInput, &q);
 
         let total_results = res.movies.len() + res.series.len() + res.people.len();
         let status_label = format_search_status_label(total_results, self.full_search_loading_tmdb);
@@ -287,23 +280,13 @@ impl AppShell {
             || !res.people.is_empty();
 
         let viewport_w = self.viewport_size_px.0;
-        let side_pad = if viewport_w.is_finite() && viewport_w > 0.0 {
-            (viewport_w * 0.03).clamp(24.0, 56.0)
-        } else {
-            32.0
-        };
-        let grid_gap = t.density.grid_gap_px() * t.ui_scale;
-        let media_metrics = compute_dynamic_grid_metrics(
+        let side_pad = page_gutter_px(viewport_w);
+        let media_metrics = compute_app_grid_metrics(
             res.movies.len().max(res.series.len()),
             viewport_w,
             0.0,
-            side_pad * 2.0,
-            None,
-            t.density.target_poster_width_px() * t.ui_scale,
-            grid_gap,
-            grid_gap,
-            GRID_METADATA_HEIGHT_PX * t.ui_scale,
             PosterAspect::Portrait2x3,
+            &t,
         );
         let people_metrics = compute_dynamic_grid_metrics(
             res.people.len(),
@@ -406,198 +389,86 @@ impl AppShell {
             .size_full()
             .overflow_y_scroll()
             .child(
-                div()
-                    .w_full()
-                    .px(px(side_pad))
-                    .pt(sp(16.0))
-                    .pb(sp(72.0))
-                    .flex()
-                    .flex_col()
-                    .gap(sp(32.0))
+                page_container(PageWidth::Wide, viewport_w)
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .gap(sp(14.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(sp(16.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(sp(12.0))
-                                            .child(glass_back_button(
-                                                "search-view-back",
-                                                "Back",
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.navigate_back(cx);
-                                                }),
-                                            ))
-                                            .child(
-                                                div()
-                                                    .font(editorial_serif())
-                                                    .text_size(sp(32.0))
-                                                    .text_color(rgb(t.text_primary))
-                                                    .child("Search"),
-                                            ),
-                                    )
-                                    .when(!q_empty, |el| el.child(neutral_chip(status_label))),
-                            )
-                            .child(
-                                div()
-                                    .id("full-search-input")
-                                    .cursor_text()
-                                    .w_full()
-                                    .h(sp(48.0))
-                                    .px(sp(16.0))
-                                    .rounded(px(RADIUS_CONTROL))
-                                    .bg(rgba(t.glass_trough_bg))
-                                    .border_1()
-                                    .border_color(if focused {
-                                        rgba(t.border_poster_hover)
-                                    } else {
-                                        rgba(t.glass_border)
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(sp(12.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
+                            .child(render_page_header(
+                                PageHeader::new("Search")
+                                    .back_button(
+                                        "search-view-back",
+                                        "Back",
                                         cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.focused_input =
-                                                Some(FocusedInput::FullSearchInput);
-                                            this.input_cursors
-                                                .entry(FocusedInput::FullSearchInput)
-                                                .or_insert(this.full_search_query.len());
-                                            cx.notify();
+                                            this.navigate_back(cx);
                                         }),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap(sp(12.0))
-                                            .child(svg_icon_weighted(
-                                                IconName::Search,
-                                                IconWeight::Regular,
-                                                18.0 * t.ui_scale,
-                                                if focused {
-                                                    rgb(accent_ink)
-                                                } else {
-                                                    rgb(t.text_muted)
-                                                },
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .truncate()
-                                                    .font(ui_sans(FontWeight::MEDIUM))
-                                                    .text_size(sp(15.5))
-                                                    .text_color(if q_empty && !focused {
-                                                        rgb(t.text_muted)
-                                                    } else {
-                                                        rgb(t.text_primary)
-                                                    })
-                                                    .child(search_display),
-                                            ),
-                                    )
-                                    .when(!q.is_empty(), |el| {
-                                        el.child(
-                                            div()
-                                                .id("full-search-clear")
-                                                .cursor_pointer()
-                                                .w(sp(28.0))
-                                                .h(sp(28.0))
-                                                .rounded(px(RADIUS_PILL))
-                                                .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.full_search_query.clear();
-                                                        this.palette_query.clear();
-                                                        this.input_cursors
-                                                            .remove(&FocusedInput::FullSearchInput);
-                                                        this.input_selected_all
-                                                            .remove(&FocusedInput::FullSearchInput);
-                                                        this.focused_input =
-                                                            Some(FocusedInput::FullSearchInput);
-                                                        this.refresh_full_search(cx);
-                                                    }),
-                                                )
-                                                .child(svg_icon_weighted(
-                                                    IconName::X,
-                                                    IconWeight::Regular,
-                                                    14.0 * t.ui_scale,
-                                                    rgb(t.text_secondary),
-                                                )),
-                                        )
-                                    }),
-                            ),
+                                    .right_slot(
+                                        (!q_empty).then(|| neutral_chip(status_label).into_any_element()),
+                                    ),
+                            ))
+                            .child(search_field(
+                                SearchFieldProps::new(
+                                    "full-search-input",
+                                    search_display,
+                                    "Search movies, series, directors, actors...",
+                                    q.is_empty(),
+                                    focused,
+                                )
+                                .clear_id("full-search-clear")
+                                .full_width()
+                                .height_px(48.0)
+                                .on_focus(cx.listener(|this, _, _, cx| {
+                                    this.focused_input = Some(FocusedInput::FullSearchInput);
+                                    this.input_cursors
+                                        .entry(FocusedInput::FullSearchInput)
+                                        .or_insert(this.full_search_query.len());
+                                    cx.notify();
+                                }))
+                                .on_clear(cx.listener(|this, _, _, cx| {
+                                    this.full_search_query.clear();
+                                    this.palette_query.clear();
+                                    this.input_cursors
+                                        .remove(&FocusedInput::FullSearchInput);
+                                    this.input_selected_all
+                                        .remove(&FocusedInput::FullSearchInput);
+                                    this.focused_input = Some(FocusedInput::FullSearchInput);
+                                    this.refresh_full_search(cx);
+                                })),
+                            )),
                     )
                     .when(q_empty, |el| {
-                        el.child(
-                            div()
-                                .p(sp(32.0))
-                                .rounded(px(RADIUS_CARD))
-                                .bg(rgba(t.glass_card_bg))
-                                .border_1()
-                                .border_color(rgba(t.glass_border))
-                                .flex()
-                                .flex_col()
-                                .gap(sp(8.0))
-                                .child(
-                                    div()
-                                        .font(editorial_serif())
-                                        .text_size(sp(26.0))
-                                        .text_color(rgb(t.text_primary))
-                                        .child("Search movies, series, and people"),
-                                )
-                                .child(
-                                    div()
-                                        .max_w(px(620.0))
-                                        .text_size(sp(14.0))
-                                        .text_color(rgb(t.text_secondary))
-                                        .child("Find titles across your library, installed catalogs, and connected metadata sources."),
-                                ),
-                        )
+                        el.child(render_empty_state(EmptyStateProps::new(
+                            IconName::Search,
+                            "Search movies, series, and people",
+                            "Find titles across your library, installed catalogs, and connected metadata sources.",
+                        )))
                     })
                     .when(!q_empty && !has_any_hits && !self.full_search_loading_tmdb, |el| {
-                        el.child(
-                            div()
-                                .p(sp(32.0))
-                                .rounded(px(RADIUS_CARD))
-                                .bg(rgba(t.glass_card_bg))
-                                .border_1()
-                                .border_color(rgba(t.glass_border))
-                                .flex()
-                                .flex_col()
-                                .gap(sp(8.0))
-                                .child(
-                                    div()
-                                        .font(editorial_serif())
-                                        .text_size(sp(26.0))
-                                        .text_color(rgb(t.text_primary))
-                                        .child(format!("No matches for \"{}\"", res.query)),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(sp(14.0))
-                                        .text_color(rgb(t.text_secondary))
-                                        .child("Try another title, actor, or director — or add a TMDB key in Settings for broader discovery."),
-                                ),
-                        )
+                        el.child(render_empty_state(
+                            EmptyStateProps::new(
+                                IconName::Search,
+                                format!("No matches for \"{}\"", res.query),
+                                "Try another title, actor, or director — or add a TMDB key in Settings for broader discovery.",
+                            )
+                            .action(secondary_glass_button(
+                                "search-empty-clear",
+                                Some(IconName::X),
+                                "Clear search",
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.full_search_query.clear();
+                                    this.palette_query.clear();
+                                    this.input_cursors
+                                        .remove(&FocusedInput::FullSearchInput);
+                                    this.input_selected_all
+                                        .remove(&FocusedInput::FullSearchInput);
+                                    this.focused_input = Some(FocusedInput::FullSearchInput);
+                                    this.refresh_full_search(cx);
+                                }),
+                            )),
+                        ))
                     })
                     .when_some(top_match_el, |el, card| {
                         el.child(
@@ -605,13 +476,7 @@ impl AppShell {
                                 .flex()
                                 .flex_col()
                                 .gap(sp(12.0))
-                                .child(
-                                    div()
-                                        .font(mono_font())
-                                        .text_xs()
-                                        .text_color(rgb(accent_ink))
-                                        .child("TOP MATCH"),
-                                )
+                                .child(render_section_header(SectionHeader::new("Top Match")))
                                 .child(card),
                         )
                     })
@@ -625,7 +490,6 @@ impl AppShell {
                             &res.movies,
                             &library_statuses,
                             movies_kb_offset,
-                            side_pad,
                             t,
                             cx,
                         ))
@@ -640,7 +504,6 @@ impl AppShell {
                             &res.series,
                             &library_statuses,
                             series_kb_offset,
-                            side_pad,
                             t,
                             cx,
                         ))
@@ -651,32 +514,16 @@ impl AppShell {
                                 .flex()
                                 .flex_col()
                                 .gap(sp(16.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_baseline()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_baseline()
-                                                .gap(sp(12.0))
-                                                .child(
-                                                    div()
-                                                        .font(editorial_serif())
-                                                        .text_size(sp(26.0))
-                                                        .text_color(rgb(t.text_primary))
-                                                        .child("People"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(sp(13.0))
-                                                        .text_color(rgb(t.text_muted))
-                                                        .child("Cast & Directors"),
-                                                ),
-                                        )
-                                        .child(neutral_chip(format!("{} people", res.people.len()))),
-                                )
+                                .child(render_section_header(
+                                    SectionHeader::new("People")
+                                        .subtitle(Some(SharedString::new_static(
+                                            "Cast & Directors",
+                                        )))
+                                        .right_slot(Some(
+                                            neutral_chip(format!("{} people", res.people.len()))
+                                                .into_any_element(),
+                                        )),
+                                ))
                                 .child(
                                     div()
                                         .w_full()
@@ -1185,23 +1032,17 @@ impl AppShell {
         hits: &[EditorialMediaHit],
         library_statuses: &Arc<HashMap<String, LibraryStatusTab>>,
         kb_idx_offset: usize,
-        side_pad: f32,
         t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let total_items = hits.len();
-        let grid_gap = t.density.grid_gap_px() * t.ui_scale;
-        let metrics = compute_dynamic_grid_metrics(
+        let grid_gap = PosterMetrics::from_theme(&t).gap_px;
+        let metrics = compute_app_grid_metrics(
             total_items,
             self.viewport_size_px.0,
             0.0,
-            side_pad * 2.0,
-            None,
-            t.density.target_poster_width_px() * t.ui_scale,
-            grid_gap,
-            grid_gap,
-            GRID_METADATA_HEIGHT_PX * t.ui_scale,
             PosterAspect::Portrait2x3,
+            &t,
         );
         let columns = metrics.columns;
         let row_count = metrics.layout.row_count;
@@ -1219,20 +1060,11 @@ impl AppShell {
             .flex()
             .flex_col()
             .gap(sp(16.0))
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(sp(26.0))
-                            .text_color(rgb(t.text_primary))
-                            .child(heading),
-                    )
-                    .child(neutral_chip(format!("{total_items} titles"))),
-            )
+            .child(render_section_header(
+                SectionHeader::new(heading).right_slot(Some(
+                    neutral_chip(format!("{total_items} titles")).into_any_element(),
+                )),
+            ))
             .child(
                 div()
                     .w_full()
