@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use gpui::RenderImage;
@@ -32,11 +32,12 @@ const MAX_FAILED_ENTRIES: usize = 256;
 const DISK_PRUNE_INTERVAL_WRITES: u64 = 200;
 const VARIANT_JPEG_QUALITY: u8 = 82;
 
-pub const MAX_DECODED_TEXTURES: usize = 64;
+pub const MAX_DECODED_TEXTURES: usize = 160;
 pub const MAX_THUMB_TEXTURES: usize = 16;
 pub const MAX_AMBIENT_TEXTURES: usize = 6;
 pub const MAX_HERO_TEXTURES: usize = 2;
 pub const MAX_STILL_TEXTURES: usize = 24;
+const LRU_SWEEP_MIN_INTERVAL_MS: u64 = 250;
 
 pub const PLAYBACK_RETAINED_DECODED_TEXTURES: usize = 16;
 pub const PLAYBACK_RETAINED_THUMB_TEXTURES: usize = 8;
@@ -165,6 +166,11 @@ impl BoundedTextureLru {
 
     pub fn len_ready(&self) -> usize {
         self.ready_count
+    }
+
+    #[inline]
+    pub fn is_over_capacity(&self) -> bool {
+        self.ready_count > self.capacity
     }
 
     #[inline]
@@ -1004,6 +1010,10 @@ struct PosterCacheInner {
     wakeup_tx: async_channel::Sender<()>,
     temp_seq: AtomicU64,
     render_epoch: AtomicU64,
+    created_at: Instant,
+    last_sweep_ms: AtomicU64,
+    lru_over_capacity: AtomicBool,
+    has_evicted_images: AtomicBool,
     disk_writes: AtomicU64,
     disk_cache_bytes: AtomicU64,
     disk_epoch: AtomicU64,
@@ -1065,6 +1075,10 @@ impl PosterCache {
             wakeup_tx,
             temp_seq: AtomicU64::new(1),
             render_epoch: AtomicU64::new(1),
+            created_at: Instant::now(),
+            last_sweep_ms: AtomicU64::new(0),
+            lru_over_capacity: AtomicBool::new(false),
+            has_evicted_images: AtomicBool::new(false),
             disk_writes: AtomicU64::new(0),
             disk_cache_bytes: AtomicU64::new(0),
             disk_epoch: AtomicU64::new(1),
@@ -1097,13 +1111,58 @@ impl PosterCache {
 
     pub fn begin_render_frame(&self) -> u64 {
         let epoch = self.inner.render_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        let mut swept = self.inner.decoded_lru.lock().sweep_to_capacity(epoch);
-        swept.extend(self.inner.thumb_lru.lock().sweep_to_capacity(epoch));
-        swept.extend(self.inner.still_lru.lock().sweep_to_capacity(epoch));
-        swept.extend(self.inner.hero_lru.lock().sweep_to_capacity(epoch));
-        swept.extend(self.inner.ambient_lru.lock().sweep_to_capacity(epoch));
+        // Fast path: when all 5 texture LRUs are within capacity, skip locking
+        // all 5 mutexes on high-frequency scroll/animation frames.
+        if !self.inner.lru_over_capacity.load(Ordering::Acquire) {
+            return epoch;
+        }
+        let now_ms = self.inner.created_at.elapsed().as_millis() as u64;
+        let last_ms = self.inner.last_sweep_ms.load(Ordering::Relaxed);
+        if last_ms > 0 && now_ms.saturating_sub(last_ms) < LRU_SWEEP_MIN_INTERVAL_MS {
+            return epoch;
+        }
+        if self
+            .inner
+            .last_sweep_ms
+            .compare_exchange(last_ms, now_ms.max(1), Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return epoch;
+        }
+
+        let mut still_over = false;
+        let mut swept = {
+            let mut lru = self.inner.decoded_lru.lock();
+            let s = lru.sweep_to_capacity(epoch);
+            still_over |= lru.is_over_capacity();
+            s
+        };
+        {
+            let mut lru = self.inner.thumb_lru.lock();
+            swept.extend(lru.sweep_to_capacity(epoch));
+            still_over |= lru.is_over_capacity();
+        }
+        {
+            let mut lru = self.inner.still_lru.lock();
+            swept.extend(lru.sweep_to_capacity(epoch));
+            still_over |= lru.is_over_capacity();
+        }
+        {
+            let mut lru = self.inner.hero_lru.lock();
+            swept.extend(lru.sweep_to_capacity(epoch));
+            still_over |= lru.is_over_capacity();
+        }
+        {
+            let mut lru = self.inner.ambient_lru.lock();
+            swept.extend(lru.sweep_to_capacity(epoch));
+            still_over |= lru.is_over_capacity();
+        }
+        self.inner
+            .lru_over_capacity
+            .store(still_over, Ordering::Release);
         if !swept.is_empty() {
             self.inner.evicted_images.lock().extend(swept);
+            self.inner.has_evicted_images.store(true, Ordering::Release);
         }
         epoch
     }
@@ -1206,6 +1265,7 @@ impl PosterCache {
 
     pub fn push_evicted_image(&self, image: Arc<RenderImage>) {
         self.inner.evicted_images.lock().push(image);
+        self.inner.has_evicted_images.store(true, Ordering::Release);
     }
 
     fn trim_all_lrus(
@@ -1221,8 +1281,10 @@ impl PosterCache {
         newly_evicted.extend(self.inner.still_lru.lock().trim_to_limit(still_keep));
         newly_evicted.extend(self.inner.hero_lru.lock().trim_to_limit(hero_keep));
         newly_evicted.extend(self.inner.ambient_lru.lock().trim_to_limit(ambient_keep));
+        self.inner.lru_over_capacity.store(false, Ordering::Release);
         if !newly_evicted.is_empty() {
             self.inner.evicted_images.lock().extend(newly_evicted);
+            self.inner.has_evicted_images.store(true, Ordering::Release);
         }
     }
 
@@ -1313,6 +1375,9 @@ impl PosterCache {
     }
 
     pub fn drain_evicted_images(&self) -> Vec<Arc<RenderImage>> {
+        if !self.inner.has_evicted_images.swap(false, Ordering::AcqRel) {
+            return Vec::new();
+        }
         std::mem::take(&mut *self.inner.evicted_images.lock())
     }
 
@@ -1795,12 +1860,17 @@ fn insert_ready_and_wake(
     render_img: Arc<RenderImage>,
 ) {
     let ep = inner.current_epoch();
-    let evicted = inner
-        .lru_mutex(target)
-        .lock()
-        .insert_ready_variant(variant, original_url, render_img, ep);
+    let (evicted, over_cap) = {
+        let mut lru = inner.lru_mutex(target).lock();
+        let evicted = lru.insert_ready_variant(variant, original_url, render_img, ep);
+        (evicted, lru.is_over_capacity())
+    };
+    if over_cap {
+        inner.lru_over_capacity.store(true, Ordering::Release);
+    }
     if !evicted.is_empty() {
         inner.evicted_images.lock().extend(evicted);
+        inner.has_evicted_images.store(true, Ordering::Release);
     }
     let _ = inner.wakeup_tx.try_send(());
 }
@@ -2972,7 +3042,7 @@ mod tests {
     #[test]
     fn cache_limits_and_halved_capacities_match_budget() {
         assert_eq!(MAX_DISK_CACHE_BYTES, 96 * 1024 * 1024);
-        assert_eq!(MAX_DECODED_TEXTURES, 64);
+        assert_eq!(MAX_DECODED_TEXTURES, 160);
         assert_eq!(MAX_STILL_TEXTURES, 24);
         assert_eq!(MAX_THUMB_TEXTURES, 16);
         assert_eq!(MAX_AMBIENT_TEXTURES, 6);

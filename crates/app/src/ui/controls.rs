@@ -7,7 +7,7 @@ use gpui::{
 
 use crate::{
     icons::{svg_icon, IconName},
-    theme::{active_theme, sp, ui_sans, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL},
+    theme::{active_theme, ui_sans, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL},
 };
 
 pub use crate::theme::{keycap, meta_divider, neutral_chip, semantic_status_pill};
@@ -25,8 +25,8 @@ pub fn toolbar_bar() -> Div {
     div()
         .w_full()
         .flex_shrink_0()
-        .px(sp(12.0))
-        .py(sp(9.0))
+        .px(theme.sp(12.0))
+        .py(theme.sp(9.0))
         .rounded(px(RADIUS_CARD))
         .bg(rgba(theme.glass_card_bg))
         .border_1()
@@ -35,7 +35,7 @@ pub fn toolbar_bar() -> Div {
         .flex_wrap()
         .items_center()
         .justify_between()
-        .gap(sp(10.0))
+        .gap(theme.sp(10.0))
 }
 
 /// Props for the canonical `h(sp(36.0))`, `RADIUS_CONTROL` inline filter/search input.
@@ -132,8 +132,8 @@ pub fn search_field(props: SearchFieldProps) -> Stateful<Div> {
     let mut box_el = div()
         .id(props.id)
         .cursor_text()
-        .h(sp(props.height_px))
-        .px(sp(11.0))
+        .h(theme.sp(props.height_px))
+        .px(theme.sp(11.0))
         .rounded(px(RADIUS_CONTROL))
         .bg(if focused {
             rgba(theme.glass_row_selected_bg)
@@ -156,10 +156,10 @@ pub fn search_field(props: SearchFieldProps) -> Stateful<Div> {
         .flex()
         .items_center()
         .justify_between()
-        .gap(sp(8.0));
+        .gap(theme.sp(8.0));
 
     if let Some(w) = props.width_px {
-        box_el = box_el.w(sp(w));
+        box_el = box_el.w(theme.sp(w));
     } else {
         box_el = box_el.w_full();
     }
@@ -177,7 +177,7 @@ pub fn search_field(props: SearchFieldProps) -> Stateful<Div> {
             .min_w(px(0.0))
             .flex()
             .items_center()
-            .gap(sp(7.0))
+            .gap(theme.sp(7.0))
             .child(svg_icon(
                 IconName::Search,
                 13.5 * theme.ui_scale,
@@ -194,7 +194,7 @@ pub fn search_field(props: SearchFieldProps) -> Stateful<Div> {
                     .flex()
                     .items_center()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(sp(12.5))
+                    .text_size(theme.sp(12.5))
                     .text_color(if is_empty {
                         rgb(theme.text_muted)
                     } else {
@@ -205,7 +205,7 @@ pub fn search_field(props: SearchFieldProps) -> Stateful<Div> {
                     .when(is_empty, |d| {
                         d.child(
                             div()
-                                .when(focused, |p| p.pl(sp(3.0)))
+                                .when(focused, |p| p.pl(theme.sp(3.0)))
                                 .text_color(rgb(theme.text_muted))
                                 .child(props.placeholder),
                         )
@@ -219,7 +219,7 @@ pub fn search_field(props: SearchFieldProps) -> Stateful<Div> {
                 div()
                     .id(clear_id)
                     .cursor_pointer()
-                    .p(sp(3.0))
+                    .p(theme.sp(3.0))
                     .rounded(px(4.0))
                     .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
                     .flex()
@@ -322,8 +322,8 @@ pub fn dropdown_trigger(props: DropdownTriggerProps) -> Stateful<Div> {
     let mut btn = div()
         .id(props.id)
         .cursor_pointer()
-        .h(sp(36.0))
-        .px(sp(11.0))
+        .h(theme.sp(36.0))
+        .px(theme.sp(11.0))
         .rounded(px(RADIUS_CONTROL))
         .bg(if props.is_open {
             rgba(theme.glass_row_selected_bg)
@@ -355,9 +355,9 @@ pub fn dropdown_trigger(props: DropdownTriggerProps) -> Stateful<Div> {
         .flex()
         .items_center()
         .when(spread_between, |el| el.justify_between())
-        .gap(sp(7.0))
+        .gap(theme.sp(7.0))
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(sp(12.5))
+        .text_size(theme.sp(12.5))
         .text_color(if highlighted {
             rgb(accent_ink)
         } else {
@@ -369,17 +369,17 @@ pub fn dropdown_trigger(props: DropdownTriggerProps) -> Stateful<Div> {
         });
 
     if let Some(min_w) = props.min_width_px {
-        btn = btn.min_w(sp(min_w));
+        btn = btn.min_w(theme.sp(min_w));
     }
     if let Some(max_w) = props.max_width_px {
-        btn = btn.max_w(sp(max_w));
+        btn = btn.max_w(theme.sp(max_w));
     }
 
     let left_content = div()
         .min_w(px(0.0))
         .flex()
         .items_center()
-        .gap(sp(6.0))
+        .gap(theme.sp(6.0))
         .when_some(props.leading_icon, |row, icon| {
             row.child(svg_icon(
                 icon,
@@ -396,14 +396,14 @@ pub fn dropdown_trigger(props: DropdownTriggerProps) -> Stateful<Div> {
                 div()
                     .flex_shrink_0()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(sp(12.0))
+                    .text_size(theme.sp(12.0))
                     .text_color(rgb(theme.text_muted))
                     .child(prefix),
             )
             .child(
                 div()
                     .w(px(1.0))
-                    .h(sp(12.0))
+                    .h(theme.sp(12.0))
                     .flex_shrink_0()
                     .bg(rgba(theme.glass_divider)),
             )
@@ -414,7 +414,7 @@ pub fn dropdown_trigger(props: DropdownTriggerProps) -> Stateful<Div> {
                 div()
                     .flex_shrink_0()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(sp(11.5))
+                    .text_size(theme.sp(11.5))
                     .text_color(rgb(theme.text_muted))
                     .truncate()
                     .child(secondary),
@@ -449,8 +449,8 @@ pub fn choice_pill(
     div()
         .id(id)
         .cursor_pointer()
-        .h(sp(32.0))
-        .px(sp(13.0))
+        .h(theme.sp(32.0))
+        .px(theme.sp(13.0))
         .rounded(px(RADIUS_PILL))
         .bg(if active {
             rgba(theme.accent_soft)
@@ -480,7 +480,7 @@ pub fn choice_pill(
         .justify_center()
         .whitespace_nowrap()
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(sp(12.5))
+        .text_size(theme.sp(12.5))
         .text_color(if active {
             rgb(accent_ink)
         } else {

@@ -1,6 +1,6 @@
 use gpui::{div, prelude::*, px, Div};
 
-use crate::theme::sp;
+use crate::theme::active_theme;
 
 /// Fallback horizontal page gutter when viewport width is unavailable or non-finite.
 pub const PAGE_GUTTER_DEFAULT_PX: f32 = 32.0;
@@ -96,29 +96,31 @@ pub fn apply_page_width(container: Div, width: PageWidth) -> Div {
 /// Builds a standard non-hero page container with canonical width, fluid horizontal gutter,
 /// and vertical rhythm (`pt(16)`, `pb(72)`, `gap(24)`).
 pub fn page_container(width: PageWidth, viewport_w: f32) -> Div {
+    let theme = active_theme();
     let gutter = page_gutter_px(viewport_w);
     apply_page_width(div(), width)
         .px(px(gutter))
-        .pt(sp(PAGE_PADDING_TOP_PX))
-        .pb(sp(PAGE_PADDING_BOTTOM_PX))
+        .pt(theme.sp(PAGE_PADDING_TOP_PX))
+        .pb(theme.sp(PAGE_PADDING_BOTTOM_PX))
         .flex()
         .flex_col()
-        .gap(sp(PAGE_SECTION_GAP_PX))
+        .gap(theme.sp(PAGE_SECTION_GAP_PX))
 }
 
 /// Builds a full-height flex page container for `uniform_list`-backed routes (Discover, Library)
 /// with canonical width, fluid horizontal gutter, and compact bottom inset (`pt(16)`, `pb(24)`, `gap(24)`).
 pub fn full_height_page_container(width: PageWidth, viewport_w: f32) -> Div {
+    let theme = active_theme();
     let gutter = page_gutter_px(viewport_w);
     apply_page_width(div(), width)
         .flex_1()
         .min_h(px(0.0))
         .px(px(gutter))
-        .pt(sp(PAGE_PADDING_TOP_PX))
-        .pb(sp(PAGE_LIST_PADDING_BOTTOM_PX))
+        .pt(theme.sp(PAGE_PADDING_TOP_PX))
+        .pb(theme.sp(PAGE_LIST_PADDING_BOTTOM_PX))
         .flex()
         .flex_col()
-        .gap(sp(PAGE_SECTION_GAP_PX))
+        .gap(theme.sp(PAGE_SECTION_GAP_PX))
 }
 
 #[cfg(test)]

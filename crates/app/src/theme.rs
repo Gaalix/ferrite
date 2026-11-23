@@ -1,5 +1,9 @@
 use std::{
-    sync::{Arc, LazyLock},
+    cell::Cell,
+    sync::{
+        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc, LazyLock,
+    },
     time::Duration,
 };
 
@@ -493,17 +497,50 @@ pub const fn build_palette(
     }
 }
 
-static ACTIVE_THEME: RwLock<ThemePalette> = RwLock::new(build_palette(
+impl ThemePalette {
+    /// Scales a base UI measurement (px) by this palette's UI scale factor without global lookup.
+    #[inline]
+    pub fn sp(&self, val: f32) -> Pixels {
+        px(val * self.ui_scale)
+    }
+}
+
+const DEFAULT_THEME_PALETTE: ThemePalette = build_palette(
     ThemePreset::EtherealDark,
     AccentChoice::EmberCoral,
     true,
     1.0,
     CardDensityChoice::Comfortable,
-));
+);
 
+static ACTIVE_THEME: RwLock<ThemePalette> = RwLock::new(DEFAULT_THEME_PALETTE);
+static ACTIVE_THEME_VERSION: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_UI_SCALE_BITS: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
+
+thread_local! {
+    static THREAD_LOCAL_THEME: Cell<(u64, ThemePalette)> = const {
+        Cell::new((0, DEFAULT_THEME_PALETTE))
+    };
+}
+
+/// Returns the active `ThemePalette` via a lock-free thread-local cache synchronized
+/// with an atomic version counter (zero `RwLock` contention on the UI thread hot path).
 #[inline]
 pub fn active_theme() -> ThemePalette {
-    *ACTIVE_THEME.read()
+    let ver = ACTIVE_THEME_VERSION.load(Ordering::Acquire);
+    THREAD_LOCAL_THEME.with(|cell| {
+        let (cached_ver, cached_palette) = cell.get();
+        if cached_ver == ver {
+            cached_palette
+        } else {
+            let guard = ACTIVE_THEME.read();
+            let fresh = *guard;
+            let synced_ver = ACTIVE_THEME_VERSION.load(Ordering::Acquire);
+            drop(guard);
+            cell.set((synced_ver, fresh));
+            fresh
+        }
+    })
 }
 
 pub fn set_active_theme(
@@ -514,13 +551,17 @@ pub fn set_active_theme(
     density: CardDensityChoice,
 ) {
     let palette = build_palette(preset, accent_choice, ambient_bleed, ui_scale, density);
-    *ACTIVE_THEME.write() = palette;
+    let mut guard = ACTIVE_THEME.write();
+    *guard = palette;
+    ACTIVE_UI_SCALE_BITS.store(palette.ui_scale.to_bits(), Ordering::Relaxed);
+    ACTIVE_THEME_VERSION.fetch_add(1, Ordering::Release);
 }
 
-/// Scales a base UI measurement (px) by the active theme's UI scale factor.
+/// Scales a base UI measurement (px) by the active theme's UI scale factor
+/// via a single lock-free relaxed atomic load.
 #[inline]
 pub fn sp(val: f32) -> Pixels {
-    px(val * active_theme().ui_scale)
+    px(val * f32::from_bits(ACTIVE_UI_SCALE_BITS.load(Ordering::Relaxed)))
 }
 
 pub const BG_OBSIDIAN: u32 = 0x0b0b0d;
@@ -613,6 +654,21 @@ static UI_SANS_FALLBACKS: LazyLock<FontFallbacks> = LazyLock::new(|| {
     ])
 });
 
+fn build_ui_sans(weight: FontWeight) -> Font {
+    Font {
+        family: "Geist".into(),
+        fallbacks: Some(UI_SANS_FALLBACKS.clone()),
+        features: FontFeatures::default(),
+        weight,
+        style: FontStyle::Normal,
+    }
+}
+
+static UI_SANS_NORMAL: LazyLock<Font> = LazyLock::new(|| build_ui_sans(FontWeight::NORMAL));
+static UI_SANS_MEDIUM: LazyLock<Font> = LazyLock::new(|| build_ui_sans(FontWeight::MEDIUM));
+static UI_SANS_SEMIBOLD: LazyLock<Font> = LazyLock::new(|| build_ui_sans(FontWeight::SEMIBOLD));
+static UI_SANS_BOLD: LazyLock<Font> = LazyLock::new(|| build_ui_sans(FontWeight::BOLD));
+
 static MONO_TABULAR_FONT: LazyLock<Font> = LazyLock::new(|| Font {
     family: "Geist Mono".into(),
     fallbacks: Some(FontFallbacks::from_fonts(vec![
@@ -638,12 +694,16 @@ pub fn editorial_serif() -> Font {
 
 #[inline]
 pub fn ui_sans(weight: FontWeight) -> Font {
-    Font {
-        family: "Geist".into(),
-        fallbacks: Some(UI_SANS_FALLBACKS.clone()),
-        features: FontFeatures::default(),
-        weight,
-        style: FontStyle::Normal,
+    if weight == FontWeight::NORMAL {
+        UI_SANS_NORMAL.clone()
+    } else if weight == FontWeight::MEDIUM {
+        UI_SANS_MEDIUM.clone()
+    } else if weight == FontWeight::SEMIBOLD {
+        UI_SANS_SEMIBOLD.clone()
+    } else if weight == FontWeight::BOLD {
+        UI_SANS_BOLD.clone()
+    } else {
+        build_ui_sans(weight)
     }
 }
 
@@ -671,11 +731,29 @@ pub fn glass_capsule_shadow() -> Vec<BoxShadow> {
     }
 }
 
+/// Lightweight single-layer shadow (`1px`/`6px` blur) for scrolled bars and floating pills,
+/// avoiding the heavy full-width 32px Gaussian blur fill-rate cost of `glass_capsule_shadow()`.
+pub fn subtle_bar_shadow() -> Vec<BoxShadow> {
+    if active_theme().is_light {
+        vec![BoxShadow::new(px(0.0), px(1.0), rgba(0x0f172a1c).into()).blur_radius(px(6.0))]
+    } else {
+        vec![BoxShadow::new(px(0.0), px(1.0), rgba(0x00000052).into()).blur_radius(px(6.0))]
+    }
+}
+
+/// Lightweight elevation shadow for the scrolled full-width TopNav bar.
+#[inline]
+pub fn topnav_scrolled_shadow() -> Vec<BoxShadow> {
+    subtle_bar_shadow()
+}
+
+/// Resting card elevation shadow: subtle shadow on `LightMist`, empty on dark presets where
+/// dark drop shadows over obsidian canvases are imperceptible and waste GPU fragment fill-rate.
 pub fn poster_card_shadow() -> Vec<BoxShadow> {
     if active_theme().is_light {
         vec![BoxShadow::new(px(0.0), px(2.0), rgba(0x0f172a1a).into()).blur_radius(px(6.0))]
     } else {
-        vec![BoxShadow::new(px(0.0), px(1.0), rgba(0x00000066).into()).blur_radius(px(2.0))]
+        Vec::new()
     }
 }
 
@@ -687,13 +765,13 @@ pub fn poster_hover_glow_shadow(palette: &ThemePalette) -> Vec<BoxShadow> {
     };
     let glow_alpha = if palette.is_light { 0x38 } else { 0x48 };
     vec![
-        BoxShadow::new(px(0.0), px(8.0), rgba(drop_rgba).into()).blur_radius(px(20.0)),
+        BoxShadow::new(px(0.0), px(6.0), rgba(drop_rgba).into()).blur_radius(px(14.0)),
         BoxShadow::new(
             px(0.0),
             px(0.0),
             rgba((palette.accent << 8) | glow_alpha).into(),
         )
-        .blur_radius(px(16.0))
+        .blur_radius(px(12.0))
         .spread_radius(px(1.0)),
     ]
 }
@@ -956,55 +1034,53 @@ pub fn compact_codec_badge(codec: VideoCodec) -> Option<&'static str> {
 }
 
 pub fn parse_runtime_minutes(raw: &str) -> Option<u32> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    if trimmed.is_empty() {
+    let bytes = raw.trim().as_bytes();
+    if bytes.is_empty() {
         return None;
     }
 
-    if let Ok(plain) = trimmed.parse::<u32>() {
-        return (plain > 0).then_some(plain);
-    }
-
     let mut total_mins: u32 = 0;
-    let mut num_buf = String::new();
-    let mut chars = trimmed.chars().peekable();
+    let mut current_num: u32 = 0;
+    let mut has_num = false;
     let mut found_unit = false;
+    let mut i = 0;
 
-    while let Some(ch) = chars.next() {
-        if ch.is_ascii_digit() {
-            num_buf.push(ch);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            current_num = current_num
+                .checked_mul(10)?
+                .checked_add(u32::from(b - b'0'))?;
+            has_num = true;
+            i += 1;
             continue;
         }
-        if ch.is_ascii_whitespace() {
+        if b.is_ascii_whitespace() {
+            i += 1;
             continue;
         }
-        if !num_buf.is_empty() {
-            let val = num_buf.parse::<u32>().ok()?;
-            num_buf.clear();
-            let mut unit = String::new();
-            unit.push(ch);
-            while let Some(&next) = chars.peek() {
-                if next.is_ascii_alphabetic() {
-                    unit.push(next);
-                    chars.next();
-                } else {
-                    break;
-                }
+        if has_num {
+            let unit_start = b.to_ascii_lowercase();
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
             }
-            if unit.starts_with('h') {
-                total_mins = total_mins.saturating_add(val.saturating_mul(60));
+            if unit_start == b'h' {
+                total_mins = total_mins.saturating_add(current_num.saturating_mul(60));
                 found_unit = true;
-            } else if unit.starts_with('m') {
-                total_mins = total_mins.saturating_add(val);
+            } else if unit_start == b'm' {
+                total_mins = total_mins.saturating_add(current_num);
                 found_unit = true;
             }
+            current_num = 0;
+            has_num = false;
+        } else {
+            i += 1;
         }
     }
 
-    if !num_buf.is_empty() && !found_unit {
-        if let Ok(val) = num_buf.parse::<u32>() {
-            total_mins = total_mins.saturating_add(val);
-        }
+    if has_num && !found_unit {
+        total_mins = total_mins.saturating_add(current_num);
     }
 
     (total_mins > 0).then_some(total_mins)
@@ -1031,13 +1107,14 @@ pub fn format_episode_air_date(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.format("%b %-d, %Y").to_string()
 }
 
-pub fn placeholder_tint_for_id(id: &str) -> u32 {
+#[inline]
+pub fn placeholder_tint_for_id_with_preset(id: &str, preset: ThemePreset) -> u32 {
     let mut hash: u32 = 2166136261;
     for b in id.bytes() {
         hash ^= b as u32;
         hash = hash.wrapping_mul(16777619);
     }
-    let palette = match active_theme().preset {
+    let palette = match preset {
         ThemePreset::LightMist => [0xe3e8f0, 0xe7e5ec, 0xe0e7ed, 0xe8e4e6],
         ThemePreset::PureOled => [0x0c0c0f, 0x100f12, 0x0e1014, 0x121116],
         ThemePreset::AuroraIndigo => [0x14192e, 0x171c34, 0x151b30, 0x1a1e38],
@@ -1045,6 +1122,11 @@ pub fn placeholder_tint_for_id(id: &str) -> u32 {
         ThemePreset::EtherealDark => [0x1c1c20, 0x201e20, 0x1d1f23, 0x222024],
     };
     palette[(hash as usize) % palette.len()]
+}
+
+#[inline]
+pub fn placeholder_tint_for_id(id: &str) -> u32 {
+    placeholder_tint_for_id_with_preset(id, active_theme().preset)
 }
 
 #[cfg(test)]
@@ -1055,9 +1137,11 @@ mod tests {
     fn runtime_and_bitrate_helpers_parse_and_estimate_cleanly() {
         assert_eq!(parse_runtime_minutes("52 min"), Some(52));
         assert_eq!(parse_runtime_minutes("1h 42m"), Some(102));
+        assert_eq!(parse_runtime_minutes(" 1H  42MIN "), Some(102));
         assert_eq!(parse_runtime_minutes("2h"), Some(120));
         assert_eq!(parse_runtime_minutes("102"), Some(102));
         assert_eq!(parse_runtime_minutes("0 min"), None);
+        assert_eq!(parse_runtime_minutes("999999999999999999m"), None);
         assert_eq!(parse_runtime_minutes(""), None);
 
         let bytes_18_4_gb = (18.4_f64 * 1_000_000_000.0) as u64;
@@ -1173,6 +1257,10 @@ mod tests {
         assert!(!updated.ambient_bleed);
         assert_eq!(updated.density, CardDensityChoice::Cinema);
         assert_eq!(sp(16.0), px(20.0));
+        assert_eq!(updated.sp(16.0), px(20.0));
+        assert_eq!(poster_card_shadow().len(), 1);
+        assert_eq!(subtle_bar_shadow().len(), 1);
+        assert_eq!(topnav_scrolled_shadow().len(), 1);
 
         // Invalid scale falls back safely to 1.0.
         let sanitized = build_palette(
@@ -1193,5 +1281,8 @@ mod tests {
             CardDensityChoice::Comfortable,
         );
         assert_eq!(sp(16.0), px(16.0));
+        assert_eq!(active_theme().sp(16.0), px(16.0));
+        assert!(poster_card_shadow().is_empty());
+        assert_eq!(subtle_bar_shadow().len(), 1);
     }
 }

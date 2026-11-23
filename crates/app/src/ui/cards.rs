@@ -10,8 +10,8 @@ use crate::{
     icons::{svg_icon, svg_icon_weighted, IconName, IconWeight},
     theme::{
         active_theme, editorial_serif, mono_font, placeholder_tint_for_id, poster_card_shadow,
-        poster_hover_glow_shadow, sp, tabular_nums, ui_sans, CardDensityChoice, ThemePalette,
-        RADIUS_PILL, RADIUS_POSTER,
+        poster_hover_glow_shadow, tabular_nums, CardDensityChoice, ThemePalette, RADIUS_PILL,
+        RADIUS_POSTER,
     },
     ui_components::{ClickHandler, HoverHandler},
     virtual_grid::PosterAspect,
@@ -119,7 +119,7 @@ impl LandscapeCardBadge {
 pub struct LandscapeCardProps {
     pub id: ElementId,
     pub title: SharedString,
-    pub placeholder_id: String,
+    pub placeholder_tint: u32,
     pub subtitle: Option<SharedString>,
     pub image: Option<Arc<RenderImage>>,
     pub width_px: Option<f32>,
@@ -142,12 +142,12 @@ impl LandscapeCardProps {
     pub fn new(
         id: impl Into<ElementId>,
         title: impl Into<SharedString>,
-        placeholder_id: impl Into<String>,
+        placeholder_id: impl AsRef<str>,
     ) -> Self {
         Self {
             id: id.into(),
             title: title.into(),
-            placeholder_id: placeholder_id.into(),
+            placeholder_tint: placeholder_tint_for_id(placeholder_id.as_ref()),
             subtitle: None,
             image: None,
             width_px: None,
@@ -241,11 +241,21 @@ impl LandscapeCardProps {
         self
     }
 
+    pub fn on_open_handler(mut self, handler: ClickHandler) -> Self {
+        self.on_open = Some(handler);
+        self
+    }
+
     pub fn on_quick_play(
         mut self,
         handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_quick_play = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_quick_play_handler(mut self, handler: ClickHandler) -> Self {
+        self.on_quick_play = Some(handler);
         self
     }
 
@@ -257,6 +267,11 @@ impl LandscapeCardProps {
         self
     }
 
+    pub fn on_quick_peek_handler(mut self, handler: ClickHandler) -> Self {
+        self.on_quick_peek = Some(handler);
+        self
+    }
+
     pub fn on_context_menu(
         mut self,
         handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -265,8 +280,18 @@ impl LandscapeCardProps {
         self
     }
 
+    pub fn on_context_menu_handler(mut self, handler: ClickHandler) -> Self {
+        self.on_context_menu = Some(handler);
+        self
+    }
+
     pub fn on_hover(mut self, handler: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self {
         self.on_hover = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_hover_handler(mut self, handler: HoverHandler) -> Self {
+        self.on_hover = Some(handler);
         self
     }
 }
@@ -282,10 +307,9 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
         .unwrap_or(default_w);
     let card_h = (card_w * PosterAspect::Landscape16x9.height_over_width()).ceil();
 
-    let base_id = Arc::new(props.id.clone());
-    let grp: SharedString = format!("landscape-card-grp-{base_id}").into();
-    let peek_id = ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("peek"));
-    let play_id = ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("play"));
+    let needs_child_ids = props.on_quick_peek.is_some() || props.on_quick_play.is_some();
+    let base_id = needs_child_ids.then(|| Arc::new(props.id.clone()));
+    let grp: SharedString = format!("landscape-card-grp-{}", props.id).into();
 
     let progress = clamp_progress_fraction(props.progress_fraction);
     let hover_glow = poster_hover_glow_shadow(&theme);
@@ -315,8 +339,8 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
         .rounded(px(RADIUS_POSTER))
         .overflow_hidden()
         .relative()
-        .bg(rgb(placeholder_tint_for_id(&props.placeholder_id)))
-        .shadow(poster_card_shadow());
+        .bg(rgb(props.placeholder_tint))
+        .when(theme.is_light, |el| el.shadow(poster_card_shadow()));
 
     if is_highlighted {
         card = card
@@ -359,7 +383,7 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
     } else {
         div()
             .size_full()
-            .p(sp(12.0))
+            .p(theme.sp(12.0))
             .bg(rgb(theme.bg_surface))
             .flex()
             .items_start()
@@ -367,7 +391,7 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
                 div()
                     .w_full()
                     .font(editorial_serif())
-                    .text_size(sp(18.0))
+                    .text_size(theme.sp(18.0))
                     .text_color(rgb(theme.text_muted))
                     .truncate()
                     .child(props.title.clone()),
@@ -420,21 +444,32 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
     if has_top_right_controls {
         let mut actions = div()
             .absolute()
-            .top(sp(8.0))
-            .right(sp(8.0))
+            .top(theme.sp(8.0))
+            .right(theme.sp(8.0))
             .flex()
             .items_center()
-            .gap(sp(5.0))
-            .opacity(if props.is_active { 0.94 } else { 0.0 })
-            .group_hover(grp.clone(), |s| s.opacity(1.0));
+            .gap(theme.sp(5.0));
 
-        if let Some(on_peek) = props.on_quick_peek {
+        if props.is_active {
+            actions = actions
+                .opacity(0.94)
+                .group_hover(grp.clone(), |s| s.opacity(1.0));
+        } else {
+            // `invisible()` hits GPUI's Visibility::Hidden early-out (zero GPU primitives at rest).
+            actions = actions
+                .invisible()
+                .group_hover(grp.clone(), |s| s.visible());
+        }
+
+        if let (Some(on_peek), Some(base_id)) = (props.on_quick_peek, base_id.as_ref()) {
+            let peek_id =
+                ElementId::NamedChild(Arc::clone(base_id), SharedString::new_static("peek"));
             actions = actions.child(
                 div()
                     .id(peek_id)
                     .cursor_pointer()
-                    .w(sp(28.0))
-                    .h(sp(28.0))
+                    .w(theme.sp(28.0))
+                    .h(theme.sp(28.0))
                     .rounded(px(RADIUS_PILL))
                     .bg(rgba(0x0B0D14CC))
                     .border_1()
@@ -458,13 +493,15 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
             );
         }
 
-        if let Some(on_play) = top_right_play {
+        if let (Some(on_play), Some(base_id)) = (top_right_play, base_id.as_ref()) {
+            let play_id =
+                ElementId::NamedChild(Arc::clone(base_id), SharedString::new_static("play"));
             actions = actions.child(
                 div()
-                    .id(play_id.clone())
+                    .id(play_id)
                     .cursor_pointer()
-                    .w(sp(28.0))
-                    .h(sp(28.0))
+                    .w(theme.sp(28.0))
+                    .h(theme.sp(28.0))
                     .rounded(px(RADIUS_PILL))
                     .bg(rgb(theme.accent))
                     .hover(move |s| s.bg(rgb(theme.accent_hover)))
@@ -499,12 +536,12 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
         .min_w(px(0.0))
         .flex()
         .flex_col()
-        .gap(sp(2.0))
+        .gap(theme.sp(2.0))
         .child(
             div()
-                .font(ui_sans(FontWeight::SEMIBOLD))
-                .text_size(sp(13.0))
-                .line_height(sp(16.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(theme.sp(13.0))
+                .line_height(theme.sp(16.0))
                 .text_color(rgb(0xF5F1E8))
                 .truncate()
                 .child(props.title),
@@ -516,19 +553,19 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
             .min_w(px(0.0))
             .flex()
             .items_center()
-            .gap(sp(6.0));
+            .gap(theme.sp(6.0));
 
         if let Some((ep_code, watched)) = props.episode_badge {
             meta_row = meta_row.child(
                 div()
                     .flex_shrink_0()
-                    .px(sp(5.5))
-                    .py(sp(1.0))
+                    .px(theme.sp(5.5))
+                    .py(theme.sp(1.0))
                     .rounded(px(4.0))
                     .bg(rgba(0xFFFFFF1C))
                     .font(mono_font())
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(sp(10.5))
+                    .text_size(theme.sp(10.5))
                     .text_color(if watched {
                         rgb(theme.status_watched)
                     } else {
@@ -544,9 +581,9 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(sp(3.0))
+                    .gap(theme.sp(3.0))
                     .font(mono_font())
-                    .text_size(sp(10.5))
+                    .text_size(theme.sp(10.5))
                     .text_color(rgb(0xF5F1E8))
                     .child(svg_icon(
                         IconName::Star,
@@ -562,10 +599,10 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
-                    .font(ui_sans(FontWeight::MEDIUM))
+                    .font_weight(FontWeight::MEDIUM)
                     .font_features(tabular_nums())
-                    .text_size(sp(11.5))
-                    .line_height(sp(14.0))
+                    .text_size(theme.sp(11.5))
+                    .line_height(theme.sp(14.0))
                     .text_color(rgb(0xC8C8D2))
                     .truncate()
                     .child(subtitle),
@@ -577,31 +614,32 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
 
     let mut bottom_overlay = div()
         .absolute()
-        .left(sp(10.0))
-        .right(sp(10.0))
-        .bottom(sp(bottom_offset_px))
+        .left(theme.sp(10.0))
+        .right(theme.sp(10.0))
+        .bottom(theme.sp(bottom_offset_px))
         .flex()
         .items_end()
         .justify_between()
-        .gap(sp(8.0))
+        .gap(theme.sp(8.0))
         .child(meta_col);
 
-    if let Some((on_play, label)) = bottom_right_play {
+    if let (Some((on_play, label)), Some(base_id)) = (bottom_right_play, base_id.as_ref()) {
+        let play_id = ElementId::NamedChild(Arc::clone(base_id), SharedString::new_static("play"));
         bottom_overlay = bottom_overlay.child(
             div()
                 .id(play_id)
                 .cursor_pointer()
                 .flex_shrink_0()
-                .h(sp(28.0))
-                .px(sp(10.0))
+                .h(theme.sp(28.0))
+                .px(theme.sp(10.0))
                 .rounded(px(RADIUS_PILL))
                 .bg(rgb(theme.accent))
                 .hover(move |s| s.bg(rgb(theme.accent_hover)))
                 .flex()
                 .items_center()
-                .gap(sp(5.0))
-                .font(ui_sans(FontWeight::SEMIBOLD))
-                .text_size(sp(11.5))
+                .gap(theme.sp(5.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(theme.sp(11.5))
                 .text_color(rgb(theme.cta_on_accent))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
@@ -627,7 +665,7 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
                 .bottom_0()
                 .left_0()
                 .right_0()
-                .h(sp(3.0))
+                .h(theme.sp(3.0))
                 .bg(rgba(0xFFFFFF2E))
                 .child(div().h_full().w(relative(frac)).bg(rgb(theme.accent))),
         );
@@ -639,21 +677,21 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
 fn render_corner_badge(badge: LandscapeCardBadge, is_left: bool, theme: &ThemePalette) -> AnyElement {
     let mut el = div()
         .absolute()
-        .top(sp(8.0))
-        .h(sp(20.0))
-        .px(sp(7.0))
+        .top(theme.sp(8.0))
+        .h(theme.sp(20.0))
+        .px(theme.sp(7.0))
         .rounded(px(RADIUS_PILL))
         .flex()
         .items_center()
         .justify_center()
         .font(mono_font())
         .font_weight(FontWeight::BOLD)
-        .text_size(sp(10.0));
+        .text_size(theme.sp(10.0));
 
     el = if is_left {
-        el.left(sp(8.0))
+        el.left(theme.sp(8.0))
     } else {
-        el.right(sp(8.0))
+        el.right(theme.sp(8.0))
     };
 
     if badge.accent {

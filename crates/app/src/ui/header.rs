@@ -6,7 +6,7 @@ use gpui::{
 use crate::{
     icons::{svg_icon_weighted, IconName, IconWeight},
     theme::{
-        active_theme, editorial_serif, mono_font, sp, tabular_nums, ui_sans, RADIUS_CARD,
+        active_theme, editorial_serif, mono_font, tabular_nums, ui_sans, ThemePalette, RADIUS_CARD,
         RADIUS_PILL,
     },
     ui_components::{glass_back_button, ClickHandler},
@@ -97,17 +97,17 @@ pub fn render_page_header(props: PageHeader) -> Div {
         .flex()
         .flex_wrap()
         .items_baseline()
-        .gap(sp(12.0))
+        .gap(theme.sp(12.0))
         .child(
             div()
                 .font(editorial_serif())
-                .text_size(sp(36.0))
+                .text_size(theme.sp(36.0))
                 .line_height(relative(1.08))
                 .text_color(rgb(theme.text_primary))
                 .child(props.title),
         )
         .when_some(props.count_badge, |row, badge| {
-            row.child(render_header_count_pill(badge))
+            row.child(render_header_count_pill(badge, &theme))
         });
 
     let title_col = div()
@@ -115,13 +115,13 @@ pub fn render_page_header(props: PageHeader) -> Div {
         .min_w(px(0.0))
         .flex()
         .flex_col()
-        .gap(sp(4.0))
+        .gap(theme.sp(4.0))
         .child(title_row)
         .when_some(props.subtitle, |col, sub| {
             col.child(
                 div()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(sp(13.5))
+                    .text_size(theme.sp(13.5))
                     .text_color(rgb(theme.text_secondary))
                     .child(sub),
             )
@@ -132,15 +132,15 @@ pub fn render_page_header(props: PageHeader) -> Div {
         .min_w(px(0.0))
         .flex()
         .items_center()
-        .gap(sp(14.0))
+        .gap(theme.sp(14.0))
         .when_some(props.back_button, |row, back| {
             row.child(glass_back_button(back.id, back.label, back.on_click))
         })
         .when_some(props.leading_icon, |row, icon| {
             row.child(
                 div()
-                    .w(sp(42.0))
-                    .h(sp(42.0))
+                    .w(theme.sp(42.0))
+                    .h(theme.sp(42.0))
                     .flex_shrink_0()
                     .rounded(px(RADIUS_CARD))
                     .bg(rgba(theme.accent_soft))
@@ -163,7 +163,7 @@ pub fn render_page_header(props: PageHeader) -> Div {
         .w_full()
         .flex_shrink_0()
         .when(props.bottom_divider, |el| {
-            el.pb(sp(14.0))
+            el.pb(theme.sp(14.0))
                 .border_b_1()
                 .border_color(rgba(theme.glass_divider))
         })
@@ -171,7 +171,7 @@ pub fn render_page_header(props: PageHeader) -> Div {
         .flex_wrap()
         .items_end()
         .justify_between()
-        .gap(sp(16.0))
+        .gap(theme.sp(16.0))
         .child(left_group)
         .when_some(props.right_slot, |row, right| {
             row.child(div().flex_shrink_0().child(right))
@@ -228,17 +228,17 @@ pub fn render_section_header(props: SectionHeader) -> Div {
         .flex()
         .flex_wrap()
         .items_baseline()
-        .gap(sp(10.0))
+        .gap(theme.sp(10.0))
         .child(
             div()
                 .font(editorial_serif())
-                .text_size(sp(26.0))
+                .text_size(theme.sp(26.0))
                 .line_height(relative(1.1))
                 .text_color(rgb(theme.text_primary))
                 .child(props.title),
         )
         .when_some(props.count_badge, |row, badge| {
-            row.child(render_header_count_pill(badge))
+            row.child(render_header_count_pill(badge, &theme))
         })
         .when_some(props.inline_badge, |row, badge| row.child(badge));
 
@@ -247,13 +247,13 @@ pub fn render_section_header(props: SectionHeader) -> Div {
         .min_w(px(0.0))
         .flex()
         .flex_col()
-        .gap(sp(2.0))
+        .gap(theme.sp(2.0))
         .child(title_row)
         .when_some(props.subtitle, |col, sub| {
             col.child(
                 div()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(sp(12.5))
+                    .text_size(theme.sp(12.5))
                     .text_color(rgb(theme.text_muted))
                     .truncate()
                     .child(sub),
@@ -267,26 +267,25 @@ pub fn render_section_header(props: SectionHeader) -> Div {
         .flex_wrap()
         .items_end()
         .justify_between()
-        .gap(sp(12.0))
+        .gap(theme.sp(12.0))
         .child(left_col)
         .when_some(props.right_slot, |row, right| {
             row.child(div().flex_shrink_0().child(right))
         })
 }
 
-fn render_header_count_pill(label: SharedString) -> Div {
-    let theme = active_theme();
+fn render_header_count_pill(label: SharedString, theme: &ThemePalette) -> Div {
     div()
         .flex_shrink_0()
-        .px(sp(9.0))
-        .py(sp(2.5))
+        .px(theme.sp(9.0))
+        .py(theme.sp(2.5))
         .rounded(px(RADIUS_PILL))
         .bg(rgba(theme.glass_trough_bg))
         .border_1()
         .border_color(rgba(theme.glass_border))
         .font(mono_font())
         .font_features(tabular_nums())
-        .text_size(sp(11.5))
+        .text_size(theme.sp(11.5))
         .text_color(rgb(theme.text_muted))
         .child(label)
 }

@@ -2,7 +2,7 @@ use gpui::{div, prelude::*, px, relative, rgb, rgba, AnyElement, Div, SharedStri
 
 use crate::{
     icons::{svg_icon, IconName},
-    theme::{active_theme, editorial_serif, sp, RADIUS_CARD, RADIUS_PILL},
+    theme::{active_theme, editorial_serif, RADIUS_CARD, RADIUS_PILL},
 };
 
 /// Props for the unified centered frosted-glass empty state card shared across
@@ -59,9 +59,9 @@ pub fn render_empty_state(props: EmptyStateProps) -> Div {
     let theme = active_theme();
     let card = div()
         .w_full()
-        .max_w(sp(props.max_width_px))
-        .py(sp(52.0))
-        .px(sp(28.0))
+        .max_w(theme.sp(props.max_width_px))
+        .py(theme.sp(52.0))
+        .px(theme.sp(28.0))
         .rounded(px(RADIUS_CARD))
         .border_1()
         .border_color(rgba(theme.glass_border))
@@ -69,11 +69,11 @@ pub fn render_empty_state(props: EmptyStateProps) -> Div {
         .flex()
         .flex_col()
         .items_center()
-        .gap(sp(12.0))
+        .gap(theme.sp(12.0))
         .child(
             div()
-                .w(sp(44.0))
-                .h(sp(44.0))
+                .w(theme.sp(44.0))
+                .h(theme.sp(44.0))
                 .flex_shrink_0()
                 .rounded(px(RADIUS_PILL))
                 .bg(rgba(theme.glass_trough_bg))
@@ -91,7 +91,7 @@ pub fn render_empty_state(props: EmptyStateProps) -> Div {
         .child(
             div()
                 .font(editorial_serif())
-                .text_size(sp(28.0))
+                .text_size(theme.sp(28.0))
                 .line_height(relative(1.12))
                 .text_color(rgb(theme.text_primary))
                 .text_center()
@@ -99,8 +99,8 @@ pub fn render_empty_state(props: EmptyStateProps) -> Div {
         )
         .child(
             div()
-                .max_w(sp(420.0))
-                .text_size(sp(13.5))
+                .max_w(theme.sp(420.0))
+                .text_size(theme.sp(13.5))
                 .text_color(rgb(theme.text_secondary))
                 .text_center()
                 .child(props.body),
@@ -108,12 +108,12 @@ pub fn render_empty_state(props: EmptyStateProps) -> Div {
         .when(!props.actions.is_empty(), |card| {
             card.child(
                 div()
-                    .pt(sp(6.0))
+                    .pt(theme.sp(6.0))
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .justify_center()
-                    .gap(sp(10.0))
+                    .gap(theme.sp(10.0))
                     .children(props.actions),
             )
         });

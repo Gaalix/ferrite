@@ -43,10 +43,10 @@ pub use layout::{
 };
 pub use scroll::{
     back_to_top_right_inset_px, compute_scrollbar_metrics, compute_scrollbar_track_span,
-    render_back_to_top_button, render_vertical_scrollbar, scroll_geometry_changed,
-    scroll_offset_for_pointer_y, scrollbar_press_action, should_show_back_to_top,
+    render_back_to_top_button, scroll_chrome_flags, scroll_offset_for_pointer_y,
+    scrollbar_press_action, should_show_back_to_top, ScrollbarDragState, ScrollbarElement,
     ScrollbarMetrics, BACK_TO_TOP_THRESHOLD_PX, SCROLLBAR_BOTTOM_INSET_PX,
-    SCROLLBAR_MIN_THUMB_HEIGHT_PX, SCROLLBAR_OVERFLOW_EPSILON_PX, SCROLLBAR_RAIL_WIDTH_PX,
-    SCROLLBAR_RIGHT_INSET_PX, SCROLLBAR_THUMB_WIDTH_ACTIVE_PX, SCROLLBAR_THUMB_WIDTH_REST_PX,
-    SCROLLBAR_TOPNAV_CLEARANCE_PX, SCROLL_SYNC_EPSILON_PX,
+    SCROLLBAR_DRAG_EPSILON_PX, SCROLLBAR_MIN_THUMB_HEIGHT_PX, SCROLLBAR_OVERFLOW_EPSILON_PX,
+    SCROLLBAR_RAIL_WIDTH_PX, SCROLLBAR_RIGHT_INSET_PX, SCROLLBAR_THUMB_WIDTH_ACTIVE_PX,
+    SCROLLBAR_THUMB_WIDTH_REST_PX, SCROLLBAR_TOPNAV_CLEARANCE_PX,
 };

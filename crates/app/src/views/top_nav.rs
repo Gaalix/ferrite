@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, rgba, AnimationExt, Context, FontWeight, MouseButton, SharedString,
-    Window, WindowControlArea,
+    div, prelude::*, px, rgb, rgba, AnimationExt, BoxShadow, Context, FontWeight, MouseButton,
+    SharedString, Window, WindowControlArea,
 };
 
 use crate::{
@@ -28,6 +28,16 @@ pub fn is_topnav_scrolled(scroll_y: f32) -> bool {
     scroll_y.is_finite() && scroll_y >= TOPNAV_SCROLLED_THRESHOLD_PX
 }
 
+#[inline]
+fn topnav_scrolled_bar_shadow(is_light: bool) -> Vec<BoxShadow> {
+    let color = if is_light {
+        rgba(0x0F172A18)
+    } else {
+        rgba(0x00000040)
+    };
+    vec![BoxShadow::new(px(0.0), px(1.0), color.into()).blur_radius(px(6.0))]
+}
+
 impl AppShell {
     pub fn render_floating_topnav(
         &self,
@@ -46,14 +56,8 @@ impl AppShell {
         let compact_width = is_compact_viewport(viewport_w);
         let nav_gutter_px = topnav_gutter_px(viewport_w);
 
-        let (signed_in_email, avatar_initial) = self.core.with_model(|m| {
-            let email = m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone());
-            let init = email
-                .as_deref()
-                .and_then(|e| e.chars().next())
-                .map(|c| c.to_ascii_uppercase().to_string());
-            (email, init)
-        });
+        let signed_in_email = self.cached_auth_email.as_deref();
+        let avatar_initial = self.cached_auth_initial.clone();
 
         let can_back = !self.nav_history.is_empty();
         let can_forward = !self.nav_forward.is_empty();
@@ -677,7 +681,7 @@ impl AppShell {
                 el.bg(rgba(theme.bg_topnav_scrolled))
                     .border_b_1()
                     .border_color(rgba(theme.glass_divider))
-                    .shadow(glass_capsule_shadow())
+                    .shadow(topnav_scrolled_bar_shadow(theme.is_light))
             })
             .flex()
             .items_center()
@@ -707,9 +711,7 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = active_theme();
-        let email_opt = self
-            .core
-            .with_model(|m| m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone()));
+        let email_opt = self.cached_auth_email.clone();
         let active_tab = self.route.active_sidebar_tab();
 
         let nav_gutter_px = topnav_gutter_px(self.viewport_size_px.0);

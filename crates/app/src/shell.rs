@@ -1,6 +1,7 @@
 use std::{
-    cell::Cell,
-    collections::{HashMap, HashSet},
+    cell::{Cell, RefCell},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     path::PathBuf,
     rc::Rc,
     sync::{Arc, OnceLock},
@@ -8,11 +9,10 @@ use std::{
 };
 
 use gpui::{
-    canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba,
-    AnimationExt, AsyncApp, ClipboardItem, Context, CursorStyle, Decorations, DispatchPhase,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Render,
-    RenderImage, ResizeEdge, ScrollDelta, ScrollHandle, SharedString, WeakEntity, Window,
+    div, img, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, AnimationExt,
+    AsyncApp, ClipboardItem, Context, CursorStyle, Decorations, FocusHandle, Focusable, FontWeight,
+    KeyDownEvent, KeyUpEvent, MouseButton, NavigationDirection, ObjectFit, PathPromptOptions,
+    Render, RenderImage, ResizeEdge, ScrollDelta, ScrollHandle, SharedString, WeakEntity, Window,
     WindowBackgroundAppearance, WindowControlArea,
 };
 use gpui_mpv::{
@@ -81,10 +81,8 @@ use crate::{
         AccentChoice, CardDensityChoice, ThemePreset, UiScaleChoice, RADIUS_CONTROL, RADIUS_PILL,
     },
     ui::{
-        compute_scrollbar_metrics, compute_scrollbar_track_span, render_back_to_top_button,
-        render_vertical_scrollbar, scroll_geometry_changed, scroll_offset_for_pointer_y,
-        scrollbar_press_action, should_show_back_to_top, ScrollbarMetrics,
-        SCROLLBAR_MIN_THUMB_HEIGHT_PX,
+        render_back_to_top_button, scroll_chrome_flags, should_show_back_to_top,
+        ScrollbarDragState, ScrollbarElement,
     },
     ui_components::{click_handler, glass_dropdown_panel, ClickHandler},
     updater::{self, AppliedUpdateOutcome, UpdateStatus},
@@ -106,14 +104,7 @@ const TOAST_LIFETIME: Duration = Duration::from_millis(3600);
 const PREWARM_HEAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_NAV_HISTORY: usize = 64;
 const HEAP_TRIM_MIN_INTERVAL: Duration = Duration::from_secs(10);
-
-pub struct ScrollbarDragState {
-    pub route_key: String,
-    pub handle: ScrollHandle,
-    pub track_top: f32,
-    pub grab_offset_y: f32,
-    pub metrics: ScrollbarMetrics,
-}
+const SCROLL_HOVER_PREFETCH_COOLDOWN: Duration = Duration::from_millis(150);
 
 pub struct AppShell {
     pub focus_handle: FocusHandle,
@@ -207,10 +198,14 @@ pub struct AppShell {
     pub search_movies_scroll: gpui::UniformListScrollHandle,
     pub search_series_scroll: gpui::UniformListScrollHandle,
     pub person_credits_scroll: gpui::UniformListScrollHandle,
-    pub scrollbar_drag: Option<ScrollbarDragState>,
-    pub scrollbar_drag_active: Rc<Cell<bool>>,
-    pub scrollbar_hovered: bool,
+    pub scrollbar_drag: Rc<RefCell<Option<ScrollbarDragState>>>,
+    pub scrollbar_hovered: Rc<Cell<bool>>,
+    pub last_scroll_chrome_flags: Rc<Cell<(bool, bool)>>,
+    pub last_scroll_at: Rc<Cell<Option<Instant>>>,
+    pub last_observed_scroll: Rc<Cell<(u64, f32)>>,
     pub active_scroll_suppressed: Cell<bool>,
+    pub cached_auth_email: Option<String>,
+    pub cached_auth_initial: Option<String>,
     pub episode_list_scrolled_key: Option<(String, String)>,
     pub meta_addon_dropdown_open: bool,
     pub discover_open_dropdown: Option<DiscoverDropdown>,
@@ -351,6 +346,7 @@ impl AppShell {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let _ = this.update(cx, |shell, cx| {
+                            shell.refresh_cached_auth();
                             shell.sync_player_from_core_model(cx);
                             cx.notify();
                         });
@@ -421,6 +417,14 @@ impl AppShell {
 
         let private_cfg = services.core.private_integrations();
         let last_debrid_latency_ms = services.core.last_debrid_resolve_latency_ms();
+        let (cached_auth_email, cached_auth_initial) = services.core.with_model(|m| {
+            let email = m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone());
+            let init = email
+                .as_deref()
+                .and_then(|e| e.chars().next())
+                .map(|c| c.to_ascii_uppercase().to_string());
+            (email, init)
+        });
 
         let initial_vp = window.viewport_size();
         let viewport_size_px = (f32::from(initial_vp.width), f32::from(initial_vp.height));
@@ -520,10 +524,14 @@ impl AppShell {
             search_movies_scroll: gpui::UniformListScrollHandle::new(),
             search_series_scroll: gpui::UniformListScrollHandle::new(),
             person_credits_scroll: gpui::UniformListScrollHandle::new(),
-            scrollbar_drag: None,
-            scrollbar_drag_active: Rc::new(Cell::new(false)),
-            scrollbar_hovered: false,
+            scrollbar_drag: Rc::new(RefCell::new(None)),
+            scrollbar_hovered: Rc::new(Cell::new(false)),
+            last_scroll_chrome_flags: Rc::new(Cell::new((false, false))),
+            last_scroll_at: Rc::new(Cell::new(None)),
+            last_observed_scroll: Rc::new(Cell::new((0, 0.0))),
             active_scroll_suppressed: Cell::new(false),
+            cached_auth_email,
+            cached_auth_initial,
             episode_list_scrolled_key: None,
             meta_addon_dropdown_open: false,
             discover_open_dropdown: None,
@@ -985,6 +993,14 @@ impl AppShell {
                 self.hover_prefetch_target = None;
                 self.hover_prefetch_seq = self.hover_prefetch_seq.wrapping_add(1);
             }
+            return;
+        }
+
+        if self
+            .last_scroll_at
+            .get()
+            .is_some_and(|t| t.elapsed() < SCROLL_HOVER_PREFETCH_COOLDOWN)
+        {
             return;
         }
 
@@ -1473,6 +1489,19 @@ impl AppShell {
         }
     }
 
+    fn refresh_cached_auth(&mut self) {
+        let (email, initial) = self.core.with_model(|m| {
+            let email = m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone());
+            let init = email
+                .as_deref()
+                .and_then(|e| e.chars().next())
+                .map(|c| c.to_ascii_uppercase().to_string());
+            (email, init)
+        });
+        self.cached_auth_email = email;
+        self.cached_auth_initial = initial;
+    }
+
     fn handle_core_runtime_event(
         &mut self,
         ev: &crate::CoreRuntimeEventAlias,
@@ -1481,6 +1510,9 @@ impl AppShell {
         match ev {
             RuntimeEvent::NewState(fields) => {
                 self.bump_state_revisions(fields);
+                if fields.contains(&DesktopModelField::Ctx) {
+                    self.refresh_cached_auth();
+                }
 
                 if fields.contains(&DesktopModelField::AuthLink) && self.link_poll_active {
                     let resolved_token = self.core.with_model(|m| match &m.auth_link.data {
@@ -1544,6 +1576,7 @@ impl AppShell {
             }
             RuntimeEvent::CoreEvent(core_ev) => match core_ev {
                 CoreEvent::UserAuthenticated { auth_request: _ } => {
+                    self.refresh_cached_auth();
                     self.auth_password_input.clear();
                     self.input_cursors.remove(&FocusedInput::AuthPassword);
                     self.input_selected_all.remove(&FocusedInput::AuthPassword);
@@ -2120,16 +2153,14 @@ impl AppShell {
     }
 
     pub(crate) fn clear_scrollbar_interaction(&mut self) {
-        self.scrollbar_drag = None;
-        self.scrollbar_drag_active.set(false);
-        self.scrollbar_hovered = false;
+        *self.scrollbar_drag.borrow_mut() = None;
+        self.scrollbar_hovered.set(false);
     }
 
     pub(crate) fn scroll_active_route_to_top(&mut self, cx: &mut Context<Self>) {
         let route = self.route.clone();
         self.restore_route_scroll_y(&route, 0.0);
-        self.scrollbar_drag = None;
-        self.scrollbar_drag_active.set(false);
+        *self.scrollbar_drag.borrow_mut() = None;
         cx.notify();
     }
 
@@ -2144,182 +2175,54 @@ impl AppShell {
         &self,
         is_hero_route: bool,
         cx: &mut Context<Self>,
-    ) -> (
-        Option<gpui::Stateful<gpui::Div>>,
-        Option<gpui::Stateful<gpui::Div>>,
-        Option<gpui::AnyElement>,
-    ) {
+    ) -> (Option<gpui::AnyElement>, Option<gpui::Stateful<gpui::Div>>) {
         if self.route.is_player() {
-            return (None, None, None);
+            return (None, None);
         }
 
         let Some(handle) = self.active_route_scroll_handle() else {
-            return (None, None, None);
+            return (None, None);
         };
 
         let suppressed =
             self.active_scroll_suppressed.get() || self.has_blocking_scroll_overlay();
-        let theme = active_theme();
         let scroll_y = (-handle.offset().y / px(1.0)).max(0.0);
-        let max_offset_y = (handle.max_offset().y / px(1.0)).max(0.0);
-        let bounds = handle.bounds();
-        let container_top = f32::from(bounds.top());
-        let container_bottom = f32::from(bounds.bottom());
-        let container_height = f32::from(bounds.size.height);
-        let (viewport_w, viewport_h) = self.viewport_size_px;
+        let rendered_flags = scroll_chrome_flags(scroll_y, suppressed);
+        self.last_scroll_chrome_flags.set(rendered_flags);
 
-        let rendered_snapshot = (max_offset_y, container_top, container_bottom, scroll_y);
-        let probe_handle = handle.clone();
-        let probe_entity_id = cx.entity_id();
-        let drag_active_for_move = Rc::clone(&self.scrollbar_drag_active);
-        let drag_active_for_up = Rc::clone(&self.scrollbar_drag_active);
-        let entity_for_move = cx.entity().downgrade();
-        let entity_for_up = cx.entity().downgrade();
+        let route_key = self.route.transition_id();
+        let mut hasher = DefaultHasher::new();
+        route_key.hash(&mut hasher);
+        let route_hash = hasher.finish();
 
-        // Mounted as a sibling AFTER `active_content` so:
-        // 1. `prepaint` runs after `active_content` updates `handle.max_offset()` and
-        //    `handle.bounds()`, scheduling a single follow-up frame when geometry changed.
-        // 2. `paint` registers unconditional `Capture`-phase window mouse listeners so
-        //    scrollbar dragging continues smoothly over `.occlude()` elements (including
-        //    the scrollbar rail itself and TopNav) and outside window bounds.
-        let sync_probe_el = canvas(
-            move |_bounds, window, _cx| {
-                if suppressed {
-                    return;
-                }
-                let post_max_y = (probe_handle.max_offset().y / px(1.0)).max(0.0);
-                let post_bounds = probe_handle.bounds();
-                let post_top = f32::from(post_bounds.top());
-                let post_bottom = f32::from(post_bounds.bottom());
-                let post_scroll_y = (-probe_handle.offset().y / px(1.0)).max(0.0);
-                if scroll_geometry_changed(
-                    rendered_snapshot,
-                    (post_max_y, post_top, post_bottom, post_scroll_y),
-                ) {
-                    window.on_next_frame(move |_window, cx| {
-                        cx.notify(probe_entity_id);
-                    });
-                }
-            },
-            move |_bounds, (), window, _cx| {
-                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _window, cx| {
-                    if phase != DispatchPhase::Capture || !drag_active_for_move.get() {
-                        return;
-                    }
-                    let _ = entity_for_move.update(cx, |this, cx| {
-                        let Some(drag) = this.scrollbar_drag.as_ref() else {
-                            this.scrollbar_drag_active.set(false);
-                            return;
-                        };
-                        if ev.pressed_button != Some(MouseButton::Left) {
-                            this.scrollbar_drag = None;
-                            this.scrollbar_drag_active.set(false);
-                            cx.notify();
-                            return;
-                        }
-                        let target_y = scroll_offset_for_pointer_y(
-                            f32::from(ev.position.y),
-                            drag.track_top,
-                            drag.grab_offset_y,
-                            drag.metrics,
-                        );
-                        let cur_x = drag.handle.offset().x;
-                        drag.handle.set_offset(point(cur_x, px(-target_y)));
-                        cx.notify();
-                    });
-                });
-
-                window.on_mouse_event(move |ev: &MouseUpEvent, phase, _window, cx| {
-                    if phase != DispatchPhase::Capture
-                        || ev.button != MouseButton::Left
-                        || !drag_active_for_up.get()
-                    {
-                        return;
-                    }
-                    let _ = entity_for_up.update(cx, |this, cx| {
-                        this.scrollbar_drag_active.set(false);
-                        if this.scrollbar_drag.take().is_some() {
-                            cx.notify();
-                        }
-                    });
-                });
-            },
+        // Mounted as a sibling AFTER `active_content` so `ScrollbarElement::prepaint`
+        // reads live post-prepaint `offset`, `max_offset`, and `bounds` and paints the
+        // track/thumb directly in `paint()` with zero follow-up double-renders.
+        let scrollbar_el = ScrollbarElement::new(
+            route_key,
+            route_hash,
+            handle,
+            is_hero_route,
+            suppressed,
+            cx.entity_id(),
+            Rc::clone(&self.scrollbar_drag),
+            Rc::clone(&self.scrollbar_hovered),
+            Rc::clone(&self.last_scroll_chrome_flags),
+            Rc::clone(&self.last_scroll_at),
+            Rc::clone(&self.last_observed_scroll),
         )
-        .absolute()
-        .size(px(0.0))
         .into_any_element();
 
-        if suppressed {
-            return (None, None, Some(sync_probe_el));
-        }
-
-        let scrollbar_el = compute_scrollbar_track_span(
-            container_top,
-            container_bottom,
-            viewport_h,
-            is_hero_route,
-            theme.ui_scale,
-        )
-        .and_then(|(track_top, track_height)| {
-            let vp_h = if container_height > 1.0 {
-                container_height
-            } else {
-                track_height
-            };
-            compute_scrollbar_metrics(
-                scroll_y,
-                max_offset_y,
-                vp_h,
-                track_height,
-                SCROLLBAR_MIN_THUMB_HEIGHT_PX * theme.ui_scale,
-            )
-            .map(|metrics| (track_top, metrics))
-        })
-        .map(|(track_top, metrics)| {
-            let handle_for_down = handle.clone();
-            let route_key = self.route.transition_id();
-            render_vertical_scrollbar(
-                track_top,
-                metrics,
-                self.scrollbar_hovered,
-                self.scrollbar_drag.is_some(),
-                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    let pointer_y = f32::from(ev.position.y);
-                    let (grab_offset_y, immediate_scroll_y) =
-                        scrollbar_press_action(pointer_y, track_top, metrics);
-                    if let Some(target_y) = immediate_scroll_y {
-                        let cur_x = handle_for_down.offset().x;
-                        handle_for_down.set_offset(point(cur_x, px(-target_y)));
-                    }
-                    this.scrollbar_drag_active.set(true);
-                    this.scrollbar_drag = Some(ScrollbarDragState {
-                        route_key: route_key.clone(),
-                        handle: handle_for_down.clone(),
-                        track_top,
-                        grab_offset_y,
-                        metrics,
-                    });
-                    cx.notify();
-                }),
-                cx.listener(|this, hovered: &bool, _, cx| {
-                    if this.scrollbar_hovered != *hovered {
-                        this.scrollbar_hovered = *hovered;
-                        cx.notify();
-                    }
-                }),
-            )
-        });
-
-        let back_to_top_el = should_show_back_to_top(scroll_y).then(|| {
+        let back_to_top_el = (!suppressed && should_show_back_to_top(scroll_y)).then(|| {
             render_back_to_top_button(
-                viewport_w,
+                self.viewport_size_px.0,
                 cx.listener(|this, _, _, cx| {
                     this.scroll_active_route_to_top(cx);
                 }),
             )
         });
 
-        (scrollbar_el, back_to_top_el, Some(sync_probe_el))
+        (Some(scrollbar_el), back_to_top_el)
     }
 
     pub(crate) fn current_route_scroll_y(&self) -> f32 {
@@ -3417,8 +3320,13 @@ impl AppShell {
 
     pub fn scroll_active_view_key(&self, key: &str) -> bool {
         let vh = self.viewport_size_px.1;
-        self.active_route_scroll_handle()
-            .is_some_and(|handle| Self::scroll_handle_for_page_key(&handle, key, vh))
+        let scrolled = self
+            .active_route_scroll_handle()
+            .is_some_and(|handle| Self::scroll_handle_for_page_key(&handle, key, vh));
+        if scrolled {
+            self.last_scroll_at.set(Some(Instant::now()));
+        }
+        scrolled
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7930,10 +7838,8 @@ impl Render for AppShell {
 
         let target_appearance = if is_player {
             WindowBackgroundAppearance::Transparent
-        } else if theme.is_light || theme.preset == ThemePreset::PureOled {
-            WindowBackgroundAppearance::Opaque
         } else {
-            WindowBackgroundAppearance::Blurred
+            WindowBackgroundAppearance::Opaque
         };
         if self.last_window_bg_appearance != target_appearance {
             window.set_background_appearance(target_appearance);
@@ -7948,13 +7854,12 @@ impl Render for AppShell {
         };
 
         let current_route_key = self.route.transition_id();
-        if is_player
-            || self.has_blocking_scroll_overlay()
-            || self
-                .scrollbar_drag
-                .as_ref()
-                .is_some_and(|drag| drag.route_key != current_route_key)
-        {
+        let drag_route_mismatch = self
+            .scrollbar_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.route_key != current_route_key);
+        if is_player || self.has_blocking_scroll_overlay() || drag_route_mismatch {
             self.clear_scrollbar_interaction();
         }
         self.active_scroll_suppressed.set(false);
@@ -8031,8 +7936,8 @@ impl Render for AppShell {
         if self.active_scroll_suppressed.get() {
             self.clear_scrollbar_interaction();
         }
-        let is_dragging_scrollbar = self.scrollbar_drag.is_some();
-        let (scrollbar_el, back_to_top_el, scroll_sync_probe_el) =
+        let is_dragging_scrollbar = self.scrollbar_drag.borrow().is_some();
+        let (scrollbar_el, back_to_top_el) =
             self.render_active_route_scroll_controls(is_hero_route, cx);
         let topnav_el = (!is_player).then(|| self.render_floating_topnav(window, cx));
         let quick_peek_el = (!is_player)
@@ -8097,7 +8002,6 @@ impl Render for AppShell {
                             .into_any_element()
                     }),
             )
-            .when_some(scroll_sync_probe_el, |el, probe| el.child(probe))
             .when(is_dragging_scrollbar, |el| {
                 el.child(
                     div()
