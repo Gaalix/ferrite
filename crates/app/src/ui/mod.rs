@@ -12,6 +12,7 @@ pub mod empty_state;
 pub mod grid;
 pub mod header;
 pub mod layout;
+pub mod scroll;
 
 pub use cards::{
     clamp_progress_fraction, format_notification_badge_label, landscape_card_dimensions,
@@ -39,4 +40,13 @@ pub use layout::{
     FOCUSED_PAGE_MAX_WIDTH_PX, PAGE_GUTTER_COMPACT_PX, PAGE_GUTTER_DEFAULT_PX, PAGE_GUTTER_MAX_PX,
     PAGE_GUTTER_MIN_PX, PAGE_LIST_PADDING_BOTTOM_PX, PAGE_PADDING_BOTTOM_PX, PAGE_PADDING_TOP_PX,
     PAGE_SECTION_GAP_PX,
+};
+pub use scroll::{
+    back_to_top_right_inset_px, compute_scrollbar_metrics, compute_scrollbar_track_span,
+    render_back_to_top_button, render_vertical_scrollbar, scroll_geometry_changed,
+    scroll_offset_for_pointer_y, scrollbar_press_action, should_show_back_to_top,
+    ScrollbarMetrics, BACK_TO_TOP_THRESHOLD_PX, SCROLLBAR_BOTTOM_INSET_PX,
+    SCROLLBAR_MIN_THUMB_HEIGHT_PX, SCROLLBAR_OVERFLOW_EPSILON_PX, SCROLLBAR_RAIL_WIDTH_PX,
+    SCROLLBAR_RIGHT_INSET_PX, SCROLLBAR_THUMB_WIDTH_ACTIVE_PX, SCROLLBAR_THUMB_WIDTH_REST_PX,
+    SCROLLBAR_TOPNAV_CLEARANCE_PX, SCROLL_SYNC_EPSILON_PX,
 };

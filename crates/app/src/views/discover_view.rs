@@ -1778,12 +1778,6 @@ impl AppShell {
         let is_loading = snap.is_loading;
         let has_next_page = snap.has_next_page;
 
-        let count_badge = (total_items > 0).then(|| {
-            SharedString::from(format!(
-                "{total_items} {}",
-                if total_items == 1 { "title" } else { "titles" }
-            ))
-        });
         let header_subtitle: Option<SharedString> = if !active_catalog_title.is_empty() {
             Some(match active_catalog_addon.as_deref() {
                 Some(addon) if !addon.is_empty() => format!("{active_catalog_title} · {addon}").into(),
@@ -1801,7 +1795,6 @@ impl AppShell {
         };
         let page_header = render_page_header(
             PageHeader::new("Discover")
-                .count_badge(count_badge)
                 .subtitle(header_subtitle)
                 .right_slot(header_right),
         );
@@ -1827,6 +1820,7 @@ impl AppShell {
 
         let statuses_for_grid = Arc::clone(statuses_arc);
         let grid_body = if is_loading && raw_total_items == 0 {
+            self.active_scroll_suppressed.set(true);
             render_discover_skeleton_grid(
                 columns,
                 image_height_px,
@@ -1835,6 +1829,7 @@ impl AppShell {
                 &theme,
             )
         } else if total_items == 0 {
+            self.active_scroll_suppressed.set(true);
             render_discover_empty_state(
                 has_active_filters,
                 hide_watched && hidden_watched_count > 0,

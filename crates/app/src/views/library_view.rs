@@ -124,6 +124,7 @@ impl AppShell {
             .collect();
 
         let content_area: AnyElement = if total_filtered == 0 {
+            self.active_scroll_suppressed.set(true);
             render_library_empty_state(
                 active_tab,
                 active_type,
@@ -345,17 +346,6 @@ impl AppShell {
                     // 1. Canonical Page Header with frosted glass stat pills.
                     .child(render_page_header(
                         PageHeader::new("Library")
-                            .count_badge((memo.count_all > 0).then(|| {
-                                SharedString::from(format!(
-                                    "{} {}",
-                                    memo.count_all,
-                                    if memo.count_all == 1 {
-                                        "title"
-                                    } else {
-                                        "titles"
-                                    }
-                                ))
-                            }))
                             .right_slot(Some(
                                 div()
                                     .flex()

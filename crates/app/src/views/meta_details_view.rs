@@ -295,6 +295,7 @@ impl AppShell {
         } = match details_snap {
             Ok(ready) => ready,
             Err((is_meta_loading, cached_preview)) => {
+                self.active_scroll_suppressed.set(true);
                 return self
                     .render_loading_meta_details_view(
                         route_type,
