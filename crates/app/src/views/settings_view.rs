@@ -17,14 +17,17 @@ use crate::{
         DEFAULT_SUBTITLE_FONT_SIZE, DEFAULT_SUBTITLE_VERTICAL_POS,
     },
     theme::{
-        active_theme, build_palette, editorial_serif, keycap, mono_font, neutral_chip,
-        semantic_status_pill, sp, tabular_nums, ui_sans, AccentChoice, CardDensityChoice,
-        ThemePalette, ThemePreset, UiScaleChoice, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL,
-        RADIUS_POSTER, RADIUS_SHEET,
+        active_theme, build_palette, editorial_serif, mono_font, sp, tabular_nums, ui_sans,
+        AccentChoice, CardDensityChoice, ThemePalette, ThemePreset, UiScaleChoice, RADIUS_CARD,
+        RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER, RADIUS_SHEET,
     },
-    ui_components::{
-        glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar, glass_segmented_item,
-        glass_stepper, glass_switch, primary_accent_button, secondary_glass_button,
+    ui::{
+        apply_page_width, choice_pill, dropdown_trigger, glass_dropdown_option,
+        glass_dropdown_panel, glass_segmented_bar, glass_segmented_item, glass_stepper,
+        glass_switch, keycap, neutral_chip, page_gutter_px, primary_accent_button,
+        render_empty_state, render_page_header, search_field, secondary_glass_button,
+        semantic_status_pill, DropdownTriggerProps, EmptyStateProps, PageHeader, PageWidth,
+        SearchFieldProps, PAGE_PADDING_BOTTOM_PX, PAGE_PADDING_TOP_PX, PAGE_SECTION_GAP_PX,
     },
     updater::{self, UpdateStatus, CURRENT_APP_VERSION},
 };
@@ -705,6 +708,8 @@ impl AppShell {
             0
         };
 
+        let gutter_px = page_gutter_px(self.viewport_size_px.0);
+
         div()
             .id("settings-two-pane-root")
             .size_full()
@@ -720,15 +725,13 @@ impl AppShell {
                 }),
             )
             .child(
-                div()
-                    .w_full()
-                    .max_w(px(1240.0))
+                apply_page_width(div(), PageWidth::Focused)
                     .h_full()
-                    .px(sp(28.0))
-                    .pt(sp(12.0))
+                    .px(px(gutter_px))
+                    .pt(sp(PAGE_PADDING_TOP_PX))
                     .pb(sp(18.0))
                     .flex()
-                    .gap(sp(24.0))
+                    .gap(sp(PAGE_SECTION_GAP_PX))
                     .overflow_hidden()
                     .child(self.render_settings_sidebar_rail(
                         &query,
@@ -755,23 +758,16 @@ impl AppShell {
         let theme = active_theme();
         let ink_accent = accent_ink(&theme);
         let focused = self.focused_input == Some(FocusedInput::SettingsSearch);
-        let query_display: SharedString = if self.settings_search_query.is_empty() {
-            if focused {
-                "|".into()
-            } else {
-                "Search settings...".into()
-            }
-        } else if focused {
-            format!("{}|", self.settings_search_query).into()
-        } else {
-            self.settings_search_query.clone().into()
-        };
+        let query_display = self.format_input_with_caret(
+            FocusedInput::SettingsSearch,
+            &self.settings_search_query,
+        );
 
         let watched_border = rgba_with_alpha(theme.status_watched, if theme.is_light { 0x66 } else { 0x4d });
         let watched_bg = rgba_with_alpha(theme.status_watched, if theme.is_light { 0x1a } else { 0x1c });
 
         div()
-            .w(px(248.0))
+            .w(sp(248.0))
             .h_full()
             .flex_shrink_0()
             .pb(sp(8.0))
@@ -815,90 +811,23 @@ impl AppShell {
                             .flex()
                             .flex_col()
                             .gap(sp(6.0))
-                            .child(
-                                div()
-                                    .id("input-settings-search")
-                                    .cursor_text()
-                                    .w_full()
-                                    .h(sp(36.0))
-                                    .px(sp(10.0))
-                                    .rounded(px(RADIUS_CONTROL))
-                                    .bg(rgba(theme.glass_trough_bg))
-                                    .border_1()
-                                    .border_color(if focused {
-                                        rgb(theme.accent)
-                                    } else {
-                                        rgba(theme.glass_border)
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .gap(sp(8.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.focus_settings_input(
-                                                FocusedInput::SettingsSearch,
-                                                cx,
-                                            );
-                                        }),
-                                    )
-                                    .child(svg_icon(
-                                        IconName::Search,
-                                        14.0 * theme.ui_scale,
-                                        if focused {
-                                            rgb(ink_accent)
-                                        } else {
-                                            rgb(theme.text_muted)
-                                        },
-                                    ))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .truncate()
-                                            .font(ui_sans(FontWeight::NORMAL))
-                                            .text_size(sp(12.5))
-                                            .text_color(
-                                                if self.settings_search_query.is_empty() && !focused
-                                                {
-                                                    rgb(theme.text_muted)
-                                                } else {
-                                                    rgb(theme.text_primary)
-                                                },
-                                            )
-                                            .child(query_display),
-                                    )
-                                    .when(!self.settings_search_query.is_empty(), |el| {
-                                        el.child(
-                                            div()
-                                                .id("btn-clear-settings-search")
-                                                .cursor_pointer()
-                                                .w(sp(20.0))
-                                                .h(sp(20.0))
-                                                .rounded(px(RADIUS_PILL))
-                                                .bg(rgba(theme.glass_row_selected_bg))
-                                                .hover(move |s| {
-                                                    s.bg(rgba(theme.glass_border_strong))
-                                                })
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.clear_settings_search(cx);
-                                                    }),
-                                                )
-                                                .child(svg_icon(
-                                                    IconName::X,
-                                                    11.0 * theme.ui_scale,
-                                                    rgb(theme.text_secondary),
-                                                )),
-                                        )
-                                    }),
-                            )
+                            .child(search_field(
+                                SearchFieldProps::new(
+                                    "input-settings-search",
+                                    query_display,
+                                    "Search settings...",
+                                    self.settings_search_query.is_empty(),
+                                    focused,
+                                )
+                                .clear_id("btn-clear-settings-search")
+                                .full_width()
+                                .on_focus(cx.listener(|this, _, _, cx| {
+                                    this.focus_settings_input(FocusedInput::SettingsSearch, cx);
+                                }))
+                                .on_clear(cx.listener(|this, _, _, cx| {
+                                    this.clear_settings_search(cx);
+                                })),
+                            ))
                             .when(is_searching, |el| {
                                 let label = if total_matches == 1 {
                                     "1 matching setting".to_owned()
@@ -1098,10 +1027,10 @@ impl AppShell {
                 div()
                     .w_full()
                     .pr(sp(6.0))
-                    .pb(sp(68.0))
+                    .pb(sp(PAGE_PADDING_BOTTOM_PX))
                     .flex()
                     .flex_col()
-                    .gap(sp(20.0))
+                    .gap(sp(PAGE_SECTION_GAP_PX))
                     .child(if is_searching {
                         self.render_settings_search_results(query, total_matches, cx)
                     } else {
@@ -1120,54 +1049,22 @@ impl AppShell {
         let ink_accent = accent_ink(&theme);
 
         if total_matches == 0 {
-            return settings_glass_card(&theme)
-                .py(sp(56.0))
-                .px(sp(28.0))
-                .items_center()
-                .gap(sp(12.0))
-                .child(
-                    div()
-                        .w(sp(48.0))
-                        .h(sp(48.0))
-                        .rounded(px(RADIUS_PILL))
-                        .bg(rgba(theme.glass_trough_bg))
-                        .border_1()
-                        .border_color(rgba(theme.glass_border))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(svg_icon(
-                            IconName::Search,
-                            20.0 * theme.ui_scale,
-                            rgb(theme.text_muted),
-                        )),
+            return render_empty_state(
+                EmptyStateProps::new(
+                    IconName::Search,
+                    format!("No settings match \"{query}\""),
+                    "Try searching for theme, accent, hdr, subtitle, debrid, cache, prowlarr, or shortcut.",
                 )
-                .child(
-                    div()
-                        .font(ui_sans(FontWeight::SEMIBOLD))
-                        .text_size(sp(15.5))
-                        .text_color(rgb(theme.text_primary))
-                        .child(format!("No settings match \"{query}\"")),
-                )
-                .child(
-                    div()
-                        .text_size(sp(13.0))
-                        .text_color(rgb(theme.text_secondary))
-                        .child(
-                            "Try searching for theme, accent, hdr, subtitle, debrid, cache, prowlarr, or shortcut.",
-                        ),
-                )
-                .child(
-                    div().pt(sp(4.0)).child(render_choice_pill(
-                        "btn-empty-clear-search",
-                        "Clear search",
-                        false,
-                        cx.listener(|this, _, _, cx| {
-                            this.clear_settings_search(cx);
-                        }),
-                    )),
-                )
-                .into_any_element();
+                .action(choice_pill(
+                    "btn-empty-clear-search",
+                    "Clear search",
+                    false,
+                    cx.listener(|this, _, _, cx| {
+                        this.clear_settings_search(cx);
+                    }),
+                )),
+            )
+            .into_any_element();
         }
 
         let summary_text = if total_matches == 1 {
@@ -1176,44 +1073,24 @@ impl AppShell {
             format!("{total_matches} matching settings")
         };
 
-        let header = div()
-            .pb(sp(12.0))
-            .border_b_1()
-            .border_color(rgba(theme.glass_divider))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(sp(14.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(sp(2.0))
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(sp(30.0))
-                            .text_color(rgb(theme.text_primary))
-                            .child(format!("Results for \"{query}\"")),
+        let header = render_page_header(
+            PageHeader::new(format!("Results for \"{query}\""))
+                .subtitle(Some(SharedString::from(format!(
+                    "{summary_text} — Advanced sections auto-expanded where matched."
+                ))))
+                .right_slot(Some(
+                    choice_pill(
+                        "btn-search-header-clear",
+                        "Clear search",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.clear_settings_search(cx);
+                        }),
                     )
-                    .child(
-                        div()
-                            .font(ui_sans(FontWeight::NORMAL))
-                            .text_size(sp(12.5))
-                            .text_color(rgb(theme.text_secondary))
-                            .child(format!(
-                                "{summary_text} — Advanced sections auto-expanded where matched."
-                            )),
-                    ),
-            )
-            .child(render_choice_pill(
-                "btn-search-header-clear",
-                "Clear search",
-                false,
-                cx.listener(|this, _, _, cx| {
-                    this.clear_settings_search(cx);
-                }),
-            ));
+                    .into_any_element(),
+                ))
+                .bottom_divider(true),
+        );
 
         let mut sections: Vec<AnyElement> = vec![header.into_any_element()];
 
@@ -1298,67 +1175,14 @@ impl AppShell {
 
     fn render_active_settings_category(&self, query: &str, cx: &mut Context<Self>) -> AnyElement {
         let theme = active_theme();
-        let ink_accent = accent_ink(&theme);
         let cat = self.active_settings_category;
 
-        let header = div()
-            .pb(sp(14.0))
-            .border_b_1()
-            .border_color(rgba(theme.glass_divider))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(sp(16.0))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_center()
-                    .gap(sp(14.0))
-                    .child(
-                        div()
-                            .w(sp(42.0))
-                            .h(sp(42.0))
-                            .flex_shrink_0()
-                            .rounded(px(RADIUS_CARD))
-                            .bg(rgba(theme.accent_soft))
-                            .border_1()
-                            .border_color(rgba(theme.border_accent))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(svg_icon_weighted(
-                                cat.icon_name(),
-                                IconWeight::Fill,
-                                19.0 * theme.ui_scale,
-                                rgb(ink_accent),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap(sp(2.0))
-                            .child(
-                                div()
-                                    .font(editorial_serif())
-                                    .text_size(sp(32.0))
-                                    .line_height(sp(36.0))
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(cat.label()),
-                            )
-                            .child(
-                                div()
-                                    .font(ui_sans(FontWeight::NORMAL))
-                                    .text_size(sp(13.0))
-                                    .text_color(rgb(theme.text_secondary))
-                                    .child(cat.subtitle()),
-                            ),
-                    ),
-            );
+        let header = render_page_header(
+            PageHeader::new(cat.label())
+                .leading_icon(Some(cat.icon_name()))
+                .subtitle(Some(SharedString::new_static(cat.subtitle())))
+                .bottom_divider(true),
+        );
 
         let mut body: Vec<AnyElement> = vec![header.into_any_element()];
 
@@ -2371,7 +2195,7 @@ impl AppShell {
                                 prefs.subtitle_font_size,
                                 prefs.subtitle_vertical_pos
                             )))
-                            .child(render_choice_pill(
+                            .child(choice_pill(
                                 "btn-reset-sub-style",
                                 "Reset",
                                 false,
@@ -2740,7 +2564,7 @@ impl AppShell {
                                 } else {
                                     format!("{gb} GB")
                                 };
-                                render_choice_pill(
+                                choice_pill(
                                     SharedString::from(format!("pill-cache-disk-{gb}")),
                                     label,
                                     active,
@@ -2766,7 +2590,7 @@ impl AppShell {
                             .children(StorageModeChoice::ALL_RAM_GB.into_iter().map(|gb| {
                                 let choice = StorageModeChoice::RamOnly { budget_gb: gb };
                                 let active = prefs.storage_mode == choice;
-                                render_choice_pill(
+                                choice_pill(
                                     SharedString::from(format!("pill-cache-ram-{gb}")),
                                     format!("{gb} GB"),
                                     active,
@@ -3064,7 +2888,7 @@ impl AppShell {
             SettingsRowId::AmbientArtworkBleed => render_control_row(
                 "Ambient artwork bleed",
                 "Cast a soft blurred color aura from active posters and backdrops behind the interface.",
-                render_movietracker_switch(
+                glass_switch(
                     "switch-ambient-bleed",
                     prefs.ambient_bleed_enabled,
                     cx.listener(|this, _, _, cx| {
@@ -3107,7 +2931,7 @@ impl AppShell {
             SettingsRowId::ShowHomeSpotlight => render_control_row(
                 "Featured hero on Home",
                 "Display an editorial hero spotlight with title logo and quick Resume / Details actions on Home.",
-                render_movietracker_switch(
+                glass_switch(
                     "switch-home-spotlight",
                     prefs.show_home_spotlight,
                     cx.listener(|this, _, _, cx| {
@@ -3138,7 +2962,7 @@ impl AppShell {
             SettingsRowId::AutoPlayNextEpisode => render_control_row(
                 "Auto-play & pre-buffer next episode",
                 "Pre-match and pre-buffer Episode N+1 45s before credits and auto-play at end of stream.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-auto-play-next-episode",
                     prefs.auto_play_next_episode,
                     cx.listener(|this, _, _, cx| {
@@ -3149,7 +2973,7 @@ impl AppShell {
             SettingsRowId::PreventDisplaySleep => render_control_row(
                 "Prevent display sleep while playing",
                 "Keep the display awake and suppress screensaver lock during active playback.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-prevent-display-sleep",
                     prefs.prevent_display_sleep,
                     cx.listener(|this, _, _, cx| {
@@ -3160,7 +2984,7 @@ impl AppShell {
             SettingsRowId::OsMediaControls => render_control_row(
                 "OS media controls (MPRIS2 / SMTC)",
                 "Publish now-playing metadata and transport keys to Linux MPRIS2 and Windows SMTC.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-os-media-controls",
                     prefs.enable_os_media_controls,
                     cx.listener(|this, _, _, cx| {
@@ -3266,7 +3090,7 @@ impl AppShell {
             SettingsRowId::DarkSceneDebanding => render_control_row(
                 "Dark-scene debanding",
                 "Smooth 8-bit compression banding gradients in dark scenes.",
-                render_movietracker_switch(
+                glass_switch(
                     "exp-toggle-deband",
                     exp.deband_enabled,
                     cx.listener(|this, _, _, cx| {
@@ -3281,7 +3105,7 @@ impl AppShell {
             SettingsRowId::DolbyVisionReshape => render_control_row(
                 "Dolby Vision reshape",
                 "Enable experimental Dolby Vision RPU metadata reshaping in libmpv.",
-                render_movietracker_switch(
+                glass_switch(
                     "exp-toggle-dv",
                     exp.dolby_vision_reshape,
                     cx.listener(|this, _, _, cx| {
@@ -3296,7 +3120,7 @@ impl AppShell {
             SettingsRowId::DynamicHdrPeak => render_control_row(
                 "Dynamic HDR peak",
                 "Compute per-frame HDR peak luminance for dynamic tone mapping.",
-                render_movietracker_switch(
+                glass_switch(
                     "exp-toggle-peak",
                     exp.hdr_compute_peak,
                     cx.listener(|this, _, _, cx| {
@@ -3380,7 +3204,7 @@ impl AppShell {
             SettingsRowId::AutoSelectSubtitles => render_control_row(
                 "Auto-select subtitles",
                 "Automatically enable matching subtitle tracks when playback begins.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-auto-select-subtitles",
                     prefs.auto_select_subtitles,
                     cx.listener(|this, _, _, cx| {
@@ -3391,7 +3215,7 @@ impl AppShell {
             SettingsRowId::AutoMatchNativeSubtitles => render_control_row(
                 "Auto-match native hash subtitles (OpenSubtitles + SubDL)",
                 "Compute 64 KiB stream hash and auto-align matching subtitles when playback starts.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-auto-match-native-subs",
                     prefs.auto_match_native_subtitles,
                     cx.listener(|this, _, _, cx| {
@@ -3430,7 +3254,7 @@ impl AppShell {
             SettingsRowId::SubtitleAssScaleOverride => render_control_row(
                 "ASS scale override",
                 "Apply your font sizing preferences to styled ASS/SSA subtitle tracks.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-ass-scale-override",
                     prefs.subtitle_ass_scale_override,
                     cx.listener(|this, _, _, cx| {
@@ -3460,7 +3284,7 @@ impl AppShell {
             SettingsRowId::LocalDebridCachedOnly => render_control_row(
                 "Cached-only stream filter",
                 "Hide uncached P2P torrents when a local Debrid provider is active.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-local-debrid-cached-only",
                     self.local_debrid_cached_only,
                     cx.listener(|this, _, _, cx| {
@@ -3481,7 +3305,7 @@ impl AppShell {
                         .items_center()
                         .gap(sp(10.0))
                         .child(neutral_chip(latency_badge))
-                        .child(render_movietracker_switch(
+                        .child(glass_switch(
                             "toggle-local-debrid-direct",
                             self.local_debrid_direct_unrestrict,
                             cx.listener(|this, _, _, cx| {
@@ -3510,7 +3334,7 @@ impl AppShell {
                             )
                         }),
                     ))
-                    .child(render_movietracker_switch(
+                    .child(glass_switch(
                         "toggle-dead-swarm",
                         prefs.dead_swarm_failover,
                         cx.listener(|this, _, _, cx| {
@@ -3524,7 +3348,7 @@ impl AppShell {
             SettingsRowId::UpnpPortMapping => render_control_row(
                 "UPnP / NAT-PMP port mapping",
                 "Automatically map inbound BitTorrent listener ports on your local router.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-upnp",
                     prefs.enable_upnp,
                     cx.listener(|this, _, _, cx| {
@@ -3575,7 +3399,7 @@ impl AppShell {
             SettingsRowId::ClipboardAddonDetect => render_control_row(
                 "Clipboard addon link detection",
                 "Detect copied stremio:// or manifest.json addon URLs when opening Addons Studio.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-clipboard-addon-detect",
                     prefs.clipboard_addon_detect,
                     cx.listener(|this, _, _, cx| {
@@ -3650,7 +3474,7 @@ impl AppShell {
                                 ),
                         )
                         .when(has_any, |el| {
-                            el.child(render_choice_pill(
+                            el.child(choice_pill(
                                 "btn-clear-tmdb-key",
                                 "Clear",
                                 false,
@@ -3659,7 +3483,7 @@ impl AppShell {
                                 }),
                             ))
                         })
-                        .child(render_choice_pill(
+                        .child(choice_pill(
                             "btn-verify-tmdb",
                             "Verify",
                             true,
@@ -3824,7 +3648,7 @@ impl AppShell {
                                 this.step_prowlarr_timeout(500, cx);
                             }),
                         ))
-                        .child(render_choice_pill(
+                        .child(choice_pill(
                             "btn-test-prowlarr",
                             "Test Indexer",
                             true,
@@ -3841,7 +3665,7 @@ impl AppShell {
             SettingsRowId::CheckUpdatesOnStartup => render_control_row(
                 "Check for updates on startup",
                 "Automatically check GitHub Releases for signed updates when Ferrite launches.",
-                render_movietracker_switch(
+                glass_switch(
                     "toggle-check-updates-startup",
                     prefs.check_updates_on_startup,
                     cx.listener(|this, _, _, cx| {
@@ -4026,7 +3850,7 @@ impl AppShell {
                         ),
                 )
                 .when(has_any, |el| {
-                    el.child(render_choice_pill(clear_id, "Clear", false, on_clear))
+                    el.child(choice_pill(clear_id, "Clear", false, on_clear))
                 }),
         )
     }
@@ -4118,7 +3942,7 @@ impl AppShell {
                         ),
                 )
                 .when(has_any, |el| {
-                    el.child(render_choice_pill(
+                    el.child(choice_pill(
                         clear_id,
                         "Clear",
                         false,
@@ -4127,7 +3951,7 @@ impl AppShell {
                         }),
                     ))
                 })
-                .child(render_choice_pill(
+                .child(choice_pill(
                     verify_id,
                     "Verify",
                     self.local_debrid_provider_idx == provider_idx && has_any,
@@ -4150,7 +3974,7 @@ impl AppShell {
         let action_row = render_control_row(
             "Check & install updates",
             "Releases are verified over HTTPS against SHA256SUMS.txt from Gaalix/ferrite.",
-            render_choice_pill(
+            choice_pill(
                 "btn-check-updates",
                 if busy {
                     "Working..."
@@ -4328,7 +4152,7 @@ impl AppShell {
                                         .flex()
                                         .items_center()
                                         .gap(sp(8.0))
-                                        .child(render_choice_pill(
+                                        .child(choice_pill(
                                             "btn-copy-deb-cmd",
                                             "Copy apt command",
                                             false,
@@ -4344,7 +4168,7 @@ impl AppShell {
                                                 );
                                             }),
                                         ))
-                                        .child(render_choice_pill(
+                                        .child(choice_pill(
                                             "btn-open-deb",
                                             "Open package",
                                             true,
@@ -4560,61 +4384,23 @@ where
     L: Into<SharedString>,
     F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 {
-    let theme = active_theme();
     let trigger_id = SharedString::from(format!("{id_prefix}-trigger"));
     let menu_id = SharedString::from(format!("{id_prefix}-menu"));
 
     div()
         .relative()
-        .child(
-            div()
-                .id(trigger_id)
-                .cursor_pointer()
-                .h(sp(34.0))
-                .min_w(sp(196.0))
-                .px(sp(12.0))
-                .rounded(px(RADIUS_CONTROL))
-                .bg(rgba(theme.glass_trough_bg))
-                .border_1()
-                .border_color(if open {
-                    rgb(theme.accent)
-                } else {
-                    rgba(theme.glass_border)
-                })
-                .hover(move |s| {
-                    s.bg(rgba(theme.glass_row_hover_bg))
-                        .border_color(if open {
-                            rgb(theme.accent)
-                        } else {
-                            rgba(theme.glass_border_strong)
-                        })
-                })
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(sp(10.0))
-                .on_mouse_down(MouseButton::Left, on_toggle)
-                .child(
-                    div()
-                        .font(ui_sans(FontWeight::MEDIUM))
-                        .text_size(sp(12.5))
-                        .text_color(rgb(theme.text_primary))
-                        .child(active_label),
-                )
-                .child(svg_icon(
-                    IconName::ChevronDown,
-                    13.0 * theme.ui_scale,
-                    rgb(theme.text_secondary),
-                )),
-        )
+        .child(dropdown_trigger(
+            DropdownTriggerProps::new(trigger_id, active_label, open, on_toggle)
+                .min_width_px(Some(196.0)),
+        ))
         .when(open, |wrap| {
             wrap.child(
                 deferred(
                     glass_dropdown_panel(menu_id, 232.0)
                         .absolute()
-                        .top(sp(38.0))
+                        .top(sp(42.0))
                         .right_0()
-                        .max_h(px(280.0))
+                        .max_h(sp(280.0))
                         .overflow_y_scroll()
                         .children(items.into_iter().enumerate().map(
                             |(idx, (label, selected, on_select))| {
@@ -4678,64 +4464,6 @@ fn render_shortcut_grid_block(
                 })),
         )
         .into_any_element()
-}
-
-pub(crate) fn render_choice_pill(
-    id: impl Into<gpui::ElementId>,
-    label: impl Into<SharedString>,
-    active: bool,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let theme = active_theme();
-    let ink_accent = accent_ink(&theme);
-    div()
-        .id(id)
-        .cursor_pointer()
-        .h(sp(32.0))
-        .px(sp(13.0))
-        .rounded(px(RADIUS_PILL))
-        .bg(if active {
-            rgba(theme.accent_soft)
-        } else {
-            rgba(theme.glass_trough_bg)
-        })
-        .border_1()
-        .border_color(if active {
-            rgba(theme.border_accent)
-        } else {
-            rgba(theme.glass_border)
-        })
-        .hover(move |s| {
-            s.bg(if active {
-                rgba(theme.accent_soft)
-            } else {
-                rgba(theme.glass_row_hover_bg)
-            })
-            .border_color(if active {
-                rgb(theme.accent)
-            } else {
-                rgba(theme.glass_border_strong)
-            })
-        })
-        .flex()
-        .items_center()
-        .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(sp(12.5))
-        .text_color(if active {
-            rgb(ink_accent)
-        } else {
-            rgb(theme.text_secondary)
-        })
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(label.into())
-}
-
-pub(crate) fn render_movietracker_switch(
-    id: impl Into<gpui::ElementId>,
-    enabled: bool,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    glass_switch(id, enabled, on_click)
 }
 
 #[cfg(test)]

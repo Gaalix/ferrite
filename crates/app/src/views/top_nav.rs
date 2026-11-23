@@ -8,10 +8,10 @@ use crate::{
     shell::{uses_native_windows_nc_chrome, AppShell},
     state::{FocusedInput, SidebarTab, ToastKind},
     theme::{
-        active_theme, editorial_serif, glass_capsule_shadow, keycap, movietracker_mark,
-        obsidian_fade_in, sp, ui_sans, RADIUS_CONTROL, RADIUS_PILL,
+        active_theme, editorial_serif, glass_capsule_shadow, movietracker_mark, obsidian_fade_in,
+        sp, ui_sans, RADIUS_CONTROL, RADIUS_PILL,
     },
-    ui_components::glass_dropdown_option,
+    ui::{glass_dropdown_option, is_compact_viewport, keycap, topnav_gutter_px},
 };
 
 pub const TOPNAV_SCROLLED_THRESHOLD_PX: f32 = 24.0;
@@ -42,7 +42,9 @@ impl AppShell {
 
         let scroll_y = self.current_route_scroll_y();
         let is_scrolled = is_topnav_scrolled(scroll_y);
-        let compact_width = self.viewport_size_px.0 > 0.0 && self.viewport_size_px.0 < 1040.0;
+        let viewport_w = self.viewport_size_px.0;
+        let compact_width = is_compact_viewport(viewport_w);
+        let nav_gutter_px = topnav_gutter_px(viewport_w);
 
         let (signed_in_email, avatar_initial) = self.core.with_model(|m| {
             let email = m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone());
@@ -669,7 +671,7 @@ impl AppShell {
                 el.window_control_area(WindowControlArea::Drag)
             })
             .h(if is_scrolled { sp(60.0) } else { sp(68.0) })
-            .px(sp(if compact_width { 14.0 } else { 24.0 }))
+            .px(px(nav_gutter_px))
             .when(!is_scrolled, |el| el.pt(sp(8.0)))
             .when(is_scrolled, |el| {
                 el.bg(rgba(theme.bg_topnav_scrolled))
@@ -710,6 +712,8 @@ impl AppShell {
             .with_model(|m| m.ctx.profile.auth.as_ref().map(|a| a.user.email.clone()));
         let active_tab = self.route.active_sidebar_tab();
 
+        let nav_gutter_px = topnav_gutter_px(self.viewport_size_px.0);
+
         div()
             .id("avatar-menu-backdrop")
             .absolute()
@@ -727,7 +731,11 @@ impl AppShell {
                     .occlude()
                     .absolute()
                     .top(sp(62.0))
-                    .right(if is_csd { sp(132.0) } else { sp(24.0) })
+                    .right(if is_csd {
+                        px(nav_gutter_px + 108.0 * theme.ui_scale)
+                    } else {
+                        px(nav_gutter_px)
+                    })
                     .w(sp(248.0))
                     .p(sp(6.0))
                     .rounded(px(14.0))

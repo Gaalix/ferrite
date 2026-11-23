@@ -17,10 +17,15 @@ use crate::{
     shell::AppShell,
     state::{addon_matches_search_query, AddonCategoryFilter, AddonSubTab, FocusedInput, ToastKind},
     theme::{
-        active_theme, editorial_serif, meta_divider, mono_font, neutral_chip, semantic_status_pill,
-        sp, ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL,
+        active_theme, mono_font, sp, ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL,
+        RADIUS_PILL,
     },
-    views::settings_view::{render_choice_pill, render_movietracker_switch},
+    ui::{
+        choice_pill, glass_segmented_bar, glass_segmented_item, glass_switch, meta_divider,
+        neutral_chip, page_container, render_empty_state, render_page_header, search_field,
+        secondary_glass_button, semantic_status_pill, toolbar_bar, EmptyStateProps, PageHeader,
+        PageWidth, SearchFieldProps,
+    },
 };
 
 #[derive(Clone)]
@@ -64,27 +69,13 @@ impl AppShell {
         let directory_cards = build_deduplicated_directory(&remote_descriptors);
         let total_directory = directory_cards.len();
 
-        let side_pad = if self.viewport_size_px.0.is_finite() && self.viewport_size_px.0 > 0.0 {
-            (self.viewport_size_px.0 * 0.03).clamp(24.0, 56.0)
-        } else {
-            32.0
-        };
-
         div()
             .id("addons-studio-scroll")
+            .track_scroll(&self.addons_scroll_handle)
             .size_full()
             .overflow_y_scroll()
             .child(
-                div()
-                    .w_full()
-                    .max_w(px(1180.0))
-                    .mx_auto()
-                    .px(px(side_pad))
-                    .pt(sp(16.0))
-                    .pb(sp(72.0))
-                    .flex()
-                    .flex_col()
-                    .gap(sp(22.0))
+                page_container(PageWidth::Focused, self.viewport_size_px.0)
                     .child(Self::render_addons_header(
                         total_active,
                         &cache_stats,
@@ -103,7 +94,6 @@ impl AppShell {
                     .child(self.render_addons_toolbar(
                         total_installed_and_muted,
                         total_directory,
-                        t,
                         cx,
                     ))
                     .child(match self.addon_sub_tab {
@@ -139,80 +129,58 @@ impl AppShell {
         let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         let has_cache = cache_stats.entries > 0 || cache_stats.hits > 0;
 
-        div()
+        let stats_pill = div()
+            .h(sp(34.0))
+            .px(sp(14.0))
+            .rounded(px(RADIUS_PILL))
+            .bg(rgba(t.glass_card_bg))
+            .border_1()
+            .border_color(rgba(t.glass_border))
             .flex()
-            .flex_wrap()
-            .items_end()
-            .justify_between()
-            .gap(sp(16.0))
+            .items_center()
+            .gap(sp(10.0))
+            .font(mono_font())
+            .text_xs()
+            .text_color(rgb(t.text_secondary))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(sp(4.0))
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(sp(38.0))
-                            .line_height(gpui::relative(1.06))
-                            .text_color(rgb(t.text_primary))
-                            .child("Addons"),
-                    )
-                    .child(
-                        div()
-                            .text_size(sp(13.5))
-                            .text_color(rgb(t.text_secondary))
-                            .child(
-                                "Priority execution order, soft-mute preserving secret config URLs, and live origin health.",
-                            ),
-                    ),
+                    .text_color(rgb(t.text_primary))
+                    .child(format!("{active_count} active")),
             )
-            .child(
-                div()
-                    .h(sp(34.0))
-                    .px(sp(14.0))
-                    .rounded(px(RADIUS_PILL))
-                    .bg(rgba(t.glass_card_bg))
-                    .border_1()
-                    .border_color(rgba(t.glass_border))
-                    .flex()
-                    .items_center()
-                    .gap(sp(10.0))
-                    .font(mono_font())
-                    .text_xs()
-                    .text_color(rgb(t.text_secondary))
-                    .child(
-                        div()
-                            .text_color(rgb(t.text_primary))
-                            .child(format!("{active_count} active")),
-                    )
-                    .child(meta_divider())
-                    .child(format!("{} cache hits", cache_stats.hits))
-                    .child(meta_divider())
-                    .child(format_bytes(cache_stats.total_bytes as u64))
-                    .when(has_cache, |el| {
-                        el.child(meta_divider()).child(
-                            div()
-                                .id("btn-clear-addon-http-cache")
-                                .cursor_pointer()
-                                .text_color(rgb(accent_ink))
-                                .hover(move |s| s.text_color(rgb(t.accent_hover)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.core.clear_addon_cache();
-                                        this.push_toast(
-                                            ToastKind::Info,
-                                            "Cleared addon HTTP cache",
-                                            None,
-                                            cx,
-                                        );
-                                    }),
-                                )
-                                .child("Clear cache"),
+            .child(meta_divider())
+            .child(format!("{} cache hits", cache_stats.hits))
+            .child(meta_divider())
+            .child(format_bytes(cache_stats.total_bytes as u64))
+            .when(has_cache, |el| {
+                el.child(meta_divider()).child(
+                    div()
+                        .id("btn-clear-addon-http-cache")
+                        .cursor_pointer()
+                        .text_color(rgb(accent_ink))
+                        .hover(move |s| s.text_color(rgb(t.accent_hover)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.core.clear_addon_cache();
+                                this.push_toast(
+                                    ToastKind::Info,
+                                    "Cleared addon HTTP cache",
+                                    None,
+                                    cx,
+                                );
+                            }),
                         )
-                    }),
-            )
+                        .child("Clear cache"),
+                )
+            });
+
+        render_page_header(
+            PageHeader::new("Addons")
+                .subtitle(Some(SharedString::new_static(
+                    "Priority execution order, soft-mute preserving secret config URLs, and live origin health.",
+                )))
+                .right_slot(Some(stats_pill.into_any_element())),
+        )
     }
 
     fn render_clipboard_addon_bar(
@@ -502,57 +470,33 @@ impl AppShell {
         &self,
         installed_count: usize,
         directory_count: usize,
-        t: ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let search_focused = self.focused_input == Some(FocusedInput::AddonSearch);
-        let search_display: SharedString = if self.addon_search_query.is_empty() {
-            if search_focused {
-                "|".into()
-            } else {
-                "Filter addons...".into()
-            }
-        } else if search_focused {
-            format!("{}|", self.addon_search_query).into()
-        } else {
-            self.addon_search_query.clone().into()
-        };
+        let search_display =
+            self.format_input_with_caret(FocusedInput::AddonSearch, &self.addon_search_query);
 
         div()
             .flex()
             .flex_col()
-            .gap(sp(14.0))
+            .gap(sp(12.0))
             .child(
-                div()
-                    .border_b_1()
-                    .border_color(rgba(t.glass_divider))
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap(sp(16.0))
+                toolbar_bar()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(sp(24.0))
-                            .child(render_subtab_button(
+                        glass_segmented_bar("addons-subtabs")
+                            .child(glass_segmented_item(
                                 "addons-tab-installed",
-                                "Installed",
-                                installed_count,
+                                format!("Installed ({installed_count})"),
                                 self.addon_sub_tab == AddonSubTab::Installed,
-                                t,
                                 cx.listener(|this, _, _, cx| {
                                     this.addon_sub_tab = AddonSubTab::Installed;
                                     cx.notify();
                                 }),
                             ))
-                            .child(render_subtab_button(
+                            .child(glass_segmented_item(
                                 "addons-tab-explore",
-                                "Explore directory",
-                                directory_count,
+                                format!("Explore directory ({directory_count})"),
                                 self.addon_sub_tab == AddonSubTab::Explore,
-                                t,
                                 cx.listener(|this, _, _, cx| {
                                     this.addon_sub_tab = AddonSubTab::Explore;
                                     this.core.load_default_remote_addons();
@@ -560,89 +504,27 @@ impl AppShell {
                                 }),
                             )),
                     )
-                    .child(
-                        div()
-                            .pb(sp(8.0))
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .id("input-addon-search")
-                                    .cursor_text()
-                                    .w(sp(240.0))
-                                    .h(sp(34.0))
-                                    .px(sp(11.0))
-                                    .rounded(px(RADIUS_CONTROL))
-                                    .bg(rgba(t.glass_trough_bg))
-                                    .border_1()
-                                    .border_color(if search_focused {
-                                        rgba(t.border_poster_hover)
-                                    } else {
-                                        rgba(t.glass_border)
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .gap(sp(8.0))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.focused_input = Some(FocusedInput::AddonSearch);
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(svg_icon_weighted(
-                                        IconName::Search,
-                                        IconWeight::Regular,
-                                        13.5 * t.ui_scale,
-                                        rgb(t.text_muted),
-                                    ))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .truncate()
-                                            .text_size(sp(12.5))
-                                            .text_color(
-                                                if self.addon_search_query.is_empty()
-                                                    && !search_focused
-                                                {
-                                                    rgb(t.text_muted)
-                                                } else {
-                                                    rgb(t.text_primary)
-                                                },
-                                            )
-                                            .child(search_display),
-                                    )
-                                    .when(!self.addon_search_query.is_empty(), |el| {
-                                        el.child(
-                                            div()
-                                                .id("btn-clear-addon-search")
-                                                .cursor_pointer()
-                                                .w(sp(18.0))
-                                                .h(sp(18.0))
-                                                .rounded(px(4.0))
-                                                .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.addon_search_query.clear();
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                                .child(svg_icon_weighted(
-                                                    IconName::X,
-                                                    IconWeight::Regular,
-                                                    11.5 * t.ui_scale,
-                                                    rgb(t.text_muted),
-                                                )),
-                                        )
-                                    }),
-                            ),
-                    ),
+                    .child(search_field(
+                        SearchFieldProps::new(
+                            "input-addon-search",
+                            search_display,
+                            "Filter addons...",
+                            self.addon_search_query.is_empty(),
+                            search_focused,
+                        )
+                        .clear_id("btn-clear-addon-search")
+                        .width_px(Some(240.0))
+                        .on_focus(cx.listener(|this, _, _, cx| {
+                            this.focused_input = Some(FocusedInput::AddonSearch);
+                            cx.notify();
+                        }))
+                        .on_clear(cx.listener(|this, _, _, cx| {
+                            this.addon_search_query.clear();
+                            this.input_cursors.remove(&FocusedInput::AddonSearch);
+                            this.input_selected_all.remove(&FocusedInput::AddonSearch);
+                            cx.notify();
+                        })),
+                    )),
             )
             .child(
                 div()
@@ -653,7 +535,7 @@ impl AppShell {
                     .children(AddonCategoryFilter::ALL.into_iter().enumerate().map(
                         |(idx, pill)| {
                             let active = self.addon_category_filter == pill;
-                            render_choice_pill(
+                            choice_pill(
                                 ("addon-cat-pill", idx),
                                 pill.label(),
                                 active,
@@ -723,31 +605,28 @@ impl AppShell {
             .collect();
 
         if visible_active.is_empty() && visible_muted.is_empty() {
-            return div()
-                .p(sp(36.0))
-                .rounded(px(RADIUS_CARD))
-                .bg(rgba(t.glass_card_bg))
-                .border_1()
-                .border_color(rgba(t.glass_border))
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(sp(8.0))
-                .child(
-                    div()
-                        .font(editorial_serif())
-                        .text_size(sp(26.0))
-                        .text_color(rgb(t.text_primary))
-                        .child("No matching installed addons"),
-                )
-                .child(
-                    div()
-                        .text_size(sp(13.5))
-                        .text_color(rgb(t.text_secondary))
-                        .child(
-                            "Clear your search filter or switch to Explore directory to install sources.",
-                        ),
-                );
+            let has_filters = !query.is_empty() || cat_filter != AddonCategoryFilter::All;
+            let mut props = EmptyStateProps::new(
+                IconName::Layers,
+                "No matching installed addons",
+                "Clear your search filter or switch to Explore directory to install sources.",
+            );
+            if has_filters {
+                props = props.action(secondary_glass_button(
+                    "addons-installed-empty-clear",
+                    Some(IconName::X),
+                    "Clear filters",
+                    false,
+                    cx.listener(|this, _, _, cx| {
+                        this.addon_search_query.clear();
+                        this.input_cursors.remove(&FocusedInput::AddonSearch);
+                        this.input_selected_all.remove(&FocusedInput::AddonSearch);
+                        this.addon_category_filter = AddonCategoryFilter::All;
+                        cx.notify();
+                    }),
+                ));
+            }
+            return render_empty_state(props);
         }
 
         div()
@@ -1164,7 +1043,7 @@ impl AppShell {
                             .child("Core")
                             .into_any_element()
                     } else {
-                        render_movietracker_switch(
+                        glass_switch(
                             ("addon-soft-switch", dom_idx),
                             is_active,
                             cx.listener(move |this, _, _, cx| {
@@ -1433,33 +1312,36 @@ impl AppShell {
             .collect();
 
         if filtered.is_empty() {
-            return div()
-                .p(sp(36.0))
-                .rounded(px(RADIUS_CARD))
-                .bg(rgba(t.glass_card_bg))
-                .border_1()
-                .border_color(rgba(t.glass_border))
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(sp(8.0))
-                .child(
-                    div()
-                        .font(editorial_serif())
-                        .text_size(sp(26.0))
-                        .text_color(rgb(t.text_primary))
-                        .child(if remote_loading {
-                            "Loading addon directory..."
-                        } else {
-                            "No directory addons match this filter"
-                        }),
-                )
-                .child(
-                    div()
-                        .text_size(sp(13.5))
-                        .text_color(rgb(t.text_secondary))
-                        .child("Try switching category pills or clearing the search box."),
-                );
+            let has_filters = !query.is_empty() || cat_filter != AddonCategoryFilter::All;
+            let mut props = EmptyStateProps::new(
+                if remote_loading {
+                    IconName::RefreshCw
+                } else {
+                    IconName::Search
+                },
+                if remote_loading {
+                    "Loading addon directory..."
+                } else {
+                    "No directory addons match this filter"
+                },
+                "Try switching category pills or clearing the search box.",
+            );
+            if !remote_loading && has_filters {
+                props = props.action(secondary_glass_button(
+                    "addons-explore-empty-clear",
+                    Some(IconName::X),
+                    "Clear filters",
+                    false,
+                    cx.listener(|this, _, _, cx| {
+                        this.addon_search_query.clear();
+                        this.input_cursors.remove(&FocusedInput::AddonSearch);
+                        this.input_selected_all.remove(&FocusedInput::AddonSearch);
+                        this.addon_category_filter = AddonCategoryFilter::All;
+                        cx.notify();
+                    }),
+                ));
+            }
+            return render_empty_state(props);
         }
 
         div()
@@ -1797,65 +1679,6 @@ impl AppShell {
                     }),
             )
     }
-}
-
-fn render_subtab_button(
-    id: &'static str,
-    label: &'static str,
-    count: usize,
-    active: bool,
-    t: ThemePalette,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let accent_ink = if t.is_light { t.accent_press } else { t.accent };
-    div()
-        .id(id)
-        .cursor_pointer()
-        .pb(sp(10.0))
-        .border_b_2()
-        .border_color(if active {
-            rgb(t.accent)
-        } else {
-            rgba(0x00000000)
-        })
-        .flex()
-        .items_center()
-        .gap(sp(8.0))
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(
-            div()
-                .font(ui_sans(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                }))
-                .text_size(sp(14.0))
-                .text_color(if active {
-                    rgb(t.text_primary)
-                } else {
-                    rgb(t.text_secondary)
-                })
-                .child(label),
-        )
-        .child(
-            div()
-                .px(sp(6.5))
-                .py(sp(1.5))
-                .rounded(px(RADIUS_PILL))
-                .bg(if active {
-                    rgba(t.accent_soft)
-                } else {
-                    rgba(t.glass_trough_bg)
-                })
-                .font(mono_font())
-                .text_size(sp(11.0))
-                .text_color(if active {
-                    rgb(accent_ink)
-                } else {
-                    rgb(t.text_muted)
-                })
-                .child(format!("{count}")),
-        )
 }
 
 fn render_reorder_icon_btn(

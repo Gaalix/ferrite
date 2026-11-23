@@ -9,10 +9,13 @@ use crate::{
     shell::AppShell,
     state::{FocusedInput, SidebarTab, ToastKind},
     theme::{
-        active_theme, editorial_serif, mono_font, semantic_status_pill, sp, tabular_nums, ui_sans,
-        ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL,
+        active_theme, editorial_serif, mono_font, sp, tabular_nums, ui_sans, ThemePalette,
+        RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL,
     },
-    ui_components::{primary_accent_button, secondary_glass_button},
+    ui::{
+        page_container, primary_accent_button, render_page_header, render_section_header,
+        secondary_glass_button, semantic_status_pill, PageHeader, PageWidth, SectionHeader,
+    },
 };
 
 impl AppShell {
@@ -51,76 +54,41 @@ impl AppShell {
                 )
             });
 
-        let side_pad = if self.viewport_size_px.0.is_finite() && self.viewport_size_px.0 > 0.0 {
-            (self.viewport_size_px.0 * 0.03).clamp(24.0, 56.0)
-        } else {
-            32.0
-        };
         let pill_border_alpha = if t.is_light { 0x59 } else { 0x4d };
         let pill_bg_alpha = if t.is_light { 0x1f } else { 0x1c };
 
+        let status_pill = if auth_user.is_some() {
+            semantic_status_pill(
+                IconName::Check,
+                "Cloud sync active",
+                t.status_watched,
+                (t.status_watched << 8) | pill_border_alpha,
+                (t.status_watched << 8) | pill_bg_alpha,
+            )
+        } else {
+            semantic_status_pill(
+                IconName::User,
+                "Guest profile",
+                t.status_watching,
+                (t.status_watching << 8) | pill_border_alpha,
+                (t.status_watching << 8) | pill_bg_alpha,
+            )
+        };
+
         div()
             .id("auth-view-scroll")
+            .track_scroll(&self.auth_scroll_handle)
             .size_full()
             .overflow_y_scroll()
             .child(
-                div()
-                    .w_full()
-                    .max_w(px(1120.0))
-                    .mx_auto()
-                    .px(px(side_pad))
-                    .pt(sp(16.0))
-                    .pb(sp(72.0))
-                    .flex()
-                    .flex_col()
-                    .gap(sp(24.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_end()
-                            .justify_between()
-                            .gap(sp(16.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(sp(4.0))
-                                    .child(
-                                        div()
-                                            .font(editorial_serif())
-                                            .text_size(sp(38.0))
-                                            .line_height(gpui::relative(1.06))
-                                            .text_color(rgb(t.text_primary))
-                                            .child("Account"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(sp(13.5))
-                                            .text_color(rgb(t.text_secondary))
-                                            .child(
-                                                "Sync your Stremio library, watch progress, and installed addons across devices.",
-                                            ),
-                                    ),
-                            )
-                            .child(if auth_user.is_some() {
-                                semantic_status_pill(
-                                    IconName::Check,
-                                    "Cloud sync active",
-                                    t.status_watched,
-                                    (t.status_watched << 8) | pill_border_alpha,
-                                    (t.status_watched << 8) | pill_bg_alpha,
-                                )
-                            } else {
-                                semantic_status_pill(
-                                    IconName::User,
-                                    "Guest profile",
-                                    t.status_watching,
-                                    (t.status_watching << 8) | pill_border_alpha,
-                                    (t.status_watching << 8) | pill_bg_alpha,
-                                )
-                            }),
-                    )
+                page_container(PageWidth::Focused, self.viewport_size_px.0)
+                    .child(render_page_header(
+                        PageHeader::new("Account")
+                            .subtitle(Some(SharedString::new_static(
+                                "Sync your Stremio library, watch progress, and installed addons across devices.",
+                            )))
+                            .right_slot(Some(status_pill.into_any_element())),
+                    ))
                     .child(
                         div()
                             .grid()
@@ -342,13 +310,9 @@ impl AppShell {
                             .flex()
                             .flex_col()
                             .gap(sp(4.0))
-                            .child(
-                                div()
-                                    .font(editorial_serif())
-                                    .text_size(sp(26.0))
-                                    .text_color(rgb(t.text_primary))
-                                    .child("Sign in with email"),
-                            )
+                            .child(render_section_header(SectionHeader::new(
+                                "Sign in with email",
+                            )))
                             .child(
                                 div()
                                     .text_xs()
@@ -500,13 +464,9 @@ impl AppShell {
                     .flex()
                     .flex_col()
                     .gap(sp(4.0))
-                    .child(
-                        div()
-                            .font(editorial_serif())
-                            .text_size(sp(26.0))
-                            .text_color(rgb(t.text_primary))
-                            .child("QR / link code sign-in"),
-                    )
+                    .child(render_section_header(SectionHeader::new(
+                        "QR / link code sign-in",
+                    )))
                     .child(
                         div()
                             .text_xs()
