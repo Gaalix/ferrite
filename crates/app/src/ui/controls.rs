@@ -194,7 +194,7 @@ pub fn search_field(props: SearchFieldProps) -> Stateful<Div> {
                     .flex()
                     .items_center()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(theme.sp(12.5))
+                    .text_size(theme.text_body())
                     .text_color(if is_empty {
                         rgb(theme.text_muted)
                     } else {
@@ -357,7 +357,7 @@ pub fn dropdown_trigger(props: DropdownTriggerProps) -> Stateful<Div> {
         .when(spread_between, |el| el.justify_between())
         .gap(theme.sp(7.0))
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(theme.sp(12.5))
+        .text_size(theme.text_body())
         .text_color(if highlighted {
             rgb(accent_ink)
         } else {
@@ -396,7 +396,7 @@ pub fn dropdown_trigger(props: DropdownTriggerProps) -> Stateful<Div> {
                 div()
                     .flex_shrink_0()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(theme.sp(12.0))
+                    .text_size(theme.text_micro())
                     .text_color(rgb(theme.text_muted))
                     .child(prefix),
             )
@@ -414,7 +414,7 @@ pub fn dropdown_trigger(props: DropdownTriggerProps) -> Stateful<Div> {
                 div()
                     .flex_shrink_0()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(theme.sp(11.5))
+                    .text_size(theme.text_micro())
                     .text_color(rgb(theme.text_muted))
                     .truncate()
                     .child(secondary),
@@ -480,7 +480,7 @@ pub fn choice_pill(
         .justify_center()
         .whitespace_nowrap()
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(theme.sp(12.5))
+        .text_size(theme.text_body())
         .text_color(if active {
             rgb(accent_ink)
         } else {

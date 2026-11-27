@@ -30,7 +30,7 @@ use crate::{
     state::{
         build_default_meta_request, build_subtitles_resource_path, classify_library_item_status,
         extract_cast_and_directors_from_links, extract_genres, extract_imdb_rating,
-        find_cached_preview_in_model, format_movietracker_episode_code,
+        find_cached_preview_in_model, format_movietracker_episode_code, is_meaningful_resume,
         pick_default_series_episode_id, resolve_ready_meta_item, resume_offset_for_library_item,
         sync_memoized_enriched_streams, sync_memoized_meta_streams, AddonStreamCounts,
         BrowsingContextMenu, CachedTitlePreview, LibraryStatusTab, PlaybackCandidate,
@@ -38,7 +38,7 @@ use crate::{
     },
     theme::{
         active_theme, compact_audio_badge, compact_codec_badge, compact_hdr_badge, editorial_serif,
-        estimate_bitrate_mbps, format_bitrate_mbps, format_episode_air_date,
+        estimate_bitrate_mbps, format_bitrate_mbps, format_episode_air_date, format_release_info,
         format_timestamp_secs, mono_font, parse_runtime_minutes, placeholder_tint_for_id,
         poster_card_shadow, sentence_case_label, sp, summarize_stream_for_humans, tabular_nums,
         ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
@@ -551,7 +551,8 @@ impl AppShell {
                     .as_ref()
                     .and_then(|e| e.year.clone())
                     .filter(|s| !s.trim().is_empty())
-            });
+            })
+            .map(|y| format_release_info(&y));
         let runtime_display = meta
             .preview
             .runtime
@@ -630,11 +631,39 @@ impl AppShell {
             )
         });
 
-        let primary_cta_label = match (&active_ep_code, resume_secs) {
-            (Some(code), Some(_)) => format!("Continue {code}"),
+        let meaningful_resume = is_meaningful_resume(resume_secs, runtime_minutes);
+        let effective_resume_secs = meaningful_resume.then_some(resume_secs).flatten();
+        let primary_cta_label = match (&active_ep_code, effective_resume_secs) {
+            (Some(code), Some(s)) => format!("Resume {code} · {}", format_timestamp_secs(s)),
             (Some(code), None) => format!("Play {code}"),
-            (None, Some(s)) => format!("Resume ({})", format_timestamp_secs(s)),
-            (None, None) => "Watch".to_owned(),
+            (None, Some(s)) => format!("Resume {}", format_timestamp_secs(s)),
+            (None, None) => "Play".to_owned(),
+        };
+
+        // Compact inline director + lead cast summary for the hero (since full Cast sits below Sources).
+        let hero_credits_line: Option<String> = if combined_credits.is_empty() {
+            None
+        } else {
+            let dirs: Vec<&str> = combined_credits
+                .iter()
+                .filter(|c| c.is_director)
+                .map(|c| c.name.as_str())
+                .take(2)
+                .collect();
+            let stars: Vec<&str> = combined_credits
+                .iter()
+                .filter(|c| !c.is_director)
+                .map(|c| c.name.as_str())
+                .take(3)
+                .collect();
+            let mut parts = Vec::new();
+            if !dirs.is_empty() {
+                parts.push(format!("Directed by {}", dirs.join(", ")));
+            }
+            if !stars.is_empty() {
+                parts.push(format!("Starring {}", stars.join(", ")));
+            }
+            (!parts.is_empty()).then(|| parts.join(" · "))
         };
 
         let meta_type_for_genre = meta.preview.r#type.clone();
@@ -650,7 +679,7 @@ impl AppShell {
                     .flex_wrap()
                     .items_center()
                     .gap(sp(10.0))
-                    .text_size(sp(13.0))
+                    .text_size(t.text_body())
                     .text_color(rgb(HERO_INK_SECONDARY))
                     .child(sentence_case_label(&meta.preview.r#type))
                     .when_some(certification, |el, cert| {
@@ -675,7 +704,7 @@ impl AppShell {
                                 .child(svg_icon_weighted(
                                     IconName::Star,
                                     IconWeight::Fill,
-                                    12.5 * t.ui_scale,
+                                    13.5 * t.ui_scale,
                                     rgb(0xFBBF24),
                                 ))
                                 .child(r),
@@ -710,8 +739,8 @@ impl AppShell {
             )
             .child(if let Some(logo_img) = title_logo_tex {
                 img(logo_img)
-                    .h(sp(84.0))
-                    .max_w(sp(420.0))
+                    .h(sp(96.0))
+                    .max_w(sp(460.0))
                     .object_fit(gpui::ObjectFit::Contain)
                     .into_any_element()
             } else {
@@ -726,10 +755,10 @@ impl AppShell {
             .when_some(tagline, |el, line| {
                 el.child(
                     div()
-                        .max_w(px(640.0))
+                        .max_w(px(680.0))
                         .font(ui_sans(FontWeight::NORMAL))
                         .italic()
-                        .text_size(sp(15.0))
+                        .text_size(t.text_subhead())
                         .text_color(rgb(HERO_INK_SECONDARY))
                         .child(line),
                 )
@@ -737,12 +766,22 @@ impl AppShell {
             .when_some(description_text, |el, desc| {
                 el.child(
                     div()
-                        .max_w(px(660.0))
-                        .text_size(sp(14.5))
-                        .line_height(gpui::relative(1.45))
+                        .max_w(px(700.0))
+                        .text_size(t.text_body())
+                        .line_height(gpui::relative(1.5))
                         .text_color(rgb(HERO_INK_PRIMARY))
-                        .opacity(0.90)
+                        .opacity(0.92)
                         .child(desc),
+                )
+            })
+            .when_some(hero_credits_line, |el, line| {
+                el.child(
+                    div()
+                        .max_w(px(700.0))
+                        .font(ui_sans(FontWeight::NORMAL))
+                        .text_size(t.text_body())
+                        .text_color(rgb(HERO_INK_SECONDARY))
+                        .child(line),
                 )
             })
             .when(!genres.is_empty(), |el| {
@@ -774,37 +813,77 @@ impl AppShell {
                     .flex_wrap()
                     .items_center()
                     .gap(sp(10.0))
-                    .when_some(filtered_indices.first().copied(), |el, best_play_idx| {
-                        let top_cands = Arc::clone(&all_playable_arc);
-                        let p_type = meta.preview.r#type.clone();
-                        let p_id = meta.preview.id.clone();
-                        let p_vid = active_video_id.clone();
-                        let p_title = meta.preview.name.clone();
-                        let p_ep = episode_header_label.clone();
-                        let p_mreq = meta_request.clone();
+                    .when_some(
+                        last_used_orig_idx
+                            .filter(|idx| filtered_indices.contains(idx))
+                            .or_else(|| filtered_indices.first().copied()),
+                        |el, best_play_idx| {
+                            let top_cands = Arc::clone(&all_playable_arc);
+                            let p_type = meta.preview.r#type.clone();
+                            let p_id = meta.preview.id.clone();
+                            let p_vid = active_video_id.clone();
+                            let p_title = meta.preview.name.clone();
+                            let p_ep = episode_header_label.clone();
+                            let p_mreq = meta_request.clone();
 
-                        el.child(primary_accent_button(
-                            "meta-btn-play-best",
-                            Some(IconName::Play),
-                            primary_cta_label,
-                            cx.listener(move |this, _, _, cx| {
-                                let subs = Some(build_subtitles_resource_path(&p_type, &p_vid));
-                                this.start_playback_session(
-                                    p_type.clone(),
-                                    p_id.clone(),
-                                    p_vid.clone(),
-                                    p_title.clone(),
-                                    p_ep.clone(),
-                                    Some(p_mreq.clone()),
-                                    subs,
-                                    Arc::clone(&top_cands),
-                                    best_play_idx,
-                                    resume_secs,
-                                    cx,
-                                );
-                            }),
-                        ))
-                    })
+                            let start_over_cands = Arc::clone(&all_playable_arc);
+                            let so_type = meta.preview.r#type.clone();
+                            let so_id = meta.preview.id.clone();
+                            let so_vid = active_video_id.clone();
+                            let so_title = meta.preview.name.clone();
+                            let so_ep = episode_header_label.clone();
+                            let so_mreq = meta_request.clone();
+
+                            el.child(primary_accent_button(
+                                "meta-btn-play-best",
+                                Some(IconName::Play),
+                                primary_cta_label,
+                                cx.listener(move |this, _, _, cx| {
+                                    let subs = Some(build_subtitles_resource_path(&p_type, &p_vid));
+                                    this.start_playback_session(
+                                        p_type.clone(),
+                                        p_id.clone(),
+                                        p_vid.clone(),
+                                        p_title.clone(),
+                                        p_ep.clone(),
+                                        Some(p_mreq.clone()),
+                                        subs,
+                                        Arc::clone(&top_cands),
+                                        best_play_idx,
+                                        effective_resume_secs,
+                                        cx,
+                                    );
+                                }),
+                            ))
+                            .when(effective_resume_secs.is_some(), |btn_row| {
+                                btn_row.child(render_hero_glass_button(
+                                    "meta-btn-start-over",
+                                    IconName::RotateCcw,
+                                    IconWeight::Regular,
+                                    "Start over",
+                                    false,
+                                    t,
+                                    cx.listener(move |this, _, _, cx| {
+                                        let subs =
+                                            Some(build_subtitles_resource_path(&so_type, &so_vid));
+                                        this.start_playback_session(
+                                            so_type.clone(),
+                                            so_id.clone(),
+                                            so_vid.clone(),
+                                            so_title.clone(),
+                                            so_ep.clone(),
+                                            Some(so_mreq.clone()),
+                                            subs,
+                                            Arc::clone(&start_over_cands),
+                                            best_play_idx,
+                                            None,
+                                            cx,
+                                        );
+                                    }),
+                                ))
+                            })
+                        },
+                    )
                     .when_some(trailer_target, |el, target| {
                         let t_type = meta.preview.r#type.clone();
                         let t_id = meta.preview.id.clone();
@@ -977,8 +1056,9 @@ impl AppShell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.meta_addon_dropdown_open {
+                    if this.meta_addon_dropdown_open || this.meta_season_dropdown_open {
                         this.meta_addon_dropdown_open = false;
+                        this.meta_season_dropdown_open = false;
                         cx.notify();
                     }
                 }),
@@ -1001,10 +1081,10 @@ impl AppShell {
                         t,
                         cx,
                     ))
+                    .child(main_sections)
                     .when(!combined_credits.is_empty(), |el| {
                         el.child(self.render_cast_rail(combined_credits, side_pad, t, cx))
                     })
-                    .child(main_sections)
                     .when_some(collection_section, |el, section| el.child(section))
                     .when_some(recommendations_section, |el, section| el.child(section)),
             )
@@ -1213,6 +1293,176 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> Div {
         let accent_ink = if t.is_light { t.accent_press } else { t.accent };
+        let has_any_headshots = combined_credits.iter().any(|c| c.headshot_url.is_some());
+
+        let credits_body = if !has_any_headshots {
+            // Compact editorial chip strip when TMDB headshots aren't available (avoids empty-circle placeholders).
+            div()
+                .id("meta-cast-chips")
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(sp(8.0))
+                .children(combined_credits.into_iter().enumerate().map(|(idx, chip)| {
+                    let pk = chip.person_key.clone();
+                    let pname = chip.name.clone();
+                    let is_director = chip.is_director;
+                    div()
+                        .id(("meta-cast-chip", idx))
+                        .cursor_pointer()
+                        .h(sp(34.0))
+                        .px(sp(13.0))
+                        .rounded(px(RADIUS_PILL))
+                        .bg(if is_director {
+                            rgba(t.accent_soft)
+                        } else {
+                            rgba(t.glass_card_bg)
+                        })
+                        .border_1()
+                        .border_color(if is_director {
+                            rgba(t.border_accent)
+                        } else {
+                            rgba(t.glass_border)
+                        })
+                        .hover(move |s| {
+                            s.bg(rgba(t.glass_row_hover_bg))
+                                .border_color(rgba(t.glass_border_strong))
+                        })
+                        .flex()
+                        .items_center()
+                        .gap(sp(6.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_person_details(pk.clone(), pname.clone(), cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .font(ui_sans(FontWeight::MEDIUM))
+                                .text_size(t.text_body())
+                                .text_color(rgb(t.text_primary))
+                                .child(chip.name),
+                        )
+                        .when(is_director, |el| {
+                            el.child(
+                                div()
+                                    .font(ui_sans(FontWeight::MEDIUM))
+                                    .text_size(t.text_micro())
+                                    .text_color(rgb(accent_ink))
+                                    .child("Director"),
+                            )
+                        })
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .id("meta-cast-rail")
+                .w_full()
+                .overflow_x_scroll()
+                .pb(sp(6.0))
+                .flex()
+                .items_center()
+                .gap(sp(12.0))
+                .children(combined_credits.into_iter().enumerate().map(|(idx, chip)| {
+                    let pk = chip.person_key.clone();
+                    let pname = chip.name.clone();
+                    let headshot_tex = chip
+                        .headshot_url
+                        .as_deref()
+                        .and_then(|u| self.poster_cache.resolve_thumbnail_image(u));
+                    let initials = person_initials(&chip.name);
+                    let role_label = chip.role_or_character.clone().unwrap_or_else(|| {
+                        if chip.is_director {
+                            "Director".to_owned()
+                        } else {
+                            "Cast".to_owned()
+                        }
+                    });
+
+                    div()
+                        .id(("meta-cast-card", idx))
+                        .flex_shrink_0()
+                        .w(sp(224.0))
+                        .cursor_pointer()
+                        .p(sp(10.0))
+                        .rounded(px(RADIUS_CARD))
+                        .bg(rgba(t.glass_card_bg))
+                        .border_1()
+                        .border_color(rgba(t.glass_border))
+                        .hover(move |s| {
+                            s.bg(rgba(t.glass_row_hover_bg))
+                                .border_color(rgba(t.glass_border_strong))
+                        })
+                        .flex()
+                        .items_center()
+                        .gap(sp(12.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_person_details(pk.clone(), pname.clone(), cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(sp(48.0))
+                                .h(sp(48.0))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .overflow_hidden()
+                                .bg(rgba(t.glass_trough_bg))
+                                .border_1()
+                                .border_color(rgba(t.glass_border))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(if let Some(tex) = headshot_tex {
+                                    img(tex)
+                                        .size_full()
+                                        .object_fit(gpui::ObjectFit::Cover)
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .font(editorial_serif())
+                                        .text_size(t.text_subhead())
+                                        .text_color(rgb(t.text_secondary))
+                                        .child(initials)
+                                        .into_any_element()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(sp(2.0))
+                                .child(
+                                    div()
+                                        .font(ui_sans(FontWeight::SEMIBOLD))
+                                        .text_size(t.text_body())
+                                        .text_color(rgb(t.text_primary))
+                                        .truncate()
+                                        .child(chip.name),
+                                )
+                                .child(
+                                    div()
+                                        .font(ui_sans(FontWeight::NORMAL))
+                                        .text_size(t.text_micro())
+                                        .text_color(if chip.is_director {
+                                            rgb(accent_ink)
+                                        } else {
+                                            rgb(t.text_secondary)
+                                        })
+                                        .truncate()
+                                        .child(role_label),
+                                ),
+                        )
+                }))
+                .into_any_element()
+        };
+
         div()
             .w_full()
             .flex_shrink_0()
@@ -1222,114 +1472,10 @@ impl AppShell {
             .gap(sp(14.0))
             .child(render_section_header(
                 SectionHeader::new("Cast & Crew").subtitle(Some(SharedString::new_static(
-                    "Click any person for filmography",
+                    "Select any person for filmography",
                 ))),
             ))
-            .child(
-                div()
-                    .id("meta-cast-rail")
-                    .w_full()
-                    .overflow_x_scroll()
-                    .pb(sp(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(sp(12.0))
-                    .children(combined_credits.into_iter().enumerate().map(|(idx, chip)| {
-                        let pk = chip.person_key.clone();
-                        let pname = chip.name.clone();
-                        let headshot_tex = chip
-                            .headshot_url
-                            .as_deref()
-                            .and_then(|u| self.poster_cache.resolve_thumbnail_image(u));
-                        let initials = person_initials(&chip.name);
-                        let role_label = chip.role_or_character.clone().unwrap_or_else(|| {
-                            if chip.is_director {
-                                "Director".to_owned()
-                            } else {
-                                "Cast".to_owned()
-                            }
-                        });
-
-                        div()
-                            .id(("meta-cast-card", idx))
-                            .flex_shrink_0()
-                            .w(sp(216.0))
-                            .cursor_pointer()
-                            .p(sp(10.0))
-                            .rounded(px(RADIUS_CARD))
-                            .bg(rgba(t.glass_card_bg))
-                            .border_1()
-                            .border_color(rgba(t.glass_border))
-                            .hover(move |s| {
-                                s.bg(rgba(t.glass_row_hover_bg))
-                                    .border_color(rgba(t.glass_border_strong))
-                            })
-                            .flex()
-                            .items_center()
-                            .gap(sp(12.0))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.open_person_details(pk.clone(), pname.clone(), cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .w(sp(46.0))
-                                    .h(sp(46.0))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .overflow_hidden()
-                                    .bg(rgba(t.glass_trough_bg))
-                                    .border_1()
-                                    .border_color(rgba(t.glass_border))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(if let Some(tex) = headshot_tex {
-                                        img(tex)
-                                            .size_full()
-                                            .object_fit(gpui::ObjectFit::Cover)
-                                            .into_any_element()
-                                    } else {
-                                        div()
-                                            .font(editorial_serif())
-                                            .text_size(sp(16.0))
-                                            .text_color(rgb(t.text_secondary))
-                                            .child(initials)
-                                            .into_any_element()
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(sp(2.0))
-                                    .child(
-                                        div()
-                                            .font(ui_sans(FontWeight::SEMIBOLD))
-                                            .text_size(sp(13.5))
-                                            .text_color(rgb(t.text_primary))
-                                            .truncate()
-                                            .child(chip.name),
-                                    )
-                                    .child(
-                                        div()
-                                            .font(ui_sans(FontWeight::NORMAL))
-                                            .text_size(sp(12.0))
-                                            .text_color(if chip.is_director {
-                                                rgb(accent_ink)
-                                            } else {
-                                                rgb(t.text_muted)
-                                            })
-                                            .truncate()
-                                            .child(role_label),
-                                    ),
-                            )
-                    })),
-            )
+            .child(credits_body)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1846,47 +1992,117 @@ impl AppShell {
             .into_any_element()
         });
 
+        let season_selector = if seasons.len() > 6 {
+            let season_dd_open = self.meta_season_dropdown_open;
+            let seasons_owned: Vec<u32> = seasons.to_vec();
+            div()
+                .relative()
+                .flex()
+                .child(dropdown_trigger(
+                    DropdownTriggerProps::new(
+                        "meta-season-dropdown-btn",
+                        season_heading.clone(),
+                        season_dd_open,
+                        cx.listener(|this, _, _, cx| {
+                            this.meta_season_dropdown_open = !this.meta_season_dropdown_open;
+                            cx.notify();
+                        }),
+                    )
+                    .secondary_label(Some(SharedString::from(format!("{} seasons", seasons.len()))))
+                    .min_width_px(Some(220.0)),
+                ))
+                .when(season_dd_open, |wrap| {
+                    wrap.child(
+                        gpui::deferred(
+                            glass_dropdown_panel("meta-season-dropdown-menu", 240.0)
+                                .absolute()
+                                .top(sp(42.0))
+                                .left_0()
+                                .child(
+                                    div()
+                                        .id("meta-season-dropdown-scroll")
+                                        .w_full()
+                                        .max_h(sp(300.0))
+                                        .overflow_y_scroll()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(sp(2.0))
+                                        .children(seasons_owned.into_iter().enumerate().map(
+                                            |(idx, s_num)| {
+                                                let is_active = active_season == Some(s_num);
+                                                let label = if s_num == 0 {
+                                                    "Specials".to_owned()
+                                                } else {
+                                                    format!("Season {s_num}")
+                                                };
+                                                glass_dropdown_option(
+                                                    ("season-dd-opt", idx),
+                                                    label,
+                                                    None,
+                                                    is_active,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.selected_season = Some(s_num);
+                                                        this.meta_season_dropdown_open = false;
+                                                        this.episode_list_scroll_handle
+                                                            .0
+                                                            .borrow()
+                                                            .base_handle
+                                                            .set_offset(point(px(0.0), px(0.0)));
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                            },
+                                        )),
+                                ),
+                        )
+                        .with_priority(10),
+                    )
+                })
+                .into_any_element()
+        } else {
+            div()
+                .id("season-pills-scroll")
+                .w_full()
+                .overflow_x_scroll()
+                .pb(sp(2.0))
+                .child(
+                    div().flex().child(
+                        glass_segmented_bar("meta-season-tabs-bar").children(
+                            seasons.iter().copied().enumerate().map(|(idx, s_num)| {
+                                let is_active = active_season == Some(s_num);
+                                let label = if s_num == 0 {
+                                    "Specials".to_owned()
+                                } else {
+                                    format!("Season {s_num}")
+                                };
+                                glass_segmented_item(
+                                    ("season-pill", idx),
+                                    label,
+                                    is_active,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.selected_season = Some(s_num);
+                                        this.episode_list_scroll_handle
+                                            .0
+                                            .borrow()
+                                            .base_handle
+                                            .set_offset(point(px(0.0), px(0.0)));
+                                        cx.notify();
+                                    }),
+                                )
+                            }),
+                        ),
+                    ),
+                )
+                .into_any_element()
+        };
+
         panel
             .child(render_section_header(
                 SectionHeader::new(season_heading)
                     .count_badge(Some(ep_badge))
                     .right_slot(mark_season_btn),
             ))
-            .child(
-                div()
-                    .id("season-pills-scroll")
-                    .w_full()
-                    .overflow_x_scroll()
-                    .pb(sp(2.0))
-                    .child(
-                        div().flex().child(
-                            glass_segmented_bar("meta-season-tabs-bar").children(
-                                seasons.iter().copied().enumerate().map(|(idx, s_num)| {
-                                    let is_active = active_season == Some(s_num);
-                                    let label = if s_num == 0 {
-                                        "Specials".to_owned()
-                                    } else {
-                                        format!("Season {s_num}")
-                                    };
-                                    glass_segmented_item(
-                                        ("season-pill", idx),
-                                        label,
-                                        is_active,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.selected_season = Some(s_num);
-                                            this.episode_list_scroll_handle
-                                                .0
-                                                .borrow()
-                                                .base_handle
-                                                .set_offset(point(px(0.0), px(0.0)));
-                                            cx.notify();
-                                        }),
-                                    )
-                                }),
-                            ),
-                        ),
-                    ),
-            )
+            .child(season_selector)
             .child(if ep_count == 0 {
                 render_empty_state(EmptyStateProps::new(
                     IconName::Tv,
@@ -2258,7 +2474,7 @@ impl AppShell {
                                                                             .font(ui_sans(
                                                                                 FontWeight::SEMIBOLD,
                                                                             ))
-                                                                            .text_size(sp(13.5))
+                                                                            .text_size(t.text_body())
                                                                             .text_color(rgb(
                                                                                 t.text_primary,
                                                                             ))
@@ -2368,18 +2584,16 @@ impl AppShell {
                                                                     .flex()
                                                                     .items_center()
                                                                     .gap(sp(8.0))
-                                                                    .text_xs()
+                                                                    .text_size(t.text_micro())
                                                                     .font_features(tabular_nums())
-                                                                    .text_color(rgb(t.text_muted))
+                                                                    .text_color(rgb(t.text_secondary))
                                                                     .when_some(
                                                                         ep.air_date.clone(),
                                                                         |row, date| {
                                                                             row.child(
                                                                                 div()
                                                                                     .font(mono_font())
-                                                                                    .text_size(sp(
-                                                                                        11.0,
-                                                                                    ))
+                                                                                    .text_size(t.text_micro())
                                                                                     .child(date),
                                                                             )
                                                                         },
@@ -2390,7 +2604,7 @@ impl AppShell {
                                                                             row.child(
                                                                                 div()
                                                                                     .px(sp(6.0))
-                                                                                    .py(sp(1.0))
+                                                                                    .py(sp(1.5))
                                                                                     .rounded(px(
                                                                                         4.0,
                                                                                     ))
@@ -2400,9 +2614,7 @@ impl AppShell {
                                                                                     .font(
                                                                                         mono_font(),
                                                                                     )
-                                                                                    .text_size(sp(
-                                                                                        10.5,
-                                                                                    ))
+                                                                                    .text_size(t.text_micro())
                                                                                     .text_color(rgb(
                                                                                         t.text_secondary,
                                                                                     ))
@@ -2411,28 +2623,22 @@ impl AppShell {
                                                                         },
                                                                     ),
                                                             )
-                                                            .child(
-                                                                div()
-                                                                    .w_full()
-                                                                    .min_w(px(0.0))
-                                                                    .text_size(sp(12.0))
-                                                                    .line_height(sp(16.5))
-                                                                    .line_clamp(2)
-                                                                    .text_color(
-                                                                        if ep.synopsis.is_some() {
-                                                                            rgb(t.text_secondary)
-                                                                        } else {
-                                                                            rgb(t.text_muted)
-                                                                        },
+                                                            .when_some(
+                                                                ep.synopsis.clone(),
+                                                                |col, synopsis| {
+                                                                    col.child(
+                                                                        div()
+                                                                            .w_full()
+                                                                            .min_w(px(0.0))
+                                                                            .text_size(t.text_micro())
+                                                                            .line_height(sp(17.0))
+                                                                            .line_clamp(2)
+                                                                            .text_color(rgb(
+                                                                                t.text_secondary,
+                                                                            ))
+                                                                            .child(synopsis),
                                                                     )
-                                                                    .child(
-                                                                        ep.synopsis
-                                                                            .clone()
-                                                                            .unwrap_or_else(|| {
-                                                                                "No synopsis available."
-                                                                                    .to_owned()
-                                                                            }),
-                                                                    ),
+                                                                },
                                                             ),
                                                     ),
                                             )
@@ -2756,12 +2962,162 @@ impl AppShell {
                 render_empty_state(empty_props).into_any_element()
             } else {
                 let page_slice = &filtered_indices[page_start..page_end];
+                let recommended_idx = (cur_page == 0).then(|| {
+                    last_used_orig_idx
+                        .filter(|idx| filtered_indices.contains(idx))
+                        .unwrap_or(filtered_indices[0])
+                });
+
+                let recommended_card = recommended_idx.map(|rec_idx| {
+                    let cand = &all_playable_arc[rec_idx];
+                    let summary = summarize_stream_for_humans(&cand.parsed);
+                    let rec_headline = [
+                        Some(summary.resolution),
+                        compact_hdr_badge(cand.parsed.hdr),
+                        compact_codec_badge(cand.parsed.codec),
+                        compact_audio_badge(cand.parsed.audio),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+
+                    let bitrate_text =
+                        estimate_bitrate_mbps(cand.parsed.size_bytes, runtime_minutes)
+                            .map(format_bitrate_mbps);
+                    let rec_meta = [
+                        summary.size_text.clone(),
+                        bitrate_text,
+                        Some(summary.availability_text.clone()),
+                        summary
+                            .addon_label
+                            .or_else(|| (!cand.addon_name.trim().is_empty()).then(|| cand.addon_name.clone())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+
+                    let rec_eyebrow = if last_used_orig_idx == Some(rec_idx) {
+                        "LAST USED · BEST MATCH"
+                    } else {
+                        "RECOMMENDED"
+                    };
+
+                    let cands_rec = Arc::clone(&all_playable_arc);
+                    let r_type = type_name.to_owned();
+                    let r_id = meta_id.to_owned();
+                    let r_vid = active_video_id.to_owned();
+                    let r_title = title.to_owned();
+                    let r_ep = episode_label.clone();
+                    let r_mreq = meta_request.clone();
+
+                    div()
+                        .id("meta-recommended-stream-card")
+                        .w_full()
+                        .p(sp(16.0))
+                        .rounded(px(RADIUS_CARD))
+                        .bg(rgba(t.accent_soft))
+                        .border_1()
+                        .border_color(rgba(t.border_accent))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(sp(16.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(sp(4.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(sp(6.0))
+                                        .font(mono_font())
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(t.text_micro())
+                                        .text_color(rgb(accent_ink))
+                                        .child(svg_icon_weighted(
+                                            IconName::Sparkles,
+                                            IconWeight::Fill,
+                                            12.0 * t.ui_scale,
+                                            rgb(accent_ink),
+                                        ))
+                                        .child(rec_eyebrow),
+                                )
+                                .child(
+                                    div()
+                                        .font(ui_sans(FontWeight::SEMIBOLD))
+                                        .text_size(t.text_subhead())
+                                        .text_color(rgb(t.text_primary))
+                                        .truncate()
+                                        .child(rec_headline),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(sp(7.0))
+                                        .when(cand.parsed.is_cached, |row| {
+                                            row.child(
+                                                div()
+                                                    .w(px(7.0))
+                                                    .h(px(7.0))
+                                                    .rounded_full()
+                                                    .flex_shrink_0()
+                                                    .bg(rgb(t.status_watched)),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .min_w(px(0.0))
+                                                .truncate()
+                                                .font(ui_sans(FontWeight::NORMAL))
+                                                .font_features(tabular_nums())
+                                                .text_size(t.text_body())
+                                                .text_color(rgb(t.text_secondary))
+                                                .child(rec_meta),
+                                        ),
+                                ),
+                        )
+                        .child(primary_accent_button(
+                            "meta-recommended-play-btn",
+                            Some(IconName::Play),
+                            "Play best match",
+                            cx.listener(move |this, _, _, cx| {
+                                let subs = Some(build_subtitles_resource_path(&r_type, &r_vid));
+                                this.start_playback_session(
+                                    r_type.clone(),
+                                    r_id.clone(),
+                                    r_vid.clone(),
+                                    r_title.clone(),
+                                    r_ep.clone(),
+                                    Some(r_mreq.clone()),
+                                    subs,
+                                    Arc::clone(&cands_rec),
+                                    rec_idx,
+                                    resume_secs,
+                                    cx,
+                                );
+                            }),
+                        ))
+                });
+
                 div()
                     .w_full()
                     .flex()
                     .flex_col()
                     .gap(sp(8.0))
-                    .children(page_slice.iter().copied().map(|orig_idx| {
+                    .when_some(recommended_card, |list, card| list.child(card))
+                    .children(
+                        page_slice
+                            .iter()
+                            .copied()
+                            .filter(|&idx| recommended_idx != Some(idx))
+                            .map(|orig_idx| {
                         let cand = &all_playable_arc[orig_idx];
                         let summary = summarize_stream_for_humans(&cand.parsed);
                         let headline = [

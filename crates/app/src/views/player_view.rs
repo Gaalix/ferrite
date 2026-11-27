@@ -12,6 +12,7 @@ use gpui::{
     Pixels, Point, ScrollEvent, SharedString, Window, WindowControlArea,
 };
 use gpui_mpv::mpv_viewport;
+use stremio_core_runtime::stremio_core::types::resource::Video;
 
 use crate::{
     icons::{svg_icon_weighted, IconName, IconWeight},
@@ -21,6 +22,7 @@ use crate::{
         editorial_serif, format_timestamp_secs, mono_font, movietracker_mark, obsidian_fade_in,
         summarize_stream_for_humans, tabular_nums, transparent_cutout, ui_sans,
     },
+    ui_components::simple_tooltip,
 };
 
 use self::components::{player_glass_shadow, player_hud_palette, player_meta_divider};
@@ -565,14 +567,14 @@ impl AppShell {
                         el.window_control_area(WindowControlArea::Drag)
                     })
                     .w_full()
-                    .h(px(108.0))
+                    .h(px(124.0))
                     .bg(linear_gradient(
                         180.0,
-                        linear_color_stop(rgba(0x000000B0), 0.0),
+                        linear_color_stop(rgba(0x000000D4), 0.0),
                         linear_color_stop(rgba(0x00000000), 1.0),
                     ))
                     .px(px(28.0))
-                    .pt(px(18.0))
+                    .pt(px(20.0))
                     .flex()
                     .items_start()
                     .justify_between()
@@ -608,13 +610,14 @@ impl AppShell {
                                     .id("player-btn-back")
                                     .flex_shrink_0()
                                     .cursor_pointer()
-                                    .w(px(34.0))
-                                    .h(px(34.0))
+                                    .w(px(40.0))
+                                    .h(px(40.0))
                                     .rounded(px(999.0))
-                                    .hover(|s| s.bg(rgba(0xFFFFFF14)))
+                                    .hover(|s| s.bg(rgba(0xFFFFFF1C)))
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .tooltip(simple_tooltip("Exit player", Some("Esc")))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, window, cx| {
@@ -629,7 +632,7 @@ impl AppShell {
                                     .child(svg_icon_weighted(
                                         IconName::ChevronLeft,
                                         IconWeight::Regular,
-                                        18.0,
+                                        20.0,
                                         rgb(t.text_primary),
                                     )),
                             )
@@ -642,8 +645,8 @@ impl AppShell {
                                     .child(
                                         div()
                                             .font(ui_sans(FontWeight::SEMIBOLD))
-                                            .text_size(px(15.5))
-                                            .line_height(px(20.0))
+                                            .text_size(px(17.0))
+                                            .line_height(px(22.0))
                                             .text_color(rgb(t.text_primary))
                                             .truncate()
                                             .child(title),
@@ -652,8 +655,8 @@ impl AppShell {
                                         col.child(
                                             div()
                                                 .font(ui_sans(FontWeight::NORMAL))
-                                                .text_size(px(12.5))
-                                                .line_height(px(16.0))
+                                                .text_size(px(14.0))
+                                                .line_height(px(18.0))
                                                 .text_color(rgb(t.text_secondary))
                                                 .truncate()
                                                 .child(sub),
@@ -695,6 +698,7 @@ impl AppShell {
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .tooltip(simple_tooltip("Playback stats", Some("I")))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -729,6 +733,7 @@ impl AppShell {
                 self.render_player_bottom_deck(
                     is_fullscreen,
                     intro_bounds_secs,
+                    next_video,
                     &scrub_bounds,
                     vol_slider_bounds,
                     cx,
@@ -802,6 +807,13 @@ impl AppShell {
 
         let dl_mbps = dl_bps / (1024.0 * 1024.0);
         let show_dl_telemetry = is_torrent || dl_bps > 1024.0;
+        let failover_countdown = self.failover_countdown_secs;
+        let slow_swarm_hint = failover_countdown.is_some()
+            || (is_torrent
+                && !self.failover_paused
+                && candidate_count > 1
+                && dl_bps < 1024.0
+                && peers_opt.is_some_and(|p| p <= 3));
 
         div()
             .id("player-loading-showcase")
@@ -814,15 +826,15 @@ impl AppShell {
                     div()
                         .absolute()
                         .inset_0()
-                        .opacity(0.32)
+                        .opacity(0.44)
                         .child(img(amb).size_full().object_fit(gpui::ObjectFit::Cover)),
                 )
             })
             .child(
                 div().absolute().inset_0().bg(linear_gradient(
                     180.0,
-                    linear_color_stop(rgba((t.bg_canvas << 8) | 0xb5), 0.0),
-                    linear_color_stop(rgba((t.bg_canvas << 8) | 0xf7), 1.0),
+                    linear_color_stop(rgba((t.bg_canvas << 8) | 0xa6), 0.0),
+                    linear_color_stop(rgba((t.bg_canvas << 8) | 0xf2), 1.0),
                 )),
             )
             .child(
@@ -837,8 +849,8 @@ impl AppShell {
                     .gap(px(18.0))
                     .child(
                         div()
-                            .w(px(148.0))
-                            .h(px(222.0))
+                            .w(px(164.0))
+                            .h(px(246.0))
                             .rounded(px(10.0))
                             .overflow_hidden()
                             .bg(rgb(t.bg_surface))
@@ -867,7 +879,7 @@ impl AppShell {
                             .child(
                                 div()
                                     .font(editorial_serif())
-                                    .text_size(px(34.0))
+                                    .text_size(px(38.0))
                                     .text_color(rgb(t.text_primary))
                                     .text_center()
                                     .child(title.to_owned()),
@@ -876,7 +888,7 @@ impl AppShell {
                                 col.child(
                                     div()
                                         .font(mono_font())
-                                        .text_xs()
+                                        .text_size(px(14.0))
                                         .text_color(rgb(t.accent))
                                         .child(ep.to_owned()),
                                 )
@@ -884,8 +896,8 @@ impl AppShell {
                     )
                     .child(
                         div()
-                            .px(px(16.0))
-                            .py(px(8.0))
+                            .px(px(18.0))
+                            .py(px(10.0))
                             .rounded(px(999.0))
                             .bg(rgba(t.glass_popover_bg))
                             .border_1()
@@ -899,13 +911,13 @@ impl AppShell {
                             .child(svg_icon_weighted(
                                 IconName::RefreshCw,
                                 IconWeight::Regular,
-                                13.0,
+                                14.0,
                                 rgb(t.accent),
                             ))
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::MEDIUM))
-                                    .text_size(px(13.0))
+                                    .text_size(px(14.0))
                                     .text_color(rgb(t.text_primary))
                                     .child(status_label),
                             )
@@ -913,7 +925,7 @@ impl AppShell {
                                 pill.child(player_meta_divider(&t)).child(
                                     div()
                                         .font(mono_font())
-                                        .text_xs()
+                                        .text_size(px(13.0))
                                         .text_color(rgb(t.text_secondary))
                                         .child(format!("{dl_mbps:.2} MB/s")),
                                 )
@@ -922,7 +934,7 @@ impl AppShell {
                                 pill.child(player_meta_divider(&t)).child(
                                     div()
                                         .font(mono_font())
-                                        .text_xs()
+                                        .text_size(px(13.0))
                                         .text_color(rgb(t.text_secondary))
                                         .child(format!("{peers} peers")),
                                 )
@@ -931,7 +943,7 @@ impl AppShell {
                                 pill.child(player_meta_divider(&t)).child(
                                     div()
                                         .font(mono_font())
-                                        .text_xs()
+                                        .text_size(px(13.0))
                                         .text_color(rgb(t.text_muted))
                                         .child(match sum.addon_label {
                                             Some(addon) => format!("{} / {addon}", sum.resolution),
@@ -940,6 +952,83 @@ impl AppShell {
                                 )
                             }),
                     )
+                    .when(slow_swarm_hint, |col| {
+                        let prompt_text = match failover_countdown {
+                            Some(secs) => format!(
+                                "This source is slow — switching to backup in {secs} s"
+                            ),
+                            None => "This source looks slow — a backup stream is ready".to_owned(),
+                        };
+                        col.child(
+                            div()
+                                .px(px(16.0))
+                                .py(px(10.0))
+                                .rounded(px(12.0))
+                                .bg(rgba((t.accent_amber << 8) | 0x1A))
+                                .border_1()
+                                .border_color(rgba((t.accent_amber << 8) | 0x55))
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .font(ui_sans(FontWeight::MEDIUM))
+                                        .text_size(px(13.5))
+                                        .text_color(rgb(t.text_primary))
+                                        .child(prompt_text),
+                                )
+                                .child(
+                                    div()
+                                        .id("loading-btn-failover-now")
+                                        .cursor_pointer()
+                                        .h(px(32.0))
+                                        .px(px(12.0))
+                                        .rounded(px(999.0))
+                                        .bg(rgb(t.accent))
+                                        .hover(move |s| s.bg(rgb(t.accent_hover)))
+                                        .flex()
+                                        .items_center()
+                                        .font(ui_sans(FontWeight::SEMIBOLD))
+                                        .text_size(px(13.0))
+                                        .text_color(rgb(t.cta_on_accent))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.switch_to_next_backup_source(cx);
+                                            }),
+                                        )
+                                        .child("Switch now"),
+                                )
+                                .child(
+                                    div()
+                                        .id("loading-btn-keep-waiting")
+                                        .cursor_pointer()
+                                        .h(px(32.0))
+                                        .px(px(12.0))
+                                        .rounded(px(999.0))
+                                        .bg(rgba(t.glass_trough_bg))
+                                        .border_1()
+                                        .border_color(rgba(t.glass_border))
+                                        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
+                                        .flex()
+                                        .items_center()
+                                        .font(ui_sans(FontWeight::MEDIUM))
+                                        .text_size(px(13.0))
+                                        .text_color(rgb(t.text_secondary))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.pause_dead_swarm_failover(cx);
+                                            }),
+                                        )
+                                        .child("Keep waiting"),
+                                ),
+                        )
+                    })
                     .when(candidate_count > 1, |col| {
                         let drawer_open = self.player_popover == Some(PlayerPopover::SwitchStream);
                         col.child(
@@ -1001,6 +1090,7 @@ impl AppShell {
         &self,
         is_fullscreen: bool,
         intro_bounds_secs: Option<(f64, f64)>,
+        next_video: Option<Video>,
         scrub_bounds: &Rc<Cell<Option<Bounds<Pixels>>>>,
         vol_slider_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
         cx: &mut Context<Self>,
@@ -1078,9 +1168,10 @@ impl AppShell {
             .child(
                 div()
                     .id("player-scrub-track")
+                    .group("player-scrub-grp")
                     .cursor_pointer()
                     .w_full()
-                    .h(px(18.0))
+                    .h(px(22.0))
                     .relative()
                     .flex()
                     .items_center()
@@ -1131,9 +1222,10 @@ impl AppShell {
                     .child(
                         div()
                             .w_full()
-                            .h(px(4.0))
+                            .h(px(5.0))
+                            .group_hover("player-scrub-grp", |s| s.h(px(7.0)))
                             .rounded(px(999.0))
-                            .bg(rgba(0xFFFFFF26))
+                            .bg(rgba(0xFFFFFF2A))
                             .relative()
                             .overflow_hidden()
                             .child(
@@ -1264,13 +1356,17 @@ impl AppShell {
                                 div()
                                     .id("osd-play-toggle")
                                     .cursor_pointer()
-                                    .w(px(36.0))
-                                    .h(px(36.0))
+                                    .w(px(42.0))
+                                    .h(px(42.0))
                                     .rounded(px(999.0))
-                                    .hover(|s| s.bg(rgba(0xFFFFFF14)))
+                                    .hover(|s| s.bg(rgba(0xFFFFFF18)))
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .tooltip(simple_tooltip(
+                                        if snap.paused { "Play" } else { "Pause" },
+                                        Some("Space"),
+                                    ))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -1288,7 +1384,7 @@ impl AppShell {
                                             IconName::Pause
                                         },
                                         IconWeight::Fill,
-                                        18.0,
+                                        23.0,
                                         rgb(0xFFFFFF),
                                     )),
                             )
@@ -1296,13 +1392,14 @@ impl AppShell {
                                 div()
                                     .id("osd-seek-b10")
                                     .cursor_pointer()
-                                    .w(px(36.0))
-                                    .h(px(36.0))
+                                    .w(px(40.0))
+                                    .h(px(40.0))
                                     .rounded(px(999.0))
-                                    .hover(|s| s.bg(rgba(0xFFFFFF14)))
+                                    .hover(|s| s.bg(rgba(0xFFFFFF18)))
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .tooltip(simple_tooltip("Back 10s", Some("←")))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -1313,7 +1410,7 @@ impl AppShell {
                                     .child(svg_icon_weighted(
                                         IconName::Replay10,
                                         IconWeight::Regular,
-                                        20.0,
+                                        23.0,
                                         rgb(0xFFFFFF),
                                     )),
                             )
@@ -1321,13 +1418,14 @@ impl AppShell {
                                 div()
                                     .id("osd-seek-f10")
                                     .cursor_pointer()
-                                    .w(px(36.0))
-                                    .h(px(36.0))
+                                    .w(px(40.0))
+                                    .h(px(40.0))
                                     .rounded(px(999.0))
-                                    .hover(|s| s.bg(rgba(0xFFFFFF14)))
+                                    .hover(|s| s.bg(rgba(0xFFFFFF18)))
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .tooltip(simple_tooltip("Forward 10s", Some("→")))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -1338,10 +1436,43 @@ impl AppShell {
                                     .child(svg_icon_weighted(
                                         IconName::Forward10,
                                         IconWeight::Regular,
-                                        20.0,
+                                        23.0,
                                         rgb(0xFFFFFF),
                                     )),
                             )
+                            .when_some(next_video, |row, next_vid| {
+                                let next_label = next_vid
+                                    .series_info
+                                    .as_ref()
+                                    .map(|s| format!("Next: S{} E{}", s.season, s.episode))
+                                    .unwrap_or_else(|| "Next episode".to_owned());
+                                row.child(
+                                    div()
+                                        .id("osd-next-episode")
+                                        .cursor_pointer()
+                                        .w(px(40.0))
+                                        .h(px(40.0))
+                                        .rounded(px(999.0))
+                                        .hover(|s| s.bg(rgba(0xFFFFFF18)))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .tooltip(simple_tooltip(next_label, Some("N")))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.advance_to_next_episode(next_vid.clone(), cx);
+                                            }),
+                                        )
+                                        .child(svg_icon_weighted(
+                                            IconName::StepForward,
+                                            IconWeight::Fill,
+                                            21.0,
+                                            rgb(0xFFFFFF),
+                                        )),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -1351,13 +1482,17 @@ impl AppShell {
                                         div()
                                             .id("osd-volume-btn")
                                             .cursor_pointer()
-                                            .w(px(34.0))
-                                            .h(px(34.0))
+                                            .w(px(38.0))
+                                            .h(px(38.0))
                                             .rounded(px(999.0))
-                                            .hover(|s| s.bg(rgba(0xFFFFFF14)))
+                                            .hover(|s| s.bg(rgba(0xFFFFFF18)))
                                             .flex()
                                             .items_center()
                                             .justify_center()
+                                            .tooltip(simple_tooltip(
+                                                if muted { "Unmute" } else { "Mute" },
+                                                Some("M"),
+                                            ))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
@@ -1495,7 +1630,7 @@ impl AppShell {
                                     .items_center()
                                     .font(ui_sans(FontWeight::MEDIUM))
                                     .font_features(tabular_nums())
-                                    .text_size(px(13.0))
+                                    .text_size(px(14.5))
                                     .child(
                                         div()
                                             .text_color(rgb(t.text_primary))
@@ -1512,58 +1647,77 @@ impl AppShell {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
-                            .child(sheet_icon_btn(
-                                "osd-pop-audio-subs",
-                                IconName::ClosedCaption,
-                                19.0,
-                                cc_active,
-                                cx.listener(|this, _, _, cx| {
-                                    this.toggle_player_popover(
-                                        PlayerPopover::AudioAndSubtitles,
-                                        cx,
-                                    );
-                                }),
-                            ))
-                            .child(sheet_icon_btn(
-                                "osd-pop-picture-playback",
-                                IconName::Sliders,
-                                18.5,
-                                picture_active,
-                                cx.listener(|this, _, _, cx| {
-                                    this.toggle_player_popover(
-                                        PlayerPopover::PictureAndPlayback,
-                                        cx,
-                                    );
-                                }),
-                            ))
-                            .when(has_session, |row| {
-                                row.child(sheet_icon_btn(
-                                    "osd-pop-switch-stream",
-                                    IconName::Layers,
-                                    18.5,
-                                    sources_active,
+                            .gap(px(8.0))
+                            .child(
+                                sheet_icon_btn(
+                                    "osd-pop-audio-subs",
+                                    IconName::ClosedCaption,
+                                    22.0,
+                                    cc_active,
                                     cx.listener(|this, _, _, cx| {
                                         this.toggle_player_popover(
-                                            PlayerPopover::SwitchStream,
+                                            PlayerPopover::AudioAndSubtitles,
                                             cx,
                                         );
                                     }),
-                                ))
+                                )
+                                .tooltip(simple_tooltip("Audio & subtitles", Some("S"))),
+                            )
+                            .child(
+                                sheet_icon_btn(
+                                    "osd-pop-picture-playback",
+                                    IconName::Sliders,
+                                    21.5,
+                                    picture_active,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.toggle_player_popover(
+                                            PlayerPopover::PictureAndPlayback,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .tooltip(simple_tooltip("Picture & playback", Some("P"))),
+                            )
+                            .when(has_session, |row| {
+                                row.child(
+                                    sheet_icon_btn(
+                                        "osd-pop-switch-stream",
+                                        IconName::Layers,
+                                        21.5,
+                                        sources_active,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_player_popover(
+                                                PlayerPopover::SwitchStream,
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .tooltip(simple_tooltip("Switch source", Some("Tab"))),
+                                )
                             })
-                            .child(sheet_icon_btn(
-                                "osd-fullscreen",
-                                if is_fullscreen {
-                                    IconName::Minimize
-                                } else {
-                                    IconName::Maximize
-                                },
-                                18.5,
-                                false,
-                                cx.listener(|_this, _, window, _cx| {
-                                    window.toggle_fullscreen();
-                                }),
-                            )),
+                            .child(
+                                sheet_icon_btn(
+                                    "osd-fullscreen",
+                                    if is_fullscreen {
+                                        IconName::Minimize
+                                    } else {
+                                        IconName::Maximize
+                                    },
+                                    21.5,
+                                    false,
+                                    cx.listener(|_this, _, window, _cx| {
+                                        window.toggle_fullscreen();
+                                    }),
+                                )
+                                .tooltip(simple_tooltip(
+                                    if is_fullscreen {
+                                        "Exit fullscreen"
+                                    } else {
+                                        "Fullscreen"
+                                    },
+                                    Some("F"),
+                                )),
+                            ),
                     ),
             )
             .with_animation("player-bottom-osd-fade", obsidian_fade_in(), |el, delta| {

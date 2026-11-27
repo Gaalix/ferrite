@@ -81,6 +81,14 @@ impl AppShell {
         let upscaler_label = upscaler_display_label(prefs.upscale_mode);
         let shader_label = shader_display_label(exp.shader_preset);
 
+        let quality_preset_idx = match (prefs.upscale_mode, exp.deband_enabled) {
+            (UpscaleChoice::Bilinear, false) => Some(0),
+            (UpscaleChoice::Spline36, false) => Some(1),
+            (UpscaleChoice::EwaLanczos, true) => Some(2),
+            _ => None,
+        };
+        let advanced_open = self.picture_advanced_open;
+
         player_sheet_card("player-picture-playback-sheet")
             .child(sheet_header_close(
                 "Picture & playback",
@@ -120,87 +128,155 @@ impl AppShell {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
-                            .child(div().pb(px(4.0)).child(section_eyebrow("Picture")))
-                            .child(drilldown_row(
-                                "pp-row-tonemap",
-                                "HDR tone-mapping",
-                                prefs.tone_mapping.label(),
-                                cx.listener(|this, _, _, cx| {
-                                    this.player_popover = Some(PlayerPopover::ToneMappingPicker);
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(drilldown_row(
-                                "pp-row-upscaler",
-                                "Upscaler",
-                                upscaler_label,
-                                cx.listener(|this, _, _, cx| {
-                                    this.player_popover = Some(PlayerPopover::UpscalerPicker);
-                                    cx.notify();
-                                }),
-                            )),
+                            .gap(px(8.0))
+                            .child(section_eyebrow("Picture quality"))
+                            .child(
+                                segmented_trough()
+                                    .child(segmented_item(
+                                        "pp-quality-fast",
+                                        "Fast",
+                                        quality_preset_idx == Some(0),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.preferences.experimental_video.deband_enabled =
+                                                false;
+                                            this.preferences.experimental_video.shader_preset =
+                                                ShaderPresetChoice::Off;
+                                            this.apply_experimental_video_to_mpv();
+                                            this.set_upscale_choice(UpscaleChoice::Bilinear, cx);
+                                        }),
+                                    ))
+                                    .child(segmented_item(
+                                        "pp-quality-balanced",
+                                        "Balanced",
+                                        quality_preset_idx == Some(1),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.preferences.experimental_video.deband_enabled =
+                                                false;
+                                            this.preferences.experimental_video.shader_preset =
+                                                ShaderPresetChoice::Off;
+                                            this.apply_experimental_video_to_mpv();
+                                            this.set_upscale_choice(UpscaleChoice::Spline36, cx);
+                                        }),
+                                    ))
+                                    .child(segmented_item(
+                                        "pp-quality-best",
+                                        "Best",
+                                        quality_preset_idx == Some(2),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.preferences.experimental_video.deband_enabled =
+                                                true;
+                                            this.apply_experimental_video_to_mpv();
+                                            this.set_upscale_choice(UpscaleChoice::EwaLanczos, cx);
+                                        }),
+                                    )),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
+                            .gap(px(4.0))
                             .child(
                                 div()
-                                    .pb(px(4.0))
+                                    .id("pp-advanced-toggle")
+                                    .cursor_pointer()
+                                    .px(px(10.0))
+                                    .py(px(8.0))
+                                    .rounded(px(10.0))
+                                    .bg(rgba(t.glass_card_bg))
+                                    .border_1()
+                                    .border_color(rgba(t.glass_border))
+                                    .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
                                     .flex()
                                     .items_center()
-                                    .gap(px(8.0))
-                                    .child(section_eyebrow("Experimental"))
+                                    .justify_between()
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.picture_advanced_open =
+                                                !this.picture_advanced_open;
+                                            cx.notify();
+                                        }),
+                                    )
                                     .child(
                                         div()
-                                            .px(px(8.0))
-                                            .py(px(2.0))
-                                            .rounded(px(999.0))
-                                            .border_1()
-                                            .border_color(rgba(t.glass_border))
                                             .font(ui_sans(FontWeight::MEDIUM))
-                                            .text_size(px(11.0))
+                                            .text_size(px(13.0))
+                                            .text_color(rgb(t.text_primary))
+                                            .child("Advanced mpv controls"),
+                                    )
+                                    .child(
+                                        div()
+                                            .font(ui_sans(FontWeight::MEDIUM))
+                                            .text_size(px(12.0))
                                             .text_color(rgb(t.text_secondary))
-                                            .child("Off by default"),
+                                            .child(if advanced_open { "Hide" } else { "Show" }),
                                     ),
                             )
-                            .child(drilldown_row(
-                                "pp-row-shader",
-                                "Shader preset",
-                                shader_label,
-                                cx.listener(|this, _, _, cx| {
-                                    this.player_popover = Some(PlayerPopover::ShaderPresetPicker);
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(toggle_switch_row(
-                                "osd-toggle-deband",
-                                "Deband",
-                                None,
-                                exp.deband_enabled,
-                                cx.listener(|this, _, _, cx| {
-                                    this.preferences.experimental_video.deband_enabled =
-                                        !this.preferences.experimental_video.deband_enabled;
-                                    this.apply_experimental_video_to_mpv();
-                                    let _ = this.preferences.save();
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(toggle_switch_row(
-                                "osd-toggle-dv",
-                                "Dolby Vision reshaping",
-                                None,
-                                exp.dolby_vision_reshape,
-                                cx.listener(|this, _, _, cx| {
-                                    this.preferences.experimental_video.dolby_vision_reshape =
-                                        !this.preferences.experimental_video.dolby_vision_reshape;
-                                    this.apply_experimental_video_to_mpv();
-                                    let _ = this.preferences.save();
-                                    cx.notify();
-                                }),
-                            )),
+                            .when(advanced_open, |adv| {
+                                adv.pt(px(6.0))
+                                    .child(drilldown_row(
+                                        "pp-row-tonemap",
+                                        "HDR tone-mapping",
+                                        prefs.tone_mapping.label(),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.player_popover =
+                                                Some(PlayerPopover::ToneMappingPicker);
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(drilldown_row(
+                                        "pp-row-upscaler",
+                                        "Upscaler",
+                                        upscaler_label,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.player_popover =
+                                                Some(PlayerPopover::UpscalerPicker);
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(drilldown_row(
+                                        "pp-row-shader",
+                                        "Shader preset",
+                                        shader_label,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.player_popover =
+                                                Some(PlayerPopover::ShaderPresetPicker);
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(toggle_switch_row(
+                                        "osd-toggle-deband",
+                                        "Deband",
+                                        None,
+                                        exp.deband_enabled,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.preferences.experimental_video.deband_enabled =
+                                                !this.preferences.experimental_video.deband_enabled;
+                                            this.apply_experimental_video_to_mpv();
+                                            let _ = this.preferences.save();
+                                            cx.notify();
+                                        }),
+                                    ))
+                                    .child(toggle_switch_row(
+                                        "osd-toggle-dv",
+                                        "Dolby Vision reshaping",
+                                        None,
+                                        exp.dolby_vision_reshape,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.preferences
+                                                .experimental_video
+                                                .dolby_vision_reshape = !this
+                                                .preferences
+                                                .experimental_video
+                                                .dolby_vision_reshape;
+                                            this.apply_experimental_video_to_mpv();
+                                            let _ = this.preferences.save();
+                                            cx.notify();
+                                        }),
+                                    ))
+                            }),
                     ),
             )
     }

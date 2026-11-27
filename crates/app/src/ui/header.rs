@@ -101,7 +101,7 @@ pub fn render_page_header(props: PageHeader) -> Div {
         .child(
             div()
                 .font(editorial_serif())
-                .text_size(theme.sp(36.0))
+                .text_size(theme.text_hero())
                 .line_height(relative(1.08))
                 .text_color(rgb(theme.text_primary))
                 .child(props.title),
@@ -121,7 +121,7 @@ pub fn render_page_header(props: PageHeader) -> Div {
             col.child(
                 div()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(theme.sp(13.5))
+                    .text_size(theme.text_body())
                     .text_color(rgb(theme.text_secondary))
                     .child(sub),
             )
@@ -244,7 +244,7 @@ pub fn render_section_header(props: SectionHeader) -> Div {
         .child(
             div()
                 .font(editorial_serif())
-                .text_size(theme.sp(26.0))
+                .text_size(theme.text_display())
                 .line_height(relative(1.1))
                 .text_color(rgb(theme.text_primary))
                 .when(single_line, |el| el.min_w(px(0.0)).truncate())
@@ -266,9 +266,9 @@ pub fn render_section_header(props: SectionHeader) -> Div {
             col.child(
                 div()
                     .font(ui_sans(FontWeight::NORMAL))
-                    .text_size(theme.sp(12.5))
-                    .line_height(theme.sp(16.0))
-                    .text_color(rgb(theme.text_muted))
+                    .text_size(theme.text_body())
+                    .line_height(theme.sp(18.0))
+                    .text_color(rgb(theme.text_secondary))
                     .truncate()
                     .child(sub),
             )
@@ -299,7 +299,7 @@ fn render_header_count_pill(label: SharedString, theme: &ThemePalette) -> Div {
         .border_color(rgba(theme.glass_border))
         .font(mono_font())
         .font_features(tabular_nums())
-        .text_size(theme.sp(11.5))
-        .text_color(rgb(theme.text_muted))
+        .text_size(theme.text_micro())
+        .text_color(rgb(theme.text_secondary))
         .child(label)
 }

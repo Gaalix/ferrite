@@ -4,8 +4,8 @@ use std::{
 };
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, AsyncApp, ClipboardItem, Context, FontWeight, MouseButton,
-    SharedString, WeakEntity,
+    div, img, prelude::*, px, rgb, rgba, AsyncApp, ClipboardItem, Context, FontWeight, MouseButton,
+    ObjectFit, SharedString, WeakEntity,
 };
 use stremio_core_runtime::{
     addon_configure_url, addon_origin_from_url, classify_descriptor_categories,
@@ -23,11 +23,13 @@ use crate::{
         active_theme, mono_font, ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL,
     },
     ui::{
-        choice_pill, glass_segmented_bar, glass_segmented_item, glass_switch, meta_divider,
-        neutral_chip, page_container, render_empty_state, render_page_header, search_field,
-        secondary_glass_button, semantic_status_pill, toolbar_bar, EmptyStateProps, PageHeader,
-        PageWidth, SearchFieldProps,
+        choice_pill, glass_dropdown_option, glass_dropdown_panel, glass_segmented_bar,
+        glass_segmented_item, glass_switch, meta_divider, neutral_chip, page_container,
+        render_empty_state, render_page_header, search_field, secondary_glass_button,
+        semantic_status_pill, toolbar_bar, EmptyStateProps, PageHeader, PageWidth,
+        SearchFieldProps,
     },
+    ui_components::simple_tooltip,
 };
 
 #[derive(Clone)]
@@ -138,6 +140,7 @@ impl AppShell {
         let accent_ink = if t.is_light { t.accent_press } else { t.accent };
         let has_cache = cache_stats.entries > 0 || cache_stats.hits > 0;
 
+        let _ = (format_bytes(cache_stats.total_bytes as u64), cache_stats.hits);
         let stats_pill = div()
             .h(t.sp(34.0))
             .px(t.sp(14.0))
@@ -148,18 +151,14 @@ impl AppShell {
             .flex()
             .items_center()
             .gap(t.sp(10.0))
-            .font(mono_font())
-            .text_xs()
+            .font(ui_sans(FontWeight::MEDIUM))
+            .text_size(t.text_micro())
             .text_color(rgb(t.text_secondary))
             .child(
                 div()
                     .text_color(rgb(t.text_primary))
                     .child(format!("{active_count} active")),
             )
-            .child(meta_divider())
-            .child(format!("{} cache hits", cache_stats.hits))
-            .child(meta_divider())
-            .child(format_bytes(cache_stats.total_bytes as u64))
             .when(has_cache, |el| {
                 el.child(meta_divider()).child(
                     div()
@@ -173,7 +172,7 @@ impl AppShell {
                                 this.core.clear_addon_cache();
                                 this.push_toast(
                                     ToastKind::Info,
-                                    "Cleared addon HTTP cache",
+                                    "Cleared addon cache",
                                     None,
                                     cx,
                                 );
@@ -186,7 +185,7 @@ impl AppShell {
         render_page_header(
             PageHeader::new("Addons")
                 .subtitle(Some(SharedString::new_static(
-                    "Priority execution order, soft-mute preserving secret config URLs, and live origin health.",
+                    "Addons decide where Ferrite finds movies, streams, and subtitles. Order sets which ones are tried first.",
                 )))
                 .right_slot(Some(stats_pill.into_any_element())),
         )
@@ -684,10 +683,10 @@ impl AppShell {
                                 .justify_between()
                                 .child(
                                     div()
-                                        .font(mono_font())
-                                        .text_xs()
-                                        .text_color(rgb(t.text_muted))
-                                        .child("SOFT-MUTED SOURCES (SECRET CONFIG URLS PRESERVED)"),
+                                        .font(ui_sans(FontWeight::SEMIBOLD))
+                                        .text_size(t.text_micro())
+                                        .text_color(rgb(t.text_secondary))
+                                        .child("Disabled addons (settings preserved)"),
                                 )
                                 .child(
                                     div()
@@ -744,10 +743,24 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let accent_ink = if t.is_light { t.accent_press } else { t.accent };
-        let rose_bg = (t.accent_rose << 8) | if t.is_light { 0x17 } else { 0x1a };
-        let rose_hover = (t.accent_rose << 8) | if t.is_light { 0x2b } else { 0x2e };
         let is_protected = addon.flags.protected;
         let url_str = addon.transport_url.as_str();
+        let row_menu_key = format!("{}:{url_str}", if is_active { "a" } else { "m" });
+        let row_menu_open = self.open_addon_menu_id.as_deref() == Some(row_menu_key.as_str());
+        let addon_logo_tex = addon
+            .manifest
+            .logo
+            .as_ref()
+            .map(|u| u.as_str())
+            .and_then(|u| self.poster_cache.resolve_thumbnail_image(u));
+        let addon_initial: String = addon
+            .manifest
+            .name
+            .trim()
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "A".to_owned());
 
         let configurable = addon.manifest.behavior_hints.configurable
             || addon.manifest.behavior_hints.configuration_required;
@@ -772,6 +785,7 @@ impl AppShell {
         let can_move_down = is_active && slot_idx + 1 < total_active;
 
         let url_for_copy = url_str.to_owned();
+        let url_for_top = addon.transport_url.clone();
 
         div()
             .id(("studio-addon-row", dom_idx))
@@ -796,47 +810,16 @@ impl AppShell {
                     .flex()
                     .items_center()
                     .gap(t.sp(10.0))
-                    .child(
-                        div()
-                            .w(t.sp(28.0))
-                            .font(mono_font())
-                            .font_weight(FontWeight::BOLD)
-                            .text_size(t.sp(14.0))
-                            .text_color(if !is_active {
-                                rgb(t.text_muted)
-                            } else if slot_idx == 0 {
-                                rgb(accent_ink)
-                            } else {
-                                rgb(t.text_secondary)
-                            })
-                            .child(if is_active {
-                                format!("{:02}", slot_idx + 1)
-                            } else {
-                                "--".to_owned()
-                            }),
-                    )
                     .when(is_active && total_active > 1, |el| {
                         let shared_url = Arc::new(addon.transport_url.clone());
-                        let url_for_top = Arc::clone(&shared_url);
                         let url_for_up = Arc::clone(&shared_url);
                         let url_for_down = shared_url;
                         el.child(
                             div()
                                 .flex()
+                                .flex_col()
                                 .items_center()
-                                .gap(t.sp(3.0))
-                                .child(render_reorder_icon_btn(
-                                    ("addon-pin-top", dom_idx),
-                                    IconName::ArrowUpToLine,
-                                    can_move_up,
-                                    t,
-                                    cx.listener(move |this, _, _, cx| {
-                                        if can_move_up && this.core.move_addon_to_top(&url_for_top)
-                                        {
-                                            cx.notify();
-                                        }
-                                    }),
-                                ))
+                                .gap(t.sp(2.0))
                                 .child(render_reorder_icon_btn(
                                     ("addon-move-up", dom_idx),
                                     IconName::ArrowUp,
@@ -861,7 +844,38 @@ impl AppShell {
                                     }),
                                 )),
                         )
-                    }),
+                    })
+                    .child(
+                        div()
+                            .w(t.sp(38.0))
+                            .h(t.sp(38.0))
+                            .flex_shrink_0()
+                            .rounded(px(RADIUS_CONTROL))
+                            .overflow_hidden()
+                            .bg(rgba(t.glass_trough_bg))
+                            .border_1()
+                            .border_color(rgba(t.glass_border))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if let Some(logo) = addon_logo_tex {
+                                img(logo)
+                                    .size_full()
+                                    .object_fit(ObjectFit::Contain)
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .font(ui_sans(FontWeight::SEMIBOLD))
+                                    .text_size(t.text_body())
+                                    .text_color(if is_active {
+                                        rgb(accent_ink)
+                                    } else {
+                                        rgb(t.text_muted)
+                                    })
+                                    .child(addon_initial)
+                                    .into_any_element()
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -879,7 +893,7 @@ impl AppShell {
                             .child(
                                 div()
                                     .font(ui_sans(FontWeight::SEMIBOLD))
-                                    .text_size(t.sp(14.5))
+                                    .text_size(t.text_body())
                                     .text_color(if is_active {
                                         rgb(t.text_primary)
                                     } else {
@@ -891,23 +905,23 @@ impl AppShell {
                             .when(!is_active, |el| {
                                 el.child(
                                     div()
-                                        .px(t.sp(7.0))
+                                        .px(t.sp(8.0))
                                         .py(t.sp(2.0))
                                         .rounded(px(RADIUS_PILL))
                                         .bg(rgba(t.glass_trough_bg))
                                         .border_1()
                                         .border_color(rgba(t.glass_border))
                                         .font(mono_font())
-                                        .text_size(t.sp(11.0))
-                                        .text_color(rgb(t.text_muted))
-                                        .child("Muted"),
+                                        .text_size(t.text_micro())
+                                        .text_color(rgb(t.text_secondary))
+                                        .child("Disabled"),
                                 )
                             })
                             .child(meta_divider())
                             .child(
                                 div()
                                     .font(mono_font())
-                                    .text_xs()
+                                    .text_size(t.text_micro())
                                     .text_color(rgb(t.text_secondary))
                                     .child(cat_summary),
                             )
@@ -915,7 +929,7 @@ impl AppShell {
                                 el.child(meta_divider()).child(
                                     div()
                                         .font(mono_font())
-                                        .text_xs()
+                                        .text_size(t.text_micro())
                                         .text_color(rgb(t.text_muted))
                                         .child(types_summary),
                                 )
@@ -934,7 +948,7 @@ impl AppShell {
                     .when_some(addon.manifest.description.clone(), |el, desc| {
                         el.child(
                             div()
-                                .text_xs()
+                                .text_size(t.text_micro())
                                 .text_color(rgb(t.text_secondary))
                                 .truncate()
                                 .max_w(px(640.0))
@@ -953,8 +967,8 @@ impl AppShell {
                             div()
                                 .id(("addon-configure-btn", dom_idx))
                                 .cursor_pointer()
-                                .h(t.sp(30.0))
-                                .px(t.sp(10.0))
+                                .h(t.sp(32.0))
+                                .px(t.sp(11.0))
                                 .rounded(px(RADIUS_CONTROL))
                                 .bg(rgba(t.glass_trough_bg))
                                 .border_1()
@@ -966,7 +980,8 @@ impl AppShell {
                                 .flex()
                                 .items_center()
                                 .gap(t.sp(5.0))
-                                .text_xs()
+                                .text_size(t.text_micro())
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(t.text_primary))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -986,57 +1001,16 @@ impl AppShell {
                                 .child(svg_icon_weighted(
                                     IconName::ExternalLink,
                                     IconWeight::Regular,
-                                    12.0 * t.ui_scale,
+                                    13.0 * t.ui_scale,
                                     rgb(t.text_secondary),
                                 ))
                                 .child("Configure"),
                         )
                     })
-                    .child(
-                        div()
-                            .id(("addon-copy-url-btn", dom_idx))
-                            .cursor_pointer()
-                            .h(t.sp(30.0))
-                            .px(t.sp(10.0))
-                            .rounded(px(RADIUS_CONTROL))
-                            .bg(rgba(t.glass_trough_bg))
-                            .border_1()
-                            .border_color(rgba(t.glass_border))
-                            .hover(move |s| {
-                                s.bg(rgba(t.glass_row_hover_bg))
-                                    .border_color(rgba(t.glass_border_strong))
-                            })
-                            .flex()
-                            .items_center()
-                            .gap(t.sp(5.0))
-                            .text_xs()
-                            .text_color(rgb(t.text_secondary))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        url_for_copy.clone(),
-                                    ));
-                                    this.push_toast(
-                                        ToastKind::Info,
-                                        "Copied manifest URL",
-                                        None,
-                                        cx,
-                                    );
-                                }),
-                            )
-                            .child(svg_icon_weighted(
-                                IconName::Clipboard,
-                                IconWeight::Regular,
-                                12.0 * t.ui_scale,
-                                rgb(t.text_muted),
-                            ))
-                            .child("Copy URL"),
-                    )
                     .child(if is_protected {
                         div()
-                            .h(t.sp(26.0))
-                            .px(t.sp(9.0))
+                            .h(t.sp(28.0))
+                            .px(t.sp(10.0))
                             .rounded(px(RADIUS_PILL))
                             .bg(rgba(t.glass_trough_bg))
                             .border_1()
@@ -1044,8 +1018,8 @@ impl AppShell {
                             .flex()
                             .items_center()
                             .font(mono_font())
-                            .text_size(t.sp(11.0))
-                            .text_color(rgb(t.text_muted))
+                            .text_size(t.text_micro())
+                            .text_color(rgb(t.text_secondary))
                             .child("Core")
                             .into_any_element()
                     } else {
@@ -1060,12 +1034,12 @@ impl AppShell {
                                         this.push_toast(
                                             ToastKind::Info,
                                             if is_active {
-                                                format!("Muted {addon_name_for_switch}")
+                                                format!("Disabled {addon_name_for_switch}")
                                             } else {
                                                 format!("Enabled {addon_name_for_switch}")
                                             },
                                             if is_active {
-                                                Some("Config URL kept locally".to_owned())
+                                                Some("Settings kept locally".to_owned())
                                             } else {
                                                 None
                                             },
@@ -1086,46 +1060,136 @@ impl AppShell {
                         )
                         .into_any_element()
                     })
-                    .when(!is_protected, |el| {
+                    .child({
+                        let toggle_menu_key = row_menu_key.clone();
                         let remove_active_desc = is_active.then(|| addon.clone());
                         let remove_muted_url = (!is_active).then(|| addon.transport_url.clone());
                         let removed_name = addon.manifest.name.clone();
-                        el.child(
-                            div()
-                                .id(("addon-remove-btn", dom_idx))
-                                .cursor_pointer()
-                                .w(t.sp(30.0))
-                                .h(t.sp(30.0))
-                                .rounded(px(RADIUS_CONTROL))
-                                .bg(rgba(rose_bg))
-                                .hover(move |s| s.bg(rgba(rose_hover)))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        if let Some(desc) = remove_active_desc.as_ref() {
-                                            this.core.uninstall_addon(desc.clone());
-                                        } else if let Some(url) = remove_muted_url.as_ref() {
-                                            this.core.remove_muted_addon(url);
-                                        }
-                                        this.push_toast(
-                                            ToastKind::Info,
-                                            format!("Removed {removed_name}"),
-                                            None,
-                                            cx,
-                                        );
-                                        cx.notify();
-                                    }),
+                        div()
+                            .relative()
+                            .child(
+                                div()
+                                    .id(("addon-more-btn", dom_idx))
+                                    .cursor_pointer()
+                                    .w(t.sp(32.0))
+                                    .h(t.sp(32.0))
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(if row_menu_open {
+                                        rgba(t.accent_soft)
+                                    } else {
+                                        rgba(0x00000000)
+                                    })
+                                    .border_1()
+                                    .border_color(if row_menu_open {
+                                        rgba(t.border_accent)
+                                    } else {
+                                        rgba(t.glass_border)
+                                    })
+                                    .hover(move |s| {
+                                        s.bg(rgba(t.glass_row_hover_bg))
+                                            .border_color(rgba(t.glass_border_strong))
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .tooltip(simple_tooltip("More actions", None))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if this.open_addon_menu_id.as_deref()
+                                                == Some(toggle_menu_key.as_str())
+                                            {
+                                                this.open_addon_menu_id = None;
+                                            } else {
+                                                this.open_addon_menu_id =
+                                                    Some(toggle_menu_key.clone());
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(svg_icon_weighted(
+                                        IconName::MoreHorizontal,
+                                        IconWeight::Regular,
+                                        15.0 * t.ui_scale,
+                                        if row_menu_open {
+                                            rgb(accent_ink)
+                                        } else {
+                                            rgb(t.text_secondary)
+                                        },
+                                    )),
+                            )
+                            .when(row_menu_open, |wrap| {
+                                let top_url = url_for_top.clone();
+                                let copy_url = url_for_copy.clone();
+                                let rem_desc = remove_active_desc.clone();
+                                let rem_url = remove_muted_url.clone();
+                                let rem_name = removed_name.clone();
+                                wrap.child(
+                                    gpui::deferred(
+                                        glass_dropdown_panel(("addon-row-menu", dom_idx), 192.0)
+                                            .absolute()
+                                            .top(t.sp(38.0))
+                                            .right_0()
+                                            .when(can_move_up, |menu| {
+                                                menu.child(glass_dropdown_option(
+                                                    ("addon-menu-top", dom_idx),
+                                                    "Move to top",
+                                                    None,
+                                                    false,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.open_addon_menu_id = None;
+                                                        let _ =
+                                                            this.core.move_addon_to_top(&top_url);
+                                                        cx.notify();
+                                                    }),
+                                                ))
+                                            })
+                                            .child(glass_dropdown_option(
+                                                ("addon-menu-copy", dom_idx),
+                                                "Copy manifest link",
+                                                None,
+                                                false,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_addon_menu_id = None;
+                                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                                        copy_url.clone(),
+                                                    ));
+                                                    this.push_toast(
+                                                        ToastKind::Info,
+                                                        "Copied manifest link",
+                                                        None,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ))
+                                            .when(!is_protected, |menu| {
+                                                menu.child(glass_dropdown_option(
+                                                    ("addon-menu-remove", dom_idx),
+                                                    "Remove addon",
+                                                    None,
+                                                    false,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.open_addon_menu_id = None;
+                                                        if let Some(desc) = rem_desc.as_ref() {
+                                                            this.core.uninstall_addon(desc.clone());
+                                                        } else if let Some(url) = rem_url.as_ref() {
+                                                            this.core.remove_muted_addon(url);
+                                                        }
+                                                        this.push_toast(
+                                                            ToastKind::Info,
+                                                            format!("Removed {rem_name}"),
+                                                            None,
+                                                            cx,
+                                                        );
+                                                        cx.notify();
+                                                    }),
+                                                ))
+                                            }),
+                                    )
+                                    .with_priority(10),
                                 )
-                                .child(svg_icon_weighted(
-                                    IconName::Trash2,
-                                    IconWeight::Regular,
-                                    13.5 * t.ui_scale,
-                                    rgb(t.accent_rose),
-                                )),
-                        )
+                            })
                     }),
             )
     }

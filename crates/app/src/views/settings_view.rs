@@ -4233,11 +4233,11 @@ fn settings_glass_card(theme: &ThemePalette) -> Div {
 const fn advanced_section_hint(cat: SettingsCategory) -> &'static str {
     match cat {
         SettingsCategory::Appearance => "Player overlay timing",
-        SettingsCategory::Playback => "GLSL shaders, debanding, Dolby Vision, dynamic HDR peak & pipeline diagnostics",
-        SettingsCategory::SubtitlesAndAudio => "Hash auto-matching, default delay stepper & ASS scale override",
-        SettingsCategory::StreamingAndDebrid => "Direct unrestrict, dead-swarm failover, UPnP, visibility & Prowlarr fallback",
-        SettingsCategory::IntegrationsAndAddons => "Local Real-Debrid, TorBox, AllDebrid keys & local Prowlarr indexer",
-        SettingsCategory::SystemAndStorage => "Local streaming architecture, loopback endpoint & build metadata",
+        SettingsCategory::Playback => "Custom shaders, debanding, Dolby Vision & picture diagnostics",
+        SettingsCategory::SubtitlesAndAudio => "Automatic subtitle matching, default delay & style override",
+        SettingsCategory::StreamingAndDebrid => "Direct Debrid playback, slow-source failover & backup indexers",
+        SettingsCategory::IntegrationsAndAddons => "Real-Debrid, TorBox, AllDebrid & Prowlarr API keys",
+        SettingsCategory::SystemAndStorage => "Streaming engine details, cache & app diagnostics",
     }
 }
 

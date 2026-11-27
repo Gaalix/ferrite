@@ -29,7 +29,7 @@ use crate::{
         ThemePalette, ThemePreset, RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
     },
     ui::{
-        card_action_dispatcher, clamp_progress_fraction, click_handler, compute_app_grid_metrics,
+        card_action_dispatcher, clamp_progress_fraction, compute_app_grid_metrics,
         compute_app_landscape_grid_metrics, dropdown_trigger, format_notification_badge_label,
         full_height_page_container, glass_dropdown_option, glass_dropdown_panel,
         glass_segmented_bar, glass_segmented_item, infer_grid_poster_aspect, primary_accent_button,
@@ -268,65 +268,20 @@ impl AppShell {
             .flex()
             .flex_col()
             .gap(theme.sp(PAGE_SECTION_GAP_PX))
-            // 1. Canonical Page Header with frosted glass stat pills.
+            // 1. Canonical Page Header with unique watch-time pill (tab bar below owns counts).
             .child(render_page_header(
                 PageHeader::new("Library").right_slot(Some(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(sp(8.0))
-                        .child(render_library_stat_pill(
-                            "lib-stat-watching",
-                            IconName::Play,
-                            IconWeight::Fill,
-                            theme.status_watching,
-                            memo.count_watching.to_string(),
-                            "Watching",
-                            active_tab == LibraryFilterTab::Watching,
-                            Some(click_handler(cx.listener(|this, _, _, cx| {
-                                this.select_library_filter_tab(LibraryFilterTab::Watching, cx);
-                            }))),
-                        ))
-                        .child(render_library_stat_pill(
-                            "lib-stat-saved",
-                            IconName::Bookmark,
-                            if active_tab == LibraryFilterTab::Watchlist {
-                                IconWeight::Fill
-                            } else {
-                                IconWeight::Regular
-                            },
-                            theme.status_watchlist,
-                            memo.count_watchlist.to_string(),
-                            "Saved",
-                            active_tab == LibraryFilterTab::Watchlist,
-                            Some(click_handler(cx.listener(|this, _, _, cx| {
-                                this.select_library_filter_tab(LibraryFilterTab::Watchlist, cx);
-                            }))),
-                        ))
-                        .child(render_library_stat_pill(
-                            "lib-stat-watched",
-                            IconName::Check,
-                            IconWeight::Regular,
-                            theme.status_watched,
-                            memo.count_watched.to_string(),
-                            "Watched",
-                            active_tab == LibraryFilterTab::Watched,
-                            Some(click_handler(cx.listener(|this, _, _, cx| {
-                                this.select_library_filter_tab(LibraryFilterTab::Watched, cx);
-                            }))),
-                        ))
-                        .child(render_library_stat_pill(
-                            "lib-stat-hours",
-                            IconName::Clock,
-                            IconWeight::Regular,
-                            theme.accent_amber,
-                            memo.hours_logged.to_string(),
-                            "Hours",
-                            false,
-                            None,
-                        ))
-                        .into_any_element(),
+                    render_library_stat_pill(
+                        "lib-stat-hours",
+                        IconName::Clock,
+                        IconWeight::Regular,
+                        theme.accent_amber,
+                        memo.hours_logged.to_string(),
+                        "Hours watched",
+                        false,
+                        None,
+                    )
+                    .into_any_element(),
                 )),
             ))
             // 2. "New Episodes & Up Next" Highlight Shelf.
@@ -1270,10 +1225,15 @@ impl AppShell {
             let mut total_watched_ms = 0_u64;
             let mut filtered = Vec::new();
 
-            let mut process_item = |li: &LibraryItem| {
-                let Some(status) = classify_library_item_status(li) else {
+            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut process_item = |li: &LibraryItem, forced_status: Option<LibraryStatusTab>| {
+                let Some(status) = forced_status.or_else(|| classify_library_item_status(li))
+                else {
                     return;
                 };
+                if !seen_ids.insert(li.id.clone()) {
+                    return;
+                }
                 let notif_count = notif_counts.get(li.id.as_str()).copied().unwrap_or(0);
 
                 count_all += 1;
@@ -1320,12 +1280,18 @@ impl AppShell {
 
             if !model.ctx.library.items.is_empty() {
                 for li in model.ctx.library.items.values() {
-                    process_item(li);
+                    process_item(li, None);
                 }
             } else {
                 for li in &model.library.catalog {
-                    process_item(li);
+                    process_item(li, None);
                 }
+            }
+
+            // Unify Library › Watching with Home Continue Watching so in-progress titles
+            // watched without explicitly saving to Library are still reflected in Watching.
+            for cw in &model.continue_watching_preview.items {
+                process_item(&cw.library_item, Some(LibraryStatusTab::Watching));
             }
 
             (
@@ -1479,16 +1445,26 @@ impl AppShell {
                 (PosterAspect::from_stremio_poster_shape(&li.poster_shape), sub)
             };
 
+            // Show corner status glyphs only when they add information (avoid putting a purple
+            // Watchlist dot on every single saved poster).
+            let visible_status_badge = match (self.library_filter_tab, *status) {
+                (LibraryFilterTab::Watchlist, LibraryStatusTab::Watchlist) => None,
+                (LibraryFilterTab::Watched, LibraryStatusTab::Watched) => None,
+                (LibraryFilterTab::Watching, LibraryStatusTab::Watching) => None,
+                (LibraryFilterTab::All, LibraryStatusTab::Watchlist) => None,
+                (_, st) => Some(st),
+            };
+
             cards.push(
                 PreparedPosterCard::with_tint(SharedString::new(&li.name), tint)
                     .subtitle(Some(subtitle))
                     .type_badge(Some(SharedString::from(type_label)))
                     .poster_url_str(poster_url)
                     .aspect(card_aspect)
-                    .status_tab(Some(*status))
+                    .status_tab(visible_status_badge)
                     .notification_count(notif_count)
                     .progress_fraction(progress_fraction)
-                    .in_library(true)
+                    .in_library(!li.removed && !li.temp)
                     .watched(li.watched())
                     .capabilities(PosterCardCapabilities::STANDARD_BROWSING),
             );

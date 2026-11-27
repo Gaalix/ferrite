@@ -991,30 +991,131 @@ impl AppShell {
     }
 
     fn render_calendar_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        render_empty_state(
-            EmptyStateProps::new(
-                IconName::Calendar,
-                "No releases scheduled this month",
-                "Add ongoing series to your library to track upcoming episode air dates here.",
-            )
-            .action(primary_accent_button(
-                "cal-empty-discover",
-                Some(IconName::Compass),
-                "Browse Discover",
-                cx.listener(|this, _, _, cx| {
-                    this.navigate_tab(SidebarTab::Discover, cx);
-                }),
+        let t = active_theme();
+        let tracked_series: Vec<(String, String, String, Option<String>)> =
+            self.core.with_model(|m| {
+                let mut list: Vec<_> = m
+                    .ctx
+                    .library
+                    .items
+                    .values()
+                    .filter(|li| {
+                        !li.removed && !li.temp && li.r#type.eq_ignore_ascii_case("series")
+                    })
+                    .map(|li| {
+                        (
+                            li.id.clone(),
+                            li.r#type.clone(),
+                            li.name.clone(),
+                            li.state.video_id.clone(),
+                        )
+                    })
+                    .collect();
+                list.sort_by_key(|a| a.2.to_ascii_lowercase());
+                list.truncate(12);
+                list
+            });
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(sp(24.0))
+            .child(render_empty_state(
+                EmptyStateProps::new(
+                    IconName::Calendar,
+                    "No episodes airing this month",
+                    "Use the arrows above to browse adjacent months, or add ongoing series to your library.",
+                )
+                .action(primary_accent_button(
+                    "cal-empty-discover",
+                    Some(IconName::Compass),
+                    "Browse Discover",
+                    cx.listener(|this, _, _, cx| {
+                        this.navigate_tab(SidebarTab::Discover, cx);
+                    }),
+                ))
+                .action(secondary_glass_button(
+                    "cal-empty-library",
+                    Some(IconName::Bookmark),
+                    "Open Library",
+                    false,
+                    cx.listener(|this, _, _, cx| {
+                        this.navigate_tab(SidebarTab::Library, cx);
+                    }),
+                )),
             ))
-            .action(secondary_glass_button(
-                "cal-empty-library",
-                Some(IconName::Bookmark),
-                "Open Library",
-                false,
-                cx.listener(|this, _, _, cx| {
-                    this.navigate_tab(SidebarTab::Library, cx);
-                }),
-            )),
-        )
+            .when(!tracked_series.is_empty(), |col| {
+                col.child(
+                    div()
+                        .w_full()
+                        .p(sp(18.0))
+                        .rounded(px(RADIUS_CARD))
+                        .bg(rgba(t.glass_card_bg))
+                        .border_1()
+                        .border_color(rgba(t.glass_border))
+                        .flex()
+                        .flex_col()
+                        .gap(sp(12.0))
+                        .child(render_section_header(
+                            SectionHeader::new("Tracked series in your library")
+                                .count_badge(Some(SharedString::from(format!(
+                                    "{} series",
+                                    tracked_series.len()
+                                )))),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(sp(8.0))
+                                .children(tracked_series.into_iter().enumerate().map(
+                                    |(idx, (id, ty, name, vid))| {
+                                        div()
+                                            .id(("cal-tracked-series", idx))
+                                            .cursor_pointer()
+                                            .h(sp(36.0))
+                                            .px(sp(14.0))
+                                            .rounded(px(RADIUS_PILL))
+                                            .bg(rgba(t.glass_trough_bg))
+                                            .border_1()
+                                            .border_color(rgba(t.glass_border))
+                                            .hover(move |s| {
+                                                s.bg(rgba(t.glass_row_hover_bg))
+                                                    .border_color(rgba(t.glass_border_strong))
+                                            })
+                                            .flex()
+                                            .items_center()
+                                            .gap(sp(8.0))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_meta_details(
+                                                        ty.clone(),
+                                                        id.clone(),
+                                                        vid.clone(),
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                            .child(svg_icon_weighted(
+                                                IconName::Tv,
+                                                IconWeight::Regular,
+                                                14.0 * t.ui_scale,
+                                                rgb(t.accent),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .font(ui_sans(FontWeight::MEDIUM))
+                                                    .text_size(t.text_body())
+                                                    .text_color(rgb(t.text_primary))
+                                                    .child(name),
+                                            )
+                                    },
+                                )),
+                        ),
+                )
+            })
     }
 }
 

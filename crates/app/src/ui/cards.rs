@@ -32,8 +32,8 @@ pub struct PosterMetrics {
 }
 
 impl PosterMetrics {
-    /// Unscaled metadata block height below poster artwork (`52px` at 100% UI scale).
-    pub const BASE_METADATA_HEIGHT_PX: f32 = 52.0;
+    /// Unscaled metadata block height below poster artwork (`56px` at 100% UI scale).
+    pub const BASE_METADATA_HEIGHT_PX: f32 = 56.0;
 
     /// Computes density- and scale-aware poster metrics for `theme`.
     pub fn from_theme(theme: &ThemePalette) -> Self {
@@ -74,13 +74,13 @@ fn sanitize_ui_scale(ui_scale: f32) -> f32 {
 }
 
 /// Canonical 16:9 landscape card width scaled by `CardDensityChoice` and `ui_scale`:
-/// Compact `220.0`, Comfortable `256.0`, Cinema `292.0` multiplied by `ui_scale`.
+/// Compact `256.0`, Comfortable `300.0`, Cinema `344.0` multiplied by `ui_scale`.
 #[inline]
 pub fn landscape_card_width_px(density: CardDensityChoice, ui_scale: f32) -> f32 {
     let base = match density {
-        CardDensityChoice::Compact => 220.0,
-        CardDensityChoice::Comfortable => 256.0,
-        CardDensityChoice::Cinema => 292.0,
+        CardDensityChoice::Compact => 256.0,
+        CardDensityChoice::Comfortable => 300.0,
+        CardDensityChoice::Cinema => 344.0,
     };
     base * sanitize_ui_scale(ui_scale)
 }
@@ -502,8 +502,8 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
                 div()
                     .id(play_id)
                     .cursor_pointer()
-                    .w(theme.sp(28.0))
-                    .h(theme.sp(28.0))
+                    .w(theme.sp(34.0))
+                    .h(theme.sp(34.0))
                     .rounded(px(RADIUS_PILL))
                     .bg(rgb(theme.accent))
                     .hover(move |s| s.bg(rgb(theme.accent_hover)))
@@ -517,7 +517,7 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
                     .child(svg_icon_weighted(
                         IconName::Play,
                         IconWeight::Fill,
-                        12.0 * theme.ui_scale,
+                        14.0 * theme.ui_scale,
                         rgb(theme.cta_on_accent),
                     )),
             );
@@ -542,8 +542,8 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
         .child(
             div()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_size(theme.sp(13.0))
-                .line_height(theme.sp(16.0))
+                .text_size(theme.text_body())
+                .line_height(theme.sp(19.0))
                 .text_color(rgb(0xF5F1E8))
                 .truncate()
                 .child(props.title),
@@ -561,13 +561,13 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
             meta_row = meta_row.child(
                 div()
                     .flex_shrink_0()
-                    .px(theme.sp(5.5))
-                    .py(theme.sp(1.0))
+                    .px(theme.sp(6.0))
+                    .py(theme.sp(1.5))
                     .rounded(px(4.0))
-                    .bg(rgba(0xFFFFFF1C))
+                    .bg(rgba(0xFFFFFF22))
                     .font(mono_font())
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(theme.sp(10.5))
+                    .text_size(theme.text_micro())
                     .text_color(if watched {
                         rgb(theme.status_watched)
                     } else {
@@ -585,11 +585,11 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
                     .items_center()
                     .gap(theme.sp(3.0))
                     .font(mono_font())
-                    .text_size(theme.sp(10.5))
+                    .text_size(theme.text_micro())
                     .text_color(rgb(0xF5F1E8))
                     .child(svg_icon(
                         IconName::Star,
-                        10.0 * theme.ui_scale,
+                        11.5 * theme.ui_scale,
                         rgb(0xfbbf24),
                     ))
                     .child(rating),
@@ -603,9 +603,9 @@ pub fn render_landscape_card(props: LandscapeCardProps) -> AnyElement {
                     .min_w(px(0.0))
                     .font_weight(FontWeight::MEDIUM)
                     .font_features(tabular_nums())
-                    .text_size(theme.sp(11.5))
-                    .line_height(theme.sp(14.0))
-                    .text_color(rgb(0xC8C8D2))
+                    .text_size(theme.text_micro())
+                    .line_height(theme.sp(16.0))
+                    .text_color(rgb(0xD8D8E2))
                     .truncate()
                     .child(subtitle),
             );
@@ -732,7 +732,7 @@ mod tests {
 
                 let expected_w = density.target_poster_width_px() * scale;
                 let expected_gap = density.grid_gap_px() * scale;
-                let expected_meta_h = 52.0 * scale;
+                let expected_meta_h = 56.0 * scale;
 
                 assert!(
                     (metrics.card_width_px - expected_w).abs() < 1e-4,
@@ -764,9 +764,9 @@ mod tests {
     #[test]
     fn landscape_card_dimensions_scale_with_density_and_ui_scale() {
         for (density, base_w) in [
-            (CardDensityChoice::Compact, 220.0_f32),
-            (CardDensityChoice::Comfortable, 256.0_f32),
-            (CardDensityChoice::Cinema, 292.0_f32),
+            (CardDensityChoice::Compact, 256.0_f32),
+            (CardDensityChoice::Comfortable, 300.0_f32),
+            (CardDensityChoice::Cinema, 344.0_f32),
         ] {
             for scale_choice in UiScaleChoice::ALL {
                 let scale = scale_choice.factor();
@@ -786,7 +786,7 @@ mod tests {
         // Non-finite scale sanitizes safely to 1.0.
         assert_eq!(
             landscape_card_width_px(CardDensityChoice::Comfortable, f32::NAN),
-            256.0
+            300.0
         );
     }
 

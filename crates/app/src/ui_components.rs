@@ -6,20 +6,67 @@ use std::{
 
 use gpui::{
     div, img, linear_color_stop, linear_gradient, prelude::*, px, relative, rgb, rgba, AnyElement,
-    App, Div, ElementId, FontWeight, MouseButton, MouseDownEvent, ObjectFit, Pixels, Point,
-    RenderImage, SharedString, Stateful, Window,
+    AnyView, App, Context, Div, ElementId, FontWeight, MouseButton, MouseDownEvent, ObjectFit,
+    Pixels, Point, RenderImage, SharedString, Stateful, Window,
 };
 
 use crate::{
     icons::{svg_icon, IconName},
     state::LibraryStatusTab,
     theme::{
-        active_theme, editorial_serif, glass_capsule_shadow, mono_font, placeholder_tint_for_id,
-        poster_card_shadow, poster_hover_glow_shadow, tabular_nums, ui_sans, ThemePalette,
-        RADIUS_CARD, RADIUS_CONTROL, RADIUS_PILL, RADIUS_POSTER,
+        active_theme, editorial_serif, format_release_info, glass_capsule_shadow, keycap,
+        mono_font, placeholder_gradient_for_seed, placeholder_tint_for_id, poster_card_shadow,
+        poster_hover_glow_shadow, tabular_nums, ui_sans, ThemePalette, RADIUS_CARD, RADIUS_CONTROL,
+        RADIUS_PILL, RADIUS_POSTER,
     },
     virtual_grid::PosterAspect,
 };
+
+/// Lightweight tooltip view styled with the active glass theme, supporting an optional shortcut keycap.
+pub struct SimpleTooltip {
+    label: SharedString,
+    shortcut: Option<SharedString>,
+}
+
+impl gpui::Render for SimpleTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active_theme();
+        div()
+            .px(theme.sp(10.0))
+            .py(theme.sp(6.0))
+            .rounded(px(RADIUS_POSTER))
+            .bg(rgba(theme.glass_popover_bg))
+            .border_1()
+            .border_color(rgba(theme.glass_border_strong))
+            .shadow(glass_capsule_shadow())
+            .flex()
+            .items_center()
+            .gap(theme.sp(8.0))
+            .child(
+                div()
+                    .font(ui_sans(FontWeight::MEDIUM))
+                    .text_size(theme.text_micro())
+                    .text_color(rgb(theme.text_primary))
+                    .whitespace_nowrap()
+                    .child(self.label.clone()),
+            )
+            .when_some(self.shortcut.clone(), |el, sc| el.child(keycap(sc)))
+    }
+}
+
+/// Builds a GPUI `.tooltip(...)` closure showing `label` and an optional keyboard `shortcut`.
+pub fn simple_tooltip(
+    label: impl Into<SharedString>,
+    shortcut: Option<&'static str>,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let label = label.into();
+    let shortcut = shortcut.map(SharedString::new_static);
+    move |_window, cx| {
+        let label = label.clone();
+        let shortcut = shortcut.clone();
+        cx.new(|_| SimpleTooltip { label, shortcut }).into()
+    }
+}
 
 /// Click callback alias compatible with GPUI `cx.listener(...)` handlers.
 pub type ClickHandler = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
@@ -74,7 +121,7 @@ pub fn glass_segmented_item(
         .items_center()
         .justify_center()
         .whitespace_nowrap()
-        .text_size(theme.sp(12.5))
+        .text_size(theme.text_body())
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
@@ -204,7 +251,7 @@ pub fn glass_stepper(
                 .hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
                 .font(ui_sans(FontWeight::MEDIUM))
                 .font_features(tabular_nums())
-                .text_size(theme.sp(12.5))
+                .text_size(theme.text_body())
                 .text_color(rgb(theme.text_primary))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
@@ -304,7 +351,7 @@ pub fn glass_dropdown_option(
                         } else {
                             FontWeight::MEDIUM
                         }))
-                        .text_size(theme.sp(13.0))
+                        .text_size(theme.text_body())
                         .text_color(rgb(theme.text_primary))
                         .truncate()
                         .child(label.into()),
@@ -313,7 +360,7 @@ pub fn glass_dropdown_option(
                     d.child(
                         div()
                             .font(ui_sans(FontWeight::NORMAL))
-                            .text_size(theme.sp(11.5))
+                            .text_size(theme.text_micro())
                             .text_color(rgb(theme.text_muted))
                             .truncate()
                             .child(sub),
@@ -353,7 +400,7 @@ pub fn glass_back_button(
         .items_center()
         .gap(theme.sp(6.0))
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(theme.sp(13.0))
+        .text_size(theme.text_body())
         .text_color(rgb(theme.text_secondary))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
@@ -389,7 +436,7 @@ pub fn primary_accent_button(
         .gap(theme.sp(8.0))
         .font(ui_sans(FontWeight::SEMIBOLD))
         .font_features(tabular_nums())
-        .text_size(theme.sp(13.5))
+        .text_size(theme.text_body())
         .text_color(rgb(theme.cta_on_accent))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
@@ -457,7 +504,7 @@ pub fn secondary_glass_button(
         .justify_center()
         .gap(theme.sp(8.0))
         .font(ui_sans(FontWeight::MEDIUM))
-        .text_size(theme.sp(13.5))
+        .text_size(theme.text_body())
         .text_color(rgb(fg))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
@@ -1109,8 +1156,8 @@ struct PosterArtFrameSpec<'a> {
 
 fn build_poster_notif_pill(label: SharedString, theme: &ThemePalette) -> Div {
     div()
-        .h(theme.sp(20.0))
-        .px(theme.sp(7.0))
+        .h(theme.sp(22.0))
+        .px(theme.sp(8.0))
         .rounded(px(RADIUS_PILL))
         .bg(rgb(theme.accent))
         .flex()
@@ -1118,7 +1165,7 @@ fn build_poster_notif_pill(label: SharedString, theme: &ThemePalette) -> Div {
         .justify_center()
         .font(mono_font())
         .font_weight(FontWeight::BOLD)
-        .text_size(theme.sp(10.0))
+        .text_size(theme.text_micro())
         .text_color(rgb(theme.cta_on_accent))
         .child(label)
 }
@@ -1169,19 +1216,33 @@ fn build_poster_art_frame_base(spec: PosterArtFrameSpec<'_>, theme: &ThemePalett
                 .object_fit(ObjectFit::Cover)
                 .into_any_element()
         } else {
+            let (grad_top, grad_bottom) =
+                placeholder_gradient_for_seed(spec.placeholder_tint, theme.is_light);
             div()
                 .size_full()
-                .p(theme.sp(14.0))
-                .bg(rgb(theme.bg_surface))
+                .p(theme.sp(16.0))
+                .bg(linear_gradient(
+                    155.0,
+                    linear_color_stop(rgb(grad_top), 0.0),
+                    linear_color_stop(rgb(grad_bottom), 1.0),
+                ))
                 .flex()
-                .items_end()
+                .flex_col()
+                .justify_between()
+                .child(
+                    div()
+                        .w(theme.sp(28.0))
+                        .h(px(3.0))
+                        .rounded(px(RADIUS_PILL))
+                        .bg(rgb(theme.accent)),
+                )
                 .child(
                     div()
                         .w_full()
                         .font(editorial_serif())
-                        .text_size(theme.sp(19.0))
-                        .text_color(rgb(theme.text_secondary))
-                        .truncate()
+                        .text_size(theme.text_title())
+                        .line_height(relative(1.18))
+                        .text_color(rgb(theme.text_primary))
                         .child(spec.title.clone()),
                 )
                 .into_any_element()
@@ -1271,29 +1332,27 @@ fn build_poster_art_frame_base(spec: PosterArtFrameSpec<'_>, theme: &ThemePalett
             )
         })
         .when_some(spec.imdb_rating, |el, rating| {
+            let _ = spec.has_bottom_left_hover_btn;
             el.child(
                 div()
                     .absolute()
                     .bottom(theme.sp(spec.rating_bottom_px))
                     .left(theme.sp(8.0))
-                    .px(theme.sp(6.5))
-                    .py(theme.sp(2.5))
-                    .rounded(px(4.0))
-                    .bg(rgba(0x0B0D14D4))
+                    .px(theme.sp(7.0))
+                    .py(theme.sp(3.0))
+                    .rounded(px(5.0))
+                    .bg(rgba(0x0B0D14DC))
                     .border_1()
-                    .border_color(rgba(0xFFFFFF22))
+                    .border_color(rgba(0xFFFFFF28))
                     .flex()
                     .items_center()
                     .gap(theme.sp(4.0))
                     .font(mono_font())
-                    .text_size(theme.sp(11.0))
+                    .text_size(theme.text_micro())
                     .text_color(rgb(0xF5F1E8))
-                    .when(spec.has_bottom_left_hover_btn, |badge| {
-                        badge.group_hover(POSTER_CARD_GROUP, |s| s.invisible())
-                    })
                     .child(svg_icon(
                         IconName::Star,
-                        10.5 * theme.ui_scale,
+                        11.5 * theme.ui_scale,
                         rgb(0xfbbf24),
                     ))
                     .child(rating),
@@ -1319,23 +1378,24 @@ fn build_poster_quick_play_overlay(
             div()
                 .id(id)
                 .cursor_pointer()
-                .w(theme.sp(44.0))
-                .h(theme.sp(44.0))
+                .w(theme.sp(48.0))
+                .h(theme.sp(48.0))
                 .rounded(px(RADIUS_PILL))
                 .bg(rgb(theme.accent))
                 .border_1()
-                .border_color(rgba(0xFFFFFF38))
+                .border_color(rgba(0xFFFFFF44))
                 .hover(move |s| s.bg(rgb(theme.accent_hover)))
                 .flex()
                 .items_center()
                 .justify_center()
+                .tooltip(simple_tooltip("Play best match", None))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
                     on_click(ev, window, cx);
                 })
                 .child(svg_icon(
                     IconName::Play,
-                    17.0 * theme.ui_scale,
+                    18.0 * theme.ui_scale,
                     rgb(theme.cta_on_accent),
                 )),
         )
@@ -1344,33 +1404,32 @@ fn build_poster_quick_play_overlay(
 fn build_poster_toggle_library_button(
     id: impl Into<ElementId>,
     in_library: bool,
-    rating_bottom_px: f32,
     badge_fg_on_status: u32,
     theme: &ThemePalette,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let theme = *theme;
+    let tip = if in_library {
+        "Remove from library"
+    } else {
+        "Add to library"
+    };
     div()
         .id(id)
         .cursor_pointer()
-        .absolute()
-        .bottom(theme.sp(rating_bottom_px))
-        .left(theme.sp(8.0))
-        .invisible()
-        .group_hover(POSTER_CARD_GROUP, |s| s.visible())
-        .w(theme.sp(30.0))
-        .h(theme.sp(30.0))
+        .w(theme.sp(32.0))
+        .h(theme.sp(32.0))
         .rounded(px(RADIUS_PILL))
         .bg(if in_library {
             rgb(theme.status_watchlist)
         } else {
-            rgba(0x0B0D14D9)
+            rgba(0x0B0D14E0)
         })
         .border_1()
         .border_color(if in_library {
             rgb(theme.status_watchlist)
         } else {
-            rgba(0xFFFFFF33)
+            rgba(0xFFFFFF38)
         })
         .hover(move |s| {
             s.bg(rgb(theme.accent_press))
@@ -1379,6 +1438,7 @@ fn build_poster_toggle_library_button(
         .flex()
         .items_center()
         .justify_center()
+        .tooltip(simple_tooltip(tip, None))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
@@ -1389,7 +1449,7 @@ fn build_poster_toggle_library_button(
             } else {
                 IconName::Bookmark
             },
-            13.0 * theme.ui_scale,
+            14.0 * theme.ui_scale,
             if in_library {
                 rgb(badge_fg_on_status)
             } else {
@@ -1407,12 +1467,12 @@ fn build_poster_quick_peek_button(
     div()
         .id(id)
         .cursor_pointer()
-        .w(theme.sp(30.0))
-        .h(theme.sp(30.0))
+        .w(theme.sp(32.0))
+        .h(theme.sp(32.0))
         .rounded(px(RADIUS_PILL))
-        .bg(rgba(0x0B0D14D9))
+        .bg(rgba(0x0B0D14E0))
         .border_1()
-        .border_color(rgba(0xFFFFFF33))
+        .border_color(rgba(0xFFFFFF38))
         .hover(move |s| {
             s.bg(rgb(theme.accent_press))
                 .border_color(rgb(theme.accent))
@@ -1420,19 +1480,21 @@ fn build_poster_quick_peek_button(
         .flex()
         .items_center()
         .justify_center()
+        .tooltip(simple_tooltip("Quick peek", None))
         .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
             cx.stop_propagation();
             on_click(ev, window, cx);
         })
         .child(svg_icon(
             IconName::Eye,
-            13.5 * theme.ui_scale,
+            14.0 * theme.ui_scale,
             rgb(0xF5F1E8),
         ))
 }
 
 fn build_poster_right_actions_cluster(
     rating_bottom_px: f32,
+    toggle_lib_btn: Option<Stateful<Div>>,
     quick_action: Option<AnyElement>,
     quick_peek_btn: Option<Stateful<Div>>,
     theme: &ThemePalette,
@@ -1447,6 +1509,9 @@ fn build_poster_right_actions_cluster(
         .items_center()
         .gap(theme.sp(6.0));
 
+    if let Some(lib_btn) = toggle_lib_btn {
+        right_actions = right_actions.child(lib_btn);
+    }
     if let Some(slot) = quick_action {
         right_actions = right_actions.child(slot);
     }
@@ -1498,27 +1563,33 @@ fn build_poster_metadata_block(
         .min_w(px(0.0))
         .flex()
         .flex_col()
-        .gap(theme.sp(2.0))
+        .gap(theme.sp(3.0))
         .child(
             div()
                 .font_weight(FontWeight::MEDIUM)
-                .text_size(theme.sp(13.5))
-                .line_height(theme.sp(18.0))
+                .text_size(theme.text_body())
+                .line_height(theme.sp(19.0))
                 .text_color(rgb(theme.text_primary))
                 .truncate()
                 .child(title),
         );
 
     if let Some(sub) = subtitle {
+        let formatted_sub = if sub.contains('–') || sub.ends_with('-') {
+            let parts: Vec<String> = sub.split(" · ").map(format_release_info).collect();
+            SharedString::from(parts.join(" · "))
+        } else {
+            sub
+        };
         col.child(
             div()
                 .font_weight(FontWeight::NORMAL)
                 .font_features(tabular_nums())
-                .text_size(theme.sp(12.0))
+                .text_size(theme.text_micro())
                 .line_height(theme.sp(16.0))
-                .text_color(rgb(theme.text_muted))
+                .text_color(rgb(theme.text_secondary))
                 .truncate()
-                .child(sub),
+                .child(formatted_sub),
         )
     } else if fallback_type_badge.is_some() || fallback_year.is_some() {
         let mut row = div()
@@ -1529,9 +1600,9 @@ fn build_poster_metadata_block(
             .gap(theme.sp(4.0))
             .font_weight(FontWeight::NORMAL)
             .font_features(tabular_nums())
-            .text_size(theme.sp(12.0))
+            .text_size(theme.text_micro())
             .line_height(theme.sp(16.0))
-            .text_color(rgb(theme.text_muted))
+            .text_color(rgb(theme.text_secondary))
             .overflow_hidden();
 
         let has_both = fallback_type_badge.is_some() && fallback_year.is_some();
@@ -1542,7 +1613,8 @@ fn build_poster_metadata_block(
             row = row.child(div().flex_shrink_0().child(SharedString::new_static("·")));
         }
         if let Some(year) = fallback_year {
-            row = row.child(div().min_w(px(0.0)).truncate().child(year));
+            let formatted_year = SharedString::from(format_release_info(year.as_ref()));
+            row = row.child(div().min_w(px(0.0)).truncate().child(formatted_year));
         }
         col.child(row)
     } else {
@@ -1606,20 +1678,20 @@ pub fn render_prepared_poster_card(ctx: PreparedPosterRenderCtx<'_>) -> AnyEleme
         ));
     }
 
-    if has_toggle_library {
-        let dispatch = Rc::clone(dispatcher);
-        art_frame = art_frame.child(build_poster_toggle_library_button(
-            "toggle-lib",
-            card_data.in_library,
-            rating_bottom_px,
-            badge_fg_on_status,
-            &theme,
-            move |_, window, cx| dispatch(card_index, PosterCardAction::ToggleLibrary, window, cx),
-        ));
-    }
-
     let has_quick_peek = caps.contains(PosterCardCapabilities::CAN_QUICK_PEEK);
-    if ctx.quick_action.is_some() || has_quick_peek {
+    if has_toggle_library || ctx.quick_action.is_some() || has_quick_peek {
+        let toggle_lib_btn = has_toggle_library.then(|| {
+            let dispatch = Rc::clone(dispatcher);
+            build_poster_toggle_library_button(
+                "toggle-lib",
+                card_data.in_library,
+                badge_fg_on_status,
+                &theme,
+                move |_, window, cx| {
+                    dispatch(card_index, PosterCardAction::ToggleLibrary, window, cx)
+                },
+            )
+        });
         let peek_btn = has_quick_peek.then(|| {
             let dispatch = Rc::clone(dispatcher);
             build_poster_quick_peek_button("quick-peek", &theme, move |_, window, cx| {
@@ -1628,6 +1700,7 @@ pub fn render_prepared_poster_card(ctx: PreparedPosterRenderCtx<'_>) -> AnyEleme
         });
         art_frame = art_frame.child(build_poster_right_actions_cluster(
             rating_bottom_px,
+            toggle_lib_btn,
             ctx.quick_action,
             peek_btn,
             &theme,
@@ -1730,23 +1803,25 @@ pub fn render_poster_card(props: PosterCardProps) -> AnyElement {
         ));
     }
 
-    if let Some(on_toggle_library) = props.on_toggle_library {
-        art_frame = art_frame.child(build_poster_toggle_library_button(
-            "toggle-lib",
-            props.in_library,
-            rating_bottom_px,
-            badge_fg_on_status,
-            &theme,
-            on_toggle_library,
-        ));
-    }
-
-    if props.quick_action.is_some() || props.on_quick_peek.is_some() {
+    if props.on_toggle_library.is_some()
+        || props.quick_action.is_some()
+        || props.on_quick_peek.is_some()
+    {
+        let toggle_lib_btn = props.on_toggle_library.map(|on_toggle_library| {
+            build_poster_toggle_library_button(
+                "toggle-lib",
+                props.in_library,
+                badge_fg_on_status,
+                &theme,
+                on_toggle_library,
+            )
+        });
         let peek_btn = props
             .on_quick_peek
             .map(|on_quick_peek| build_poster_quick_peek_button("quick-peek", &theme, on_quick_peek));
         art_frame = art_frame.child(build_poster_right_actions_cluster(
             rating_bottom_px,
+            toggle_lib_btn,
             props.quick_action,
             peek_btn,
             &theme,
@@ -1914,7 +1989,8 @@ impl StreamSourceRowProps {
     }
 }
 
-/// Renders a unified 3-line stream source row with optional `"Last used"` badge and expandable metadata/copy drawer.
+/// Renders a compact scannable stream source row (`Quality | Size & Health | Addons | Details`)
+/// with raw release filenames tucked cleanly inside the expandable details drawer.
 pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
     let theme = active_theme();
     let accent_ink = if theme.is_light {
@@ -1927,7 +2003,8 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
     let copy_url_id = ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("copy-url"));
     let copy_hash_id = ElementId::NamedChild(Arc::clone(&base_id), SharedString::new_static("copy-hash"));
 
-    let has_drawer_content = props.raw_filename.is_some()
+    let drawer_filename = props.raw_filename.or(props.release_title);
+    let has_drawer_content = drawer_filename.is_some()
         || !props.technical_specs.is_empty()
         || props.info_hash.is_some()
         || props.on_copy_url.is_some()
@@ -1936,8 +2013,8 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
     let mut main_row = div()
         .id(props.id)
         .w_full()
-        .px(theme.sp(16.0))
-        .py(theme.sp(12.0))
+        .px(theme.sp(14.0))
+        .py(theme.sp(10.0))
         .when(!props.is_active, |row| {
             row.hover(move |s| s.bg(rgba(theme.glass_row_hover_bg)))
         })
@@ -1952,103 +2029,102 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
             .on_mouse_down(MouseButton::Left, on_play);
     }
 
-    let left_col = div()
-        .flex_1()
-        .min_w(px(0.0))
+    // Column 1: Play + Quality / HDR / Codec headline + Last used pill
+    let quality_col = div()
+        .flex_shrink_0()
+        .min_w(theme.sp(210.0))
+        .max_w(theme.sp(310.0))
         .flex()
-        .flex_col()
-        .gap(theme.sp(3.0))
+        .items_center()
+        .gap(theme.sp(9.0))
         .child(
             div()
-                .w_full()
-                .min_w(px(0.0))
+                .w(theme.sp(26.0))
+                .h(theme.sp(26.0))
+                .flex_shrink_0()
+                .rounded(px(RADIUS_PILL))
+                .bg(rgba(theme.accent_soft))
                 .flex()
                 .items_center()
-                .gap(theme.sp(8.0))
+                .justify_center()
                 .child(svg_icon(
                     IconName::Play,
-                    12.0 * theme.ui_scale,
+                    11.5 * theme.ui_scale,
                     rgb(accent_ink),
-                ))
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_size(theme.sp(13.5))
-                        .text_color(rgb(theme.text_primary))
-                        .child(props.headline),
-                )
-                .when(props.is_last_used, |row| {
-                    row.child(
-                        div()
-                            .flex_shrink_0()
-                            .px(theme.sp(7.0))
-                            .py(theme.sp(2.0))
-                            .rounded(px(RADIUS_PILL))
-                            .bg(rgba(theme.accent_soft))
-                            .border_1()
-                            .border_color(rgba(theme.border_accent))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_size(theme.sp(10.5))
-                            .text_color(rgb(accent_ink))
-                            .child("Last used"),
-                    )
-                })
-                .when_some(props.addon_label, |row, addon| {
-                    row.child(
-                        div()
-                            .flex_shrink_0()
-                            .font_weight(FontWeight::NORMAL)
-                            .text_size(theme.sp(11.5))
-                            .text_color(rgb(theme.text_muted))
-                            .child(addon),
-                    )
-                }),
+                )),
         )
         .child(
             div()
-                .w_full()
                 .min_w(px(0.0))
-                .flex()
-                .items_center()
-                .gap(theme.sp(6.0))
-                .when(props.is_cached, |row| {
-                    row.child(
-                        div()
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded_full()
-                            .flex_shrink_0()
-                            .bg(rgb(theme.status_watched)),
-                    )
-                })
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .font_weight(FontWeight::NORMAL)
-                        .font_features(tabular_nums())
-                        .text_size(theme.sp(12.0))
-                        .text_color(rgb(theme.text_secondary))
-                        .child(props.metadata_line),
-                ),
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(theme.text_body())
+                .text_color(rgb(theme.text_primary))
+                .child(props.headline),
         )
-        .when_some(props.release_title, |col, release| {
-            col.child(
+        .when(props.is_last_used, |row| {
+            row.child(
                 div()
-                    .w_full()
-                    .min_w(px(0.0))
-                    .font(mono_font())
-                    .text_size(theme.sp(11.5))
-                    .text_color(rgb(theme.text_muted))
-                    .truncate()
-                    .text_ellipsis()
-                    .child(release),
+                    .flex_shrink_0()
+                    .px(theme.sp(7.0))
+                    .py(theme.sp(2.0))
+                    .rounded(px(RADIUS_PILL))
+                    .bg(rgba(theme.accent_soft))
+                    .border_1()
+                    .border_color(rgba(theme.border_accent))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(theme.text_micro())
+                    .text_color(rgb(accent_ink))
+                    .child("Last used"),
             )
         });
 
-    let mut right_col = div().flex_shrink_0().flex().items_center().gap(theme.sp(8.0));
+    // Column 2: Size / Bitrate / Health dot & Peers or Cached
+    let meta_col = div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .gap(theme.sp(7.0))
+        .when(props.is_cached, |row| {
+            row.child(
+                div()
+                    .w(px(7.0))
+                    .h(px(7.0))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(rgb(theme.status_watched)),
+            )
+        })
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .font_weight(FontWeight::NORMAL)
+                .font_features(tabular_nums())
+                .text_size(theme.text_body())
+                .text_color(rgb(theme.text_secondary))
+                .child(props.metadata_line),
+        );
+
+    // Column 3: Merged addon attribution + Active check + Expand details button
+    let mut right_col = div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(theme.sp(10.0));
+
+    if let Some(addon) = props.addon_label {
+        right_col = right_col.child(
+            div()
+                .max_w(theme.sp(220.0))
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .text_size(theme.text_micro())
+                .text_color(rgb(theme.text_muted))
+                .child(addon),
+        );
+    }
 
     if props.is_active {
         right_col = right_col.child(svg_icon(
@@ -2064,7 +2140,7 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
             div()
                 .id(expand_id)
                 .cursor_pointer()
-                .px(theme.sp(9.0))
+                .px(theme.sp(8.0))
                 .py(theme.sp(4.0))
                 .rounded(px(RADIUS_POSTER))
                 .bg(if expanded {
@@ -2077,34 +2153,34 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                 .items_center()
                 .gap(theme.sp(4.0))
                 .font_weight(FontWeight::MEDIUM)
-                .text_size(theme.sp(11.5))
+                .text_size(theme.text_micro())
                 .text_color(if expanded {
                     rgb(accent_ink)
                 } else {
-                    rgb(theme.text_muted)
+                    rgb(theme.text_secondary)
                 })
+                .tooltip(simple_tooltip("Show release filename & stream info", None))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     cx.stop_propagation();
                     on_toggle_expand(ev, window, cx);
                 })
-                .child("Details")
                 .child(svg_icon(
                     if expanded {
                         IconName::ChevronDown
                     } else {
-                        IconName::ChevronRight
+                        IconName::Info
                     },
-                    11.5 * theme.ui_scale,
+                    13.5 * theme.ui_scale,
                     if expanded {
                         rgb(accent_ink)
                     } else {
-                        rgb(theme.text_muted)
+                        rgb(theme.text_secondary)
                     },
                 )),
         );
     }
 
-    main_row = main_row.child(left_col).child(right_col);
+    main_row = main_row.child(quality_col).child(meta_col).child(right_col);
 
     let mut outer = div()
         .w_full()
@@ -2136,11 +2212,11 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
             .flex()
             .flex_col()
             .gap(theme.sp(8.0))
-            .when_some(props.raw_filename, |el, filename| {
+            .when_some(drawer_filename, |el, filename| {
                 el.child(
                     div()
                         .font(mono_font())
-                        .text_size(theme.sp(11.5))
+                        .text_size(theme.text_micro())
                         .text_color(rgb(theme.text_secondary))
                         .child(filename),
                 )
@@ -2154,15 +2230,15 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                         .gap(theme.sp(6.0))
                         .children(props.technical_specs.into_iter().map(|spec| {
                             div()
-                                .px(theme.sp(7.0))
-                                .py(theme.sp(2.0))
+                                .px(theme.sp(8.0))
+                                .py(theme.sp(2.5))
                                 .rounded(px(RADIUS_PILL))
                                 .bg(rgba(theme.glass_trough_bg))
                                 .border_1()
                                 .border_color(rgba(theme.glass_border))
                                 .font(mono_font())
-                                .text_size(theme.sp(11.0))
-                                .text_color(rgb(theme.text_muted))
+                                .text_size(theme.text_micro())
+                                .text_color(rgb(theme.text_secondary))
                                 .child(spec)
                         })),
                 )
@@ -2171,7 +2247,7 @@ pub fn render_stream_source_row(props: StreamSourceRowProps) -> AnyElement {
                 el.child(
                     div()
                         .font(mono_font())
-                        .text_size(theme.sp(11.0))
+                        .text_size(theme.text_micro())
                         .text_color(rgb(theme.text_muted))
                         .child(format!("info_hash {hash}")),
                 )

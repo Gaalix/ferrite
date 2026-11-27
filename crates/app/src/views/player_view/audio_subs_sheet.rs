@@ -219,6 +219,19 @@ impl AppShell {
             .cloned()
             .collect();
         let any_sub_selected = sub_tracks.iter().any(|t| t.selected);
+        let (preferred_addon_subs, other_addon_subs) = self.collect_grouped_addon_subtitles();
+        let other_lang_count = other_addon_subs.len();
+        let show_other_langs = self.show_other_sub_langs;
+        let remembered_for_show = self
+            .playback_session
+            .as_ref()
+            .is_some_and(|s| s.applied_series_track_prefs);
+        let active_size_idx = match prefs.subtitle_font_size {
+            0..=41 => 0,
+            42..=51 => 1,
+            52..=61 => 2,
+            _ => 3,
+        };
 
         let delay_secs = self.player_snapshot.sub_delay;
         let delay_label = if delay_secs.abs() < 0.05 {
@@ -299,7 +312,7 @@ impl AppShell {
                                 )
                             })),
                     )
-                    // Subtitle tracks
+                    // Subtitle tracks (embedded + auto-listed addon subtitles grouped by language)
                     .child(
                         div()
                             .flex()
@@ -309,7 +322,20 @@ impl AppShell {
                                 div()
                                     .px(px(4.0))
                                     .pb(px(2.0))
-                                    .child(section_eyebrow("Subtitles")),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.0))
+                                    .child(section_eyebrow("Subtitles"))
+                                    .when(remembered_for_show, |row| {
+                                        row.child(
+                                            div()
+                                                .font(ui_sans(FontWeight::MEDIUM))
+                                                .text_size(px(11.5))
+                                                .text_color(rgb(t.accent))
+                                                .child("Remembered for this show"),
+                                        )
+                                    }),
                             )
                             .child(selectable_row(
                                 "player-sub-track-off",
@@ -332,7 +358,124 @@ impl AppShell {
                                         this.user_select_subtitle_track(Some(tid), cx);
                                     }),
                                 )
-                            })),
+                            }))
+                            .when(!preferred_addon_subs.is_empty(), |col| {
+                                let mut flat_idx = 0usize;
+                                let mut rows = Vec::new();
+                                for (lang_name, items) in preferred_addon_subs {
+                                    for (sub_url, sub_label, lang_code) in items {
+                                        let idx = flat_idx;
+                                        flat_idx += 1;
+                                        let attached = self
+                                            .playback_session
+                                            .as_ref()
+                                            .is_some_and(|s| s.attached_external_subs.contains(&sub_url));
+                                        let title_for_mpv = format!("{lang_name} — {sub_label}");
+                                        let url_clone = sub_url.clone();
+                                        let lang_clone = lang_code.clone();
+                                        rows.push(selectable_row(
+                                            ("player-addon-pref-sub", idx),
+                                            lang_name.clone(),
+                                            Some(SharedString::from(format!("Online · {sub_label}"))),
+                                            attached,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.attach_and_select_addon_subtitle(
+                                                    url_clone.clone(),
+                                                    title_for_mpv.clone(),
+                                                    lang_clone.clone(),
+                                                    cx,
+                                                );
+                                            }),
+                                        ));
+                                    }
+                                }
+                                col.children(rows)
+                            })
+                            .when(other_lang_count > 0, |col| {
+                                col.child(
+                                    div()
+                                        .id("player-sub-other-langs-toggle")
+                                        .mt(px(4.0))
+                                        .px(px(12.0))
+                                        .py(px(8.0))
+                                        .rounded(px(10.0))
+                                        .cursor_pointer()
+                                        .bg(rgba(t.glass_card_bg))
+                                        .border_1()
+                                        .border_color(rgba(t.glass_border))
+                                        .hover(move |s| s.bg(rgba(t.glass_row_hover_bg)))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.show_other_sub_langs =
+                                                    !this.show_other_sub_langs;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .font(ui_sans(FontWeight::MEDIUM))
+                                                .text_size(px(13.0))
+                                                .text_color(rgb(t.text_secondary))
+                                                .child(format!(
+                                                    "Other languages ({other_lang_count})"
+                                                )),
+                                        )
+                                        .child(svg_icon_weighted(
+                                            if show_other_langs {
+                                                IconName::ChevronDown
+                                            } else {
+                                                IconName::ChevronRight
+                                            },
+                                            IconWeight::Regular,
+                                            13.0,
+                                            rgb(t.text_secondary),
+                                        )),
+                                )
+                                .when(show_other_langs, |inner| {
+                                    let mut flat_idx = 0usize;
+                                    let mut lang_blocks = Vec::new();
+                                    for (lang_name, items) in other_addon_subs {
+                                        let mut sub_rows = Vec::new();
+                                        for (sub_url, sub_label, lang_code) in items {
+                                            let idx = flat_idx;
+                                            flat_idx += 1;
+                                            let attached = self
+                                                .playback_session
+                                                .as_ref()
+                                                .is_some_and(|s| {
+                                                    s.attached_external_subs.contains(&sub_url)
+                                                });
+                                            let title_for_mpv =
+                                                format!("{lang_name} — {sub_label}");
+                                            let url_clone = sub_url.clone();
+                                            let lang_clone = lang_code.clone();
+                                            sub_rows.push(selectable_row(
+                                                ("player-addon-other-sub", idx),
+                                                lang_name.clone(),
+                                                Some(SharedString::from(format!(
+                                                    "Online · {sub_label}"
+                                                ))),
+                                                attached,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.attach_and_select_addon_subtitle(
+                                                        url_clone.clone(),
+                                                        title_for_mpv.clone(),
+                                                        lang_clone.clone(),
+                                                        cx,
+                                                    );
+                                                }),
+                                            ));
+                                        }
+                                        lang_blocks.extend(sub_rows);
+                                    }
+                                    inner.children(lang_blocks)
+                                })
+                            }),
                     )
                     // Action buttons: Search online | Load file...
                     .child(
@@ -427,6 +570,36 @@ impl AppShell {
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .font(ui_sans(FontWeight::MEDIUM))
+                                    .text_size(px(13.5))
+                                    .text_color(rgb(t.text_primary))
+                                    .child("Subtitle size"),
+                            )
+                            .child(
+                                segmented_trough().w(px(164.0)).children(
+                                    SUBTITLE_SIZE_PRESETS.into_iter().enumerate().map(
+                                        |(idx, (label, size_px))| {
+                                            segmented_item(
+                                                ("sub-quick-size", idx),
+                                                label,
+                                                active_size_idx == idx,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.set_subtitle_font_size(size_px, cx);
+                                                }),
+                                            )
+                                        },
+                                    ),
+                                ),
+                            ),
+                    )
                     .child(stepper_row(
                         "Subtitle delay",
                         "sub-footer-delay-minus",

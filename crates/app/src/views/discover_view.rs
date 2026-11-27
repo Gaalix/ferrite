@@ -1992,10 +1992,9 @@ impl AppShell {
         } else {
             None
         };
+        let _ = header_subtitle;
         let page_header = render_page_header(
-            PageHeader::new("Discover")
-                .subtitle(header_subtitle)
-                .right_slot(header_right),
+            PageHeader::new("Discover").right_slot(header_right),
         );
 
         let toolbar = self.render_discover_toolbar(

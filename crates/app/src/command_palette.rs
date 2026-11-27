@@ -68,16 +68,6 @@ pub fn build_palette_search_entries(
         query: trimmed.to_owned(),
     });
 
-    for tab in SidebarTab::ALL {
-        if tab.label().to_ascii_lowercase().contains(&q_lower) {
-            entries.push(PaletteEntry::QuickNav {
-                tab,
-                title: tab.label(),
-                subtitle: "Jump to section",
-            });
-        }
-    }
-
     for hit in snapshot.ranked_media_hits(MAX_PALETTE_MEDIA_HITS) {
         let lib_status = hit_library_status(&hit, library_statuses);
         let target_id = hit_target_id(&hit);
@@ -100,6 +90,20 @@ pub fn build_palette_search_entries(
             headshot_url: person.headshot_url.clone(),
             known_for: person.known_for.clone(),
         });
+    }
+
+    for tab in SidebarTab::ALL {
+        if tab.label().to_ascii_lowercase().contains(&q_lower) {
+            entries.push(PaletteEntry::QuickNav {
+                tab,
+                title: tab.label(),
+                subtitle: "Jump to section",
+            });
+        }
+    }
+
+    if "reload streaming engine".contains(&q_lower) {
+        entries.push(PaletteEntry::ActionReloadEngine);
     }
 
     entries
@@ -157,14 +161,13 @@ impl AppShell {
             entries.push(PaletteEntry::QuickNav {
                 tab: SidebarTab::Settings,
                 title: "Settings",
-                subtitle: "Storage mode, UPnP, failover, and playback",
+                subtitle: "Playback, subtitles, appearance, and streaming",
             });
             entries.push(PaletteEntry::QuickNav {
                 tab: SidebarTab::Account,
                 title: "Account",
                 subtitle: "Sign in with email or Stremio link code",
             });
-            entries.push(PaletteEntry::ActionReloadEngine);
             return entries;
         }
 

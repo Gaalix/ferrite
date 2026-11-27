@@ -196,17 +196,17 @@ impl CardDensityChoice {
 
     pub const fn target_poster_width_px(self) -> f32 {
         match self {
-            Self::Compact => 148.0,
-            Self::Comfortable => 176.0,
-            Self::Cinema => 212.0,
+            Self::Compact => 176.0,
+            Self::Comfortable => 216.0,
+            Self::Cinema => 256.0,
         }
     }
 
     pub const fn grid_gap_px(self) -> f32 {
         match self {
-            Self::Compact => 14.0,
-            Self::Comfortable => 18.0,
-            Self::Cinema => 22.0,
+            Self::Compact => 16.0,
+            Self::Comfortable => 20.0,
+            Self::Cinema => 24.0,
         }
     }
 }
@@ -291,18 +291,18 @@ pub const fn build_palette(
             bg_topnav_scrolled: 0x0b0b0de6,
             glass_sheet_bg: 0x141416F2,
             glass_popover_bg: 0x141417F5,
-            glass_card_bg: 0xFFFFFF08,
-            glass_border: 0xFFFFFF14,
-            glass_border_strong: 0xFFFFFF26,
-            glass_divider: 0xFFFFFF10,
-            glass_trough_bg: 0xFFFFFF0B,
-            glass_row_hover_bg: 0xFFFFFF0A,
-            glass_row_selected_bg: 0xFFFFFF12,
+            glass_card_bg: 0xFFFFFF0A,
+            glass_border: 0xFFFFFF1C,
+            glass_border_strong: 0xFFFFFF30,
+            glass_divider: 0xFFFFFF14,
+            glass_trough_bg: 0xFFFFFF0E,
+            glass_row_hover_bg: 0xFFFFFF0D,
+            glass_row_selected_bg: 0xFFFFFF16,
             segment_active_bg: 0xF5F5F7,
             segment_active_text: 0x0B0B0D,
             text_primary: 0xF5F1E8,
-            text_secondary: 0xA0A0A8,
-            text_muted: 0x6E6E78,
+            text_secondary: 0xB6B6C0,
+            text_muted: 0x90909C,
             accent,
             accent_hover,
             accent_press,
@@ -327,25 +327,25 @@ pub const fn build_palette(
             accent_choice,
             is_light: false,
             bg_canvas: 0x000000,
-            bg_surface: 0x0A0A0C,
-            bg_elevated: 0x131317,
-            bg_surface_3: 0x1D1D22,
-            bg_topnav_float: 0x000000A6,
-            bg_topnav_scrolled: 0x000000F0,
-            glass_sheet_bg: 0x0A0A0CF5,
-            glass_popover_bg: 0x0E0E11F7,
-            glass_card_bg: 0xFFFFFF06,
-            glass_border: 0xFFFFFF18,
-            glass_border_strong: 0xFFFFFF2E,
-            glass_divider: 0xFFFFFF12,
-            glass_trough_bg: 0xFFFFFF0D,
-            glass_row_hover_bg: 0xFFFFFF0B,
-            glass_row_selected_bg: 0xFFFFFF14,
+            bg_surface: 0x0E0E12,
+            bg_elevated: 0x17171D,
+            bg_surface_3: 0x222229,
+            bg_topnav_float: 0x000000B8,
+            bg_topnav_scrolled: 0x000000F2,
+            glass_sheet_bg: 0x0E0E12F5,
+            glass_popover_bg: 0x121217F7,
+            glass_card_bg: 0xFFFFFF0B,
+            glass_border: 0xFFFFFF22,
+            glass_border_strong: 0xFFFFFF38,
+            glass_divider: 0xFFFFFF18,
+            glass_trough_bg: 0xFFFFFF10,
+            glass_row_hover_bg: 0xFFFFFF0F,
+            glass_row_selected_bg: 0xFFFFFF1A,
             segment_active_bg: 0xFFFFFF,
             segment_active_text: 0x000000,
             text_primary: 0xF7F7FA,
-            text_secondary: 0xA2A2AC,
-            text_muted: 0x6B6B75,
+            text_secondary: 0xBABAC6,
+            text_muted: 0x9292A0,
             accent,
             accent_hover,
             accent_press,
@@ -387,8 +387,8 @@ pub const fn build_palette(
             segment_active_bg: 0xEEF2FF,
             segment_active_text: 0x0B0E1A,
             text_primary: 0xEEF2FF,
-            text_secondary: 0x9CA8CC,
-            text_muted: 0x647096,
+            text_secondary: 0xB0BCDE,
+            text_muted: 0x8693BA,
             accent,
             accent_hover,
             accent_press,
@@ -430,8 +430,8 @@ pub const fn build_palette(
             segment_active_bg: 0xF7EFE6,
             segment_active_text: 0x110E0D,
             text_primary: 0xF7EFE6,
-            text_secondary: 0xB8ACA2,
-            text_muted: 0x7D7168,
+            text_secondary: 0xC8BBB0,
+            text_muted: 0x9E9187,
             accent,
             accent_hover,
             accent_press,
@@ -497,11 +497,55 @@ pub const fn build_palette(
     }
 }
 
+/// Canonical 6-step typography scale (px at 100% UI scale).
+/// - `TYPE_MICRO` (12px): badges, eyebrows, keycaps, micro-metadata
+/// - `TYPE_BODY` (14px): floor for readable prose, card titles, buttons, inputs, settings
+/// - `TYPE_SUBHEAD` (16px): card headings, sheet titles, lead metadata
+/// - `TYPE_TITLE` (20px): sub-section headings, hero subheads
+/// - `TYPE_DISPLAY` (28px): section headers, shelf titles
+/// - `TYPE_HERO` (38px): page headers, hero display titles
+pub const TYPE_MICRO: f32 = 12.0;
+pub const TYPE_BODY: f32 = 14.0;
+pub const TYPE_SUBHEAD: f32 = 16.0;
+pub const TYPE_TITLE: f32 = 20.0;
+pub const TYPE_DISPLAY: f32 = 28.0;
+pub const TYPE_HERO: f32 = 38.0;
+
 impl ThemePalette {
     /// Scales a base UI measurement (px) by this palette's UI scale factor without global lookup.
     #[inline]
     pub fn sp(&self, val: f32) -> Pixels {
         px(val * self.ui_scale)
+    }
+
+    #[inline]
+    pub fn text_micro(&self) -> Pixels {
+        self.sp(TYPE_MICRO)
+    }
+
+    #[inline]
+    pub fn text_body(&self) -> Pixels {
+        self.sp(TYPE_BODY)
+    }
+
+    #[inline]
+    pub fn text_subhead(&self) -> Pixels {
+        self.sp(TYPE_SUBHEAD)
+    }
+
+    #[inline]
+    pub fn text_title(&self) -> Pixels {
+        self.sp(TYPE_TITLE)
+    }
+
+    #[inline]
+    pub fn text_display(&self) -> Pixels {
+        self.sp(TYPE_DISPLAY)
+    }
+
+    #[inline]
+    pub fn text_hero(&self) -> Pixels {
+        self.sp(TYPE_HERO)
     }
 }
 
@@ -571,6 +615,36 @@ pub fn sp(val: f32) -> Pixels {
     px(val * f32::from_bits(ACTIVE_UI_SCALE_BITS.load(Ordering::Relaxed)))
 }
 
+#[inline]
+pub fn type_micro() -> Pixels {
+    sp(TYPE_MICRO)
+}
+
+#[inline]
+pub fn type_body() -> Pixels {
+    sp(TYPE_BODY)
+}
+
+#[inline]
+pub fn type_subhead() -> Pixels {
+    sp(TYPE_SUBHEAD)
+}
+
+#[inline]
+pub fn type_title() -> Pixels {
+    sp(TYPE_TITLE)
+}
+
+#[inline]
+pub fn type_display() -> Pixels {
+    sp(TYPE_DISPLAY)
+}
+
+#[inline]
+pub fn type_hero() -> Pixels {
+    sp(TYPE_HERO)
+}
+
 pub const BG_OBSIDIAN: u32 = 0x0b0b0d;
 pub const BG_OBSIDIAN_BLUR: u32 = 0x0b0b0df5;
 pub const BG_TOPNAV: u32 = 0x0b0b0dc7;
@@ -615,9 +689,7 @@ pub const TEXT_SECONDARY: u32 = 0x9a9a9f;
 pub const TEXT_MUTED: u32 = 0x6a6a70;
 
 pub const ACCENT: u32 = 0xff5e3a;
-pub const ACCENT_VIOLET: u32 = ACCENT;
 pub const ACCENT_HOVER: u32 = 0xff7752;
-pub const ACCENT_VIOLET_HOVER: u32 = ACCENT_HOVER;
 pub const ACCENT_PRESS: u32 = 0xe04a28;
 pub const ACCENT_SOFT: u32 = 0xff5e3a1f;
 
@@ -837,14 +909,14 @@ pub fn meta_divider() -> Div {
 pub fn neutral_chip(label: impl Into<SharedString>) -> Div {
     let theme = active_theme();
     div()
-        .px(px(8.0))
-        .py(px(2.5))
+        .px(theme.sp(9.0))
+        .py(theme.sp(3.0))
         .rounded(px(999.0))
         .bg(rgb(theme.bg_elevated))
         .border_1()
         .border_color(rgba(theme.glass_border))
         .font(mono_font())
-        .text_xs()
+        .text_size(theme.text_micro())
         .text_color(rgb(theme.text_primary))
         .child(label.into())
 }
@@ -856,35 +928,36 @@ pub fn semantic_status_pill(
     border_rgba: u32,
     bg_rgba: u32,
 ) -> Div {
+    let theme = active_theme();
     div()
-        .h(px(26.0))
-        .px(px(10.0))
+        .h(theme.sp(28.0))
+        .px(theme.sp(11.0))
         .rounded(px(999.0))
         .bg(rgba(bg_rgba))
         .border_1()
         .border_color(rgba(border_rgba))
         .flex()
         .items_center()
-        .gap(px(6.0))
-        .text_xs()
+        .gap(theme.sp(6.0))
+        .text_size(theme.text_micro())
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(fg_hex))
-        .child(svg_icon(icon, 12.0, rgb(fg_hex)))
+        .child(svg_icon(icon, 13.0 * theme.ui_scale, rgb(fg_hex)))
         .child(label)
 }
 
 pub fn keycap(label: impl Into<SharedString>) -> Div {
     let theme = active_theme();
     div()
-        .px(px(6.0))
-        .py(px(2.0))
+        .px(theme.sp(6.0))
+        .py(theme.sp(2.0))
         .rounded(px(4.0))
         .bg(rgb(theme.bg_surface_3))
         .border_1()
         .border_color(rgba(theme.glass_border))
         .font(mono_font())
-        .text_size(px(11.0))
-        .text_color(rgb(theme.text_muted))
+        .text_size(theme.text_micro())
+        .text_color(rgb(theme.text_secondary))
         .child(label.into())
 }
 
@@ -903,8 +976,8 @@ pub fn summarize_stream_for_humans(parsed: &ParsedStream) -> CleanStreamSummary 
         Resolution::Uhd4k => "4K",
         Resolution::Fhd1080p => "1080p",
         Resolution::Hd720p => "720p",
-        Resolution::Sd => "SD",
-        Resolution::Unknown => "Stream",
+        Resolution::Sd => "480p",
+        Resolution::Unknown => "Unknown quality",
     };
 
     let hdr_label = match parsed.hdr {
@@ -1136,6 +1209,49 @@ pub fn placeholder_tint_for_id(id: &str) -> u32 {
     placeholder_tint_for_id_with_preset(id, active_theme().preset)
 }
 
+/// Deterministic editorial gradient pair `(top_rgb, bottom_rgb)` for styled fallback posters
+/// when title artwork is unavailable.
+pub fn placeholder_gradient_for_seed(seed: u32, is_light: bool) -> (u32, u32) {
+    let dark_pairs: [(u32, u32); 6] = [
+        (0x1E293B, 0x0B1120), // Midnight slate
+        (0x2E1A3B, 0x110B1A), // Deep plum
+        (0x132A2E, 0x091317), // Abyssal teal
+        (0x321D1A, 0x140B0A), // Warm cinema umber
+        (0x1B233A, 0x0B0E1A), // Nocturnal indigo
+        (0x182B24, 0x0A1310), // Forest obsidian
+    ];
+    let light_pairs: [(u32, u32); 6] = [
+        (0xE2E8F0, 0xCBD5E1),
+        (0xEDE9FE, 0xDDD6FE),
+        (0xCCFBF1, 0x99F6E4),
+        (0xFFEDD5, 0xFED7AA),
+        (0xE0E7FF, 0xC7D2FE),
+        (0xD1FAE5, 0xA7F3D0),
+    ];
+    let idx = (seed as usize) % dark_pairs.len();
+    if is_light {
+        light_pairs[idx]
+    } else {
+        dark_pairs[idx]
+    }
+}
+
+/// Normalizes ongoing series release ranges like `"2024–"` or `"2024-"` into `"2024 – present"`.
+pub fn format_release_info(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(prefix) = trimmed
+        .strip_suffix('–')
+        .or_else(|| trimmed.strip_suffix('-'))
+        .or_else(|| trimmed.strip_suffix('—'))
+    {
+        let year = prefix.trim();
+        if year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("{year} – present");
+        }
+    }
+    trimmed.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,8 +1350,8 @@ mod tests {
             .collect();
         assert!(widths.windows(2).all(|w| w[0] < w[1]));
         assert!(gaps.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(CardDensityChoice::Comfortable.target_poster_width_px(), 176.0);
-        assert_eq!(CardDensityChoice::Comfortable.grid_gap_px(), 18.0);
+        assert_eq!(CardDensityChoice::Comfortable.target_poster_width_px(), 216.0);
+        assert_eq!(CardDensityChoice::Comfortable.grid_gap_px(), 20.0);
         for density in CardDensityChoice::ALL {
             assert!(!density.label().is_empty());
             let json = serde_json::to_string(&density).unwrap();
@@ -1295,5 +1411,26 @@ mod tests {
         assert_eq!(active_theme().sp(16.0), px(16.0));
         assert!(poster_card_shadow().is_empty());
         assert_eq!(subtle_bar_shadow().len(), 1);
+    }
+
+    #[test]
+    fn type_scale_and_release_info_formatting_behave_consistently() {
+        let p = build_palette(
+            ThemePreset::PureOled,
+            AccentChoice::AuroraCyan,
+            true,
+            1.0,
+            CardDensityChoice::Comfortable,
+        );
+        assert_eq!(p.text_micro(), px(12.0));
+        assert_eq!(p.text_body(), px(14.0));
+        assert_eq!(p.text_subhead(), px(16.0));
+        assert_eq!(p.text_title(), px(20.0));
+        assert_eq!(p.text_display(), px(28.0));
+        assert_eq!(p.text_hero(), px(38.0));
+        assert_eq!(format_release_info("2024–"), "2024 – present");
+        assert_eq!(format_release_info("2024-"), "2024 – present");
+        assert_eq!(format_release_info("2011–2019"), "2011–2019");
+        assert_eq!(format_release_info("2026"), "2026");
     }
 }

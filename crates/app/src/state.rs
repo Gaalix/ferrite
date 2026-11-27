@@ -612,20 +612,20 @@ impl DebridAccessMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SettingsCategory {
     #[default]
-    Appearance,
     Playback,
     SubtitlesAndAudio,
     StreamingAndDebrid,
+    Appearance,
     IntegrationsAndAddons,
     SystemAndStorage,
 }
 
 impl SettingsCategory {
     pub const ALL: [Self; 6] = [
-        Self::Appearance,
         Self::Playback,
         Self::SubtitlesAndAudio,
         Self::StreamingAndDebrid,
+        Self::Appearance,
         Self::IntegrationsAndAddons,
         Self::SystemAndStorage,
     ];
@@ -644,22 +644,22 @@ impl SettingsCategory {
     pub const fn subtitle(self) -> &'static str {
         match self {
             Self::Appearance => {
-                "Theme presets, accent palette, ambient glow, UI scale, and card density."
+                "Theme presets, accent color, ambient glow, text scale, and poster size."
             }
             Self::Playback => {
-                "Zero-copy hardware pipeline, HDR tone mapping, upscaling, GPU shaders, and OS controls."
+                "Video quality, HDR tone mapping, upscaling, auto-play next episode, and controls."
             }
             Self::SubtitlesAndAudio => {
-                "Default languages, auto-selection, subtitle appearance studio, and timing offset."
+                "Preferred languages, automatic subtitle selection, style, and timing offset."
             }
             Self::StreamingAndDebrid => {
-                "Local Rust Debrid resolver, Prowlarr outage fallback, and BitTorrent resilience."
+                "Debrid streaming, automatic failover on slow sources, and network reliability."
             }
             Self::IntegrationsAndAddons => {
-                "Local-only 0600 credentials for Debrid, Prowlarr, TMDB, OpenSubtitles, and Addons Studio."
+                "Connect Debrid services, TMDB artwork, OpenSubtitles, Prowlarr, and addons."
             }
             Self::SystemAndStorage => {
-                "Piece cache budget, cache telemetry, updates, keyboard shortcuts, and diagnostics."
+                "Cache size, app updates, keyboard shortcuts, and diagnostics."
             }
         }
     }
@@ -1305,7 +1305,12 @@ impl StreamFilterState {
         }
         if !self.selected_addons.is_empty() {
             let addon_hit = self.selected_addons.iter().any(|sel| {
-                cand.addon_key.eq_ignore_ascii_case(sel) || cand.parsed.matches_addon_source(sel)
+                cand.addon_key.eq_ignore_ascii_case(sel)
+                    || cand
+                        .merged_addon_keys
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(sel))
+                    || cand.parsed.matches_addon_source(sel)
             });
             if !addon_hit {
                 return false;
@@ -1664,6 +1669,8 @@ pub struct PlaybackCandidate {
     pub stream_request: Option<ResourceRequest>,
     pub addon_key: String,
     pub addon_name: String,
+    /// Additional addon keys that also returned this exact deduplicated torrent (`info_hash`).
+    pub merged_addon_keys: Vec<String>,
 }
 
 impl PlaybackCandidate {
@@ -1720,6 +1727,7 @@ impl PlaybackCandidate {
             stream_request,
             addon_key,
             addon_name,
+            merged_addon_keys: Vec::new(),
         }
     }
 
@@ -1739,6 +1747,7 @@ impl PlaybackCandidate {
             stream_request: None,
             addon_key: "prowlarr".to_owned(),
             addon_name,
+            merged_addon_keys: Vec::new(),
         }
     }
 
@@ -1812,39 +1821,55 @@ fn p2p_playability_tier(seeders: Option<u32>, size_bytes: Option<u64>) -> u8 {
     }
 }
 
+fn resolution_rank(res: Resolution) -> u8 {
+    match res {
+        Resolution::Uhd4k => 4,
+        Resolution::Fhd1080p => 3,
+        Resolution::Hd720p => 2,
+        Resolution::Sd => 1,
+        Resolution::Unknown => 0,
+    }
+}
+
 pub fn sort_stream_candidates(candidates: &mut [PlaybackCandidate]) {
     candidates.sort_by(|ca, cb| {
+        let a_unknown = matches!(ca.parsed.resolution, Resolution::Unknown);
+        let b_unknown = matches!(cb.parsed.resolution, Resolution::Unknown);
         let a_p2p = is_uncached_p2p_torrent(ca);
         let b_p2p = is_uncached_p2p_torrent(cb);
-        // Priority Group 1 (Cached Debrid & Direct HTTP) always ranks above Priority Group 2 (Uncached P2P).
-        a_p2p.cmp(&b_p2p).then_with(|| {
-            let a = &ca.parsed;
-            let b = &cb.parsed;
-            if !a_p2p {
-                b.is_cached
-                    .cmp(&a.is_cached)
-                    .then_with(|| b.resolution.cmp(&a.resolution))
-                    .then_with(|| b.quality.cmp(&a.quality))
-                    .then_with(|| b.hdr.cmp(&a.hdr))
-                    .then_with(|| b.audio.cmp(&a.audio))
-                    .then_with(|| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
-            } else {
-                let tier_a = p2p_playability_tier(a.seeders, a.size_bytes);
-                let tier_b = p2p_playability_tier(b.seeders, b.size_bytes);
-                tier_b
-                    .cmp(&tier_a)
-                    .then_with(|| b.resolution.cmp(&a.resolution))
-                    .then_with(|| b.seeders.unwrap_or(0).cmp(&a.seeders.unwrap_or(0)))
-                    .then_with(|| b.quality.cmp(&a.quality))
-                    .then_with(|| b.hdr.cmp(&a.hdr))
-                    .then_with(|| b.audio.cmp(&a.audio))
-                    .then_with(|| {
-                        a.size_bytes
-                            .unwrap_or(u64::MAX)
-                            .cmp(&b.size_bytes.unwrap_or(u64::MAX))
-                    })
-            }
-        })
+        // Priority Group 1 (Cached Debrid & Direct HTTP) always ranks above Priority Group 2 (Uncached P2P),
+        // and unknown-quality streams sort last within their group.
+        a_p2p
+            .cmp(&b_p2p)
+            .then_with(|| a_unknown.cmp(&b_unknown))
+            .then_with(|| {
+                let a = &ca.parsed;
+                let b = &cb.parsed;
+                if !a_p2p {
+                    b.is_cached
+                        .cmp(&a.is_cached)
+                        .then_with(|| resolution_rank(b.resolution).cmp(&resolution_rank(a.resolution)))
+                        .then_with(|| b.quality.cmp(&a.quality))
+                        .then_with(|| b.hdr.cmp(&a.hdr))
+                        .then_with(|| b.audio.cmp(&a.audio))
+                        .then_with(|| b.size_bytes.unwrap_or(0).cmp(&a.size_bytes.unwrap_or(0)))
+                } else {
+                    let tier_a = p2p_playability_tier(a.seeders, a.size_bytes);
+                    let tier_b = p2p_playability_tier(b.seeders, b.size_bytes);
+                    tier_b
+                        .cmp(&tier_a)
+                        .then_with(|| resolution_rank(b.resolution).cmp(&resolution_rank(a.resolution)))
+                        .then_with(|| b.seeders.unwrap_or(0).cmp(&a.seeders.unwrap_or(0)))
+                        .then_with(|| b.quality.cmp(&a.quality))
+                        .then_with(|| b.hdr.cmp(&a.hdr))
+                        .then_with(|| b.audio.cmp(&a.audio))
+                        .then_with(|| {
+                            a.size_bytes
+                                .unwrap_or(u64::MAX)
+                                .cmp(&b.size_bytes.unwrap_or(u64::MAX))
+                        })
+                }
+            })
     });
 }
 
@@ -2153,9 +2178,60 @@ pub fn sync_memoized_enriched_streams(
     (candidates, available_addons)
 }
 
-/// Merges Prowlarr fallback streams (deduplicated by torrent info_hash), applies
-/// local Debrid instant-cache badges (`RD+` / `TB+` / `AD+`), and filters out
-/// uncached P2P torrents when `cached_only_filter` is enabled.
+fn merge_duplicate_torrent_candidate(existing: &mut PlaybackCandidate, incoming: &PlaybackCandidate) {
+    // Prefer higher seeders, cached status, and richer metadata when merging duplicate info_hash rows.
+    if incoming.parsed.is_cached && !existing.parsed.is_cached {
+        existing.parsed.is_cached = true;
+        if existing.parsed.debrid_provider.is_none() {
+            existing.parsed.debrid_provider = incoming.parsed.debrid_provider.clone();
+        }
+    }
+    if incoming.parsed.seeders.unwrap_or(0) > existing.parsed.seeders.unwrap_or(0) {
+        existing.parsed.seeders = incoming.parsed.seeders;
+    }
+    if existing.parsed.size_bytes.is_none() && incoming.parsed.size_bytes.is_some() {
+        existing.parsed.size_bytes = incoming.parsed.size_bytes;
+        existing.parsed.size_display = incoming.parsed.size_display.clone();
+    }
+    if matches!(existing.parsed.resolution, Resolution::Unknown)
+        && !matches!(incoming.parsed.resolution, Resolution::Unknown)
+    {
+        existing.parsed.resolution = incoming.parsed.resolution;
+    }
+
+    // Track merged addon key so addon filter pills still match this consolidated row.
+    let inc_key = incoming.addon_key.trim();
+    if !inc_key.is_empty()
+        && !existing.addon_key.eq_ignore_ascii_case(inc_key)
+        && !existing
+            .merged_addon_keys
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(inc_key))
+    {
+        existing.merged_addon_keys.push(inc_key.to_owned());
+    }
+
+    // Merge human-readable addon label ("Torrentio, Torrentio Lite") without duplicates.
+    let inc_name = incoming.addon_name.trim();
+    if !inc_name.is_empty() {
+        let already_listed = existing
+            .addon_name
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case(inc_name));
+        if !already_listed {
+            if existing.addon_name.trim().is_empty() {
+                existing.addon_name = inc_name.to_owned();
+            } else {
+                existing.addon_name = format!("{}, {inc_name}", existing.addon_name.trim());
+            }
+            existing.parsed.addon_name = Some(existing.addon_name.clone());
+        }
+    }
+}
+
+/// Merges base addon streams and Prowlarr fallback streams (deduplicated across ALL addons by
+/// torrent `(info_hash, file_idx)`), applies local Debrid instant-cache badges (`RD+` / `TB+` / `AD+`),
+/// and filters out uncached P2P torrents when `cached_only_filter` is enabled.
 pub fn merge_and_enrich_stream_candidates(
     base_candidates: &[PlaybackCandidate],
     prowlarr_candidates: &[PlaybackCandidate],
@@ -2163,18 +2239,29 @@ pub fn merge_and_enrich_stream_candidates(
     debrid_cache: &HashMap<(LocalDebridProvider, [u8; 20]), DebridCacheStatus>,
     cached_only_filter: bool,
 ) -> EnrichedStreamCandidates {
-    let mut merged: Vec<PlaybackCandidate> = base_candidates
-        .iter()
-        .filter(|c| c.parsed.is_allowed() && is_native_playable_stream(&c.stream))
-        .cloned()
-        .collect();
-    let mut seen_hashes: HashSet<[u8; 20]> = merged
-        .iter()
-        .filter_map(|c| match c.stream.source {
-            StreamSource::Torrent { info_hash, .. } => Some(info_hash),
-            _ => None,
-        })
-        .collect();
+    let mut merged: Vec<PlaybackCandidate> = Vec::with_capacity(base_candidates.len());
+    let mut seen_torrents: HashMap<([u8; 20], Option<u16>), usize> = HashMap::new();
+    let mut seen_hashes: HashSet<[u8; 20]> = HashSet::new();
+
+    for cand in base_candidates {
+        if !cand.parsed.is_allowed() || !is_native_playable_stream(&cand.stream) {
+            continue;
+        }
+        if let StreamSource::Torrent {
+            info_hash,
+            file_idx,
+            ..
+        } = cand.stream.source
+        {
+            seen_hashes.insert(info_hash);
+            if let Some(&existing_idx) = seen_torrents.get(&(info_hash, file_idx)) {
+                merge_duplicate_torrent_candidate(&mut merged[existing_idx], cand);
+                continue;
+            }
+            seen_torrents.insert((info_hash, file_idx), merged.len());
+        }
+        merged.push(cand.clone());
+    }
 
     for cand in prowlarr_candidates {
         if !cand.parsed.is_allowed() || !is_native_playable_stream(&cand.stream) {
@@ -3579,6 +3666,27 @@ pub fn resume_offset_for_library_item(item: Option<&LibraryItem>, video_id: &str
     }
 }
 
+/// Returns `true` when `resume_secs` represents meaningful playback progress worth showing as
+/// "Resume" instead of "Play" (at least 2 minutes in, or >= 5% of known runtime with a 60s floor).
+pub fn is_meaningful_resume(resume_secs: Option<f64>, runtime_minutes: Option<u32>) -> bool {
+    let Some(secs) = resume_secs else {
+        return false;
+    };
+    if !secs.is_finite() || secs <= 0.0 {
+        return false;
+    }
+    if secs >= 120.0 {
+        return true;
+    }
+    if let Some(mins) = runtime_minutes.filter(|&m| m > 0) {
+        let total_secs = f64::from(mins) * 60.0;
+        let threshold = (total_secs * 0.05).max(60.0);
+        secs >= threshold
+    } else {
+        false
+    }
+}
+
 pub struct BootServices {
     pub tokio_handle: tokio::runtime::Handle,
     pub core: CoreController,
@@ -4112,10 +4220,10 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                "Appearance",
                 "Playback",
                 "Subtitles & Audio",
                 "Streaming & Debrid",
+                "Appearance",
                 "Integrations & Addons",
                 "System & Storage",
             ]
@@ -4124,15 +4232,15 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "appearance",
                 "playback",
                 "subtitles-audio",
                 "streaming-debrid",
+                "appearance",
                 "integrations-addons",
                 "system-storage",
             ]
         );
-        assert_eq!(SettingsCategory::default(), SettingsCategory::Appearance);
+        assert_eq!(SettingsCategory::default(), SettingsCategory::Playback);
         for cat in SettingsCategory::ALL {
             assert!(!cat.id().is_empty());
             assert!(!cat.subtitle().is_empty());
@@ -5184,5 +5292,58 @@ mod tests {
         let mut cached_tie = vec![cached_smaller, cached_larger];
         sort_stream_candidates(&mut cached_tie);
         assert!(cached_tie[0].parsed.size_bytes > cached_tie[1].parsed.size_bytes);
+    }
+
+    #[test]
+    fn merge_and_enrich_dedups_across_addons_and_meaningful_resume_thresholds() {
+        let shared_hash = [0xaa_u8; 20];
+        let s1 = Stream {
+            source: StreamSource::Torrent {
+                info_hash: shared_hash,
+                file_idx: Some(0),
+                announce: Vec::new(),
+                file_must_include: Vec::new(),
+            },
+            name: Some("Torrentio".to_owned()),
+            description: Some("Movie.2026.2160p.WEB.x265.mkv\n👤 382 · 💾 4.41 GB".to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+        let s2 = Stream {
+            source: StreamSource::Torrent {
+                info_hash: shared_hash,
+                file_idx: Some(0),
+                announce: Vec::new(),
+                file_must_include: Vec::new(),
+            },
+            name: Some("Torrentio Lite".to_owned()),
+            description: Some("Movie.2026.2160p.WEB.x265.mkv\n👤 382 · 💾 4.41 GB".to_owned()),
+            thumbnail: None,
+            subtitles: Vec::new(),
+            behavior_hints: Default::default(),
+        };
+        let c1 = PlaybackCandidate::from_stream_and_request(s1, None, &[]);
+        let c2 = PlaybackCandidate::from_stream_and_request(s2, None, &[]);
+
+        let (merged, _) = merge_and_enrich_stream_candidates(
+            &[c1, c2],
+            &[],
+            LocalDebridProvider::default(),
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].addon_name, "Torrentio, Torrentio Lite");
+        assert!(merged[0]
+            .merged_addon_keys
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case("torrentio lite")));
+
+        // Meaningful resume threshold: 27s is NOT a meaningful resume; 150s IS.
+        assert!(!is_meaningful_resume(Some(27.0), Some(100)));
+        assert!(!is_meaningful_resume(Some(45.0), Some(22)));
+        assert!(is_meaningful_resume(Some(120.0), Some(100)));
+        assert!(is_meaningful_resume(Some(70.0), Some(22)));
     }
 }

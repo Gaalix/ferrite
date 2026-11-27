@@ -440,6 +440,13 @@ pub struct AppShell {
     pub cached_auth_initial: Option<String>,
     pub episode_list_scrolled_key: Option<(String, String)>,
     pub meta_addon_dropdown_open: bool,
+    pub meta_season_dropdown_open: bool,
+    pub open_shelf_menu_key: Option<String>,
+    pub open_addon_menu_id: Option<String>,
+    pub failover_countdown_secs: Option<u8>,
+    pub failover_paused: bool,
+    pub show_other_sub_langs: bool,
+    pub picture_advanced_open: bool,
     pub discover_open_dropdown: Option<DiscoverDropdown>,
     pub discover_catalog_search: String,
     pub expanded_stream_rows: HashSet<usize>,
@@ -762,7 +769,7 @@ impl AppShell {
             installing_addon_urls: HashSet::new(),
             link_poll_active: false,
             board_hero_index: 0,
-            board_hero_mode_featured: false,
+            board_hero_mode_featured: true,
             board_hover_debounce_seq: 0,
             board_active_cw_idx: 0,
             discover_loaded_once: false,
@@ -816,6 +823,13 @@ impl AppShell {
             cached_auth_initial,
             episode_list_scrolled_key: None,
             meta_addon_dropdown_open: false,
+            meta_season_dropdown_open: false,
+            open_shelf_menu_key: None,
+            open_addon_menu_id: None,
+            failover_countdown_secs: None,
+            failover_paused: false,
+            show_other_sub_langs: false,
+            picture_advanced_open: false,
             discover_open_dropdown: None,
             discover_catalog_search: String::new(),
             expanded_stream_rows: HashSet::new(),
@@ -1921,21 +1935,21 @@ impl AppShell {
 
         if let Some(ih) = torrent_info_hash {
             let initial_wait = self.preferences.dead_swarm_timeout_secs.max(18);
+            let warn_after = initial_wait.saturating_sub(5).max(8);
             cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let mut elapsed_secs = initial_wait;
-                let mut wait_secs = initial_wait;
-                let mut prev_fetched = 0_u64;
-                let mut stalled_ticks = 0_u8;
+                // First wait until 5 seconds before failover to inspect whether the swarm is stalled.
+                cx.background_executor()
+                    .timer(Duration::from_secs(warn_after))
+                    .await;
 
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(wait_secs))
-                        .await;
-
-                    let mut sleep_next: Option<u64> = None;
-                    let update_res = this.update(cx, |shell, cx| {
+                // Show a live 5-second countdown before switching away from a stalled swarm,
+                // allowing the user to click [Switch now] or [Keep waiting].
+                for remaining in (1..=5_u8).rev() {
+                    let mut should_continue_countdown = false;
+                    let res = this.update(cx, |shell, cx| {
                         let still_waiting = shell.route.is_player()
                             && shell.preferences.dead_swarm_failover
+                            && !shell.failover_paused
                             && shell.playback_session.as_ref().is_some_and(|cur| {
                                 cur.generation == gen_id
                                     && cur.active_index == cand_idx
@@ -1943,6 +1957,54 @@ impl AppShell {
                                     && cur.candidates.len() > cur.active_index + 1
                             });
                         if !still_waiting {
+                            shell.failover_countdown_secs = None;
+                            return;
+                        }
+                        let snapshot = shell.engine.torrent_progress_snapshot(&ih);
+                        let making_progress = snapshot.is_some_and(|(fetched_bytes, _peers, speed_bps)| {
+                            speed_bps >= 64.0 * 1024.0 || fetched_bytes >= 2 * 1024 * 1024
+                        });
+                        if making_progress {
+                            shell.failover_countdown_secs = None;
+                        } else {
+                            shell.failover_countdown_secs = Some(remaining);
+                            should_continue_countdown = true;
+                            cx.notify();
+                        }
+                    });
+                    if res.is_err() || !should_continue_countdown {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_secs(1))
+                        .await;
+                }
+
+                let mut elapsed_secs = initial_wait;
+                let mut wait_secs = 0_u64;
+                let mut prev_fetched = 0_u64;
+                let mut stalled_ticks = 0_u8;
+
+                loop {
+                    if wait_secs > 0 {
+                        cx.background_executor()
+                            .timer(Duration::from_secs(wait_secs))
+                            .await;
+                    }
+
+                    let mut sleep_next: Option<u64> = None;
+                    let update_res = this.update(cx, |shell, cx| {
+                        let still_waiting = shell.route.is_player()
+                            && shell.preferences.dead_swarm_failover
+                            && !shell.failover_paused
+                            && shell.playback_session.as_ref().is_some_and(|cur| {
+                                cur.generation == gen_id
+                                    && cur.active_index == cand_idx
+                                    && !cur.first_media_ready
+                                    && cur.candidates.len() > cur.active_index + 1
+                            });
+                        if !still_waiting {
+                            shell.failover_countdown_secs = None;
                             return;
                         }
 
@@ -1958,12 +2020,14 @@ impl AppShell {
                                 next_stalled_ticks,
                                 sleep_secs,
                             } => {
+                                shell.failover_countdown_secs = None;
                                 prev_fetched = next_prev_fetched;
                                 stalled_ticks = next_stalled_ticks;
                                 elapsed_secs = elapsed_secs.saturating_add(sleep_secs);
                                 sleep_next = Some(sleep_secs);
                             }
                             P2pWatchdogDecision::Failover { reason } => {
+                                shell.failover_countdown_secs = None;
                                 shell.trigger_dead_swarm_failover(&reason, cx);
                             }
                         }
@@ -2272,6 +2336,98 @@ impl AppShell {
         if attached_any {
             cx.notify();
         }
+    }
+
+    /// Collects all ready addon subtitles grouped by human-readable language name, split into
+    /// `(preferred_language_groups, other_language_groups)` for the Audio & Subtitles sheet.
+    #[allow(clippy::type_complexity)]
+    pub fn collect_grouped_addon_subtitles(
+        &self,
+    ) -> (
+        Vec<(String, Vec<(String, String, String)>)>,
+        Vec<(String, Vec<(String, String, String)>)>,
+    ) {
+        let preferred_sub_lang = self.normalized_preferred_sub_lang();
+        self.core.with_model(|m| {
+            let mut preferred_map: std::collections::BTreeMap<String, Vec<(String, String, String)>> =
+                std::collections::BTreeMap::new();
+            let mut other_map: std::collections::BTreeMap<String, Vec<(String, String, String)>> =
+                std::collections::BTreeMap::new();
+            let mut seen_urls = HashSet::new();
+
+            for sub_res in &m.player.subtitles {
+                if let Some(Loadable::Ready(list)) = &sub_res.content {
+                    for s in list {
+                        let url_str = s.url.to_string();
+                        if !seen_urls.insert(url_str.clone()) {
+                            continue;
+                        }
+                        let human_lang = human_language_name(&s.lang);
+                        let raw_label = s.label.as_deref().map(str::trim).unwrap_or("");
+                        let display_label = if raw_label.is_empty()
+                            || raw_label.eq_ignore_ascii_case(&s.lang)
+                            || raw_label.eq_ignore_ascii_case(&human_lang)
+                        {
+                            "Addon subtitle".to_owned()
+                        } else {
+                            raw_label.to_owned()
+                        };
+                        let entry = (url_str, display_label, s.lang.clone());
+                        if subtitle_lang_matches(&s.lang, &preferred_sub_lang) {
+                            let bucket = preferred_map.entry(human_lang).or_default();
+                            if bucket.len() < 8 {
+                                bucket.push(entry);
+                            }
+                        } else {
+                            let bucket = other_map.entry(human_lang).or_default();
+                            if bucket.len() < 6 {
+                                bucket.push(entry);
+                            }
+                        }
+                    }
+                }
+            }
+
+            (
+                preferred_map.into_iter().collect(),
+                other_map.into_iter().collect(),
+            )
+        })
+    }
+
+    /// Loads and selects a clicked addon subtitle track directly into mpv.
+    pub fn attach_and_select_addon_subtitle(
+        &mut self,
+        sub_url: String,
+        title_label: String,
+        lang: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.playback_session.as_mut() {
+            session.attached_external_subs.insert(sub_url.clone());
+        }
+        if let Some(mpv) = &self.mpv {
+            let _ = mpv.add_subtitle(&sub_url, Some(&title_label), Some(&lang));
+        }
+        self.push_toast(
+            ToastKind::Success,
+            format!("Loaded {title_label}"),
+            None,
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub fn switch_to_next_backup_source(&mut self, cx: &mut Context<Self>) {
+        self.failover_countdown_secs = None;
+        self.failover_paused = false;
+        self.trigger_dead_swarm_failover("Switched to next source", cx);
+    }
+
+    pub fn pause_dead_swarm_failover(&mut self, cx: &mut Context<Self>) {
+        self.failover_countdown_secs = None;
+        self.failover_paused = true;
+        cx.notify();
     }
 
     fn sync_player_from_core_model(&mut self, cx: &mut Context<Self>) {
@@ -4084,6 +4240,8 @@ impl AppShell {
         if !is_auto_failover {
             session.auto_failover_attempts = 0;
             session.failover_exhausted_notified = false;
+            self.failover_countdown_secs = None;
+            self.failover_paused = false;
         }
 
         let badge = session

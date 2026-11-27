@@ -31,7 +31,7 @@ use crate::{
     state::{
         extract_genres, extract_imdb_rating, format_movietracker_episode_code, scroll_near_bottom,
         AppRoute, BrowsingContextMenu, KbFocusableCard, LibraryFilterTab, LibraryStatusTab,
-        PlaybackCandidate, QuickPeekTarget, SidebarTab, ToastKind,
+        QuickPeekTarget, SidebarTab, ToastKind,
     },
     theme::{
         active_theme, editorial_serif, glass_capsule_shadow, mono_font,
@@ -112,6 +112,7 @@ struct HomeSpotlightCandidate {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 enum SpotlightTrailerTarget {
     DirectStream(Box<Stream>),
     YouTubeUrl(String),
@@ -866,14 +867,14 @@ impl AppShell {
                                     // Title logo or display typography.
                                     .child(if let Some(ltex) = logo_tex {
                                         img(ltex)
-                                            .h(px(64.0))
-                                            .max_w(px(360.0))
+                                            .h(px(76.0))
+                                            .max_w(px(400.0))
                                             .object_fit(ObjectFit::Contain)
                                             .into_any_element()
                                     } else {
                                         div()
                                             .font(editorial_serif())
-                                            .text_size(theme.sp(44.0))
+                                            .text_size(theme.sp(48.0))
                                             .line_height(relative(1.04))
                                             .text_color(rgb(HERO_INK_PRIMARY))
                                             .truncate()
@@ -884,17 +885,28 @@ impl AppShell {
                                     .when_some(active.description.clone(), |el, desc| {
                                         el.child(
                                             div()
-                                                .max_w(px(560.0))
-                                                .text_size(theme.sp(13.5))
-                                                .line_height(theme.sp(19.5))
+                                                .max_w(px(620.0))
+                                                .text_size(theme.text_body())
+                                                .line_height(theme.sp(21.0))
                                                 .text_color(rgb(HERO_INK_SECONDARY))
-                                                .max_h(theme.sp(40.0))
+                                                .max_h(theme.sp(44.0))
                                                 .overflow_hidden()
                                                 .child(desc),
                                         )
                                     })
-                                    // Primary & secondary action pills.
-                                    .child(
+                                    // Focused hierarchy: 1 primary CTA + 2 secondary pills (Details & Library).
+                                    .child({
+                                        let _ = (
+                                            trailer_target,
+                                            tr_type,
+                                            tr_id,
+                                            tr_name,
+                                            peek_type,
+                                            peek_id,
+                                            peek_vid,
+                                            peek_title,
+                                            peek_preview,
+                                        );
                                         div()
                                             .mt(px(4.0))
                                             .flex()
@@ -905,8 +917,8 @@ impl AppShell {
                                                 div()
                                                     .id("hero-primary-play-btn")
                                                     .cursor_pointer()
-                                                    .h(theme.sp(38.0))
-                                                    .px(theme.sp(20.0))
+                                                    .h(theme.sp(42.0))
+                                                    .px(theme.sp(22.0))
                                                     .rounded(px(RADIUS_PILL))
                                                     .bg(rgb(accent))
                                                     .hover(move |s| s.bg(rgb(accent_hover)))
@@ -917,7 +929,7 @@ impl AppShell {
                                                     .gap(theme.sp(8.0))
                                                     .font(ui_sans(FontWeight::SEMIBOLD))
                                                     .font_features(tabular_nums())
-                                                    .text_size(theme.sp(13.5))
+                                                    .text_size(theme.text_body())
                                                     .text_color(rgb(cta_on_accent))
                                                     .on_mouse_down(
                                                         MouseButton::Left,
@@ -934,7 +946,7 @@ impl AppShell {
                                                     .child(svg_icon_weighted(
                                                         IconName::Play,
                                                         IconWeight::Fill,
-                                                        14.5 * ui_scale,
+                                                        15.0 * ui_scale,
                                                         rgb(cta_on_accent),
                                                     ))
                                                     .child(active.primary_cta_label),
@@ -958,51 +970,6 @@ impl AppShell {
                                                     );
                                                 }),
                                             ))
-                                            .when_some(trailer_target, |row, target| {
-                                                row.child(render_hero_glass_pill(
-                                                    "hero-trailer-btn",
-                                                    IconName::Clapperboard,
-                                                    IconWeight::Regular,
-                                                    "Trailer",
-                                                    false,
-                                                    accent,
-                                                    accent_soft,
-                                                    border_accent,
-                                                    ui_scale,
-                                                    cx.listener(move |this, _, _, cx| match &target
-                                                    {
-                                                        SpotlightTrailerTarget::DirectStream(
-                                                            stream,
-                                                        ) => {
-                                                            let addons = this.core.with_model(
-                                                                |m| m.ctx.profile.addons.clone(),
-                                                            );
-                                                            let cand =
-                                                                PlaybackCandidate::from_stream_and_request(
-                                                                    stream.as_ref().clone(),
-                                                                    None,
-                                                                    &addons,
-                                                                );
-                                                            this.start_playback_session(
-                                                                tr_type.clone(),
-                                                                tr_id.clone(),
-                                                                tr_id.clone(),
-                                                                format!("{tr_name} · Trailer"),
-                                                                Some("Trailer".to_owned()),
-                                                                None,
-                                                                None,
-                                                                Arc::new(vec![cand]),
-                                                                0,
-                                                                None,
-                                                                cx,
-                                                            );
-                                                        }
-                                                        SpotlightTrailerTarget::YouTubeUrl(url) => {
-                                                            cx.open_url(url);
-                                                        }
-                                                    }),
-                                                ))
-                                            })
                                             .child(render_hero_glass_pill(
                                                 "hero-library-btn",
                                                 IconName::Bookmark,
@@ -1041,30 +1008,7 @@ impl AppShell {
                                                     cx.notify();
                                                 }),
                                             ))
-                                            .child(render_hero_glass_pill(
-                                                "hero-quick-peek-btn",
-                                                IconName::Eye,
-                                                IconWeight::Regular,
-                                                "Quick Peek",
-                                                false,
-                                                accent,
-                                                accent_soft,
-                                                border_accent,
-                                                ui_scale,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.open_quick_peek(
-                                                        QuickPeekTarget {
-                                                            type_name: peek_type.clone(),
-                                                            id: peek_id.clone(),
-                                                            video_id: peek_vid.clone(),
-                                                            title: peek_title.clone(),
-                                                            preview: peek_preview.clone(),
-                                                        },
-                                                        cx,
-                                                    );
-                                                }),
-                                            )),
-                                    ),
+                                    }),
                             ),
                     )
                     .child(dock_el),
@@ -1972,74 +1916,125 @@ impl AppShell {
                 .into_any_element()
         });
 
+        let shelf_grp: SharedString = format!("board-shelf-grp-{raw_index}").into();
+        let menu_open = self.open_shelf_menu_key.as_deref() == Some(pin_key.as_str());
+        let menu_toggle_key = pin_key.clone();
+
         let shelf_controls = div()
             .flex_shrink_0()
             .flex()
             .items_center()
             .gap(theme.sp(6.0))
-            .child(render_shelf_icon_button(
-                ("shelf-prev", raw_index),
-                IconName::ChevronLeft,
-                IconWeight::Regular,
-                false,
-                theme,
-                cx.listener(move |_, _, _, cx| {
-                    let cur_x = (-scroll_prev.offset().x / px(1.0)).max(0.0);
-                    let next_x = (cur_x - step_px).max(0.0);
-                    scroll_prev.set_offset(point(px(-next_x), px(0.0)));
-                    cx.notify();
-                }),
-            ))
-            .child(render_shelf_icon_button(
-                ("shelf-next", raw_index),
-                IconName::ChevronRight,
-                IconWeight::Regular,
-                false,
-                theme,
-                cx.listener(move |this, _, _, cx| {
-                    let max_x = (scroll_next.max_offset().x / px(1.0)).max(0.0);
-                    let cur_x = (-scroll_next.offset().x / px(1.0)).max(0.0);
-                    let next_x = (cur_x + step_px).min(max_x);
-                    scroll_next.set_offset(point(px(-next_x), px(0.0)));
-                    if can_load_more
-                        && !is_loading
-                        && (max_x <= 0.0 || next_x + 320.0 >= max_x)
-                    {
-                        this.core.load_board_next_page(raw_index);
-                    }
-                    cx.notify();
-                }),
-            ))
-            .child(render_shelf_icon_button(
-                ("shelf-pin", raw_index),
-                IconName::Pin,
-                if is_pinned {
-                    IconWeight::Fill
-                } else {
-                    IconWeight::Regular
-                },
-                is_pinned,
-                theme,
-                cx.listener(move |this, _, _, cx| {
-                    this.toggle_pin_board_shelf(pin_key.clone(), cx);
-                }),
-            ))
-            .child(render_shelf_icon_button(
-                ("shelf-hide", raw_index),
-                IconName::EyeOff,
-                IconWeight::Regular,
-                false,
-                theme,
-                cx.listener(move |this, _, _, cx| {
-                    this.toggle_hide_board_shelf(hide_key.clone(), cx);
-                }),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.sp(5.0))
+                    .when(!menu_open, |el| {
+                        el.opacity(0.0)
+                            .group_hover(shelf_grp.clone(), |s| s.opacity(1.0))
+                    })
+                    .child(render_shelf_icon_button(
+                        ("shelf-prev", raw_index),
+                        IconName::ChevronLeft,
+                        IconWeight::Regular,
+                        false,
+                        theme,
+                        cx.listener(move |_, _, _, cx| {
+                            let cur_x = (-scroll_prev.offset().x / px(1.0)).max(0.0);
+                            let next_x = (cur_x - step_px).max(0.0);
+                            scroll_prev.set_offset(point(px(-next_x), px(0.0)));
+                            cx.notify();
+                        }),
+                    ))
+                    .child(render_shelf_icon_button(
+                        ("shelf-next", raw_index),
+                        IconName::ChevronRight,
+                        IconWeight::Regular,
+                        false,
+                        theme,
+                        cx.listener(move |this, _, _, cx| {
+                            let max_x = (scroll_next.max_offset().x / px(1.0)).max(0.0);
+                            let cur_x = (-scroll_next.offset().x / px(1.0)).max(0.0);
+                            let next_x = (cur_x + step_px).min(max_x);
+                            scroll_next.set_offset(point(px(-next_x), px(0.0)));
+                            if can_load_more
+                                && !is_loading
+                                && (max_x <= 0.0 || next_x + 320.0 >= max_x)
+                            {
+                                this.core.load_board_next_page(raw_index);
+                            }
+                            cx.notify();
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .relative()
+                            .child(render_shelf_icon_button(
+                                ("shelf-more", raw_index),
+                                IconName::MoreHorizontal,
+                                IconWeight::Regular,
+                                menu_open || is_pinned,
+                                theme,
+                                cx.listener(move |this, _, _, cx| {
+                                    if this.open_shelf_menu_key.as_deref()
+                                        == Some(menu_toggle_key.as_str())
+                                    {
+                                        this.open_shelf_menu_key = None;
+                                    } else {
+                                        this.open_shelf_menu_key = Some(menu_toggle_key.clone());
+                                    }
+                                    cx.notify();
+                                }),
+                            ))
+                            .when(menu_open, |wrap| {
+                                let pk = pin_key.clone();
+                                let hk = hide_key.clone();
+                                wrap.child(
+                                    gpui::deferred(
+                                        crate::ui::glass_dropdown_panel(
+                                            ("shelf-more-menu", raw_index),
+                                            172.0,
+                                        )
+                                        .absolute()
+                                        .top(theme.sp(34.0))
+                                        .right_0()
+                                        .child(crate::ui::glass_dropdown_option(
+                                            ("shelf-menu-pin", raw_index),
+                                            if is_pinned {
+                                                "Unpin shelf"
+                                            } else {
+                                                "Pin to top"
+                                            },
+                                            None,
+                                            is_pinned,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.open_shelf_menu_key = None;
+                                                this.toggle_pin_board_shelf(pk.clone(), cx);
+                                            }),
+                                        ))
+                                        .child(crate::ui::glass_dropdown_option(
+                                            ("shelf-menu-hide", raw_index),
+                                            "Hide shelf",
+                                            None,
+                                            false,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.open_shelf_menu_key = None;
+                                                this.toggle_hide_board_shelf(hk.clone(), cx);
+                                            }),
+                                        )),
+                                    )
+                                    .with_priority(10),
+                                )
+                            }),
+                    ),
+            )
             .child(
                 div()
                     .id(("shelf-see-all", raw_index))
                     .cursor_pointer()
-                    .h(theme.sp(30.0))
-                    .px(theme.sp(11.0))
+                    .h(theme.sp(32.0))
+                    .px(theme.sp(12.0))
                     .ml(theme.sp(4.0))
                     .rounded(px(RADIUS_PILL))
                     .bg(rgba(theme.glass_trough_bg))
@@ -2054,7 +2049,7 @@ impl AppShell {
                     .items_center()
                     .gap(theme.sp(4.0))
                     .font(ui_sans(FontWeight::MEDIUM))
-                    .text_size(theme.sp(12.5))
+                    .text_size(theme.text_body())
                     .text_color(rgb(theme.text_secondary))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2070,8 +2065,8 @@ impl AppShell {
                     .child("See all")
                     .child(svg_icon(
                         IconName::ChevronRight,
-                        12.5 * theme.ui_scale,
-                        rgb(theme.text_muted),
+                        13.0 * theme.ui_scale,
+                        rgb(theme.text_secondary),
                     )),
             );
 
@@ -2087,6 +2082,7 @@ impl AppShell {
         // `max_offset_y` stays strictly invariant when shelves cross overscan boundaries.
         div()
             .id(("board-shelf", raw_index))
+            .group(shelf_grp)
             .w_full()
             .h(px(shelf_total_h))
             .overflow_hidden()

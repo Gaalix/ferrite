@@ -12,6 +12,7 @@ use crate::{
         sp, ui_sans, RADIUS_CONTROL, RADIUS_PILL,
     },
     ui::{glass_dropdown_option, is_compact_viewport, keycap, topnav_gutter_px},
+    ui_components::simple_tooltip,
 };
 
 pub const TOPNAV_SCROLLED_THRESHOLD_PX: f32 = 24.0;
@@ -280,7 +281,7 @@ impl AppShell {
                     .justify_center()
                     .gap(sp(6.0))
                     .whitespace_nowrap()
-                    .text_size(sp(13.0))
+                    .text_size(theme.text_body())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -311,14 +312,14 @@ impl AppShell {
                 .child(tab.label())
             }));
 
-        // Right zone: Compact Search pill + 1-click Addons + 1-click Settings + Avatar + CSD controls.
+        // Right zone: Wider Search pill + 1-click Addons + 1-click Settings + Avatar (detached from OS CSD controls).
         let search_pill = div()
             .id("topnav-search-box")
             .cursor_pointer()
-            .h(sp(32.0))
-            .min_w(sp(if compact_width { 98.0 } else { 140.0 }))
-            .max_w(sp(230.0))
-            .px(sp(10.0))
+            .h(sp(34.0))
+            .min_w(sp(if compact_width { 116.0 } else { 188.0 }))
+            .max_w(sp(276.0))
+            .px(sp(12.0))
             .rounded(px(RADIUS_PILL))
             .bg(if self.command_palette_open {
                 rgba(theme.glass_row_selected_bg)
@@ -376,7 +377,7 @@ impl AppShell {
                             .flex_1()
                             .min_w(px(0.0))
                             .font(ui_sans(FontWeight::MEDIUM))
-                            .text_size(sp(12.5))
+                            .text_size(theme.text_body())
                             .text_color(if query_empty {
                                 rgb(theme.text_secondary)
                             } else {
@@ -442,6 +443,7 @@ impl AppShell {
             .flex()
             .items_center()
             .justify_center()
+            .tooltip(simple_tooltip("Addons", Some("Alt+5")))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -507,6 +509,7 @@ impl AppShell {
             .flex()
             .items_center()
             .justify_center()
+            .tooltip(simple_tooltip("Settings", Some("Alt+6")))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -553,6 +556,7 @@ impl AppShell {
             .flex()
             .items_center()
             .justify_center()
+            .tooltip(simple_tooltip("Account", Some("Alt+7")))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -588,7 +592,7 @@ impl AppShell {
                 .into_any_element()
             });
 
-        let right_zone = div()
+        let app_utility_pill = div()
             .occlude()
             .flex_shrink_0()
             .h(sp(42.0))
@@ -624,7 +628,7 @@ impl AppShell {
                             .items_center()
                             .gap(sp(5.0))
                             .font(ui_sans(FontWeight::SEMIBOLD))
-                            .text_size(sp(11.5))
+                            .text_size(theme.text_micro())
                             .text_color(rgb(accent_ink))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -670,7 +674,7 @@ impl AppShell {
                         .items_center()
                         .gap(sp(5.0))
                         .font(ui_sans(FontWeight::MEDIUM))
-                        .text_size(sp(12.0))
+                        .text_size(theme.text_micro())
                         .text_color(rgb(theme.text_primary))
                         .on_mouse_down(MouseButton::Left, |_, window, cx| {
                             cx.stop_propagation();
@@ -683,16 +687,33 @@ impl AppShell {
                         ))
                         .child("Exit fullscreen"),
                 )
-            })
+            });
+
+        // Keep OS window controls in their own separate cluster detached from app utilities.
+        let right_zone = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(sp(8.0))
+            .child(app_utility_pill)
             .when_some(csd_controls, |row, controls_el| {
                 row.child(
                     div()
-                        .w(px(1.0))
-                        .h(sp(16.0))
+                        .occlude()
                         .flex_shrink_0()
-                        .bg(rgba(theme.glass_divider)),
+                        .h(sp(42.0))
+                        .px(sp(6.0))
+                        .rounded(px(RADIUS_PILL))
+                        .flex()
+                        .items_center()
+                        .when(!is_scrolled, |el| {
+                            el.bg(rgba(theme.bg_topnav_float))
+                                .border_1()
+                                .border_color(rgba(theme.glass_border))
+                                .shadow(glass_capsule_shadow())
+                        })
+                        .child(controls_el),
                 )
-                .child(controls_el)
             });
 
         div()
